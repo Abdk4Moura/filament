@@ -1,0 +1,11 @@
+{
+  "name": "quickshare-local-discovery",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Spike: offline LAN peer discovery for Quickshare via UDP multicast + a localhost bridge (the LocalSend model).",
+  "bin": { "quickshare-local": "discovery.js" },
+  "scripts": {
+    "start": "node discovery.js"
+  }
+}

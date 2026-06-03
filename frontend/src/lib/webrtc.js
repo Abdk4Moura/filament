@@ -33,13 +33,15 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, initiator, sendSignal, onStatus, onTransfer }) {
+  constructor({ id, name, iceServers, chunkSize, initiator, sendSignal, onStatus, onTransfer, onRoute }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
     this.sendSignal = sendSignal
     this.onStatus = onStatus || (() => {})
     this.onTransfer = onTransfer || (() => {})
+    this.onRoute = onRoute || (() => {})
+    this.route = null // 'local' | 'direct' | 'relayed'
 
     this.transfers = new Map() // id -> transfer state (mirrored to the UI)
     this._outgoingFiles = new Map() // id -> File awaiting accept
@@ -51,9 +53,14 @@ export class PeerLink {
     }
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState
-      if (s === 'connected') this.onStatus('ready')
-      else if (s === 'failed' || s === 'disconnected' || s === 'closed') this.onStatus('failed')
-      else this.onStatus('connecting')
+      if (s === 'connected') {
+        this.onStatus('ready')
+        this._detectRoute() // which physical path did ICE actually pick?
+      } else if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+        this.onStatus('failed')
+      } else {
+        this.onStatus('connecting')
+      }
     }
 
     if (initiator) {
@@ -86,6 +93,44 @@ export class PeerLink {
       }
     } catch (err) {
       console.error('signal handling failed', err)
+    }
+  }
+
+  // Inspect the ICE stats to learn which path the connection actually took:
+  //   local   — host↔host, i.e. straight across the LAN (never hit the internet)
+  //   direct  — peer-to-peer over the internet (NAT-traversed, no relay)
+  //   relayed — falling back through a TURN relay
+  // ICE renominates occasionally, so we poll a few times after connecting.
+  async _detectRoute(attempt = 0) {
+    try {
+      const stats = await this.pc.getStats()
+      const cands = {}
+      let selected = null
+      let transportSelectedId = null
+      stats.forEach((r) => {
+        if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands[r.id] = r
+        if (r.type === 'transport' && r.selectedCandidatePairId) transportSelectedId = r.selectedCandidatePairId
+      })
+      stats.forEach((r) => {
+        if (r.type !== 'candidate-pair') return
+        if (r.id === transportSelectedId || (!transportSelectedId && r.state === 'succeeded' && (r.nominated || r.selected)))
+          selected = r
+      })
+      if (!selected) {
+        if (attempt < 5) setTimeout(() => this._detectRoute(attempt + 1), 400)
+        return
+      }
+      const lt = cands[selected.localCandidateId]?.candidateType
+      const rt = cands[selected.remoteCandidateId]?.candidateType
+      let route = 'direct'
+      if (lt === 'relay' || rt === 'relay') route = 'relayed'
+      else if (lt === 'host' && rt === 'host') route = 'local'
+      if (route !== this.route) {
+        this.route = route
+        this.onRoute(route)
+      }
+    } catch {
+      /* getStats unsupported — leave route null */
     }
   }
 

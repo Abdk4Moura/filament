@@ -40,6 +40,13 @@ Firebase mode mirrors these exact events client-side via Firestore.
 
 Convention: the **newer** peer always initiates the WebRTC offer.
 
+### Rooms / discovery (REST)
+- `GET /api/room` → `{ room, network: "ipv4"|"ipv6"|"raw", scope: "auto" }` —
+  the **auto** room: everyone on the same network lands here automatically
+  ("people near you"). IPv6 is grouped by /64 prefix, IPv4 by public address.
+- `GET /api/room/code` → `{ code, room, scope: "code" }` — a short human code to
+  pair **across** networks (different WiFi / mobile data).
+
 ## UI contract — `useQuickshare()`
 
 The UI imports `useQuickshare()` and renders from its return value. It must not
@@ -50,14 +57,20 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   me: { id: string, name: string, color: string } | null,
   connected: boolean,
   signalingKind: "socketio" | "firebase" | null,
+
+  // room / discovery
   roomId: string | null,
   roomUrl: string | null,            // share this to pair
+  roomScope: "auto" | "code" | "link" | null,  // how you got into this room
+  roomCode: string | null,           // the 6-char code when scope === "code"
+  network: "ipv4" | "ipv6" | "raw" | null,     // how the auto room was grouped
 
   peers: Array<{
     id: string,
     name: string,
     color: string,                   // stable hsl() per peer
     status: "connecting" | "ready" | "failed",
+    route: "local" | "direct" | "relayed" | null,  // PATH the data takes (Part A)
   }>,
 
   transfers: Array<{
@@ -73,12 +86,18 @@ touch the socket, Firestore, or RTCPeerConnection directly.
     url?: string,                    // present on completed RECEIVES → download
   }>,
 
+  // optional native LAN-discovery helper (Part C); available:false when absent
+  localHelper: { available: boolean, peers: Array<{ id, name, addr }> },
+
   // actions
   sendFiles(peerId: string, files: FileList | File[]): void,
   acceptTransfer(transferId: string): void,   // receiver accepts an "offered"
   declineTransfer(transferId: string): void,
   saveTransfer(transferId: string): void,     // download a completed receive
   clearTransfer(transferId: string): void,    // dismiss from the list
+  pairWithCode(code: string): void,           // join a code room (cross-network)
+  generateCode(): Promise<string>,            // mint a code, switch to it
+  useAutoRoom(): Promise<void>,               // back to the "people near you" room
 }
 ```
 
@@ -88,3 +107,19 @@ touch the socket, Firestore, or RTCPeerConnection directly.
 - After accept it goes `transferring` (watch `progress`) → `complete`.
 - A completed `receive` exposes `url` → show **save**.
 - A `send` transfer is `offered` until the peer accepts, then `transferring` → `complete`, or `declined`.
+
+### Part A — `peer.route` (the privacy/trust signal)
+Once a peer connects, `route` tells you the **physical path** ICE chose:
+- `"local"` — host↔host, straight across the LAN; **bytes never hit the internet**.
+- `"direct"` — peer-to-peer over the internet (NAT-traversed, no relay).
+- `"relayed"` — falling back through a TURN relay.
+Surface it on the peer tile (e.g. a small badge: `⟶ local` / `⟶ direct` / `⟶ relayed`).
+
+### Part B — discovery modes
+- `roomScope === "auto"` → "people near you"; show the `network` and that it's automatic.
+- `roomScope === "code"` → show the big `roomCode` to read aloud; offer "back to nearby" (`useAutoRoom`).
+- Provide a "pair with code" entry (calls `pairWithCode`) and a "create code" button (`generateCode`).
+
+### Part C — `localHelper`
+When `localHelper.available`, optionally show its `peers` as "found on your LAN
+(offline)". It's a presence hint from the native helper; absent by default.

@@ -24,6 +24,10 @@ export default function App() {
     setCopied(true)
     setTimeout(() => setCopied(false), 1200)
   }
+  const enterCode = () => {
+    const code = window.prompt('Enter a pairing code:')
+    if (code) qs.pairWithCode(code)
+  }
 
   return (
     <div className="qs">
@@ -45,10 +49,35 @@ export default function App() {
         </button>
       </header>
 
+      {/* discovery bar (Part B) */}
+      <div className="qs-discovery">
+        {qs.roomScope === 'code' ? (
+          <>
+            <span className="qs-scope">pairing code</span>
+            <code className="qs-code">{qs.roomCode}</code>
+            <button onClick={qs.useAutoRoom}>← back to nearby</button>
+          </>
+        ) : (
+          <>
+            <span className="qs-scope">
+              people near you{qs.network ? ` · ${qs.network}` : ''}
+            </span>
+            <button onClick={enterCode}>pair with code</button>
+            <button onClick={() => qs.generateCode()}>create code</button>
+          </>
+        )}
+        {qs.localHelper.available && (
+          <span className="qs-local" title="discovered by the native LAN helper">
+            ◇ {qs.localHelper.peers.length} on your LAN (offline)
+          </span>
+        )}
+      </div>
+
       <main className="qs-grid">
         {qs.peers.length === 0 && (
           <p className="qs-empty">
-            No one here yet. Open this room link on another device or tab to pair.
+            No one here yet. Devices on the same WiFi appear automatically — or
+            share the room link / a pairing code.
           </p>
         )}
         {qs.peers.map((p) => (
@@ -63,6 +92,7 @@ export default function App() {
             </span>
             <span className="qs-name">{p.name}</span>
             <span className="qs-status">{p.status}</span>
+            {p.route && <span className={`qs-route ${p.route}`}>⟶ {p.route}</span>}
           </button>
         ))}
       </main>

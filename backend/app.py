@@ -9,7 +9,9 @@ Files themselves never touch this server: they go peer-to-peer over a WebRTC
 data channel. The server only helps two browsers find each other.
 """
 import hashlib
+import ipaddress
 import os
+import secrets
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
@@ -35,16 +37,52 @@ def api_config():
     return jsonify(config.public_config())
 
 
+# Human-friendly code alphabet: no 0/O/1/I/L to avoid mistyping.
+_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _client_ip():
+    return request.headers.get("cf-connecting-ip", request.remote_addr or "0.0.0.0")
+
+
+def _network_key(ip_str):
+    """Group peers onto the same LAN.
+
+    IPv4 devices behind a home/office router share one public IPv4, so the full
+    address groups them. IPv6 devices each get a unique address but share a /64
+    prefix on the same link, so we group on that prefix instead — otherwise
+    every IPv6 device would land in its own room and never see each other.
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return ("raw", ip_str)
+    if ip.version == 6:
+        return ("ipv6", str(ipaddress.ip_network(f"{ip}/64", strict=False).network_address))
+    return ("ipv4", str(ip))
+
+
 @app.get("/api/room")
 def api_room():
-    """A stable default room name derived from the caller's network address.
+    """A stable default room derived from the caller's network — 'people near you'.
 
-    Two people behind the same public IP get the same name, so they land in the
-    same room automatically — the original Quickshare 'people near you' idea.
+    Devices on the same WiFi resolve to the same room automatically (no link to
+    share). WebRTC/ICE then connects them host-to-host straight over the LAN.
     """
-    ip = request.headers.get("cf-connecting-ip", request.remote_addr or "0.0.0.0")
-    name = hashlib.sha256(f"{config.SECRET}:{ip}".encode()).hexdigest()[:12]
-    return jsonify({"room": name})
+    network, key = _network_key(_client_ip())
+    room = hashlib.sha256(f"{config.SECRET}:{key}".encode()).hexdigest()[:12]
+    return jsonify({"room": room, "network": network, "scope": "auto"})
+
+
+@app.get("/api/room/code")
+def api_room_code():
+    """Mint a short human code for pairing ACROSS networks (over the internet).
+
+    For when the IP-grouping can't help — different WiFi, mobile data, CGNAT.
+    The code maps to a deterministic room id both sides join.
+    """
+    code = "".join(secrets.choice(_CODE_ALPHABET) for _ in range(6))
+    return jsonify({"code": code, "room": f"code-{code}", "scope": "code"})
 
 
 @app.get("/api/health")
