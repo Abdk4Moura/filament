@@ -1,8 +1,0 @@
-beginning
-COMMANDS
-```
-................
-pipenv [USAGE]
-pipenv install --> to create a new venv or use a Pipfile
-pipenv shell --> shell activate
-.....END...........

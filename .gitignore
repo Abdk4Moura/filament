@@ -1,9 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg
+.venv/
+venv/
+.env
+
+# Node / Vite
+node_modules/
+frontend/dist/
+backend/dist/
+
+# Build / coverage
+build
+htmlcov
+
+# Editor / OS
 .DS_Store
 .idea
 *.log
 tmp/
-
-*.py[cod]
-*.egg
-build
-htmlcov

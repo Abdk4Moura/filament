@@ -1,30 +1,86 @@
 # Quickshare
 
-Quickshare is a free web app that allows file sharing through a Peer-to-Peer(P2P) network.
-It uses a middleman or signalling channel using firebase connection and then establishes a direct connection between the peers.
-The files are transferred directly between the peers and the middleman is not involved in the transfer. The middleman/signalling channel is only used to establish a connection between the peers.
+Peer-to-peer file sharing in the browser. Files travel **directly between
+browsers** over a WebRTC data channel — the server only helps two peers find
+each other (signaling). No uploads, no size cap, no account.
 
-## Features
+This repo is a small, honest demo of **how Flask and React work together**: one
+Flask app serves the built React bundle, exposes a tiny REST surface, and relays
+WebRTC signaling over Socket.IO. Firebase is supported as an alternative
+signaling channel, selectable at runtime.
 
-1. Share files with anyone in the world.
-2. No size limit on files.
-3. No need to install any software.
-4. No need to sign up.
-5. No need to login.
-6. QR code for easy sharing.
-7. Share files with multiple people at once.
+```
+              one origin
+   browser ── REST /api/* ─────────► Flask ── serves React build (dist/)
+      │       Socket.IO /socket.io ► signaling relay
+      └────── WebRTC DataChannel ──► other browser   (the files go here)
+```
 
-## How to use
+## Layout
 
-1. Go to [Quickshare](https://quickshare-1.web.app/).
-2. Click on the `+` symbol to generate a QR code for sharing as well as a link.
-3. Share the QR code or the link with the person you want to share with.
-4. After connection is established, you can drag and drop files to share.
-5. Alternatively, you can click on the avatar of theh user to select files to share.
-6. You can also share files with multiple people at once by clicking on the `+` symbol again and sharing the new QR code or link.
+```
+backend/        Flask app
+  app.py          routes + SPA serving + Socket.IO mount
+  signaling.py    the signaling relay (dumb pipe; never sees files)
+  config.py       runtime config served at /api/config
+  requirements.txt
+frontend/       React app (Vite)
+  src/lib/        the networking layer — the part that must "just work"
+    signaling.js    Socket.IO ⟷ Firebase abstraction (one interface)
+    webrtc.js       PeerLink: RTCPeerConnection + chunked file transfer
+    useQuickshare.js the single hook the UI consumes
+  src/App.jsx     placeholder UI (replace with Claude Design's output)
+CONTRACT.md     the shape everything agrees on (REST + events + hook)
+CLAUDE_DESIGN_PROMPT.md  prompt that makes Claude Design produce the UI
+```
 
-## Credits
+## Run it
 
-This is inspired by Sharedrop <link for sharedrop> and uses WebRTC for peer-to-peer connection and Firebase for the signalling channel.
+**Dev (hot reload, two processes):**
+```bash
+# 1. backend
+cd backend
+pip install -r requirements.txt
+python app.py                     # http://localhost:5000
 
-(PS: You can also share files with yourself by opening the link in a new tab.)
+# 2. frontend (new terminal) — proxies /api + /socket.io to Flask
+cd frontend
+npm install
+npm run dev                       # http://localhost:5173
+```
+
+**Production-style (one process):**
+```bash
+cd frontend && npm install && npm run build   # emits backend/dist
+cd ../backend && pip install -r requirements.txt && python app.py
+# open http://localhost:5000
+```
+
+Open the same room link in two tabs / two devices to pair, then click a peer
+tile (or drag files onto it) to send.
+
+## Switching signaling backends
+
+Everything is driven by `/api/config`, so no rebuild is needed:
+
+```bash
+export QS_SIGNALING=socketio          # default
+# or, to use Firebase Firestore signaling:
+export QS_SIGNALING=firebase
+export QS_FIREBASE_CONFIG='{"apiKey":"…","projectId":"…"}'   # web config
+```
+
+Other env knobs: `QS_ICE_SERVERS` (JSON array, add TURN for hard NATs),
+`QS_SECRET` (salts the default room name), `QS_CHUNK_SIZE`, `PORT`.
+
+## Designing the UI with Claude Design
+
+See `CLAUDE_DESIGN_PROMPT.md`. The prompt is written against `CONTRACT.md` so
+the generated component drops onto `useQuickshare()` with no rewrites.
+
+## A note on the "framework"
+
+An earlier version of this project shipped a hand-rolled, Flutter-flavored
+reactive UI engine (a `StateNotifier` + lifecycle-driven element system). That
+experiment now lives on its own as **[statelet](https://github.com/Abdk4Moura/statelet)**.
+This repo uses real React so the Flask⟷React question stays the focus.

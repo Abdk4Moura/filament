@@ -1,0 +1,53 @@
+/* Minimal placeholder styling — square tiles, monospace, no flourish.
+   Claude Design's output replaces this. */
+:root {
+  --bg: #0e0f13;
+  --panel: #171a21;
+  --line: #262b36;
+  --text: #e7e9ee;
+  --muted: #8b93a7;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.qs { max-width: 920px; margin: 0 auto; padding: 24px; }
+.qs-bar {
+  display: flex; align-items: center; gap: 16px;
+  padding-bottom: 16px; border-bottom: 1px solid var(--line);
+}
+.qs-brand { font-weight: 700; letter-spacing: 0.04em; }
+.qs-me { display: flex; align-items: center; gap: 8px; color: var(--muted); margin-left: auto; }
+.qs-me .dot { width: 10px; height: 10px; border-radius: 2px; }
+.qs-kind { font-size: 11px; padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; }
+.qs-link { background: var(--panel); color: var(--text); border: 1px solid var(--line); padding: 6px 12px; border-radius: 4px; cursor: pointer; }
+.qs-link:disabled { opacity: 0.5; cursor: default; }
+
+.qs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 12px; margin: 24px 0; }
+.qs-empty { grid-column: 1 / -1; color: var(--muted); text-align: center; padding: 48px 0; }
+.qs-peer {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  aspect-ratio: 1; padding: 16px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; color: var(--text);
+  cursor: pointer; transition: border-color 0.15s;
+}
+.qs-peer.ready:hover { border-color: var(--text); }
+.qs-peer.connecting, .qs-peer.failed { opacity: 0.55; cursor: default; }
+.qs-avatar { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 6px; color: #0e0f13; font-weight: 700; }
+.qs-name { font-size: 13px; }
+.qs-status { font-size: 11px; color: var(--muted); }
+
+.qs-transfers { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 16px; }
+.qs-transfer { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px; }
+.qs-tinfo { display: flex; align-items: center; gap: 10px; font-size: 13px; }
+.qs-fname { font-weight: 600; }
+.qs-fsize, .qs-tstatus { color: var(--muted); font-size: 12px; }
+.qs-tstatus { margin-left: auto; }
+.qs-progress { height: 4px; background: var(--line); border-radius: 2px; margin: 8px 0; overflow: hidden; }
+.qs-bar2 { height: 100%; background: var(--text); transition: width 0.1s; }
+.qs-actions { display: flex; gap: 8px; }
+.qs-actions button { background: transparent; color: var(--text); border: 1px solid var(--line); padding: 4px 10px; border-radius: 4px; cursor: pointer; font: inherit; font-size: 12px; }
+.qs-actions button:hover { border-color: var(--text); }
