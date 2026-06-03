@@ -1,4 +1,4 @@
-// useQuickshare — the single hook the UI consumes.
+// useFilament — the single hook the UI consumes.
 //
 // It owns all the networking (config fetch, signaling, a PeerLink per peer) and
 // exposes a flat, render-friendly snapshot plus a handful of actions. The shape
@@ -31,7 +31,7 @@ function roomFromUrl() {
   return m ? decodeURIComponent(m[1]) : null
 }
 
-export function useQuickshare() {
+export function useFilament() {
   const [me, setMe] = useState(null)
   const [peers, setPeers] = useState([]) // [{ id, name, color, status }]
   const [transfers, setTransfers] = useState([]) // see CONTRACT.md
@@ -78,7 +78,7 @@ export function useQuickshare() {
   const makeLink = useCallback(
     ({ id, name, initiator }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
-      upsertPeer({ id, name, color: colorFor(id), status: 'connecting', route: null })
+      upsertPeer({ id, name, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
         name,
@@ -228,7 +228,7 @@ export function useQuickshare() {
   }, [rejoin])
 
   // ---- Part C: optional native LAN-discovery helper ------------------------
-  // If the Quickshare Local helper (experiments/localsend-discovery) is running,
+  // If the Filament Local helper (experiments/localsend-discovery) is running,
   // it exposes peers it found on the LAN via mDNS/UDP at 127.0.0.1:53317.
   // Browsers may fetch http://localhost from a secure page, so this lights up
   // automatically when present and stays silent (available:false) when not.

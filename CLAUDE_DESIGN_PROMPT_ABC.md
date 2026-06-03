@@ -7,7 +7,7 @@ once the initial square UI is done. It adds three surfaces; everything else stay
 
 ## THE PROMPT (copy from here) ⬇
 
-Add three things to the Quickshare UI you just built. Keep the same square,
+Add three things to the Filament UI you just built. Keep the same square,
 engineered, dark aesthetic and the same `state` + callback prop contract — these
 are new fields/actions on it. Don't restyle what's already there.
 

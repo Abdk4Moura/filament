@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quickshare backend: one Flask app that does three things and nothing else.
+"""Filament backend: one Flask app that does three things and nothing else.
 
   1. Serves the built React app (frontend/dist) as a single-page app.
   2. Exposes a tiny REST surface under /api (config + default room name).

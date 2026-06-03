@@ -1,21 +1,21 @@
-# Claude Design prompt — Quickshare UI
+# Claude Design prompt — Filament UI
 
 Paste the block below into Claude Design (claude.ai). It is written so the
 output **drops straight onto the real networking layer** with no rewrites: it
-pins the exact data shape (`useQuickshare()` from CONTRACT.md), forbids any real
+pins the exact data shape (`useFilament()` from CONTRACT.md), forbids any real
 networking in the artifact, and fixes the visual direction (square interface).
 
 Why it's split this way: Claude Design runs in a sandbox — it cannot do real
 WebRTC against your Flask server. So you ask it for the **presentation only**,
 driven by a single `state` prop + callback props whose names/shape match the
-hook. You then wire it in by replacing the mock with `useQuickshare()`.
+hook. You then wire it in by replacing the mock with `useFilament()`.
 
 ---
 
 ## THE PROMPT (copy from here) ⬇
 
 Build a single-file React component for a peer-to-peer file-sharing web app
-called **Quickshare**. This is the **presentation layer only** — do NOT add any
+called **Filament**. This is the **presentation layer only** — do NOT add any
 real networking (no WebRTC, no sockets, no fetch). Drive everything from props
 and local UI state. Use **plain CSS or styled JSX**, no UI libraries, no
 Tailwind. Export a default `<App>` and ship a `mockState` object so it renders
@@ -36,7 +36,7 @@ standalone.
 
 ### Data it renders (this shape is FIXED — match names exactly)
 The component receives one prop, `state`, plus action callbacks. In production
-`state` comes from a `useQuickshare()` hook; in the artifact, feed it `mockState`.
+`state` comes from a `useFilament()` hook; in the artifact, feed it `mockState`.
 
 ```js
 state = {
@@ -71,7 +71,7 @@ Action callbacks (call these — don't implement them):
 - `onCopyRoomLink()` — copy `state.roomUrl`
 
 ### Screens / states to cover
-1. **Top bar:** brand "quickshare", your identity (`me.name` + color swatch +
+1. **Top bar:** brand "filament", your identity (`me.name` + color swatch +
    `signalingKind` badge), and a "copy room link" button (calls `onCopyRoomLink`).
 2. **Peer grid:** square tiles. Show name, color accent, and a status hint.
    - `ready` → tile is interactive; clicking it opens a file picker, then calls
@@ -105,11 +105,11 @@ finished on first load.
 2. At the top of its `App`, swap the mock for the real hook and spread it as `state`:
 
    ```jsx
-   import { useQuickshare } from './lib/useQuickshare.js'
+   import { useFilament } from './lib/useFilament.js'
 
    export default function App() {
-     const qs = useQuickshare()
-     return <Quickshare
+     const qs = useFilament()
+     return <Filament
        state={qs}
        onSendFiles={qs.sendFiles}
        onAccept={qs.acceptTransfer}
@@ -120,6 +120,6 @@ finished on first load.
      />
    }
    ```
-   (Rename `Quickshare` to whatever Claude Design called its component.)
+   (Rename `Filament` to whatever Claude Design called its component.)
 3. `npm run build` and reload Flask — done. The names line up because the prompt
    was written against CONTRACT.md.

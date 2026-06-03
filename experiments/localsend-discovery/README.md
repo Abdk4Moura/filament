@@ -1,6 +1,6 @@
-# Quickshare Local — offline LAN discovery (spike)
+# Filament Local — offline LAN discovery (spike)
 
-**Experiment, not production.** A sketch of how Quickshare could discover peers
+**Experiment, not production.** A sketch of how Filament could discover peers
 on the same WiFi with **no internet and no signaling server at all** — the model
 LocalSend / Syncthing / Tailscale use.
 
@@ -20,15 +20,15 @@ process on each device. This is that process, in dependency-free Node.
  └──────┬────────┘                  └───────┬───────┘
         │ http://127.0.0.1:53317/peers      │
         ▼                                    ▼
-   browser (Quickshare web app reads the local bridge)
+   browser (Filament web app reads the local bridge)
 ```
 
 - **Presence:** each helper multicasts a tiny `{id, name, http}` datagram every
   2s and listens for everyone else's, expiring peers after 6s. TTL=1 keeps it on
   the local link — it never routes off the LAN.
 - **Bridge:** it serves whoever it found at `http://127.0.0.1:53317/peers`
-  (loopback only). The Quickshare web app polls that and lights up LAN devices
-  even offline. `useQuickshare()` already probes this and exposes `localHelper`.
+  (loopback only). The Filament web app polls that and lights up LAN devices
+  even offline. `useFilament()` already probes this and exposes `localHelper`.
 
 ## Try it
 

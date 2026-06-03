@@ -64,7 +64,7 @@ export class PeerLink {
     }
 
     if (initiator) {
-      this._setChannel(this.pc.createDataChannel('quickshare'))
+      this._setChannel(this.pc.createDataChannel('filament'))
       this._makeOffer()
     } else {
       this.pc.ondatachannel = (e) => this._setChannel(e.channel)

@@ -64,7 +64,7 @@ class FirebaseSignaling extends Emitter {
   }
   async #init() {
     // Optional dependency: only loaded in firebase mode. Install it with
-    // `npm install firebase` before setting QS_SIGNALING=firebase. @vite-ignore
+    // `npm install firebase` before setting FIL_SIGNALING=firebase. @vite-ignore
     // keeps the default (socket.io) build from trying to bundle it.
     const [{ initializeApp }, fs] = await Promise.all([
       import(/* @vite-ignore */ 'firebase/app'),

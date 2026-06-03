@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Quickshare Local — a spike of true offline LAN discovery (the LocalSend model).
+// Filament Local — a spike of true offline LAN discovery (the LocalSend model).
 //
 // A browser tab can't see other devices on the WiFi: JS has no UDP/multicast and
 // no mDNS. So discovery that works with NO internet and NO server needs a tiny
@@ -9,7 +9,7 @@
 //                and listens for everyone else's. (A pragmatic stand-in for full
 //                mDNS / Bonjour — same idea: announce + discover over multicast.)
 //   • Bridge:    it exposes whoever it found at http://127.0.0.1:53317/peers, so
-//                the Quickshare web app (running locally) can render LAN devices
+//                the Filament web app (running locally) can render LAN devices
 //                even with the internet unplugged. WebRTC/HTTP handoff for the
 //                actual transfer would build on top of this.
 //
@@ -30,8 +30,8 @@ const arg = (flag, def) => {
   return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : def
 }
 const GROUP = '239.255.79.17' // admin-scoped multicast, off the real mDNS group
-const MPORT = Number(arg('--mport', process.env.QS_MPORT || 53318))
-const HTTP_PORT = Number(arg('--http', process.env.QS_HTTP || 53317))
+const MPORT = Number(arg('--mport', process.env.FIL_MPORT || 53318))
+const HTTP_PORT = Number(arg('--http', process.env.FIL_HTTP || 53317))
 const NAME = arg('--name', os.hostname())
 const ID = crypto.randomBytes(6).toString('hex')
 const ANNOUNCE_MS = 2000

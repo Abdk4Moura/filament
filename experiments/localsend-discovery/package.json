@@ -1,10 +1,10 @@
 {
-  "name": "quickshare-local-discovery",
+  "name": "filament-local-discovery",
   "private": true,
   "version": "0.0.1",
   "type": "module",
-  "description": "Spike: offline LAN peer discovery for Quickshare via UDP multicast + a localhost bridge (the LocalSend model).",
-  "bin": { "quickshare-local": "discovery.js" },
+  "description": "Spike: offline LAN peer discovery for Filament via UDP multicast + a localhost bridge (the LocalSend model).",
+  "bin": { "filament-local": "discovery.js" },
   "scripts": {
     "start": "node discovery.js"
   }

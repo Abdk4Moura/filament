@@ -1,4 +1,4 @@
-# Quickshare
+# Filament
 
 Peer-to-peer file sharing in the browser. Files travel **directly between
 browsers** over a WebRTC data channel — the server only helps two peers find
@@ -28,7 +28,7 @@ frontend/       React app (Vite)
   src/lib/        the networking layer — the part that must "just work"
     signaling.js    Socket.IO ⟷ Firebase abstraction (one interface)
     webrtc.js       PeerLink: RTCPeerConnection + chunked file transfer
-    useQuickshare.js the single hook the UI consumes
+    useFilament.js the single hook the UI consumes
   src/App.jsx     placeholder UI (replace with Claude Design's output)
 CONTRACT.md     the shape everything agrees on (REST + events + hook)
 CLAUDE_DESIGN_PROMPT.md  prompt that makes Claude Design produce the UI
@@ -64,19 +64,19 @@ tile (or drag files onto it) to send.
 Everything is driven by `/api/config`, so no rebuild is needed:
 
 ```bash
-export QS_SIGNALING=socketio          # default
+export FIL_SIGNALING=socketio          # default
 # or, to use Firebase Firestore signaling:
-export QS_SIGNALING=firebase
-export QS_FIREBASE_CONFIG='{"apiKey":"…","projectId":"…"}'   # web config
+export FIL_SIGNALING=firebase
+export FIL_FIREBASE_CONFIG='{"apiKey":"…","projectId":"…"}'   # web config
 ```
 
-Other env knobs: `QS_ICE_SERVERS` (JSON array, add TURN for hard NATs),
-`QS_SECRET` (salts the default room name), `QS_CHUNK_SIZE`, `PORT`.
+Other env knobs: `FIL_ICE_SERVERS` (JSON array, add TURN for hard NATs),
+`FIL_SECRET` (salts the default room name), `FIL_CHUNK_SIZE`, `PORT`.
 
 ## Designing the UI with Claude Design
 
 See `CLAUDE_DESIGN_PROMPT.md`. The prompt is written against `CONTRACT.md` so
-the generated component drops onto `useQuickshare()` with no rewrites.
+the generated component drops onto `useFilament()` with no rewrites.
 
 ## A note on the "framework"
 
