@@ -17,6 +17,7 @@
 // join/signal/leave calls — that is the whole point of the abstraction.
 
 import { io } from 'socket.io-client'
+import { API_BASE } from './api.js'
 
 class Emitter {
   #handlers = {}
@@ -34,7 +35,8 @@ class SocketIOSignaling extends Emitter {
   constructor() {
     super()
     this.kind = 'socketio'
-    this.socket = io({ autoConnect: true })
+    // API_BASE === '' → same-origin; otherwise connect to the backend origin.
+    this.socket = io(API_BASE || undefined, { autoConnect: true })
     for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }

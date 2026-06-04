@@ -14,6 +14,7 @@ import os
 import secrets
 
 from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
 from flask_socketio import SocketIO
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -21,12 +22,24 @@ import config
 import signaling
 
 # The React build lands here (see frontend/vite.config.js -> build.outDir).
+# In the split deploy (Cloudflare Pages serves the SPA) this may be absent — the
+# API still works; only the SPA-fallback routes return 503.
 DIST_DIR = os.path.join(os.path.dirname(__file__), "dist")
+
+# CORS origins: "*" or a comma-separated allowlist (the Pages origin in prod).
+_origins = "*" if config.CORS_ALLOWED_ORIGINS == "*" else [
+    o.strip() for o in config.CORS_ALLOWED_ORIGINS.split(",") if o.strip()
+]
 
 app = Flask(__name__, static_folder=None)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+# The SPA on Pages fetches /api/* cross-origin, so allow it there.
+CORS(app, resources={r"/api/*": {"origins": _origins}})
 
-socketio = SocketIO(app, async_mode="threading", cors_allowed_origins=config.CORS_ALLOWED_ORIGINS)
+# Dev defaults to the dependency-light threading server; prod sets
+# FIL_ASYNC_MODE=eventlet and runs under gunicorn's eventlet worker.
+ASYNC_MODE = os.environ.get("FIL_ASYNC_MODE", "threading")
+socketio = SocketIO(app, async_mode=ASYNC_MODE, cors_allowed_origins=_origins)
 signaling.register(socketio)
 
 

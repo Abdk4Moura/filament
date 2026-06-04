@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
 import { PeerLink } from './webrtc.js'
+import { api } from './api.js'
 
 const ADJ = ['brave', 'calm', 'clever', 'eager', 'gentle', 'jolly', 'keen', 'lucky', 'mellow', 'swift']
 const ANIMALS = ['otter', 'panda', 'falcon', 'lynx', 'koala', 'heron', 'fox', 'ibex', 'marten', 'tapir']
@@ -100,7 +101,7 @@ export function useFilament() {
   useEffect(() => {
     let cancelled = false
     ;(async () => {
-      const cfg = await fetch('/api/config').then((r) => r.json())
+      const cfg = await fetch(api('/api/config')).then((r) => r.json())
       if (cancelled) return
       cfgRef.current = cfg
       setSignalingKind(cfg.signaling)
@@ -112,7 +113,7 @@ export function useFilament() {
         room = urlRoom
         scope = urlRoom.startsWith('code-') ? 'code' : 'link'
       } else {
-        const auto = await fetch('/api/room').then((r) => r.json())
+        const auto = await fetch(api('/api/room')).then((r) => r.json())
         room = auto.room
         scope = 'auto'
         setNetwork(auto.network)
@@ -216,13 +217,13 @@ export function useFilament() {
   )
 
   const generateCode = useCallback(async () => {
-    const { code, room } = await fetch('/api/room/code').then((r) => r.json())
+    const { code, room } = await fetch(api('/api/room/code')).then((r) => r.json())
     rejoin(room, 'code')
     return code
   }, [rejoin])
 
   const useAutoRoom = useCallback(async () => {
-    const auto = await fetch('/api/room').then((r) => r.json())
+    const auto = await fetch(api('/api/room')).then((r) => r.json())
     setNetwork(auto.network)
     rejoin(auto.room, 'auto')
   }, [rejoin])

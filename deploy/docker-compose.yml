@@ -1,0 +1,52 @@
+# Filament backend stack for the DigitalOcean droplet:
+#   api    — Flask signaling (gunicorn + eventlet), internal :8000
+#   caddy  — auto-HTTPS reverse proxy in front of the API
+#   coturn — self-hosted STUN/TURN relay (host networking for UDP relay range)
+#
+# Frontend is NOT here — it's static on Cloudflare Pages (see README.md).
+# Usage:  cp .env.example .env  &&  edit .env  &&  docker compose up -d --build
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      FIL_ASYNC_MODE: eventlet
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    # Host networking so coturn can hand out its UDP relay port range directly.
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    # Secret/realm/IP come from .env so they live in exactly one place.
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --static-auth-secret=${FIL_TURN_SECRET}
+      - --realm=${TURN_REALM}
+      - --external-ip=${DROPLET_IP}
+
+volumes:
+  caddy_data:
+  caddy_config:

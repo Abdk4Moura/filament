@@ -1,0 +1,3 @@
+# Cloudflare Pages SPA fallback: every path serves index.html so client-side
+# routes like /rooms/:id resolve to the app instead of a 404.
+/*  /index.html  200

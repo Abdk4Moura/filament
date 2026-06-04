@@ -25,18 +25,46 @@ PORT = int(os.environ.get("PORT", 5000))
 CORS_ALLOWED_ORIGINS = os.environ.get("FIL_CORS_ORIGINS", "*")
 
 # ICE servers handed to the browser's RTCPeerConnection. STUN is enough for most
-# networks; add a TURN entry here (JSON) for restrictive NATs.
+# networks; TURN (below) is the fallback for the ~10-15% that need a relay.
 DEFAULT_ICE = [{"urls": "stun:stun.l.google.com:19302"}]
+
+# Self-hosted coturn. We hand out *ephemeral* credentials (coturn's REST-API /
+# use-auth-secret scheme): a time-limited username + an HMAC of it, so the
+# browser never holds a long-lived TURN password.
+#   FIL_TURN_HOST   comma-separated TURN urls, e.g.
+#                   "turn:turn.filament.example.com:3478,turn:turn.filament.example.com:3478?transport=tcp"
+#   FIL_TURN_SECRET must equal coturn's `static-auth-secret`
+#   FIL_TURN_TTL    credential lifetime in seconds (default 1h)
+TURN_HOST = os.environ.get("FIL_TURN_HOST")
+TURN_SECRET = os.environ.get("FIL_TURN_SECRET")
+TURN_TTL = int(os.environ.get("FIL_TURN_TTL", 3600))
+
+
+def _turn_servers():
+    if not (TURN_HOST and TURN_SECRET):
+        return []
+    import hashlib
+    import hmac
+    import time
+    from base64 import b64encode
+
+    username = str(int(time.time()) + TURN_TTL)  # username IS the expiry timestamp
+    credential = b64encode(
+        hmac.new(TURN_SECRET.encode(), username.encode(), hashlib.sha1).digest()
+    ).decode()
+    urls = [u.strip() for u in TURN_HOST.split(",") if u.strip()]
+    return [{"urls": urls, "username": username, "credential": credential}]
 
 
 def _ice_servers():
     raw = os.environ.get("FIL_ICE_SERVERS")
-    if not raw:
-        return DEFAULT_ICE
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return DEFAULT_ICE
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    # Default STUN + (when configured) ephemeral self-hosted TURN.
+    return DEFAULT_ICE + _turn_servers()
 
 
 def _firebase_web_config():
