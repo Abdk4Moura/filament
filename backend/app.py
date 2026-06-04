@@ -24,7 +24,7 @@ import signaling
 # The React build lands here (see frontend/vite.config.js -> build.outDir).
 # In the split deploy (Cloudflare Pages serves the SPA) this may be absent — the
 # API still works; only the SPA-fallback routes return 503.
-DIST_DIR = os.path.join(os.path.dirname(__file__), "dist")
+DIST_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 
 # CORS origins: "*" or a comma-separated allowlist (the Pages origin in prod).
 _origins = "*" if config.CORS_ALLOWED_ORIGINS == "*" else [

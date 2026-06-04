@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "filament",
+  "compatibility_date": "2026-05-23",
+  "observability": { "enabled": true },
+  "assets": {
+    // Serve the Vite build, with SPA fallback so /rooms/:id survives a refresh.
+    "directory": "./dist",
+    "not_found_handling": "single-page-application"
+  }
+}

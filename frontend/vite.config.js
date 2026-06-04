@@ -3,11 +3,11 @@ import react from '@vitejs/plugin-react'
 
 // In dev: Vite serves the UI on :5173 with hot reload and proxies the API +
 // websocket to Flask on :5000, so the app behaves as a single origin.
-// In build: everything is emitted into ../backend/dist, which Flask serves.
+// In build: emits the default ./dist (frontend/dist) — Cloudflare serves it via
+// wrangler.jsonc, and Flask serves it for local single-service runs.
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: '../backend/dist',
     emptyOutDir: true,
     rollupOptions: {
       // Firebase is an optional, lazily-imported signaling backend. Keep it out
