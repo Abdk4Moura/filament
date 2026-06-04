@@ -1,0 +1,46 @@
+# Build the frontend and upload it to Cloudflare Pages with Wrangler (direct
+# upload). This bypasses Cloudflare's git build entirely — we build the real
+# assets here and ship them, so there are no Pages build-settings to misconfigure
+# (which is what produced the white screen).
+#
+# One-time setup:
+#   Repo secrets: CLOUDFLARE_API_TOKEN (scope: Account → Cloudflare Pages → Edit)
+#                 CLOUDFLARE_ACCOUNT_ID
+#   Pages project named `filament` must exist (it does). If it's git-connected,
+#   you can leave it — these direct-upload deployments simply take over.
+
+name: Deploy frontend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-frontend
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build (bakes in the API origin)
+        working-directory: frontend
+        env:
+          VITE_FILAMENT_API: https://api.filament.autumated.com
+        run: |
+          npm install
+          npm run build
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy backend/dist --project-name=filament --branch=main
