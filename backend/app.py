@@ -39,8 +39,15 @@ CORS(app, resources={r"/api/*": {"origins": _origins}})
 # Dev defaults to the dependency-light threading server; prod sets
 # FIL_ASYNC_MODE=eventlet and runs under gunicorn's eventlet worker.
 ASYNC_MODE = os.environ.get("FIL_ASYNC_MODE", "threading")
-socketio = SocketIO(app, async_mode=ASYNC_MODE, cors_allowed_origins=_origins)
-signaling.register(socketio)
+# FIL_REDIS_URL turns on horizontal scaling: a shared message queue (so emits
+# reach peers on any replica) + a shared room registry. Unset = single instance.
+socketio = SocketIO(
+    app,
+    async_mode=ASYNC_MODE,
+    cors_allowed_origins=_origins,
+    message_queue=config.REDIS_URL or None,
+)
+signaling.register(socketio, signaling.make_registry(config.REDIS_URL))
 
 
 # ---------------------------------------------------------------- REST API ---

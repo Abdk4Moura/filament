@@ -2,6 +2,8 @@ flask>=3.0
 flask-cors>=4.0
 flask-socketio>=5.3
 python-dotenv>=1.0
+# Horizontal scaling: shared room registry + Socket.IO message queue.
+redis>=5.0
 
 # Production WSGI server with native WebSocket support (single worker; the room
 # registry is in-memory). Only needed when deploying — see deploy/.

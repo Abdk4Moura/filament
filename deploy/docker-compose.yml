@@ -1,14 +1,24 @@
-# Filament backend stack for the DigitalOcean droplet:
-#   api    — Flask signaling (gunicorn + eventlet), internal :8000
-#   caddy  — auto-HTTPS reverse proxy in front of the API
-#   coturn — self-hosted STUN/TURN relay (host networking for UDP relay range)
+# Filament backend stack for the DigitalOcean droplet (shared box — stays small).
+#   api        — Flask signaling (gunicorn+eventlet). NOT exposed to the host;
+#                only reachable inside this compose network.
+#   cloudflared— Cloudflare Tunnel: dials OUT to Cloudflare and routes
+#                api.filament.autumated.com -> http://api:8000. Zero open ports.
+#   coturn     — self-hosted STUN/TURN (host networking for the UDP relay range).
 #
 # Frontend is NOT here — it's static on Cloudflare Pages (see README.md).
-# Usage:  cp .env.example .env  &&  edit .env  &&  docker compose up -d --build
+# The image is built in CI and pushed to GHCR; the droplet only pulls it.
+#
+# Resource caps are env-driven (defaults below) so you can scale a single knob
+# and redeploy just the api container:  API_MEM, API_CPUS, COTURN_MEM, ...
+# Usage:  cp .env.example .env && edit .env && docker compose up -d
 
 services:
+  # Stateless behind Redis, so `docker compose up -d --scale api=N` (or
+  # deploy/scale.sh N) spins replicas up/down in seconds. cloudflared
+  # round-robins across them by the `api` service DNS name.
   api:
-    build:
+    image: ghcr.io/abdk4moura/filament-api:latest
+    build: # only used for local builds; CI/droplet use the GHCR image
       context: ..
       dockerfile: deploy/api.Dockerfile
     restart: unless-stopped
@@ -16,21 +26,41 @@ services:
     environment:
       FIL_ASYNC_MODE: eventlet
     expose:
-      - "8000"
+      - "8000" # internal only — cloudflared reaches it as http://api:8000
+    depends_on:
+      - redis
+    mem_limit: ${API_MEM:-220m}
+    cpus: ${API_CPUS:-0.40}
+    pids_limit: 256
 
-  caddy:
-    image: caddy:2
+  # Shared room registry + Socket.IO message queue for the api replicas.
+  # Ephemeral (no persistence) — it's coordination state, not data.
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
-    env_file: .env
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${REDIS_MAXMEM:-64mb}
+      - --maxmemory-policy
+      - allkeys-lru
+    mem_limit: ${REDIS_MEM:-96m}
+    cpus: ${REDIS_CPUS:-0.20}
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN}
     depends_on:
       - api
+    mem_limit: ${CLOUDFLARED_MEM:-64m}
+    cpus: ${CLOUDFLARED_CPUS:-0.20}
 
   coturn:
     image: coturn/coturn:latest
@@ -46,7 +76,5 @@ services:
       - --static-auth-secret=${FIL_TURN_SECRET}
       - --realm=${TURN_REALM}
       - --external-ip=${DROPLET_IP}
-
-volumes:
-  caddy_data:
-  caddy_config:
+    mem_limit: ${COTURN_MEM:-96m}
+    cpus: ${COTURN_CPUS:-0.50}

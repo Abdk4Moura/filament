@@ -21,6 +21,10 @@ SECRET = os.environ.get("FIL_SECRET", "filament-dev-secret")
 
 PORT = int(os.environ.get("PORT", 5000))
 
+# Set to a redis:// URL to scale horizontally (shared room registry + Socket.IO
+# message queue across api replicas). Unset = single in-memory instance.
+REDIS_URL = os.environ.get("FIL_REDIS_URL")
+
 # Allow the Vite dev server origin to open the websocket during development.
 CORS_ALLOWED_ORIGINS = os.environ.get("FIL_CORS_ORIGINS", "*")
 
