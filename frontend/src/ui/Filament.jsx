@@ -4,7 +4,7 @@
    optional `ui` prop carries display options (theme/accent/density/columns/font);
    omit it for sensible defaults (dark / green / airy). */
 
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
@@ -312,12 +312,140 @@ export default function Filament(props) {
   const hasPeers = state.peers.length > 0
   const onToggleTheme = ui.onToggleTheme
 
-  return (
-    <div style={{ position: 'absolute', inset: 0, background: T.bg, color: T.text, font: '13px ' + font,
-      display: 'flex', flexDirection: 'column', overflow: 'hidden',
-      backgroundImage: 'linear-gradient(' + T.grid + ' 1px,transparent 1px),linear-gradient(90deg,' + T.grid + ' 1px,transparent 1px)',
-      backgroundSize: '34px 34px' }}>
+  // Responsive: measure our own width so the same component works on desktop
+  // and inside a phone frame. ui.forceMobile lets a host pin the mobile layout.
+  const rootRef = useRef(null)
+  const [narrow, setNarrow] = useState(!!ui.forceMobile)
+  const [tab, setTab] = useState('peers')
+  useEffect(() => {
+    if (ui.forceMobile) {
+      setNarrow(true)
+      return
+    }
+    const el = rootRef.current
+    if (!el) return
+    const measure = () => setNarrow(el.clientWidth < 720)
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [ui.forceMobile])
 
+  const themeBtn = onToggleTheme && (
+    <button onClick={onToggleTheme} title="Toggle theme" style={{ font: 'inherit', fontSize: 11, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
+      background: 'transparent', color: T.sub, border: '1px solid ' + T.line }}>
+      {mode === 'light' ? '◑ dark' : '◐ light'}
+    </button>
+  )
+
+  const copyBtn = (label) => (
+    <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '6px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
+      background: copied ? accent : 'transparent', color: copied ? T.onAccent : accent, border: '1px solid ' + accent, transition: 'background .12s,color .12s' }}>
+      {copied ? 'copied ✓' : label}
+    </button>
+  )
+
+  const emptyPeers = (
+    <div style={{ border: '1px dashed ' + T.line, padding: narrow ? 20 : 28, color: T.dim, maxWidth: 560 }}>
+      <div style={{ color: T.text, fontSize: 15, marginBottom: 8 }}>No threads yet</div>
+      <div style={{ fontSize: 12, lineHeight: 1.6, marginBottom: 18 }}>Share the room link to spin up a thread. Anyone who opens it joins room {state.roomId} and appears here.</div>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <span style={{ flex: 1, fontSize: 11, color: accent, border: '1px solid ' + T.line, padding: '9px 11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.panel }}>{state.roomUrl}</span>
+        <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '0 14px', cursor: 'pointer', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy'}</button>
+      </div>
+    </div>
+  )
+
+  const peerGrid = (gridCols) =>
+    hasPeers ? (
+      <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: D.gap }}>
+        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} T={T} D={D} accent={accent} />)}
+      </div>
+    ) : (
+      emptyPeers
+    )
+
+  const transfersList =
+    state.transfers.length === 0 ? (
+      <div style={{ fontSize: 12, color: T.faint, padding: '24px 0' }}>No transfers yet.</div>
+    ) : (
+      state.transfers.map((t) => <TransferRow key={t.id} t={t} onAccept={onAccept} onDecline={onDecline} onSave={onSave} onClear={onClear} T={T} D={D} accent={accent} />)
+    )
+
+  const discovery = (
+    <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
+      onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
+  )
+
+  const rootStyle = {
+    position: 'absolute', inset: 0, background: T.bg, color: T.text, font: '13px ' + font,
+    display: 'flex', flexDirection: 'column', overflow: 'hidden',
+    backgroundImage: 'linear-gradient(' + T.grid + ' 1px,transparent 1px),linear-gradient(90deg,' + T.grid + ' 1px,transparent 1px)',
+    backgroundSize: '34px 34px',
+  }
+
+  // ── Mobile layout ──────────────────────────────────────────────
+  if (narrow) {
+    const tabBtn = (k, n) => (
+      <button onClick={() => setTab(k)} style={{ flex: 1, padding: '13px 8px', cursor: 'pointer', font: 'inherit', fontSize: 12,
+        letterSpacing: '.08em', textTransform: 'uppercase', background: tab === k ? T.panel : 'transparent',
+        color: tab === k ? T.text : T.dim, border: 'none', borderBottom: '2px solid ' + (tab === k ? accent : 'transparent'),
+        display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7 }}>
+        {k}<span style={{ color: tab === k ? accent : T.faint }}>{n}</span>
+      </button>
+    )
+    return (
+      <div ref={rootRef} style={rootStyle}>
+        {/* stacked top bar */}
+        <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 16, letterSpacing: '.01em', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span className="fil-caret" style={{ width: 9, height: 15, background: accent, display: 'inline-block', boxShadow: '0 0 10px ' + accent + '88' }} />
+              filament
+            </span>
+            <Pill T={T}>{state.roomId}</Pill>
+            <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <StatusDot color={state.connected ? T.ok : T.bad} glow={state.connected} />
+              {themeBtn}
+            </span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            {state.me && (
+              <>
+                <span style={{ width: 11, height: 11, background: state.me.color, display: 'block' }} />
+                <span style={{ fontSize: 12 }}>{state.me.name}</span>
+                <Pill T={T}>{state.signalingKind}</Pill>
+              </>
+            )}
+            <span style={{ marginLeft: 'auto' }}>{copyBtn('copy link')}</span>
+          </div>
+        </div>
+        {/* scroll body */}
+        <div style={{ flex: 1, overflow: 'auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <div style={{ padding: '16px 16px 0' }}>{discovery}</div>
+          <div style={{ position: 'sticky', top: 0, zIndex: 2, display: 'flex', background: T.bg, borderBottom: '1px solid ' + T.line, flexShrink: 0 }}>
+            {tabBtn('peers', state.peers.length)}
+            {tabBtn('transfers', state.transfers.length)}
+          </div>
+          <div style={{ padding: 16 }}>
+            {tab === 'peers' ? (
+              <>
+                <div style={{ fontSize: 11, color: T.faint, marginBottom: 12 }}>tap a tile to send a file</div>
+                {peerGrid('repeat(2,minmax(0,1fr))')}
+              </>
+            ) : (
+              transfersList
+            )}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // ── Desktop layout ─────────────────────────────────────────────
+  return (
+    <div ref={rootRef} style={rootStyle}>
       {/* top bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
         borderBottom: '1px solid ' + T.line, background: T.bg }}>
@@ -338,16 +466,8 @@ export default function Filament(props) {
               <Pill T={T}>{state.signalingKind}</Pill>
             </div>
           )}
-          <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '6px 12px', cursor: 'pointer', whiteSpace: 'nowrap',
-            background: copied ? accent : 'transparent', color: copied ? T.onAccent : accent, border: '1px solid ' + accent, transition: 'background .12s,color .12s' }}>
-            {copied ? 'copied ✓' : 'copy room link'}
-          </button>
-          {onToggleTheme && (
-            <button onClick={onToggleTheme} title="Toggle theme" style={{ font: 'inherit', fontSize: 11, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
-              background: 'transparent', color: T.sub, border: '1px solid ' + T.line }}>
-              {mode === 'light' ? '◑ dark' : '◐ light'}
-            </button>
-          )}
+          {copyBtn('copy room link')}
+          {themeBtn}
         </div>
       </div>
 
@@ -355,38 +475,18 @@ export default function Filament(props) {
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {/* peers */}
         <div style={{ flex: '1 1 62%', padding: D.pad, borderRight: '1px solid ' + T.line, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-          <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
-            onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
+          {discovery}
           <div style={{ fontSize: 11, color: T.dim, marginBottom: 14, display: 'flex', justifyContent: 'space-between', flexShrink: 0 }}>
             <span style={{ letterSpacing: '.06em' }}>PEERS · {state.peers.length}</span>
             <span style={{ color: T.faint }}>click a tile or drop files to send</span>
           </div>
-          {hasPeers ? (
-            <div style={{ overflow: 'auto', minHeight: 0 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: cols, gap: D.gap }}>
-                {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} T={T} D={D} accent={accent} />)}
-              </div>
-            </div>
-          ) : (
-            <div style={{ border: '1px dashed ' + T.line, padding: 28, color: T.dim, maxWidth: 560 }}>
-              <div style={{ color: T.text, fontSize: 15, marginBottom: 8 }}>No threads yet</div>
-              <div style={{ fontSize: 12, lineHeight: 1.6, marginBottom: 18 }}>Share the room link to spin up a thread. Anyone who opens it joins room {state.roomId} and appears here.</div>
-              <div style={{ display: 'flex', gap: 8 }}>
-                <span style={{ flex: 1, fontSize: 11, color: accent, border: '1px solid ' + T.line, padding: '9px 11px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.panel }}>{state.roomUrl}</span>
-                <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '0 14px', cursor: 'pointer', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy'}</button>
-              </div>
-            </div>
-          )}
+          <div style={{ overflow: 'auto', minHeight: 0 }}>{peerGrid(cols)}</div>
         </div>
 
         {/* transfers */}
         <div style={{ flex: '1 1 38%', minWidth: 300, padding: D.pad + 'px ' + D.pad + 'px 0', background: T.panel, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{ fontSize: 11, color: T.dim, marginBottom: 6, letterSpacing: '.06em', flexShrink: 0 }}>TRANSFERS · {state.transfers.length}</div>
-          <div style={{ overflow: 'auto', minHeight: 0, paddingBottom: D.pad }}>
-            {state.transfers.length === 0
-              ? <div style={{ fontSize: 12, color: T.faint, padding: '24px 0' }}>No transfers yet.</div>
-              : state.transfers.map((t) => <TransferRow key={t.id} t={t} onAccept={onAccept} onDecline={onDecline} onSave={onSave} onClear={onClear} T={T} D={D} accent={accent} />)}
-          </div>
+          <div style={{ overflow: 'auto', minHeight: 0, paddingBottom: D.pad }}>{transfersList}</div>
         </div>
       </div>
     </div>

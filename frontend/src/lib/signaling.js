@@ -35,21 +35,38 @@ class SocketIOSignaling extends Emitter {
   constructor() {
     super()
     this.kind = 'socketio'
+    this.room = null
+    this.name = null
     // API_BASE === '' → same-origin; otherwise connect to the backend origin.
     this.socket = io(API_BASE || undefined, { autoConnect: true })
     for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
+    // Resilience: on every (re)connect, rejoin the current room. A reconnect
+    // gives us a fresh sid and the server dropped our old membership on
+    // disconnect, so without this we'd be connected but in no room. The server
+    // re-emits `welcome`, which the hook treats as a fresh roster.
+    this.socket.on('connect', () => {
+      this._emit('status', { connected: true })
+      if (this.room) this.socket.emit('join', { room: this.room, name: this.name })
+    })
+    this.socket.on('disconnect', () => this._emit('status', { connected: false }))
   }
   join(room, name) {
     this.room = room
+    this.name = name
     this.socket.emit('join', { room, name })
   }
   signal(to, data) {
     this.socket.emit('signal', { to, data })
   }
   leave() {
+    this.room = null
     this.socket.emit('leave', {})
+  }
+  // Force a reconnect attempt (e.g. when a suspended mobile tab resumes).
+  reconnect() {
+    if (this.socket && !this.socket.connected) this.socket.connect()
   }
 }
 

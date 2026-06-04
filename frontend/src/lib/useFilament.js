@@ -128,6 +128,12 @@ export function useFilament() {
       myNameRef.current = myName
 
       sig.on('welcome', ({ id, peers: existing }) => {
+        // Idempotent — also fires on every reconnect (a reconnect gives us a
+        // fresh sid). Tear down stale peer links from the previous session,
+        // then rebuild from the fresh roster.
+        linksRef.current.forEach((l) => l.close())
+        linksRef.current.clear()
+        setPeers([])
         setMe({ id, name: myName, color: colorFor(id) })
         setConnected(true)
         // We are the newcomer: initiate to everyone already here.
@@ -147,6 +153,8 @@ export function useFilament() {
           linksRef.current.get(from) || makeLink({ id: from, name: from, initiator: false })
         link.accept(data)
       })
+      // Reflect transport up/down in the UI (the rejoin itself is automatic).
+      sig.on('status', ({ connected: up }) => setConnected(up))
 
       sig.join(room, myName)
     })()
@@ -227,6 +235,21 @@ export function useFilament() {
     setNetwork(auto.network)
     rejoin(auto.room, 'auto')
   }, [rejoin])
+
+  // ---- resilience: nudge a reconnect when a suspended tab resumes ----------
+  // Mobile browsers freeze background tabs and throttle timers, so socket.io's
+  // auto-reconnect can stall. When the page becomes visible again, kick it.
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') sigRef.current?.reconnect?.()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+    }
+  }, [])
 
   // ---- Part C: optional native LAN-discovery helper ------------------------
   // If the Filament Local helper (experiments/localsend-discovery) is running,
