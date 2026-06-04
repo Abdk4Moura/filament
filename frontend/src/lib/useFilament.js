@@ -48,14 +48,21 @@ export function useFilament() {
   const transferOwner = useRef(new Map()) // transferId -> peerId
   const cfgRef = useRef(null)
   const myNameRef = useRef(null)
+  const myIdRef = useRef(null) // our current socket id, for the politeness tiebreaker (#1)
 
   // ---- snapshot helpers (keep React state in sync with the live PeerLinks) --
-  const upsertPeer = useCallback((p) => {
+  const addPeer = useCallback((p) => {
+    setPeers((prev) => (prev.some((x) => x.id === p.id) ? prev : [...prev, p]))
+  }, [])
+
+  // Update an EXISTING peer only — never re-adds (#3). A late callback from a
+  // closed PeerLink must not resurrect a tile we already removed.
+  const updatePeer = useCallback((id, patch) => {
     setPeers((prev) => {
-      const i = prev.findIndex((x) => x.id === p.id)
-      if (i === -1) return [...prev, p]
+      const i = prev.findIndex((x) => x.id === id)
+      if (i === -1) return prev
       const next = [...prev]
-      next[i] = { ...next[i], ...p }
+      next[i] = { ...next[i], ...patch }
       return next
     })
   }, [])
@@ -77,24 +84,28 @@ export function useFilament() {
 
   // ---- create a PeerLink for one remote peer -------------------------------
   const makeLink = useCallback(
-    ({ id, name, initiator }) => {
+    ({ id, name }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
-      upsertPeer({ id, name, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
+      // Perfect-negotiation role (#1): the peer with the larger id is "polite".
+      // Exactly one of each pair is impolite and owns the offer — no glare even
+      // when both join/reconnect simultaneously.
+      const polite = myIdRef.current ? myIdRef.current > id : true
+      addPeer({ id, name, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
         name,
         iceServers: cfgRef.current.iceServers,
         chunkSize: cfgRef.current.chunkSize,
-        initiator,
+        polite,
         sendSignal: (data) => sigRef.current.signal(id, data),
-        onStatus: (status) => upsertPeer({ id, status }),
+        onStatus: (status) => updatePeer(id, { status }),
         onTransfer: (t) => upsertTransfer(t),
-        onRoute: (route) => upsertPeer({ id, route }),
+        onRoute: (route) => updatePeer(id, { route }),
       })
       linksRef.current.set(id, link)
       return link
     },
-    [upsertPeer, upsertTransfer],
+    [addPeer, updatePeer, upsertTransfer],
   )
 
   // ---- bootstrap -----------------------------------------------------------
@@ -131,17 +142,16 @@ export function useFilament() {
         // Idempotent — also fires on every reconnect (a reconnect gives us a
         // fresh sid). Tear down stale peer links from the previous session,
         // then rebuild from the fresh roster.
+        myIdRef.current = id // set before makeLink so politeness can be computed (#1)
         linksRef.current.forEach((l) => l.close())
         linksRef.current.clear()
         setPeers([])
         setMe({ id, name: myName, color: colorFor(id) })
         setConnected(true)
-        // We are the newcomer: initiate to everyone already here.
-        existing.forEach((p) => makeLink({ id: p.id, name: p.name, initiator: true }))
+        existing.forEach((p) => makeLink({ id: p.id, name: p.name }))
       })
       sig.on('peer-joined', ({ id, name }) => {
-        // A newer peer arrived; they initiate to us.
-        makeLink({ id, name, initiator: false })
+        makeLink({ id, name })
       })
       sig.on('peer-left', ({ id }) => {
         linksRef.current.get(id)?.close()
@@ -149,9 +159,17 @@ export function useFilament() {
         removePeer(id)
       })
       sig.on('signal', ({ from, data }) => {
-        const link =
-          linksRef.current.get(from) || makeLink({ id: from, name: from, initiator: false })
-        link.accept(data)
+        let link = linksRef.current.get(from)
+        if (!link) {
+          // Only an incoming offer may create a new link — ignore stray answers/
+          // candidates from peers we don't know about (#7).
+          if (data?.type === 'description' && data.description?.type === 'offer') {
+            link = makeLink({ id: from, name: from })
+          } else {
+            return
+          }
+        }
+        link.enqueueSignal(data) // ordered per-peer dispatch (#2)
       })
       // Reflect transport up/down in the UI (the rejoin itself is automatic).
       sig.on('status', ({ connected: up }) => setConnected(up))

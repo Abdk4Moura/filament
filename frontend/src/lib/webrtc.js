@@ -33,7 +33,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, initiator, sendSignal, onStatus, onTransfer, onRoute }) {
+  constructor({ id, name, iceServers, chunkSize, polite, sendSignal, onStatus, onTransfer, onRoute }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -43,56 +43,122 @@ export class PeerLink {
     this.onRoute = onRoute || (() => {})
     this.route = null // 'local' | 'direct' | 'relayed'
 
+    // Perfect negotiation (docs/resilience.md RED-1): exactly one peer per pair
+    // is "impolite" and owns the offer; the polite peer yields on a glare.
+    this.polite = polite
+    this._makingOffer = false
+    this._ignoreOffer = false
+    this._signalQ = Promise.resolve() // per-peer FIFO: an offer lands before its candidates
+    this._pendingCandidates = [] // candidates that arrived before the remote description
+
     this.transfers = new Map() // id -> transfer state (mirrored to the UI)
-    this._outgoingFiles = new Map() // id -> File awaiting accept
-    this._incoming = null // { id, name, size, mime, received, buffers }
+    this._outgoingFiles = new Map() // id -> { file, sid } awaiting accept
+    this._incomingBySid = new Map() // sid -> incoming buffer; supports concurrent transfers (#4)
+    this._nextSid = 1 // channel-local stream id assigned per transfer
+    this._drainWaiters = [] // backpressure waiters fed by one shared onbufferedamountlow
+    this._closed = false // guards late callbacks after teardown (#3)
+    this._dcTimer = null // grace timer for transient 'disconnected' (#6)
 
     this.pc = new RTCPeerConnection({ iceServers })
     this.pc.onicecandidate = (e) => {
       if (e.candidate) this.sendSignal({ type: 'candidate', candidate: e.candidate })
     }
+    // All (re)negotiation funnels through here — we never hand-roll offers.
+    this.pc.onnegotiationneeded = async () => {
+      try {
+        this._makingOffer = true
+        await this.pc.setLocalDescription() // implicit offer
+        this.sendSignal({ type: 'description', description: this.pc.localDescription })
+      } catch (err) {
+        console.error('negotiation failed', err)
+      } finally {
+        this._makingOffer = false
+      }
+    }
+    this.pc.ondatachannel = (e) => this._setChannel(e.channel)
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState
       if (s === 'connected') {
+        clearTimeout(this._dcTimer)
         this.onStatus('ready')
         this._detectRoute() // which physical path did ICE actually pick?
-      } else if (s === 'failed' || s === 'disconnected' || s === 'closed') {
+      } else if (s === 'disconnected') {
+        // Usually a transient blip (#6): show 'connecting', nudge an ICE restart
+        // from the impolite side, and only fail if it doesn't recover in time.
+        this.onStatus('connecting')
+        if (!this.polite) {
+          try {
+            this.pc.restartIce()
+          } catch {}
+        }
+        clearTimeout(this._dcTimer)
+        this._dcTimer = setTimeout(() => {
+          if (this.pc.connectionState !== 'connected') {
+            this.onStatus('failed')
+            this._failActive()
+          }
+        }, 6000)
+      } else if (s === 'failed') {
+        clearTimeout(this._dcTimer)
         this.onStatus('failed')
-      } else {
+        this._failActive()
+      } else if (s === 'connecting' || s === 'new') {
         this.onStatus('connecting')
       }
     }
 
-    if (initiator) {
-      this._setChannel(this.pc.createDataChannel('filament'))
-      this._makeOffer()
-    } else {
-      this.pc.ondatachannel = (e) => this._setChannel(e.channel)
-    }
+    // The impolite peer owns the data channel; creating it triggers the first
+    // negotiationneeded → offer. The polite peer just answers.
+    if (!polite) this._setChannel(this.pc.createDataChannel('filament'))
   }
 
   // --------------------------------------------------------------- signaling
-  async _makeOffer() {
-    const offer = await this.pc.createOffer()
-    await this.pc.setLocalDescription(offer)
-    this.sendSignal({ type: 'offer', sdp: offer })
+  // Relayed signals are processed STRICTLY IN ORDER per peer (docs/resilience.md
+  // RED-2): otherwise an offer and the candidates that follow it race, and a
+  // candidate applied before the remote description is set gets dropped.
+  enqueueSignal(data) {
+    this._signalQ = this._signalQ
+      .then(() => this._handleSignal(data))
+      .catch((err) => console.error('signal handling failed', err))
+    return this._signalQ
   }
 
-  // Called by the hook when a relayed `signal` for this peer arrives.
-  async accept(data) {
-    try {
-      if (data.type === 'offer') {
-        await this.pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
-        const answer = await this.pc.createAnswer()
-        await this.pc.setLocalDescription(answer)
-        this.sendSignal({ type: 'answer', sdp: answer })
-      } else if (data.type === 'answer') {
-        await this.pc.setRemoteDescription(new RTCSessionDescription(data.sdp))
-      } else if (data.type === 'candidate') {
-        await this.pc.addIceCandidate(new RTCIceCandidate(data.candidate))
+  async _handleSignal(data) {
+    if (data.type === 'description') {
+      const description = data.description
+      const collision =
+        description.type === 'offer' && (this._makingOffer || this.pc.signalingState !== 'stable')
+      this._ignoreOffer = !this.polite && collision
+      if (this._ignoreOffer) return // impolite peer keeps its own offer
+      await this.pc.setRemoteDescription(description) // polite peer rolls back implicitly on a glare
+      await this._flushCandidates()
+      if (description.type === 'offer') {
+        await this.pc.setLocalDescription() // implicit answer
+        this.sendSignal({ type: 'description', description: this.pc.localDescription })
       }
-    } catch (err) {
-      console.error('signal handling failed', err)
+    } else if (data.type === 'candidate') {
+      // Hold candidates until there's a remote description to attach them to.
+      if (!this.pc.remoteDescription) {
+        this._pendingCandidates.push(data.candidate)
+        return
+      }
+      try {
+        await this.pc.addIceCandidate(data.candidate)
+      } catch (err) {
+        if (!this._ignoreOffer) console.error('addIceCandidate failed', err)
+      }
+    }
+  }
+
+  async _flushCandidates() {
+    const pending = this._pendingCandidates
+    this._pendingCandidates = []
+    for (const c of pending) {
+      try {
+        await this.pc.addIceCandidate(c)
+      } catch (err) {
+        console.error('queued candidate failed', err)
+      }
     }
   }
 
@@ -102,6 +168,7 @@ export class PeerLink {
   //   relayed — falling back through a TURN relay
   // ICE renominates occasionally, so we poll a few times after connecting.
   async _detectRoute(attempt = 0) {
+    if (this._closed) return
     try {
       const stats = await this.pc.getStats()
       const cands = {}
@@ -141,16 +208,26 @@ export class PeerLink {
     channel.bufferedAmountLowThreshold = this.chunkSize
     channel.onopen = () => this.onStatus('ready')
     channel.onmessage = (e) => this._onMessage(e.data)
+    // One persistent drain handler feeds ALL concurrent senders — never
+    // clobbered by a per-transfer assignment (#4).
+    channel.onbufferedamountlow = () => {
+      const waiters = this._drainWaiters
+      this._drainWaiters = []
+      waiters.forEach((r) => r())
+    }
   }
 
   _onMessage(data) {
     if (typeof data === 'string') return this._onControl(JSON.parse(data))
-    // binary chunk for the in-flight incoming transfer
-    if (!this._incoming) return
-    this._incoming.buffers.push(data)
-    this._incoming.received += data.byteLength
-    const t = this.transfers.get(this._incoming.id)
-    this._update(t, { progress: this._incoming.received / this._incoming.size })
+    // Binary chunk: first 4 bytes are the stream id, the rest is payload (#4).
+    if (data.byteLength < 4) return
+    const sid = new DataView(data).getUint32(0)
+    const inc = this._incomingBySid.get(sid)
+    if (!inc) return
+    const payload = data.slice(4)
+    inc.buffers.push(payload)
+    inc.received += payload.byteLength
+    this._update(this.transfers.get(inc.id), { progress: inc.size ? inc.received / inc.size : 0 })
   }
 
   _onControl(msg) {
@@ -160,6 +237,7 @@ export class PeerLink {
           id: msg.id, peerId: this.id, peerName: this.name, direction: 'receive',
           name: msg.name, size: msg.size, mime: msg.mime, progress: 0, status: 'offered',
         })
+        t._sid = msg.sid
         this.onTransfer(t)
         break
       }
@@ -173,12 +251,13 @@ export class PeerLink {
         break
       }
       case CTRL.END: {
-        const inc = this._incoming
-        if (!inc || inc.id !== msg.id) return
+        const inc = this._incomingBySid.get(msg.sid)
+        if (!inc) return
+        this._incomingBySid.delete(msg.sid)
         const blob = new Blob(inc.buffers, { type: inc.mime || 'application/octet-stream' })
-        this._incoming = null
-        const t = this.transfers.get(msg.id)
-        this._update(t, { status: 'complete', progress: 1, blob, url: URL.createObjectURL(blob) })
+        this._update(this.transfers.get(inc.id), {
+          status: 'complete', progress: 1, blob, url: URL.createObjectURL(blob),
+        })
         break
       }
     }
@@ -186,18 +265,20 @@ export class PeerLink {
 
   // ------------------------------------------------------------- send / accept
   // Queue files to a peer. Each becomes an 'offered' transfer the receiver must
-  // accept before bytes flow.
+  // accept before bytes flow. Each gets a stream id so multiple can run at once.
   sendFiles(fileList) {
     const ids = []
     for (const file of fileList) {
       const id = nextTransferId()
-      this._outgoingFiles.set(id, file)
+      const sid = this._nextSid++
+      this._outgoingFiles.set(id, { file, sid })
       const t = this._track({
         id, peerId: this.id, peerName: this.name, direction: 'send',
         name: file.name, size: file.size, mime: file.type, progress: 0, status: 'offered',
       })
+      t._sid = sid
       this.onTransfer(t)
-      this._control({ type: CTRL.OFFER, id, name: file.name, size: file.size, mime: file.type })
+      this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type })
       ids.push(id)
     }
     return ids
@@ -207,7 +288,7 @@ export class PeerLink {
   acceptTransfer(id) {
     const t = this.transfers.get(id)
     if (!t || t.direction !== 'receive') return
-    this._incoming = { id, name: t.name, size: t.size, mime: t.mime, received: 0, buffers: [] }
+    this._incomingBySid.set(t._sid, { id, size: t.size, mime: t.mime, received: 0, buffers: [] })
     this._update(t, { status: 'transferring' })
     this._control({ type: CTRL.ACCEPT, id })
   }
@@ -220,30 +301,38 @@ export class PeerLink {
   }
 
   async _streamFile(id) {
-    const file = this._outgoingFiles.get(id)
+    const entry = this._outgoingFiles.get(id)
     const t = this.transfers.get(id)
-    if (!file || !t) return
+    if (!entry || !t) return
+    const { file, sid } = entry
     this._update(t, { status: 'transferring' })
     let offset = 0
     while (offset < file.size) {
-      const slice = file.slice(offset, offset + this.chunkSize)
-      const buf = await slice.arrayBuffer()
-      // Backpressure: wait if the send buffer is filling up.
+      if (this._closed || this.channel?.readyState !== 'open') return // dropped mid-transfer
+      const buf = await file.slice(offset, offset + this.chunkSize).arrayBuffer()
+      // Backpressure: park without clobbering other senders (#4).
       if (this.channel.bufferedAmount > this.chunkSize * 16) {
-        await new Promise((res) => (this.channel.onbufferedamountlow = res))
+        await new Promise((res) => this._drainWaiters.push(res))
+        if (this._closed || this.channel?.readyState !== 'open') return
       }
-      this.channel.send(buf)
+      // Frame: [uint32 sid][payload]
+      const framed = new Uint8Array(4 + buf.byteLength)
+      new DataView(framed.buffer).setUint32(0, sid)
+      framed.set(new Uint8Array(buf), 4)
+      this.channel.send(framed)
       offset += buf.byteLength
       this._update(t, { progress: Math.min(offset / file.size, 1) })
     }
-    this._control({ type: CTRL.END, id })
+    this._control({ type: CTRL.END, id, sid })
     this._outgoingFiles.delete(id)
     this._update(t, { status: 'complete', progress: 1 })
   }
 
   // ------------------------------------------------------------------ helpers
   _control(obj) {
-    this.channel?.send(JSON.stringify(obj))
+    try {
+      this.channel?.send(JSON.stringify(obj))
+    } catch {}
   }
   _track(t) {
     this.transfers.set(t.id, t)
@@ -255,7 +344,29 @@ export class PeerLink {
     this.onTransfer({ ...t })
   }
 
+  // Mark in-flight transfers failed when the link drops, so they don't sit at
+  // 'transferring' forever (and become clearable in the UI) (#5).
+  _failActive() {
+    for (const t of this.transfers.values()) {
+      if (t.status === 'transferring' || t.status === 'offered') this._update(t, { status: 'failed' })
+    }
+    this._incomingBySid.clear()
+    this._outgoingFiles.clear()
+    const waiters = this._drainWaiters
+    this._drainWaiters = []
+    waiters.forEach((r) => r()) // unblock parked sender loops so they exit
+  }
+
   close() {
+    if (this._closed) return
+    this._closed = true
+    clearTimeout(this._dcTimer)
+    this._failActive() // flush 'failed' to the UI before we go silent
+    // Silence late async callbacks (detectRoute timers, channel events) so they
+    // can't resurrect a removed peer in the hook (#3).
+    this.onStatus = () => {}
+    this.onRoute = () => {}
+    this.onTransfer = () => {}
     try { this.channel?.close() } catch {}
     try { this.pc.close() } catch {}
   }
