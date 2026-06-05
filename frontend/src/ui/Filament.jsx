@@ -247,7 +247,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
   if (scope === 'code') {
     return (
       <div style={{ ...wrap, flexDirection: 'column', flexWrap: 'nowrap', alignItems: 'stretch', gap: 10 }}>
-        <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim, whiteSpace: 'nowrap' }}>ROOM CODE · READ IT ALOUD</span>
+        <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim, whiteSpace: 'nowrap' }}>ONE-TIME CODE · SAY IT ALOUD · WORKS ONCE</span>
         <span style={{ width: '100%', flexShrink: 0, fontSize: 'clamp(26px,3.2vw,38px)', lineHeight: 1.1, letterSpacing: '.14em', color: T.text, fontWeight: 500, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{state.roomCode}</span>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <LanChip localHelper={state.localHelper} T={T} />
@@ -258,6 +258,17 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
             {ghostBtn('← back to nearby', onUseAutoRoom)}
           </div>
         </div>
+      </div>
+    )
+  }
+
+  if (scope === 'pair') {
+    return (
+      <div style={wrap}>
+        <span style={{ fontSize: 13, color: T.text, whiteSpace: 'nowrap' }}>Paired privately</span>
+        <Pill T={T}>one-time code · burned</Pill>
+        <LanChip localHelper={state.localHelper} T={T} />
+        <span style={{ marginLeft: 'auto' }}>{ghostBtn('← back to nearby', onUseAutoRoom)}</span>
       </div>
     )
   }

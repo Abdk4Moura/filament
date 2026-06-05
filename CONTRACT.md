@@ -61,7 +61,7 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   // room / discovery
   roomId: string | null,
   roomUrl: string | null,            // share this to pair
-  roomScope: "auto" | "code" | "link" | null,  // how you got into this room
+  roomScope: "auto" | "code" | "link" | "pair" | null,  // how you got into this room
   roomCode: string | null,           // the 6-char code when scope === "code"
   network: "ipv4" | "ipv6" | "raw" | null,     // how the auto room was grouped
 
@@ -96,8 +96,8 @@ touch the socket, Firestore, or RTCPeerConnection directly.
   declineTransfer(transferId: string): void,
   saveTransfer(transferId: string): void,     // download a completed receive
   clearTransfer(transferId: string): void,    // dismiss from the list
-  pairWithCode(code: string): void,           // join a code room (cross-network)
-  generateCode(): Promise<string>,            // mint a code, switch to it
+  pairWithCode(code: string): void,           // claim a ONE-TIME code (burned on use)
+  generateCode(keyword?: string): Promise<string>, // mint a speakable one-time code
   useAutoRoom(): Promise<void>,               // back to the "people near you" room
 }
 ```
@@ -124,6 +124,14 @@ Once a peer connects, `route` tells you the **physical path** ICE chose:
 - `"direct"` — peer-to-peer over the internet (NAT-traversed, no relay).
 - `"relayed"` — falling back through a TURN relay.
 Surface it on the peer tile (e.g. a small badge: `⟶ local` / `⟶ direct` / `⟶ relayed`).
+
+### One-time pairing (#11)
+`generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
+pass a custom keyword — collisions are rejected). Say it aloud; the other side
+enters it via `pairWithCode()`. The server **atomically burns the code** on the
+first claim and drops both parties into a fresh unguessable `pair-…` room
+(`roomScope === "pair"`). A second claim — or an eavesdropper after the fact —
+gets `invalid`. Unclaimed codes evaporate after 10 minutes.
 
 ### Part B — discovery modes
 - `roomScope === "auto"` → "people near you"; show the `network` and that it's automatic.

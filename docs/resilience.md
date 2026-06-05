@@ -205,6 +205,23 @@ sid), briefly duplicating the tile.
 *Files:* `backend/signaling.py` (`LIVE_TTL`, `refresh`, lease-aware
 `peers_in`, `_lease_loop`), `useFilament.js` (`makeLink` supersede).
 
+## 11. One-time pairing codes (feature)
+
+**Why.** When auto-discovery can't see the person next to you (different
+carriers, AP isolation, CGNAT splitting the room hash), the human channel is
+the best signaling there is — *say a word across the table*. The old code rooms
+were persistent: anyone who overheard the code could join it later.
+
+**How.** `pair-create` registers a speakable code (`clever-lynx-63`, or a
+chosen keyword — `SET NX` rejects collisions so strangers can't cross-pair) for
+10 minutes. `pair-claim` consumes it **atomically** (`GETDEL`) — exactly one
+claim, ever — verifies the creator's liveness lease, then introduces both
+parties into a fresh unguessable `pair-…` room. The room id is independent of
+the code, so an overheard code is worthless the moment the real partner claims
+it; before that, an attacker must out-race the person physically beside you.
+*Files:* `backend/signaling.py` (`pair_create`/`pair_claim`, events),
+`signaling.js`, `useFilament.js`, `Filament.jsx` ('pair' scope).
+
 ---
 
 ## Testing

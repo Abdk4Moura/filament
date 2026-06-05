@@ -14,8 +14,24 @@ Event contract (kept in sync with CONTRACT.md):
   server -> client   welcome {id,peers:[{id,name}]} · peer-joined {id,name}
                      peer-left {id} · signal {from,data}
 """
+import re
+import secrets as _secrets
+
 from flask import request
 from flask_socketio import emit, join_room, leave_room
+
+# Speakable one-time codes: easy to say across a table, unique by NX semantics.
+_ADJ = ["brave", "calm", "clever", "eager", "gentle", "jolly", "keen", "lucky", "mellow", "swift"]
+_ANIMAL = ["otter", "panda", "falcon", "lynx", "koala", "heron", "fox", "ibex", "marten", "tapir"]
+
+
+def _mint_pair_code():
+    return f"{_secrets.choice(_ADJ)}-{_secrets.choice(_ANIMAL)}-{_secrets.randbelow(90) + 10}"
+
+
+def _norm_code(raw):
+    """Normalize a spoken keyword: lowercase, spaces→dashes, strip noise."""
+    return re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", (raw or "").strip().lower()))[:48]
 
 
 class _MemRegistry:
@@ -41,6 +57,19 @@ class _MemRegistry:
             for s, v in self._m.items()
             if v["room"] == room and s != exclude
         ]
+
+    # -- one-time pairing codes (#11) --
+    def pair_create(self, code, sid, ttl=600):
+        pairs = getattr(self, "_pairs", None)
+        if pairs is None:
+            pairs = self._pairs = {}
+        if code in pairs:
+            return False
+        pairs[code] = sid
+        return True
+
+    def pair_claim(self, code):
+        return getattr(self, "_pairs", {}).pop(code, None)
 
 
 class _RedisRegistry:
@@ -101,6 +130,18 @@ class _RedisRegistry:
             p.delete(self._lk(sid))
             p.execute()
         return room
+
+    # -- one-time pairing codes (#11): SET NX EX to create, GETDEL to consume
+    # atomically — a code can be claimed exactly once, ever.
+    def pair_create(self, code, sid, ttl=600):
+        return bool(self.r.set(f"filament:pair:{code}", sid, nx=True, ex=ttl))
+
+    def pair_claim(self, code):
+        creator = self.r.getdel(f"filament:pair:{code}")
+        # Don't match against a creator whose connection is already dead.
+        if creator and not self.r.exists(self._lk(creator)):
+            return None
+        return creator
 
     def peers_in(self, room, exclude=None):
         import json
@@ -178,6 +219,36 @@ def register(socketio, registry):
         # on every instance.
         emit("welcome", {"id": sid, "peers": registry.peers_in(room, exclude=sid)})
         emit("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
+
+    # -- one-time pairing (#11): say the code aloud; it works exactly once. --
+    PAIR_TTL = 600  # unclaimed codes evaporate after 10 minutes
+
+    @socketio.on("pair-create")
+    def on_pair_create(data=None):
+        sid = request.sid
+        keyword = _norm_code((data or {}).get("keyword"))
+        for _ in range(4):
+            code = keyword or _mint_pair_code()
+            if registry.pair_create(code, sid, ttl=PAIR_TTL):
+                emit("pair-code", {"code": code, "ttl": PAIR_TTL})
+                return
+            if keyword:  # a chosen keyword that's in use is an error, not a retry
+                emit("pair-error", {"error": "taken"})
+                return
+        emit("pair-error", {"error": "exhausted"})
+
+    @socketio.on("pair-claim")
+    def on_pair_claim(data=None):
+        code = _norm_code((data or {}).get("code"))
+        creator = registry.pair_claim(code) if code else None
+        if not creator:
+            emit("pair-error", {"error": "invalid"})
+            return
+        # The code is now BURNED (atomic claim). Introduce both sides into a
+        # fresh unguessable room — knowing the code afterwards yields nothing.
+        room = "pair-" + _secrets.token_urlsafe(9)
+        emit("pair-matched", {"room": room}, to=creator)  # routes cross-instance
+        emit("pair-matched", {"room": room})
 
     @socketio.on("signal")
     def on_signal(data):

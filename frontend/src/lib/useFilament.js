@@ -51,7 +51,8 @@ export function useFilament() {
   const [peers, setPeers] = useState([]) // [{ id, name, color, status }]
   const [transfers, setTransfers] = useState([]) // see CONTRACT.md
   const [roomId, setRoomId] = useState(null)
-  const [roomScope, setRoomScope] = useState(null) // 'auto' | 'code' | 'link'
+  const [roomScope, setRoomScope] = useState(null) // 'auto' | 'code' | 'link' | 'pair'
+  const [roomCode, setRoomCode] = useState(null) // the speakable one-time code while waiting
   const [network, setNetwork] = useState(null) // 'ipv4' | 'ipv6' | 'raw'
   const [signalingKind, setSignalingKind] = useState(null)
   const [connected, setConnected] = useState(false)
@@ -185,6 +186,7 @@ export function useFilament() {
       if (urlRoom) {
         room = urlRoom
         scope = urlRoom.startsWith('code-') ? 'code' : 'link'
+        if (scope === 'code') setRoomCode(urlRoom.slice(5))
       } else {
         const auto = await fetch(api('/api/room')).then((r) => r.json())
         room = auto.room
@@ -233,6 +235,18 @@ export function useFilament() {
         }
         link.enqueueSignal(data) // ordered per-peer dispatch (#2)
       })
+      // One-time pairing (#11): the server matched us with the code's other
+      // party — the code is burned; move both into the private room.
+      sig.on('pair-matched', ({ room }) => {
+        setRoomCode(null)
+        rejoinRef.current?.(room, 'pair')
+      })
+      sig.on('pair-error', ({ error }) => {
+        console.warn('pairing failed:', error)
+        setRoomCode(null)
+        setRoomScope((s) => (s === 'code' ? 'auto' : s)) // stop showing a dead code
+      })
+
       // Reflect transport up/down in the UI (the rejoin itself is automatic),
       // and refresh ICE config on reconnect — TURN creds are time-limited (#9).
       sig.on('status', ({ connected: up }) => {
@@ -289,6 +303,7 @@ export function useFilament() {
   }, [])
 
   // ---- room switching (Part B: pair across networks with a code) -----------
+  // (referenced from the bootstrap pair-matched handler via ref)
   // Reuses the live socket: drop the current peers, leave, and re-join. No reload.
   const rejoin = useCallback((newRoomId, scope) => {
     const sig = sigRef.current
@@ -303,21 +318,34 @@ export function useFilament() {
     sig.join(newRoomId, myNameRef.current, uidRef.current)
   }, [])
 
-  const pairWithCode = useCallback(
-    (code) => {
-      const clean = String(code).trim().toUpperCase()
-      if (clean) rejoin(`code-${clean}`, 'code')
-    },
-    [rejoin],
-  )
+  // One-time pairing (#11): claim a spoken code. On success the server emits
+  // pair-matched to BOTH parties and the code is burned forever.
+  const rejoinRef = useRef(null)
 
-  const generateCode = useCallback(async () => {
-    const { code, room } = await fetch(api('/api/room/code')).then((r) => r.json())
-    rejoin(room, 'code')
-    return code
-  }, [rejoin])
+  const pairWithCode = useCallback((code) => {
+    const clean = String(code).trim()
+    if (clean) sigRef.current?.pairClaim(clean)
+  }, [])
+
+  // Mint a single-use speakable code (or register a chosen keyword). We STAY in
+  // the current room while waiting; the big code is shown until it's claimed.
+  const generateCode = useCallback(async (keyword) => {
+    const sig = sigRef.current
+    if (!sig) return null
+    return new Promise((resolve) => {
+      sig.on('pair-code', function onCode({ code }) {
+        setRoomCode(code)
+        setRoomScope('code')
+        resolve(code)
+      })
+      sig.pairCreate(keyword)
+    })
+  }, [])
+
+  rejoinRef.current = rejoin
 
   const useAutoRoom = useCallback(async () => {
+    setRoomCode(null)
     const auto = await fetch(api('/api/room')).then((r) => r.json())
     setNetwork(auto.network)
     rejoin(auto.room, 'auto')
@@ -372,11 +400,6 @@ export function useFilament() {
       clearInterval(t)
     }
   }, [])
-
-  const roomCode = useMemo(
-    () => (roomId && roomId.startsWith('code-') ? roomId.slice(5) : null),
-    [roomId],
-  )
 
   const roomUrl = useMemo(
     () => (roomId ? `${window.location.origin}/rooms/${roomId}` : null),
