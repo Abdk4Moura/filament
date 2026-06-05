@@ -70,11 +70,16 @@ services:
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
     # Secret/realm/IP come from .env so they live in exactly one place.
+    # listening-ip pins coturn to the PUBLIC address only (avoids clashing with
+    # tailscale and the docker bridges); alt-listening-port adds a :443 listener
+    # (udp+tcp) so TURN passes strict mobile/corporate networks that block 3478.
     command:
       - -c
       - /etc/coturn/turnserver.conf
       - --static-auth-secret=${FIL_TURN_SECRET}
       - --realm=${TURN_REALM}
       - --external-ip=${DROPLET_IP}
+      - --listening-ip=${DROPLET_IP}
+      - --alt-listening-port=443
     mem_limit: ${COTURN_MEM:-96m}
     cpus: ${COTURN_CPUS:-0.50}

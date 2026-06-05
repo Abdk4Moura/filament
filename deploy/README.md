@@ -27,7 +27,8 @@ scales up/down in seconds.
 - `turn.filament.autumated.com` → **A record → `165.22.207.231`, DNS-only (grey
   cloud)**. The only manual record (UDP can't go through the tunnel).
 - `filament.autumated.com` → added as a custom domain in the Pages project.
-- Firewall: open **`3478/tcp+udp`** and **`49160-49200/udp`** (coturn) on the
+- Firewall: open **`3478/tcp+udp`**, **`443/tcp+udp`** (TURN fallback) and
+  **`49160-49200/udp`** (coturn) on the
   droplet / DO cloud firewall. Nothing else.
 
 ## 1. Cloudflare Tunnel (one-time)
@@ -108,6 +109,14 @@ the Redis groundwork here makes the api ready for it.
 4. coturn: the [Trickle ICE tester](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/)
    with your `turn:` URL + a username/credential from `/api/config` should yield
    a `relay` candidate.
+
+## TURN reachability
+Clients are handed the **raw droplet IP** for TURN (not the `turn.` hostname —
+it's orange-clouded behind Cloudflare, which can't proxy TURN). coturn listens
+on **:3478 and :443** (udp+tcp, public IP only via `--listening-ip`): the :443
+fallback passes strict mobile/corporate networks that block odd ports. For the
+full `turns:` (TLS-on-443) upgrade later: grey-cloud the `turn.` DNS record and
+issue a cert for it.
 
 ## Resource caps & notes
 - Every container is capped via `.env` (`API_MEM`, `COTURN_CPUS`, …). Defaults
