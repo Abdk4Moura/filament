@@ -27,6 +27,20 @@ function hueFor(seed) {
 }
 const colorFor = (seed) => `hsl(${hueFor(seed)} 70% 55%)`
 
+// Stable per-tab identity (survives reconnects; sids don't). Basis for resume.
+function tabUid() {
+  try {
+    let u = sessionStorage.getItem('filament.uid')
+    if (!u) {
+      u = (crypto.randomUUID && crypto.randomUUID()) || Math.random().toString(36).slice(2) + Date.now().toString(36)
+      sessionStorage.setItem('filament.uid', u)
+    }
+    return u
+  } catch {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36)
+  }
+}
+
 function roomFromUrl() {
   const m = window.location.pathname.match(/^\/rooms\/([^/]+)/)
   return m ? decodeURIComponent(m[1]) : null
@@ -49,6 +63,11 @@ export function useFilament() {
   const cfgRef = useRef(null)
   const myNameRef = useRef(null)
   const myIdRef = useRef(null) // our current socket id, for the politeness tiebreaker (#1)
+  const uidRef = useRef(tabUid()) // stable per-tab identity (resume)
+  // Resume stores — deliberately OUTLIVE individual PeerLinks (see docs/resilience.md):
+  const partialsRef = useRef(new Map()) // transferId -> { received, buffers, size, mime, name }
+  const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
+  const transferStatusRef = useRef(new Map()) // transferId -> latest status
 
   // ---- snapshot helpers (keep React state in sync with the live PeerLinks) --
   const addPeer = useCallback((p) => {
@@ -73,6 +92,7 @@ export function useFilament() {
 
   const upsertTransfer = useCallback((t) => {
     transferOwner.current.set(t.id, t.peerId)
+    if (t.status) transferStatusRef.current.set(t.id, t.status)
     setTransfers((prev) => {
       const i = prev.findIndex((x) => x.id === t.id)
       if (i === -1) return [t, ...prev]
@@ -84,23 +104,35 @@ export function useFilament() {
 
   // ---- create a PeerLink for one remote peer -------------------------------
   const makeLink = useCallback(
-    ({ id, name }) => {
+    ({ id, name, uid }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
       // Perfect-negotiation role (#1): the peer with the larger id is "polite".
       // Exactly one of each pair is impolite and owns the offer — no glare even
       // when both join/reconnect simultaneously.
       const polite = myIdRef.current ? myIdRef.current > id : true
-      addPeer({ id, name, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
+      addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
         name,
         iceServers: cfgRef.current.iceServers,
         chunkSize: cfgRef.current.chunkSize,
         polite,
+        peerUid: uid || null,
+        stores: { partials: partialsRef.current, outgoing: outgoingRef.current },
         sendSignal: (data) => sigRef.current.signal(id, data),
         onStatus: (status) => updatePeer(id, { status }),
         onTransfer: (t) => upsertTransfer(t),
         onRoute: (route) => updatePeer(id, { route }),
+        // Resume: once the channel is open, re-offer any paused sends that were
+        // headed to this same device (matched by its stable uid).
+        onChannelOpen: () => {
+          if (!uid) return
+          for (const [tid, entry] of outgoingRef.current) {
+            if (entry.peerUid === uid && transferStatusRef.current.get(tid) === 'paused') {
+              link.resumeSend(tid)
+            }
+          }
+        },
       })
       linksRef.current.set(id, link)
       return link
@@ -148,10 +180,10 @@ export function useFilament() {
         setPeers([])
         setMe({ id, name: myName, color: colorFor(id) })
         setConnected(true)
-        existing.forEach((p) => makeLink({ id: p.id, name: p.name }))
+        existing.forEach((p) => makeLink({ id: p.id, name: p.name, uid: p.uid }))
       })
-      sig.on('peer-joined', ({ id, name }) => {
-        makeLink({ id, name })
+      sig.on('peer-joined', ({ id, name, uid }) => {
+        makeLink({ id, name, uid })
       })
       sig.on('peer-left', ({ id }) => {
         linksRef.current.get(id)?.close()
@@ -174,7 +206,7 @@ export function useFilament() {
       // Reflect transport up/down in the UI (the rejoin itself is automatic).
       sig.on('status', ({ connected: up }) => setConnected(up))
 
-      sig.join(room, myName)
+      sig.join(room, myName, uidRef.current)
     })()
     return () => {
       cancelled = true
@@ -212,6 +244,9 @@ export function useFilament() {
   )
 
   const clearTransfer = useCallback((transferId) => {
+    partialsRef.current.delete(transferId) // dismissing a paused transfer frees its bytes
+    outgoingRef.current.delete(transferId)
+    transferStatusRef.current.delete(transferId)
     setTransfers((prev) => {
       const t = prev.find((x) => x.id === transferId)
       if (t?.url) URL.revokeObjectURL(t.url)
@@ -231,7 +266,7 @@ export function useFilament() {
     sig.leave()
     setRoomId(newRoomId)
     setRoomScope(scope)
-    sig.join(newRoomId, myNameRef.current)
+    sig.join(newRoomId, myNameRef.current, uidRef.current)
   }, [])
 
   const pairWithCode = useCallback(

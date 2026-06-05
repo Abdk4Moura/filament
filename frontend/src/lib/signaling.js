@@ -48,14 +48,15 @@ class SocketIOSignaling extends Emitter {
     // re-emits `welcome`, which the hook treats as a fresh roster.
     this.socket.on('connect', () => {
       this._emit('status', { connected: true })
-      if (this.room) this.socket.emit('join', { room: this.room, name: this.name })
+      if (this.room) this.socket.emit('join', { room: this.room, name: this.name, uid: this.uid })
     })
     this.socket.on('disconnect', () => this._emit('status', { connected: false }))
   }
-  join(room, name) {
+  join(room, name, uid) {
     this.room = room
     this.name = name
-    this.socket.emit('join', { room, name })
+    this.uid = uid
+    this.socket.emit('join', { room, name, uid })
   }
   signal(to, data) {
     this.socket.emit('signal', { to, data })
@@ -93,26 +94,27 @@ class FirebaseSignaling extends Emitter {
     this.db = fs.getFirestore(initializeApp(this.config))
     this.id = 'fb_' + Math.random().toString(36).slice(2, 10)
   }
-  async join(room, name) {
+  async join(room, name, uid) {
     await this._ready
     const { doc, setDoc, collection, onSnapshot, serverTimestamp } = this.fs
     this.room = room
     this.name = name
+    this.uid = uid
     const peersCol = collection(this.db, 'rooms', room, 'peers')
 
     // Existing peers become our "welcome"; then announce ourselves.
     const { getDocs } = this.fs
     const existing = (await getDocs(peersCol)).docs
       .filter((d) => d.id !== this.id)
-      .map((d) => ({ id: d.id, name: d.data().name }))
-    await setDoc(doc(peersCol, this.id), { name, joinedAt: serverTimestamp() })
+      .map((d) => ({ id: d.id, name: d.data().name, uid: d.data().uid }))
+    await setDoc(doc(peersCol, this.id), { name, uid, joinedAt: serverTimestamp() })
     this._emit('welcome', { id: this.id, peers: existing })
 
     // Watch presence.
     this._unsubPeers = onSnapshot(peersCol, (snap) => {
       snap.docChanges().forEach((c) => {
         if (c.doc.id === this.id) return
-        if (c.type === 'added') this._emit('peer-joined', { id: c.doc.id, name: c.doc.data().name })
+        if (c.type === 'added') this._emit('peer-joined', { id: c.doc.id, name: c.doc.data().name, uid: c.doc.data().uid })
         if (c.type === 'removed') this._emit('peer-left', { id: c.doc.id })
       })
     })

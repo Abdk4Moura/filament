@@ -33,7 +33,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, sendSignal, onStatus, onTransfer, onRoute }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -41,7 +41,14 @@ export class PeerLink {
     this.onStatus = onStatus || (() => {})
     this.onTransfer = onTransfer || (() => {})
     this.onRoute = onRoute || (() => {})
+    this.onChannelOpen = onChannelOpen || (() => {})
     this.route = null // 'local' | 'direct' | 'relayed'
+
+    // Resume support: a stable per-tab identity for the remote peer, plus
+    // hook-owned stores that OUTLIVE this link — partial receive buffers and
+    // unfinished outgoing files survive a drop and resume on the next link.
+    this.peerUid = peerUid || null
+    this.stores = stores || { partials: new Map(), outgoing: new Map() }
 
     // Perfect negotiation (docs/resilience.md RED-1): exactly one peer per pair
     // is "impolite" and owns the offer; the polite peer yields on a glare.
@@ -52,8 +59,8 @@ export class PeerLink {
     this._pendingCandidates = [] // candidates that arrived before the remote description
 
     this.transfers = new Map() // id -> transfer state (mirrored to the UI)
-    this._outgoingFiles = new Map() // id -> { file, sid } awaiting accept
-    this._incomingBySid = new Map() // sid -> incoming buffer; supports concurrent transfers (#4)
+    this._outgoingFiles = new Map() // id -> { file, sid } streaming on THIS link
+    this._incomingBySid = new Map() // sid -> transferId (chunk routing, #4)
     this._nextSid = 1 // channel-local stream id assigned per transfer
     this._drainWaiters = [] // backpressure waiters fed by one shared onbufferedamountlow
     this._closed = false // guards late callbacks after teardown (#3)
@@ -206,7 +213,10 @@ export class PeerLink {
     this.channel = channel
     channel.binaryType = 'arraybuffer'
     channel.bufferedAmountLowThreshold = this.chunkSize
-    channel.onopen = () => this.onStatus('ready')
+    channel.onopen = () => {
+      this.onStatus('ready')
+      this.onChannelOpen() // the hook re-offers any paused sends to this peer
+    }
     channel.onmessage = (e) => this._onMessage(e.data)
     // One persistent drain handler feeds ALL concurrent senders — never
     // clobbered by a per-transfer assignment (#4).
@@ -222,12 +232,13 @@ export class PeerLink {
     // Binary chunk: first 4 bytes are the stream id, the rest is payload (#4).
     if (data.byteLength < 4) return
     const sid = new DataView(data).getUint32(0)
-    const inc = this._incomingBySid.get(sid)
-    if (!inc) return
+    const id = this._incomingBySid.get(sid)
+    const entry = id && this.stores.partials.get(id)
+    if (!entry) return
     const payload = data.slice(4)
-    inc.buffers.push(payload)
-    inc.received += payload.byteLength
-    this._update(this.transfers.get(inc.id), { progress: inc.size ? inc.received / inc.size : 0 })
+    entry.buffers.push(payload)
+    entry.received += payload.byteLength
+    this._update(this.transfers.get(id), { progress: entry.size ? entry.received / entry.size : 0 })
   }
 
   _onControl(msg) {
@@ -238,24 +249,37 @@ export class PeerLink {
           name: msg.name, size: msg.size, mime: msg.mime, progress: 0, status: 'offered',
         })
         t._sid = msg.sid
-        this.onTransfer(t)
+        // Resume: if we already hold partial bytes for this transfer (the link
+        // dropped mid-receive), accept automatically from where we left off —
+        // the user already said yes once.
+        const partial = msg.resume && this.stores.partials.get(msg.id)
+        if (partial) {
+          this._incomingBySid.set(msg.sid, msg.id)
+          this._update(t, { status: 'transferring', progress: t.size ? partial.received / t.size : 0 })
+          this._control({ type: CTRL.ACCEPT, id: msg.id, offset: partial.received })
+        } else {
+          this.onTransfer(t)
+        }
         break
       }
       case CTRL.ACCEPT:
-        this._streamFile(msg.id)
+        this._streamFile(msg.id, msg.offset || 0)
         break
       case CTRL.DECLINE: {
         const t = this.transfers.get(msg.id)
         this._outgoingFiles.delete(msg.id)
+        this.stores.outgoing.delete(msg.id)
         if (t) this._update(t, { status: 'declined' })
         break
       }
       case CTRL.END: {
-        const inc = this._incomingBySid.get(msg.sid)
-        if (!inc) return
+        const id = this._incomingBySid.get(msg.sid)
+        const entry = id && this.stores.partials.get(id)
+        if (!entry) return
         this._incomingBySid.delete(msg.sid)
-        const blob = new Blob(inc.buffers, { type: inc.mime || 'application/octet-stream' })
-        this._update(this.transfers.get(inc.id), {
+        this.stores.partials.delete(id)
+        const blob = new Blob(entry.buffers, { type: entry.mime || 'application/octet-stream' })
+        this._update(this.transfers.get(id), {
           status: 'complete', progress: 1, blob, url: URL.createObjectURL(blob),
         })
         break
@@ -265,13 +289,17 @@ export class PeerLink {
 
   // ------------------------------------------------------------- send / accept
   // Queue files to a peer. Each becomes an 'offered' transfer the receiver must
-  // accept before bytes flow. Each gets a stream id so multiple can run at once.
+  // accept before bytes flow. Each gets a stream id so multiple can run at once,
+  // and the File is kept in the hook-owned store so a drop can resume later.
   sendFiles(fileList) {
     const ids = []
     for (const file of fileList) {
       const id = nextTransferId()
       const sid = this._nextSid++
       this._outgoingFiles.set(id, { file, sid })
+      this.stores.outgoing.set(id, {
+        file, name: file.name, size: file.size, mime: file.type, peerUid: this.peerUid,
+      })
       const t = this._track({
         id, peerId: this.id, peerName: this.name, direction: 'send',
         name: file.name, size: file.size, mime: file.type, progress: 0, status: 'offered',
@@ -284,29 +312,46 @@ export class PeerLink {
     return ids
   }
 
-  // Receiver accepts an offered incoming transfer.
+  // Re-offer an unfinished outgoing transfer on this (new) link after a drop.
+  resumeSend(id) {
+    const entry = this.stores.outgoing.get(id)
+    if (!entry || this._outgoingFiles.has(id)) return
+    const sid = this._nextSid++
+    this._outgoingFiles.set(id, { file: entry.file, sid })
+    const t = this._track({
+      id, peerId: this.id, peerName: this.name, direction: 'send',
+      name: entry.name, size: entry.size, mime: entry.mime, progress: 0, status: 'offered',
+    })
+    t._sid = sid
+    this.onTransfer(t)
+    this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true })
+  }
+
+  // Receiver accepts an offered incoming transfer (fresh, from byte 0).
   acceptTransfer(id) {
     const t = this.transfers.get(id)
     if (!t || t.direction !== 'receive') return
-    this._incomingBySid.set(t._sid, { id, size: t.size, mime: t.mime, received: 0, buffers: [] })
+    this.stores.partials.set(id, { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name })
+    this._incomingBySid.set(t._sid, id)
     this._update(t, { status: 'transferring' })
-    this._control({ type: CTRL.ACCEPT, id })
+    this._control({ type: CTRL.ACCEPT, id, offset: 0 })
   }
 
   declineTransfer(id) {
     const t = this.transfers.get(id)
     if (!t || t.direction !== 'receive') return
+    this.stores.partials.delete(id)
     this._update(t, { status: 'declined' })
     this._control({ type: CTRL.DECLINE, id })
   }
 
-  async _streamFile(id) {
+  async _streamFile(id, startOffset = 0) {
     const entry = this._outgoingFiles.get(id)
     const t = this.transfers.get(id)
     if (!entry || !t) return
     const { file, sid } = entry
-    this._update(t, { status: 'transferring' })
-    let offset = 0
+    this._update(t, { status: 'transferring', progress: file.size ? startOffset / file.size : 0 })
+    let offset = Math.max(0, Math.min(startOffset, file.size))
     while (offset < file.size) {
       if (this._closed || this.channel?.readyState !== 'open') return // dropped mid-transfer
       const buf = await file.slice(offset, offset + this.chunkSize).arrayBuffer()
@@ -325,6 +370,7 @@ export class PeerLink {
     }
     this._control({ type: CTRL.END, id, sid })
     this._outgoingFiles.delete(id)
+    this.stores.outgoing.delete(id)
     this._update(t, { status: 'complete', progress: 1 })
   }
 
@@ -344,14 +390,19 @@ export class PeerLink {
     this.onTransfer({ ...t })
   }
 
-  // Mark in-flight transfers failed when the link drops, so they don't sit at
-  // 'transferring' forever (and become clearable in the UI) (#5).
+  // When the link drops, in-flight transfers become 'paused' if they can resume
+  // (we still hold the File / the partial bytes — kept in the hook-owned stores,
+  // which deliberately survive this link), else 'failed' (#5 + resume).
   _failActive() {
     for (const t of this.transfers.values()) {
-      if (t.status === 'transferring' || t.status === 'offered') this._update(t, { status: 'failed' })
+      if (t.status !== 'transferring' && t.status !== 'offered') continue
+      const resumable =
+        (t.direction === 'send' && this.stores.outgoing.has(t.id)) ||
+        (t.direction === 'receive' && this.stores.partials.has(t.id))
+      this._update(t, { status: resumable ? 'paused' : 'failed' })
     }
-    this._incomingBySid.clear()
-    this._outgoingFiles.clear()
+    this._incomingBySid.clear() // sid routing dies with the link; partials survive
+    this._outgoingFiles.clear() // per-link send state; the Files survive in stores
     const waiters = this._drainWaiters
     this._drainWaiters = []
     waiters.forEach((r) => r()) // unblock parked sender loops so they exit

@@ -22,10 +22,10 @@ class _MemRegistry:
     """Process-local membership (single instance)."""
 
     def __init__(self):
-        self._m = {}  # sid -> {"room", "name"}
+        self._m = {}  # sid -> {"room", "name", "uid"}
 
-    def add(self, sid, room, name):
-        self._m[sid] = {"room": room, "name": name}
+    def add(self, sid, room, name, uid=None):
+        self._m[sid] = {"room": room, "name": name, "uid": uid}
 
     def room_of(self, sid):
         m = self._m.get(sid)
@@ -37,7 +37,7 @@ class _MemRegistry:
 
     def peers_in(self, room, exclude=None):
         return [
-            {"id": s, "name": v["name"]}
+            {"id": s, "name": v["name"], "uid": v.get("uid")}
             for s, v in self._m.items()
             if v["room"] == room and s != exclude
         ]
@@ -59,9 +59,11 @@ class _RedisRegistry:
     def _sk(self, sid):
         return f"filament:sid:{sid}"
 
-    def add(self, sid, room, name):
+    def add(self, sid, room, name, uid=None):
+        import json
+
         p = self.r.pipeline()
-        p.hset(self._rk(room), sid, name)
+        p.hset(self._rk(room), sid, json.dumps({"name": name, "uid": uid}))
         p.expire(self._rk(room), self.TTL)
         p.set(self._sk(sid), room, ex=self.TTL)
         p.execute()
@@ -79,11 +81,18 @@ class _RedisRegistry:
         return room
 
     def peers_in(self, room, exclude=None):
-        return [
-            {"id": s, "name": n}
-            for s, n in self.r.hgetall(self._rk(room)).items()
-            if s != exclude
-        ]
+        import json
+
+        out = []
+        for s, raw in self.r.hgetall(self._rk(room)).items():
+            if s == exclude:
+                continue
+            try:
+                v = json.loads(raw)
+                out.append({"id": s, "name": v.get("name"), "uid": v.get("uid")})
+            except (json.JSONDecodeError, AttributeError):
+                out.append({"id": s, "name": raw, "uid": None})  # pre-uid entry
+        return out
 
 
 def make_registry(redis_url):
@@ -96,18 +105,22 @@ def register(socketio, registry):
         sid = request.sid
         room = (data or {}).get("room")
         name = (data or {}).get("name") or "anonymous"
+        # uid: a stable per-tab identity that survives reconnects (sids don't).
+        # It lets peers recognize "same device, new connection" — the basis for
+        # transfer resume.
+        uid = (data or {}).get("uid")
         if not room:
             return
         _do_leave(sid)  # if this socket was already in a room, clean it first
 
         join_room(room)
-        registry.add(sid, room, name)
+        registry.add(sid, room, name, uid)
 
         # Tell the joiner who's already here (they initiate offers); tell the
         # room someone arrived. With the Redis message queue these reach peers
         # on every instance.
         emit("welcome", {"id": sid, "peers": registry.peers_in(room, exclude=sid)})
-        emit("peer-joined", {"id": sid, "name": name}, room=room, include_self=False)
+        emit("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
 
     @socketio.on("signal")
     def on_signal(data):

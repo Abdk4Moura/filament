@@ -27,6 +27,7 @@ function fileTag(t) {
 const STATUS_LABEL = {
   offered: 'offered',
   transferring: 'transferring',
+  paused: 'paused',
   complete: 'complete',
   declined: 'declined',
   failed: 'failed',
@@ -194,12 +195,13 @@ function TransferRow({ t, onAccept, onDecline, onSave, onClear, T, D, accent }) 
         <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{recv ? 'from ' : 'to '}{t.peerName}</span>
         <span style={{ marginLeft: 'auto', color: sc, whiteSpace: 'nowrap' }}>{STATUS_LABEL[t.status]}{active ? ' ' + Math.round(t.progress * 100) + '%' : ''}</span>
       </div>
-      {(active || t.status === 'failed') && <Bar p={t.progress} color={t.status === 'failed' ? T.bad : accent} T={T} animate={active} />}
-      <div style={{ display: 'flex', gap: 8, marginTop: active || t.status === 'failed' ? 11 : 0, flexWrap: 'wrap' }}>
+      {(active || t.status === 'failed' || t.status === 'paused') && <Bar p={t.progress} color={t.status === 'failed' ? T.bad : accent} T={T} animate={active} />}
+      <div style={{ display: 'flex', gap: 8, marginTop: active || t.status === 'failed' || t.status === 'paused' ? 11 : 0, flexWrap: 'wrap' }}>
         {recv && t.status === 'offered' && (<>{btn('accept', () => onAccept(t.id), T.ok)}{btn('decline', () => onDecline(t.id), T.bad)}</>)}
         {recv && t.status === 'complete' && btn('save', () => onSave(t.id), accent)}
         {!recv && t.status === 'offered' && <span style={{ fontSize: 11, color: T.dim }}>waiting for accept…</span>}
-        {(t.status === 'complete' || t.status === 'declined' || t.status === 'failed') && btn('clear', () => onClear(t.id), T.dim)}
+        {t.status === 'paused' && <span style={{ fontSize: 11, color: T.dim }}>paused — resumes on reconnect</span>}
+        {(t.status === 'complete' || t.status === 'declined' || t.status === 'failed' || t.status === 'paused') && btn('clear', () => onClear(t.id), T.dim)}
       </div>
     </div>
   )

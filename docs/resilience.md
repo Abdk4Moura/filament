@@ -149,10 +149,35 @@ end-to-end negotiation still needs two real browsers — these state-machine
 fixes are unit-tested where they can be, and verified live by reconnect/transfer
 testing on two devices.
 
+## Transfer resume (feature, builds on the fixes above)
+
+**Problem.** P2P transfers die with the connection. After the resilience fixes
+a drop re-paired automatically, but a half-sent video still restarted from 0 —
+on flaky mobile paths that can mean never finishing.
+
+**Solution.** Three pieces:
+1. **Stable identity** — each tab mints a session `uid` carried through
+   `join`/`welcome`/`peer-joined`, so peers recognize "same device, new
+   connection" after a drop (socket ids change every reconnect).
+2. **State that outlives the link** — partial receive buffers and unfinished
+   outgoing `File`s live in hook-owned stores (`partialsRef`/`outgoingRef`),
+   not in the per-connection `PeerLink`. `_failActive` marks such transfers
+   `paused` instead of `failed`.
+3. **Offset handshake** — when a new channel opens to a peer whose `uid`
+   matches a paused send, the sender re-offers with `resume: true`; the
+   receiver (which already accepted once) auto-accepts with
+   `offset: bytesReceived`; the sender streams `file.slice(offset…)`. Chunk
+   framing (#4) keys everything by transfer id, so resumed bytes land in the
+   same buffer.
+
+**Limit:** resume requires the sender's *tab* to still be alive — a page reload
+revokes the browser's file handle, and there is nothing to stream from. That's
+a platform boundary (no filesystem access), not a design choice.
+
 ## Known remaining limits (by design)
 
-- **In-flight transfers are lost on a drop** — that's inherent to P2P; the data
-  channel dies with the connection. Discovery/pairing recovers automatically so
-  you can immediately re-send; chunk-level *resume* would be a larger feature.
+- **In-flight transfers now pause + resume** across drops (above) when the
+  sender's tab survives; a sender reload still loses the transfer — the browser
+  revokes file handles on navigation.
 - **Multi-instance API scaling** needs the Redis registry (already wired); the
   glare fix (#1) is what makes that safe.

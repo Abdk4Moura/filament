@@ -71,6 +71,7 @@ touch the socket, Firestore, or RTCPeerConnection directly.
     color: string,                   // stable hsl() per peer
     status: "connecting" | "ready" | "failed",
     route: "local" | "direct" | "relayed" | null,  // PATH the data takes (Part A)
+    uid: string | null,              // stable per-tab identity (survives reconnects)
   }>,
 
   transfers: Array<{
@@ -82,7 +83,7 @@ touch the socket, Firestore, or RTCPeerConnection directly.
     size: number,                    // bytes
     mime: string,
     progress: number,                // 0..1
-    status: "offered" | "transferring" | "complete" | "declined" | "failed",
+    status: "offered" | "transferring" | "paused" | "complete" | "declined" | "failed",
     url?: string,                    // present on completed RECEIVES → download
   }>,
 
@@ -107,6 +108,15 @@ touch the socket, Firestore, or RTCPeerConnection directly.
 - After accept it goes `transferring` (watch `progress`) → `complete`.
 - A completed `receive` exposes `url` → show **save**.
 - A `send` transfer is `offered` until the peer accepts, then `transferring` → `complete`, or `declined`.
+- `paused` = the link dropped mid-transfer but it CAN resume (the sender still
+  holds the file / the receiver still holds the partial bytes). It resumes
+  automatically on re-pair — show a frozen progress bar + "resumes on
+  reconnect"; allow **clear** to abandon it.
+
+### Signaling additions for resume
+- `join` carries a `uid` (stable per-tab id); `welcome` peers and `peer-joined`
+  include it. Transfer control messages: `file-offer` may carry `resume: true`;
+  `file-accept` carries `offset` (bytes already received).
 
 ### Part A — `peer.route` (the privacy/trust signal)
 Once a peer connects, `route` tells you the **physical path** ICE chose:
