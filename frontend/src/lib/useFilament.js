@@ -8,7 +8,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
-import { PeerLink } from './webrtc.js'
+import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 
 const ADJ = ['brave', 'calm', 'clever', 'eager', 'gentle', 'jolly', 'keen', 'lucky', 'mellow', 'swift']
@@ -68,6 +68,8 @@ export function useFilament() {
   const partialsRef = useRef(new Map()) // transferId -> { received, buffers, size, mime, name }
   const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
   const transferStatusRef = useRef(new Map()) // transferId -> latest status
+  const attemptsRef = useRef(new Map()) // peerId -> watchdog retry count (#8)
+  const makeLinkRef = useRef(null) // lets onStuck re-create a link without closure cycles
 
   // ---- snapshot helpers (keep React state in sync with the live PeerLinks) --
   const addPeer = useCallback((p) => {
@@ -106,10 +108,10 @@ export function useFilament() {
   const makeLink = useCallback(
     ({ id, name, uid }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
-      // Perfect-negotiation role (#1): the peer with the larger id is "polite".
-      // Exactly one of each pair is impolite and owns the offer — no glare even
-      // when both join/reconnect simultaneously.
-      const polite = myIdRef.current ? myIdRef.current > id : true
+      // Perfect-negotiation role (#1): exactly one of each pair is impolite and
+      // owns the offer. Compared by the STABLE uid when known (so a stale sid
+      // on one side can't produce a both-polite deadlock), else by sid.
+      const polite = politeRole({ myUid: uidRef.current, peerUid: uid, myId: myIdRef.current, peerId: id })
       addPeer({ id, name, uid: uid || null, color: colorFor(id), status: 'connecting', route: null, lastSeen: 'now' })
       const link = new PeerLink({
         id,
@@ -126,6 +128,7 @@ export function useFilament() {
         // Resume: once the channel is open, re-offer any paused sends that were
         // headed to this same device (matched by its stable uid).
         onChannelOpen: () => {
+          attemptsRef.current.delete(id) // established — reset watchdog retries
           if (!uid) return
           for (const [tid, entry] of outgoingRef.current) {
             if (entry.peerUid === uid && transferStatusRef.current.get(tid) === 'paused') {
@@ -133,12 +136,25 @@ export function useFilament() {
             }
           }
         },
+        // Watchdog (#8): nothing connected within 15s ⇒ a signaling message was
+        // lost (dead-sid relay, suspended peer, swallowed SDP error). Tear down
+        // and retry with a fresh link + fresh ICE config; then fail honestly.
+        watchdogMs: 15000,
+        onStuck: () => {
+          linksRef.current.delete(id)
+          link.close()
+          const n = (attemptsRef.current.get(id) || 0) + 1
+          attemptsRef.current.set(id, n)
+          if (n <= 2) makeLinkRef.current?.({ id, name, uid })
+          else updatePeer(id, { status: 'failed' })
+        },
       })
       linksRef.current.set(id, link)
       return link
     },
     [addPeer, updatePeer, upsertTransfer],
   )
+  makeLinkRef.current = makeLink
 
   // ---- bootstrap -----------------------------------------------------------
   useEffect(() => {
@@ -203,8 +219,12 @@ export function useFilament() {
         }
         link.enqueueSignal(data) // ordered per-peer dispatch (#2)
       })
-      // Reflect transport up/down in the UI (the rejoin itself is automatic).
-      sig.on('status', ({ connected: up }) => setConnected(up))
+      // Reflect transport up/down in the UI (the rejoin itself is automatic),
+      // and refresh ICE config on reconnect — TURN creds are time-limited (#9).
+      sig.on('status', ({ connected: up }) => {
+        setConnected(up)
+        if (up) fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
+      })
 
       sig.join(room, myName, uidRef.current)
     })()
@@ -288,6 +308,16 @@ export function useFilament() {
     setNetwork(auto.network)
     rejoin(auto.room, 'auto')
   }, [rejoin])
+
+  // ---- fresh ICE credentials (#9) ------------------------------------------
+  // TURN creds in /api/config are time-limited HMACs; a tab open past their TTL
+  // would hand stale creds to NEW links. Keep cfgRef fresh in the background.
+  useEffect(() => {
+    const t = setInterval(() => {
+      fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
+    }, 10 * 60 * 1000)
+    return () => clearInterval(t)
+  }, [])
 
   // ---- resilience: nudge a reconnect when a suspended tab resumes ----------
   // Mobile browsers freeze background tabs and throttle timers, so socket.io's

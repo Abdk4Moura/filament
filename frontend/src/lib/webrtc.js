@@ -21,6 +21,16 @@ const CTRL = {
 let _tid = 0
 const nextTransferId = () => `t${++_tid}_${Math.random().toString(36).slice(2, 7)}`
 
+// Deterministic negotiation roles (#1, hardened in #8/#10): prefer the stable
+// per-tab uid — it survives reconnects, so both sides always compare the SAME
+// pair even when one of them holds a stale sid. Fall back to sids, then to
+// polite (wait for the offer) when we know nothing yet.
+export function politeRole({ myUid, peerUid, myId, peerId }) {
+  if (myUid && peerUid && myUid !== peerUid) return myUid > peerUid
+  if (myId && peerId) return myId > peerId
+  return true
+}
+
 export class PeerLink {
   /**
    * @param {object}  o
@@ -33,7 +43,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -71,10 +81,13 @@ export class PeerLink {
       if (e.candidate) this.sendSignal({ type: 'candidate', candidate: e.candidate })
     }
     // All (re)negotiation funnels through here — we never hand-roll offers.
+    // Explicit createOffer (not the no-arg setLocalDescription()) for older
+    // Safari, where the implicit form throws and silently kills the handshake.
     this.pc.onnegotiationneeded = async () => {
       try {
         this._makingOffer = true
-        await this.pc.setLocalDescription() // implicit offer
+        const offer = await this.pc.createOffer()
+        await this.pc.setLocalDescription(offer)
         this.sendSignal({ type: 'description', description: this.pc.localDescription })
       } catch (err) {
         console.error('negotiation failed', err)
@@ -87,6 +100,7 @@ export class PeerLink {
       const s = this.pc.connectionState
       if (s === 'connected') {
         clearTimeout(this._dcTimer)
+        clearTimeout(this._watchdog) // established — watchdog stands down (#8)
         this.onStatus('ready')
         this._detectRoute() // which physical path did ICE actually pick?
       } else if (s === 'disconnected') {
@@ -117,6 +131,15 @@ export class PeerLink {
     // The impolite peer owns the data channel; creating it triggers the first
     // negotiationneeded → offer. The polite peer just answers.
     if (!polite) this._setChannel(this.pc.createDataChannel('filament'))
+
+    // Establishment watchdog (#8): if signaling is lost (offer to a dead sid,
+    // peer suspended, swallowed SDP error), the connection would otherwise sit
+    // at 'connecting' FOREVER — ICE only times out once descriptions exchange.
+    // Let the hook tear down and retry instead of hanging.
+    this.onStuck = onStuck || null
+    this._watchdog = setTimeout(() => {
+      if (!this._closed && this.pc.connectionState !== 'connected') this.onStuck?.()
+    }, watchdogMs || 15000)
   }
 
   // --------------------------------------------------------------- signaling
@@ -140,7 +163,8 @@ export class PeerLink {
       await this.pc.setRemoteDescription(description) // polite peer rolls back implicitly on a glare
       await this._flushCandidates()
       if (description.type === 'offer') {
-        await this.pc.setLocalDescription() // implicit answer
+        const answer = await this.pc.createAnswer() // explicit, for older Safari
+        await this.pc.setLocalDescription(answer)
         this.sendSignal({ type: 'description', description: this.pc.localDescription })
       }
     } else if (data.type === 'candidate') {
@@ -214,6 +238,7 @@ export class PeerLink {
     channel.binaryType = 'arraybuffer'
     channel.bufferedAmountLowThreshold = this.chunkSize
     channel.onopen = () => {
+      clearTimeout(this._watchdog) // established — watchdog stands down (#8)
       this.onStatus('ready')
       this.onChannelOpen() // the hook re-offers any paused sends to this peer
     }
@@ -412,6 +437,7 @@ export class PeerLink {
     if (this._closed) return
     this._closed = true
     clearTimeout(this._dcTimer)
+    clearTimeout(this._watchdog)
     this._failActive() // flush 'failed' to the UI before we go silent
     // Silence late async callbacks (detectRoute timers, channel events) so they
     // can't resurrect a removed peer in the hook (#3).

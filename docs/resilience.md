@@ -137,6 +137,48 @@ duplicate message from a departed peer.
 create a new link; stray answers/candidates from unknown sids are ignored.
 *Files:* `useFilament.js` (signal handler).
 
+## 8. No negotiation watchdog → stuck at "connecting" forever
+
+**Symptom.** Two tiles sit at "connecting" indefinitely (not even reaching
+"failed").
+
+**Problem.** ICE only times out (→ `failed`) once offer **and** answer have
+been exchanged. If a signaling message is lost — the one offer relayed to a
+just-died sid, the peer's tab suspended mid-handshake, an SDP error swallowed
+by the signal queue, or a both-polite deadlock from politeness compared over
+mismatched (stale) sids — nothing ever starts ICE, nothing ever fails, and
+nothing retries. Infinite "connecting".
+
+**Solution.** Three layers:
+- A **15s establishment watchdog** in `PeerLink`: not `connected` in time →
+  `onStuck` → the hook tears the link down and **recreates it** (fresh offer,
+  fresh ICE config), twice, then marks the peer `failed` honestly.
+- **Politeness by stable uid** (`politeRole`): roles are compared over the
+  per-tab uids, which survive reconnects — so one side holding a stale sid can
+  no longer produce two polite peers waiting on each other.
+- **Explicit `createOffer()/createAnswer()`** instead of the no-arg
+  `setLocalDescription()`, which throws on older Safari and silently killed
+  the handshake.
+*Files:* `webrtc.js` (`politeRole`, watchdog, `onnegotiationneeded`,
+`_handleSignal`), `useFilament.js` (`onStuck` retry loop, `attemptsRef`).
+
+## 9. Stale TURN credentials in long-lived tabs
+
+**Symptom.** Pairs that need the relay (hard NATs, cellular) connect fine in a
+fresh tab but fail in a tab that's been open a while.
+
+**Problem.** `/api/config` was fetched **once at page load**, and TURN
+credentials are expiry-stamped HMACs (`FIL_TURN_TTL`). A tab older than the
+TTL hands dead credentials to every new connection → coturn rejects the
+allocation → no relay candidates → relay-dependent pairs fail.
+
+**Solution.** The hook now refreshes `/api/config` on **every reconnect** and
+every **10 minutes** in the background, so new links always carry fresh
+credentials; the server-side TTL was raised to 6h so long-running relayed
+sessions can keep refreshing their allocations.
+*Files:* `useFilament.js` (status-handler + interval refresh), droplet `.env`
+(`FIL_TURN_TTL`).
+
 ---
 
 ## Testing
