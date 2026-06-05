@@ -179,6 +179,32 @@ sessions can keep refreshing their allocations.
 *Files:* `useFilament.js` (status-handler + interval refresh), droplet `.env`
 (`FIL_TURN_TTL`).
 
+## 10. Zombie registry entries → duplicate peer tiles
+
+**Symptom.** The same device shows up twice in the peer grid (same name, two
+tiles), one of them never connecting.
+
+**Problem.** Registry entries were only removed by the disconnect handler. An
+api **restart/crash kills its sockets without running handlers**, orphaning
+those entries in the Redis room hash for up to 24h — and every subsequent
+`welcome` hands the zombies to clients as roster entries. Confirmed live: the
+room hash contained `gentle-fox` under **two sids with the same tab-uid**, one
+from a connection that died in an api recreate. A second, transient variant:
+during a reconnect, `peer-joined` (new sid) can arrive before `peer-left` (old
+sid), briefly duplicating the tile.
+
+**Solution.** Two layers:
+- **Server — liveness leases:** every connection holds a `filament:live:{sid}`
+  key (`EX 120`) refreshed every 45s by the instance that owns it; `peers_in`
+  returns only leased entries and **lazily deletes** dead ones the first time
+  anyone looks. Orphans now disappear ≤2 minutes after any crash/restart.
+- **Client — uid supersede:** a tab has exactly one live connection, so when a
+  link arrives for a uid we already display under an older sid, the old
+  link/tile is replaced immediately. This also erases the transient
+  reconnect-window duplicate.
+*Files:* `backend/signaling.py` (`LIVE_TTL`, `refresh`, lease-aware
+`peers_in`, `_lease_loop`), `useFilament.js` (`makeLink` supersede).
+
 ---
 
 ## Testing

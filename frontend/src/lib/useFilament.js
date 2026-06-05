@@ -108,6 +108,20 @@ export function useFilament() {
   const makeLink = useCallback(
     ({ id, name, uid }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
+      // Supersede (#10): a tab has exactly ONE live connection. If we already
+      // show a tile for this uid under an older sid (zombie registry entry, or
+      // peer-joined arriving before peer-left during a reconnect), replace it —
+      // never show the same device twice.
+      if (uid) {
+        for (const [oldId, oldLink] of [...linksRef.current]) {
+          if (oldId !== id && oldLink.peerUid === uid) {
+            linksRef.current.delete(oldId)
+            oldLink.close()
+            removePeer(oldId)
+            attemptsRef.current.delete(oldId)
+          }
+        }
+      }
       // Perfect-negotiation role (#1): exactly one of each pair is impolite and
       // owns the offer. Compared by the STABLE uid when known (so a stale sid
       // on one side can't produce a both-polite deadlock), else by sid.
@@ -152,7 +166,7 @@ export function useFilament() {
       linksRef.current.set(id, link)
       return link
     },
-    [addPeer, updatePeer, upsertTransfer],
+    [addPeer, updatePeer, upsertTransfer, removePeer],
   )
   makeLinkRef.current = makeLink
 

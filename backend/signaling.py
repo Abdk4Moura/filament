@@ -44,9 +44,17 @@ class _MemRegistry:
 
 
 class _RedisRegistry:
-    """Shared membership in Redis so api replicas see one another's peers."""
+    """Shared membership in Redis so api replicas see one another's peers.
 
-    TTL = 86400  # self-heal: stale entries from unclean shutdowns expire
+    Liveness (#10): membership alone can't be trusted — an api restart kills
+    sockets without running disconnect handlers, orphaning entries that then
+    appear in every `welcome` as zombie peers. So every connection also holds a
+    short LEASE, refreshed by its owning instance; `peers_in` only returns
+    leased entries and lazily deletes the dead ones.
+    """
+
+    TTL = 86400  # room/sid bookkeeping
+    LIVE_TTL = 120  # liveness lease; refreshed every ~45s while connected
 
     def __init__(self, url):
         import redis  # lazy: only needed when scaling with Redis
@@ -59,6 +67,9 @@ class _RedisRegistry:
     def _sk(self, sid):
         return f"filament:sid:{sid}"
 
+    def _lk(self, sid):
+        return f"filament:live:{sid}"
+
     def add(self, sid, room, name, uid=None):
         import json
 
@@ -66,6 +77,16 @@ class _RedisRegistry:
         p.hset(self._rk(room), sid, json.dumps({"name": name, "uid": uid}))
         p.expire(self._rk(room), self.TTL)
         p.set(self._sk(sid), room, ex=self.TTL)
+        p.set(self._lk(sid), 1, ex=self.LIVE_TTL)  # liveness lease (#10)
+        p.execute()
+
+    def refresh(self, sids):
+        """Extend the liveness lease for locally-connected sids."""
+        if not sids:
+            return
+        p = self.r.pipeline()
+        for sid in sids:
+            p.set(self._lk(sid), 1, ex=self.LIVE_TTL)
         p.execute()
 
     def room_of(self, sid):
@@ -77,21 +98,40 @@ class _RedisRegistry:
             p = self.r.pipeline()
             p.hdel(self._rk(room), sid)
             p.delete(self._sk(sid))
+            p.delete(self._lk(sid))
             p.execute()
         return room
 
     def peers_in(self, room, exclude=None):
         import json
 
-        out = []
-        for s, raw in self.r.hgetall(self._rk(room)).items():
-            if s == exclude:
+        entries = self.r.hgetall(self._rk(room))
+        sids = [s for s in entries if s != exclude]
+        if not sids:
+            return []
+        # Liveness check (#10): only entries holding a lease are real.
+        p = self.r.pipeline()
+        for s in sids:
+            p.exists(self._lk(s))
+        alive = dict(zip(sids, p.execute()))
+
+        out, dead = [], []
+        for s in sids:
+            if not alive.get(s):
+                dead.append(s)
                 continue
+            raw = entries[s]
             try:
                 v = json.loads(raw)
                 out.append({"id": s, "name": v.get("name"), "uid": v.get("uid")})
             except (json.JSONDecodeError, AttributeError):
                 out.append({"id": s, "name": raw, "uid": None})  # pre-uid entry
+        if dead:  # lazy cleanup: zombies vanish the first time anyone looks
+            p = self.r.pipeline()
+            p.hdel(self._rk(room), *dead)
+            for s in dead:
+                p.delete(self._sk(s))
+            p.execute()
         return out
 
 
@@ -100,6 +140,23 @@ def make_registry(redis_url):
 
 
 def register(socketio, registry):
+    local_sids = set()  # connections owned by THIS instance (for lease refresh)
+
+    @socketio.on("connect")
+    def on_connect():
+        local_sids.add(request.sid)
+
+    if hasattr(registry, "refresh"):
+        def _lease_loop():
+            while True:
+                socketio.sleep(45)
+                try:
+                    registry.refresh(list(local_sids))
+                except Exception:
+                    pass
+
+        socketio.start_background_task(_lease_loop)
+
     @socketio.on("join")
     def on_join(data):
         sid = request.sid
@@ -140,6 +197,7 @@ def register(socketio, registry):
         _do_leave(request.sid)
 
     def _do_leave(sid):
+        local_sids.discard(sid)
         room = registry.remove(sid)
         if not room:
             return
