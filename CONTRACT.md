@@ -128,10 +128,12 @@ Surface it on the peer tile (e.g. a small badge: `⟶ local` / `⟶ direct` / `�
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side
-enters it via `pairWithCode()`. The server **atomically burns the code** on the
-first claim and drops both parties into a fresh unguessable `pair-…` room
-(`roomScope === "pair"`). A second claim — or an eavesdropper after the fact —
-gets `invalid`. Unclaimed codes evaporate after 10 minutes.
+claims it via `pairWithCode()`. The claim is **atomic and additive**: the code
+burns on first use, the claimer joins the *creator's current room*
+(`roomScope === "pair"` on the claimer), and the creator never moves — nearby
+detection stays intact. To add another person, mint another code. A second
+claim, or an eavesdropper after the fact, gets `invalid`. Unclaimed codes
+evaporate after 10 minutes.
 
 ### Part B — discovery modes
 - `roomScope === "auto"` → "people near you"; show the `network` and that it's automatic.

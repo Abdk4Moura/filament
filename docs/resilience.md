@@ -215,10 +215,17 @@ were persistent: anyone who overheard the code could join it later.
 **How.** `pair-create` registers a speakable code (`clever-lynx-63`, or a
 chosen keyword — `SET NX` rejects collisions so strangers can't cross-pair) for
 10 minutes. `pair-claim` consumes it **atomically** (`GETDEL`) — exactly one
-claim, ever — verifies the creator's liveness lease, then introduces both
-parties into a fresh unguessable `pair-…` room. The room id is independent of
-the code, so an overheard code is worthless the moment the real partner claims
-it; before that, an attacker must out-race the person physically beside you.
+claim, ever — verifies the creator's liveness lease, then sends the claimer
+into the **creator's current room**. Pairing is ADDITIVE: the creator never
+moves (nearby/auto-room detection stays intact), each code admits exactly one
+person, and minting another code adds another person to the same group. An
+overheard code is worthless the moment the real partner claims it; before
+that, an attacker must out-race the person physically beside you.
+
+**Bug fixed along the way:** the UI's create button passes the click event as
+the first argument — `generateCode(keyword)` must type-guard (`typeof keyword
+=== 'string'`) and the server's `_norm_code` must reject non-strings, else the
+event object crashed the handler and the button silently did nothing.
 *Files:* `backend/signaling.py` (`pair_create`/`pair_claim`, events),
 `signaling.js`, `useFilament.js`, `Filament.jsx` ('pair' scope).
 

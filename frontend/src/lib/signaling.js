@@ -39,7 +39,7 @@ class SocketIOSignaling extends Emitter {
     this.name = null
     // API_BASE === '' → same-origin; otherwise connect to the backend origin.
     this.socket = io(API_BASE || undefined, { autoConnect: true })
-    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-matched', 'pair-error']) {
+    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-matched', 'pair-error', 'pair-used']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
     // Resilience: on every (re)connect, rejoin the current room. A reconnect

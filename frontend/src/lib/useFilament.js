@@ -71,6 +71,7 @@ export function useFilament() {
   const transferStatusRef = useRef(new Map()) // transferId -> latest status
   const attemptsRef = useRef(new Map()) // peerId -> watchdog retry count (#8)
   const makeLinkRef = useRef(null) // lets onStuck re-create a link without closure cycles
+  const prevScopeRef = useRef('auto') // restore the discovery bar after a code is used
 
   // ---- snapshot helpers (keep React state in sync with the live PeerLinks) --
   const addPeer = useCallback((p) => {
@@ -241,10 +242,16 @@ export function useFilament() {
         setRoomCode(null)
         rejoinRef.current?.(room, 'pair')
       })
+      sig.on('pair-used', () => {
+        // Our code was claimed: the new person is joining OUR room (we never
+        // moved). Clear the code; mint another to add another person.
+        setRoomCode(null)
+        setRoomScope((s) => (s === 'code' ? prevScopeRef.current || 'auto' : s))
+      })
       sig.on('pair-error', ({ error }) => {
         console.warn('pairing failed:', error)
         setRoomCode(null)
-        setRoomScope((s) => (s === 'code' ? 'auto' : s)) // stop showing a dead code
+        setRoomScope((s) => (s === 'code' ? prevScopeRef.current || 'auto' : s))
       })
 
       // Reflect transport up/down in the UI (the rejoin itself is automatic),
@@ -332,13 +339,17 @@ export function useFilament() {
   const generateCode = useCallback(async (keyword) => {
     const sig = sigRef.current
     if (!sig) return null
+    const kw = typeof keyword === 'string' ? keyword : null // UI passes the click event
     return new Promise((resolve) => {
       sig.on('pair-code', function onCode({ code }) {
         setRoomCode(code)
-        setRoomScope('code')
+        setRoomScope((s) => {
+          if (s !== 'code') prevScopeRef.current = s
+          return 'code'
+        })
         resolve(code)
       })
-      sig.pairCreate(keyword)
+      sig.pairCreate(kw)
     })
   }, [])
 

@@ -31,7 +31,9 @@ def _mint_pair_code():
 
 def _norm_code(raw):
     """Normalize a spoken keyword: lowercase, spaces→dashes, strip noise."""
-    return re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", (raw or "").strip().lower()))[:48]
+    if not isinstance(raw, str):
+        return ""
+    return re.sub(r"[^a-z0-9-]", "", re.sub(r"\s+", "-", raw.strip().lower()))[:48]
 
 
 class _MemRegistry:
@@ -241,14 +243,15 @@ def register(socketio, registry):
     def on_pair_claim(data=None):
         code = _norm_code((data or {}).get("code"))
         creator = registry.pair_claim(code) if code else None
-        if not creator:
+        room = registry.room_of(creator) if creator else None
+        if not room:
             emit("pair-error", {"error": "invalid"})
             return
-        # The code is now BURNED (atomic claim). Introduce both sides into a
-        # fresh unguessable room — knowing the code afterwards yields nothing.
-        room = "pair-" + _secrets.token_urlsafe(9)
-        emit("pair-matched", {"room": room}, to=creator)  # routes cross-instance
-        emit("pair-matched", {"room": room})
+        # Code BURNED (atomic claim). Pairing is ADDITIVE: the claimer joins the
+        # creator's CURRENT room — the creator never moves, keeps seeing nearby
+        # devices, and can mint another code to admit another person.
+        emit("pair-used", {"code": code}, to=creator)  # clear the displayed code
+        emit("pair-matched", {"room": room})  # claimer crosses over
 
     @socketio.on("signal")
     def on_signal(data):
