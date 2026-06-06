@@ -39,8 +39,10 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             features: ""
+          # Intel build cross-compiled from the arm64 runner: macos-13 (the
+          # last Intel runner) is being retired and queues for ages.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             features: ""
           - target: x86_64-pc-windows-msvc
             os: windows-latest
