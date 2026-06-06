@@ -14,6 +14,10 @@ Most flakiness lives in the *seams* between these, and reconnection stresses
 every seam at once. This doc records each failure mode we found and fixed —
 problem, then solution — so the reasoning isn't lost.
 
+> The Rust CLI (`../cli/`) reimplements the client side of this protocol and
+> keeps its own ledger — including which of the 11 fixes below it has and
+> hasn't earned yet: [`cli-resilience.md`](cli-resilience.md).
+
 ---
 
 ## 1. Glare: both peers offer at once → stuck "connecting"

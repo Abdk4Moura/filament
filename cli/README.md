@@ -59,3 +59,13 @@ Chunks are capped at 60 KiB payload + 4-byte stream-id header to stay under
 SCTP's 65535-byte default max message size (webrtc-rs enforces it strictly).
 
 Protocol reference: `../CONTRACT.md` and `../docs/resilience.md`.
+
+## Known failure modes / current limits
+
+Every known flaw is tracked with a status in
+[`../docs/cli-resilience.md`](../docs/cli-resilience.md) — the rule is that
+nothing gets fixed without flipping its entry there, and nothing ships while
+a suspected-breakage item is open. Headlines as of v1: browser→CLI direction
+untested and suspected broken on chunk size (C1); no watchdog/retry/credential
+refresh yet (C3–C5); resume trusts name+size (C7); throughput is modest until
+the QUIC transport lands (C8).
