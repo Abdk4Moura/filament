@@ -12,11 +12,11 @@ Drafts land in `docs/launch/` ready to paste.
 - [x] Bing Webmaster Tools verified (A)
 
 ## Phase 1 — Assets (C drafts)
-- [ ] OG card image (1200×630) at `/og.png`, wired into `og:image` + `summary_large_image`
-- [ ] Show HN draft → `docs/launch/show-hn.md`
+- [x] OG card image (1200×630) at `/og.png`, wired into `og:image` + `summary_large_image`
+- [x] Show HN draft → `docs/launch/show-hn.md`
 - [ ] Blog post draft: "Eleven ways WebRTC file transfer fails (and the fixes)" → `docs/launch/blog-webrtc-failures.md`
-- [ ] AlternativeTo listing copy → `docs/launch/alternativeto.md`
-- [ ] r/selfhosted post draft → `docs/launch/reddit-selfhosted.md`
+- [x] AlternativeTo listing copy → `docs/launch/alternativeto.md`
+- [x] r/selfhosted post draft → `docs/launch/reddit-selfhosted.md`
 - [x] awesome-selfhosted entry prepared → `docs/launch/awesome-selfhosted.md`
 - [x] MIT LICENSE added to the repo
 - [x] **v1.0.0 release** cut (required: awesome-selfhosted needs a release ≥ 4 months old)
