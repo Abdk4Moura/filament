@@ -1,503 +1,670 @@
-// Filament CLI — protocol spike.
+// filament — anywhere-to-anywhere P2P file transfer, CLI end.
 //
-// Goal: prove a Rust client can speak Filament's existing wire protocol
-// end-to-end against the unmodified backend:
-//   1. Socket.IO signaling (join / welcome / peer-joined / signal)
-//   2. Perfect-negotiation roles (impolite = lower uid loses, see politeRole)
-//   3. webrtc-rs DataChannel labelled "filament"
-//   4. Control JSON (file-offer / file-accept / file-end) + [u32 BE sid] framing
+// Speaks the exact same wire protocol as the browser app at
+// https://filament.autumated.com: Socket.IO signaling, perfect-negotiation
+// WebRTC, one-time pairing codes, and sid-framed chunk transfer with
+// offset-based resume. A browser is a first-class peer: `filament send` can
+// deliver straight to a phone with nothing installed on it.
 //
-// Usage:
-//   filament recv <server> <room>
-//   filament send <server> <room> <file>
+//   filament send video.mp4 --code          mint a speakable one-time code
+//   filament recv clever-lynx-63            claim it on the other machine
+//   filament send ./dir --room demo         directories are tarred on the fly
+//   tar c logs | filament send - --name logs.tar --code
+//   filament recv -y --dir ~/Drops          auto-accept into a directory
 //
-// Roles are decided exactly like the browser: polite = myUid > peerUid; the
-// impolite peer creates the data channel and the offer.
+// Resume: receivers keep `<name>.part` + `<name>.part.meta`; a re-offered
+// file with the same name+size continues from the bytes already on disk —
+// and unlike the browser, this survives a full process restart.
 
-use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
-use futures_util::FutureExt;
-use rust_socketio::asynchronous::{Client, ClientBuilder};
-use rust_socketio::{Event, Payload};
+mod net;
+
+use anyhow::{anyhow, bail, Context, Result};
+use clap::{Parser, Subcommand};
+use net::{Ev, Peer, Transport};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
-use webrtc::interceptor::registry::Registry;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
-// 60 KiB payload + 4-byte sid header stays under SCTP's default 65535-byte
-// max message size (the browser sends 64 KiB + 4 and Chrome accepts it, but
-// webrtc-rs enforces the limit strictly on send).
-const CHUNK: usize = 60 * 1024;
-const HIGH_WATER: usize = 4 * 1024 * 1024;
+const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
 
-#[derive(Debug)]
-enum Ev {
-    Welcome(Value),
-    PeerJoined(Value),
-    Signal(Value),
+#[derive(Parser)]
+#[command(name = "filament", version, about = "P2P file transfer between terminals and browsers — no upload, no account")]
+struct Cli {
+    /// Signaling server (self-hosters: point at your own instance)
+    #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
+    server: String,
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Role {
-    Send,
-    Recv,
+#[derive(Subcommand)]
+enum Cmd {
+    /// Send files or directories to a peer (browser or CLI)
+    Send {
+        /// Files or directories to send; '-' reads stdin
+        paths: Vec<String>,
+        /// Mint a speakable one-time code the receiver claims
+        #[arg(long)]
+        code: bool,
+        /// Choose the one-time code word yourself (implies --code)
+        #[arg(long)]
+        word: Option<String>,
+        /// Join an explicit room instead of the same-network auto room
+        #[arg(long)]
+        room: Option<String>,
+        /// File name when sending stdin ('-')
+        #[arg(long, default_value = "stdin.bin")]
+        name: String,
+    },
+    /// Receive files from a peer (browser or CLI)
+    Recv {
+        /// One-time code spoken by the sender (omit to use the auto room)
+        code: Option<String>,
+        /// Directory to write received files into
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Accept every offer without prompting
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Join an explicit room instead of the same-network auto room
+        #[arg(long)]
+        room: Option<String>,
+        /// Keep listening after a batch completes
+        #[arg(long)]
+        keep_open: bool,
+    },
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+fn mk_uid(prefix: &str) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("cli-{prefix}-{:x}{:x}", std::process::id(), nanos)
 }
 
-/// Mirror of webrtc.js politeRole(): prefer stable uids, fall back to sids.
-fn polite_role(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &str) -> bool {
-    match peer_uid {
-        Some(p) if p != my_uid => my_uid > p,
-        _ => my_id > peer_id,
+fn display_name() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+    let host = std::fs::read_to_string("/etc/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "cli".into());
+    format!("{user}@{host}")
+}
+
+fn human(bytes: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
     }
-}
-
-struct PeerState {
-    id: String,
-    pc: Arc<RTCPeerConnection>,
-    pending_candidates: Vec<RTCIceCandidateInit>,
-    has_remote: bool,
-}
-
-struct App {
-    role: Role,
-    file: Option<(String, Vec<u8>)>, // (name, bytes) for the sender
-    my_uid: String,
-    my_id: Mutex<Option<String>>,
-    peer: Mutex<Option<PeerState>>,
-    recv_bufs: Mutex<HashMap<u32, Vec<u8>>>, // sid -> bytes
-    recv_meta: Mutex<HashMap<u32, (String, u64)>>, // sid -> (name, size)
-    done: mpsc::UnboundedSender<String>,
+    if i == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", U[i]) }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let usage = "usage: filament recv <server> <room> | filament send <server> <room> <file>";
-    let role = match args.get(1).map(|s| s.as_str()) {
-        Some("send") => Role::Send,
-        Some("recv") => Role::Recv,
-        _ => return Err(anyhow!(usage)),
-    };
-    let server = args.get(2).ok_or_else(|| anyhow!(usage))?.clone();
-    let room = args.get(3).ok_or_else(|| anyhow!(usage))?.clone();
-    let file = if role == Role::Send {
-        let path = args.get(4).ok_or_else(|| anyhow!(usage))?;
-        let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
-        let name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file.bin".into());
-        println!("[send] {} ({} bytes) sha256={}", name, bytes.len(), sha256_hex(&bytes));
-        Some((name, bytes))
-    } else {
-        None
-    };
-
-    // uid convention from the frontend: any unique string works; politeness
-    // compares them lexicographically.
-    let suffix = std::process::id();
-    let my_uid = match role {
-        Role::Send => format!("cli-send-{suffix}"),
-        Role::Recv => format!("cli-recv-{suffix}"),
-    };
-    let name = my_uid.clone();
-
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<String>();
-    let app = Arc::new(App {
-        role,
-        file,
-        my_uid: my_uid.clone(),
-        my_id: Mutex::new(None),
-        peer: Mutex::new(None),
-        recv_bufs: Mutex::new(HashMap::new()),
-        recv_meta: Mutex::new(HashMap::new()),
-        done: done_tx,
-    });
-
-    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let fwd = |variant: fn(Value) -> Ev, tx: mpsc::UnboundedSender<Ev>| {
-        move |payload: Payload, _c: Client| {
-            let tx = tx.clone();
-            let v = match payload {
-                Payload::Text(mut vals) if !vals.is_empty() => Some(vals.remove(0)),
-                _ => None,
-            };
-            async move {
-                if let Some(v) = v {
-                    let _ = tx.send(variant(v));
-                }
-            }
-            .boxed()
+    // Both ring (webrtc) and aws-lc (reqwest) end up in the dep tree; rustls
+    // refuses to guess between two providers, so pick ring explicitly.
+    rustls::crypto::ring::default_provider().install_default().ok();
+    let cli = Cli::parse();
+    let server = cli.server.trim_end_matches('/').to_string();
+    match cli.cmd {
+        Cmd::Send { paths, code, word, room, name } => {
+            send_cmd(&server, paths, code || word.is_some(), word, room, name).await
         }
-    };
+        Cmd::Recv { code, dir, yes, room, keep_open } => {
+            recv_cmd(&server, code, dir, yes, room, keep_open).await
+        }
+    }
+}
 
-    let join_room = room.clone();
-    let join_name = name.clone();
-    let join_uid = my_uid.clone();
-    let sio = ClientBuilder::new(server.as_str())
-        .on(Event::Connect, move |_p: Payload, c: Client| {
-            let room = join_room.clone();
-            let name = join_name.clone();
-            let uid = join_uid.clone();
-            async move {
-                println!("[sio] connected, joining room {room}");
-                let _ = c
-                    .emit("join", json!({ "room": room, "name": name, "uid": uid }))
-                    .await;
+// ------------------------------------------------------------------- send --
+
+struct Outgoing {
+    id: String,
+    sid: u32,
+    name: String,
+    size: u64,
+    path: PathBuf,
+    temp: bool, // delete after sending (tar spools, stdin spools)
+    done: bool,
+}
+
+async fn send_cmd(
+    server: &str,
+    paths: Vec<String>,
+    use_code: bool,
+    word: Option<String>,
+    room: Option<String>,
+    stdin_name: String,
+) -> Result<()> {
+    if paths.is_empty() {
+        bail!("nothing to send — pass files, directories, or '-' for stdin");
+    }
+    let my_uid = mk_uid("s");
+    let mut outgoing: Vec<Outgoing> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let sid = (i + 1) as u32;
+        let id = format!("{}-{}", my_uid, sid);
+        if p == "-" {
+            let spool = std::env::temp_dir().join(format!("filament-stdin-{}", std::process::id()));
+            let mut f = std::fs::File::create(&spool)?;
+            let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
+            outgoing.push(Outgoing { id, sid, name: stdin_name.clone(), size: n, path: spool, temp: true, done: false });
+        } else {
+            let path = PathBuf::from(p);
+            let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
+            if meta.is_dir() {
+                let dirname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dir".into());
+                let spool = std::env::temp_dir().join(format!("filament-tar-{}-{}.tar", std::process::id(), i));
+                eprintln!("packing {p} -> {dirname}.tar ...");
+                {
+                    let f = std::fs::File::create(&spool)?;
+                    let mut b = tar::Builder::new(f);
+                    b.append_dir_all(&dirname, &path)?;
+                    b.finish()?;
+                }
+                let size = std::fs::metadata(&spool)?.len();
+                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, path: spool, temp: true, done: false });
+            } else {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+                outgoing.push(Outgoing { id, sid, name, size: meta.len(), path, temp: false, done: false });
             }
-            .boxed()
-        })
-        .on("welcome", fwd(Ev::Welcome, tx.clone()))
-        .on("peer-joined", fwd(Ev::PeerJoined, tx.clone()))
-        .on("signal", fwd(Ev::Signal, tx.clone()))
-        .connect()
-        .await
-        .context("socket.io connect")?;
+        }
+    }
+    for o in &outgoing {
+        eprintln!("send: {} ({})", o.name, human(o.size));
+    }
 
-    println!("[sio] handshake ok ({server})");
+    let cfg = net::fetch_config(server).await?;
+    let room = match room {
+        Some(r) => r,
+        None => net::fetch_auto_room(server).await?,
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+
+    if use_code {
+        let payload = match &word {
+            Some(w) => json!({ "keyword": w }),
+            None => json!({}),
+        };
+        sio.emit("pair-create", payload).await.ok();
+    } else {
+        eprintln!("waiting for a peer in room {room} (same network auto-discovers; or use --code)");
+    }
+
+    let mut my_id = String::new();
+    let mut peer: Option<Arc<Peer>> = None;
+    let mut peer_name = String::new();
+    let mut transport: Option<Arc<dyn Transport>> = None;
+    let mut code_used = !use_code; // without --code any peer is fair game
+    let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
+    let started = Instant::now();
+    let deadline = Duration::from_secs(600);
 
     loop {
-        tokio::select! {
-            Some(ev) = rx.recv() => handle_event(&app, &sio, ev).await?,
-            Some(msg) = done_rx.recv() => {
-                println!("{msg}");
-                // Give in-flight SCTP/socket writes a beat to flush.
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // The wait-for-peer deadline only applies while we have no peer; once a
+        // transfer is running it must never fire.
+        let ev = if peer.is_none() {
+            tokio::time::timeout(deadline.saturating_sub(started.elapsed()), rx.recv())
+                .await
+                .map_err(|_| anyhow!("timed out waiting for a peer"))?
+                .ok_or_else(|| anyhow!("signaling channel closed"))?
+        } else {
+            rx.recv().await.ok_or_else(|| anyhow!("signaling channel closed"))?
+        };
+        match ev {
+            Ev::Welcome(v) => {
+                my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if code_used && peer.is_none() {
+                    if let Some(first) = v["peers"].as_array().and_then(|a| a.first()) {
+                        let (p, n) = connect_peer(first, &my_uid, &my_id, cfg.ice_servers.clone(), &sio, &tx).await?;
+                        peer = Some(p);
+                        peer_name = n;
+                    }
+                }
+            }
+            Ev::PairCode(v) => {
+                let code = v["code"].as_str().unwrap_or("?");
+                let ttl = v["ttl"].as_u64().unwrap_or(600);
+                eprintln!("\n  code: {code}\n");
+                eprintln!("on the other machine:  filament recv {code}");
+                eprintln!("or in a browser:       https://filament.autumated.com (PAIR WITH CODE)");
+                eprintln!("one claim only; expires in {} min", ttl / 60);
+            }
+            Ev::PairError(v) => bail!("pairing failed: {}", v["error"].as_str().unwrap_or("?")),
+            Ev::PairUsed(_) => {
+                eprintln!("code claimed — connecting...");
+                code_used = true;
+            }
+            Ev::PeerJoined(v) => {
+                if code_used && peer.is_none() {
+                    let (p, n) = connect_peer(&v, &my_uid, &my_id, cfg.ice_servers.clone(), &sio, &tx).await?;
+                    peer = Some(p);
+                    peer_name = n;
+                }
+            }
+            Ev::Signal(v) => {
+                if let Some(p) = &peer {
+                    if v["from"].as_str() == Some(p.id.as_str()) {
+                        p.handle_signal(v["data"].clone()).await?;
+                    }
+                }
+            }
+            Ev::ChannelReady(t) => {
+                eprintln!("connected to {peer_name}");
+                if let Some(p) = &peer {
+                    let p = p.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        if let Some(r) = p.route().await {
+                            eprintln!("route: {r}");
+                        }
+                    });
+                }
+                for o in outgoing.lock().await.iter() {
+                    t.send_control(&json!({
+                        "type": "file-offer", "id": o.id, "sid": o.sid,
+                        "name": o.name, "size": o.size, "mime": "application/octet-stream",
+                    }))
+                    .await?;
+                }
+                transport = Some(t);
+            }
+            Ev::Control(v) => match v["type"].as_str() {
+                Some("file-accept") => {
+                    let t = transport.clone().ok_or_else(|| anyhow!("accept before channel"))?;
+                    let offset = v["offset"].as_u64().unwrap_or(0);
+                    let id = v["id"].as_str().unwrap_or_default().to_string();
+                    let out = outgoing.clone();
+                    let chunk = cfg.chunk_size.min(t.max_payload());
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        match stream_one(out, t, id.clone(), offset, chunk).await {
+                            Ok(()) => {
+                                let _ = tx2.send(Ev::TransferDone(id));
+                            }
+                            Err(e) => {
+                                eprintln!("send failed: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    });
+                }
+                Some("file-decline") => {
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let mut out = outgoing.lock().await;
+                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+                        eprintln!("declined: {}", o.name);
+                        o.done = true;
+                    }
+                }
+                _ => {}
+            },
+            Ev::PcState(s) => {
+                if s == "failed" && !outgoing.lock().await.iter().all(|o| o.done) {
+                    bail!("connection failed");
+                }
+            }
+            Ev::PeerLeft(v) => {
+                if let Some(p) = &peer {
+                    if v["id"].as_str() == Some(p.id.as_str())
+                        && !outgoing.lock().await.iter().all(|o| o.done)
+                    {
+                        bail!("peer left before the transfer finished");
+                    }
+                    // Receiver got everything and left — the all-done check
+                    // below ends us gracefully.
+                }
+            }
+            _ => {}
+        }
+        // Exit when every transfer reached a terminal state.
+        {
+            let out = outgoing.lock().await;
+            if !out.is_empty() && out.iter().all(|o| o.done) {
+                if let Some(t) = &transport {
+                    t.flush().await.ok();
+                }
+                for o in out.iter().filter(|o| o.temp) {
+                    let _ = std::fs::remove_file(&o.path);
+                }
+                eprintln!("done.");
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 let _ = sio.disconnect().await;
                 return Ok(());
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
-                return Err(anyhow!("spike timed out after 120s"));
-            }
         }
     }
 }
 
-async fn handle_event(app: &Arc<App>, sio: &Client, ev: Ev) -> Result<()> {
-    match ev {
-        Ev::Welcome(v) => {
-            let my_id = v["id"].as_str().unwrap_or_default().to_string();
-            println!("[sio] welcome: my sid={my_id}");
-            *app.my_id.lock().await = Some(my_id);
-            if let Some(peers) = v["peers"].as_array() {
-                for p in peers {
-                    setup_peer(app, sio, p).await?;
-                }
-            }
-        }
-        Ev::PeerJoined(v) => {
-            setup_peer(app, sio, &v).await?;
-        }
-        Ev::Signal(v) => {
-            let from = v["from"].as_str().unwrap_or_default().to_string();
-            let data = v["data"].clone();
-            handle_signal(app, sio, &from, data).await?;
-        }
-    }
-    Ok(())
+async fn connect_peer(
+    v: &Value,
+    my_uid: &str,
+    my_id: &str,
+    ice: Vec<webrtc::ice_transport::ice_server::RTCIceServer>,
+    sio: &rust_socketio::asynchronous::Client,
+    tx: &mpsc::UnboundedSender<Ev>,
+) -> Result<(Arc<Peer>, String)> {
+    let peer_id = v["id"].as_str().unwrap_or_default().to_string();
+    let peer_uid = v["uid"].as_str().map(|s| s.to_string());
+    let name = v["name"].as_str().unwrap_or("peer").to_string();
+    let polite = net::polite_role(my_uid, peer_uid.as_deref(), my_id, &peer_id);
+    let p = Peer::connect(peer_id, polite, ice, sio.clone(), tx.clone()).await?;
+    Ok((p, name))
 }
 
-async fn setup_peer(app: &Arc<App>, sio: &Client, p: &Value) -> Result<()> {
-    let peer_id = p["id"].as_str().unwrap_or_default().to_string();
-    let peer_uid = p["uid"].as_str().map(|s| s.to_string());
-    let peer_name = p["name"].as_str().unwrap_or("?").to_string();
-    if peer_id.is_empty() {
-        return Ok(());
-    }
-    if app.peer.lock().await.is_some() {
-        println!("[peer] ignoring extra peer {peer_name} (spike handles one)");
-        return Ok(());
-    }
-    let my_id = app.my_id.lock().await.clone().unwrap_or_default();
-    let polite = polite_role(&app.my_uid, peer_uid.as_deref(), &my_id, &peer_id);
-    println!("[peer] {peer_name} ({peer_id}) — I am {}", if polite { "polite" } else { "impolite" });
-
-    let mut m = MediaEngine::default();
-    m.register_default_codecs()?;
-    let mut registry = Registry::new();
-    registry = register_default_interceptors(registry, &mut m)?;
-    let api = APIBuilder::new()
-        .with_media_engine(m)
-        .with_interceptor_registry(registry)
-        .build();
-    let pc = Arc::new(
-        api.new_peer_connection(RTCConfiguration::default())
-            .await?,
-    );
-
-    // Trickle ICE → relay each candidate as the browser does.
-    {
-        let sio = sio.clone();
-        let to = peer_id.clone();
-        pc.on_ice_candidate(Box::new(move |c: Option<RTCIceCandidate>| {
-            let sio = sio.clone();
-            let to = to.clone();
-            Box::pin(async move {
-                if let Some(c) = c {
-                    if let Ok(init) = c.to_json() {
-                        let _ = sio
-                            .emit(
-                                "signal",
-                                json!({ "to": to, "data": { "type": "candidate", "candidate": init } }),
-                            )
-                            .await;
-                    }
-                }
-            })
-        }));
-    }
-
-    {
-        pc.on_peer_connection_state_change(Box::new(move |s| {
-            println!("[pc] state: {s}");
-            Box::pin(async {})
-        }));
-    }
-
-    if !polite {
-        // Impolite peer owns the channel + offer (same as the browser).
-        let dc = pc.create_data_channel("filament", None).await?;
-        wire_channel(app, dc).await;
-        let offer = pc.create_offer(None).await?;
-        pc.set_local_description(offer).await?;
-        let ld = pc
-            .local_description()
-            .await
-            .ok_or_else(|| anyhow!("no local description"))?;
-        sio.emit(
-            "signal",
-            json!({ "to": peer_id, "data": { "type": "description", "description": ld } }),
-        )
-        .await
-        .ok();
-    } else {
-        let app2 = app.clone();
-        pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-            let app2 = app2.clone();
-            Box::pin(async move {
-                wire_channel(&app2, dc).await;
-            })
-        }));
-    }
-
-    *app.peer.lock().await = Some(PeerState {
-        id: peer_id,
-        pc,
-        pending_candidates: Vec::new(),
-        has_remote: false,
-    });
-    Ok(())
-}
-
-async fn handle_signal(app: &Arc<App>, sio: &Client, from: &str, data: Value) -> Result<()> {
-    let mut guard = app.peer.lock().await;
-    let peer = match guard.as_mut() {
-        Some(p) if p.id == from => p,
-        _ => {
-            println!("[signal] from unknown sid {from}, ignoring");
-            return Ok(());
-        }
+async fn stream_one(
+    outgoing: Arc<tokio::sync::Mutex<Vec<Outgoing>>>,
+    t: Arc<dyn Transport>,
+    id: String,
+    offset: u64,
+    chunk: usize,
+) -> Result<()> {
+    let (sid, name, size, path) = {
+        let out = outgoing.lock().await;
+        let o = out.iter().find(|o| o.id == id).ok_or_else(|| anyhow!("unknown transfer {id}"))?;
+        (o.sid, o.name.clone(), o.size, o.path.clone())
     };
-    match data["type"].as_str() {
-        Some("description") => {
-            let desc: RTCSessionDescription = serde_json::from_value(data["description"].clone())
-                .context("parse remote description")?;
-            let is_offer = desc.sdp_type.to_string() == "offer";
-            peer.pc.set_remote_description(desc).await?;
-            peer.has_remote = true;
-            for c in peer.pending_candidates.drain(..) {
-                if let Err(e) = peer.pc.add_ice_candidate(c).await {
-                    println!("[ice] queued candidate failed: {e}");
-                }
-            }
-            if is_offer {
-                let answer = peer.pc.create_answer(None).await?;
-                peer.pc.set_local_description(answer).await?;
-                let ld = peer
-                    .pc
-                    .local_description()
-                    .await
-                    .ok_or_else(|| anyhow!("no local description"))?;
-                sio.emit(
-                    "signal",
-                    json!({ "to": peer.id, "data": { "type": "description", "description": ld } }),
-                )
-                .await
-                .ok();
-            }
+    if offset > 0 {
+        eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
+    }
+    let mut f = std::fs::File::open(&path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut sent = offset;
+    let mut buf = vec![0u8; chunk];
+    let start = Instant::now();
+    let mut last = Instant::now();
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
-        Some("candidate") => {
-            let init: RTCIceCandidateInit = serde_json::from_value(data["candidate"].clone())
-                .context("parse candidate")?;
-            if peer.has_remote {
-                if let Err(e) = peer.pc.add_ice_candidate(init).await {
-                    println!("[ice] addIceCandidate failed: {e}");
-                }
-            } else {
-                peer.pending_candidates.push(init);
-            }
+        t.send_frame(sid, &buf[..n]).await?;
+        sent += n as u64;
+        if last.elapsed() > Duration::from_secs(2) {
+            last = Instant::now();
+            let rate = (sent - offset) as f64 / start.elapsed().as_secs_f64();
+            eprintln!("{name}: {:.0}% ({}/s)", sent as f64 / size.max(1) as f64 * 100.0, human(rate as u64));
         }
-        other => println!("[signal] unknown type {other:?}"),
+    }
+    t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await?;
+    t.flush().await?;
+    let rate = (sent - offset) as f64 / start.elapsed().as_secs_f64().max(0.001);
+    eprintln!("{name}: complete ({}, {}/s)", human(size), human(rate as u64));
+    let mut out = outgoing.lock().await;
+    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+        o.done = true;
     }
     Ok(())
 }
 
-async fn wire_channel(app: &Arc<App>, dc: Arc<RTCDataChannel>) {
-    println!("[dc] channel '{}' wired", dc.label());
+// ------------------------------------------------------------------- recv --
 
-    // on_open: the sender offers its file, exactly like sendFiles() in webrtc.js.
-    {
-        let app = app.clone();
-        let dc2 = dc.clone();
-        dc.on_open(Box::new(move || {
-            let app = app.clone();
-            let dc2 = dc2.clone();
-            Box::pin(async move {
-                println!("[dc] open");
-                if app.role == Role::Send {
-                    if let Some((name, bytes)) = &app.file {
-                        let offer = json!({
-                            "type": "file-offer",
-                            "id": "t1-cli",
-                            "sid": 1,
-                            "name": name,
-                            "size": bytes.len(),
-                            "mime": "application/octet-stream",
-                        });
-                        let _ = dc2.send_text(offer.to_string()).await;
-                        println!("[send] offered {name}");
+struct IncomingFile {
+    #[allow(dead_code)] // transfer id; will key decline/cancel when added
+    id: String,
+    name: String,
+    size: u64,
+    received: u64,
+    file: std::io::BufWriter<std::fs::File>,
+    part_path: PathBuf,
+    started: Instant,
+}
+
+async fn recv_cmd(
+    server: &str,
+    code: Option<String>,
+    dir: PathBuf,
+    yes: bool,
+    room: Option<String>,
+    keep_open: bool,
+) -> Result<()> {
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let my_uid = mk_uid("r");
+    let cfg = net::fetch_config(server).await?;
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+
+    let paired = code.is_some();
+    match &code {
+        Some(c) => {
+            sio.emit("pair-claim", json!({ "code": c.trim().to_lowercase() })).await.ok();
+        }
+        None => {
+            let room = match &room {
+                Some(r) => r.clone(),
+                None => net::fetch_auto_room(server).await?,
+            };
+            eprintln!("listening in room {room} (dir: {})", dir.display());
+            sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+        }
+    }
+
+    let auto_accept = yes || paired; // claiming a code IS the consent gesture
+    let mut my_id = String::new();
+    let mut peer: Option<Arc<Peer>> = None;
+    let mut transport: Option<Arc<dyn Transport>> = None;
+    let mut by_sid: HashMap<u32, IncomingFile> = HashMap::new();
+    let mut completed = 0usize;
+    let mut last_progress = Instant::now();
+
+    loop {
+        // After a finished batch (nothing in flight), exit unless --keep-open.
+        let idle_exit = !keep_open && completed > 0 && by_sid.is_empty();
+        let ev = if idle_exit {
+            match tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await {
+                Ok(Some(ev)) => ev,
+                _ => {
+                    eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+                    let _ = sio.disconnect().await;
+                    return Ok(());
+                }
+            }
+        } else {
+            rx.recv().await.ok_or_else(|| anyhow!("signaling channel closed"))?
+        };
+
+        match ev {
+            Ev::PairMatched(v) => {
+                let room = v["room"].as_str().unwrap_or_default().to_string();
+                eprintln!("code accepted — joining sender");
+                sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+            }
+            Ev::PairError(v) => bail!(
+                "code rejected: {} (one-time codes burn after a single use)",
+                v["error"].as_str().unwrap_or("?")
+            ),
+            Ev::Welcome(v) => {
+                my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if peer.is_none() {
+                    if let Some(first) = v["peers"].as_array().and_then(|a| a.first()) {
+                        let (p, n) = connect_peer(first, &my_uid, &my_id, cfg.ice_servers.clone(), &sio, &tx).await?;
+                        eprintln!("peer: {n}");
+                        peer = Some(p);
                     }
                 }
-            })
-        }));
-    }
+            }
+            Ev::PeerJoined(v) => {
+                if peer.is_none() {
+                    let (p, n) = connect_peer(&v, &my_uid, &my_id, cfg.ice_servers.clone(), &sio, &tx).await?;
+                    eprintln!("peer: {n}");
+                    peer = Some(p);
+                }
+            }
+            Ev::Signal(v) => {
+                if let Some(p) = &peer {
+                    if v["from"].as_str() == Some(p.id.as_str()) {
+                        p.handle_signal(v["data"].clone()).await?;
+                    }
+                }
+            }
+            Ev::ChannelReady(t) => {
+                transport = Some(t);
+                if let Some(p) = &peer {
+                    let p = p.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                        if let Some(r) = p.route().await {
+                            eprintln!("route: {r}");
+                        }
+                    });
+                }
+            }
+            Ev::Control(v) => match v["type"].as_str() {
+                Some("file-offer") => {
+                    let t = transport.clone().ok_or_else(|| anyhow!("offer before channel"))?;
+                    let id = v["id"].as_str().unwrap_or_default().to_string();
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    // Never trust a remote name with path separators.
+                    let raw = v["name"].as_str().unwrap_or("file.bin");
+                    let name = Path::new(raw)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "file.bin".into());
+                    let size = v["size"].as_u64().unwrap_or(0);
 
-    // on_message: control JSON (text) or [u32 sid][payload] frames (binary).
-    {
-        let app = app.clone();
-        let dc2 = dc.clone();
-        dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            let app = app.clone();
-            let dc2 = dc2.clone();
-            Box::pin(async move {
-                if msg.is_string {
-                    let text = String::from_utf8_lossy(&msg.data).into_owned();
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(v) => v,
-                        Err(_) => return,
+                    let ok = if auto_accept {
+                        true
+                    } else {
+                        prompt_accept(&name, size).await
                     };
-                    handle_control(&app, &dc2, v).await;
-                } else {
-                    handle_chunk(&app, &msg.data).await;
+                    if !ok {
+                        t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
+                        continue;
+                    }
+
+                    let part_path = dir.join(format!("{name}.part"));
+                    let meta_path = dir.join(format!("{name}.part.meta"));
+                    let mut offset = 0u64;
+                    if part_path.is_file() {
+                        let prior = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                        let meta_size = std::fs::read_to_string(&meta_path)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok());
+                        if meta_size == Some(size) && prior <= size {
+                            offset = prior;
+                            eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
+                        }
+                    }
+                    let file = if offset > 0 {
+                        std::fs::OpenOptions::new().append(true).open(&part_path)?
+                    } else {
+                        std::fs::write(&meta_path, size.to_string())?;
+                        std::fs::File::create(&part_path)?
+                    };
+                    eprintln!("receiving {name} ({})", human(size));
+                    by_sid.insert(sid, IncomingFile {
+                        id: id.clone(),
+                        name,
+                        size,
+                        received: offset,
+                        file: std::io::BufWriter::with_capacity(1 << 20, file),
+                        part_path,
+                        final_path: PathBuf::new(),
+                        started: Instant::now(),
+                    });
+                    t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
                 }
-            })
-        }));
-    }
-}
-
-async fn handle_control(app: &Arc<App>, dc: &Arc<RTCDataChannel>, v: Value) {
-    match v["type"].as_str() {
-        Some("file-offer") if app.role == Role::Recv => {
-            let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-            let name = v["name"].as_str().unwrap_or("file.bin").to_string();
-            let size = v["size"].as_u64().unwrap_or(0);
-            println!("[recv] offered {name} ({size} bytes), accepting");
-            app.recv_bufs.lock().await.insert(sid, Vec::with_capacity(size as usize));
-            app.recv_meta.lock().await.insert(sid, (name, size));
-            let accept = json!({ "type": "file-accept", "id": v["id"], "offset": 0 });
-            let _ = dc.send_text(accept.to_string()).await;
-        }
-        Some("file-accept") if app.role == Role::Send => {
-            let offset = v["offset"].as_u64().unwrap_or(0) as usize;
-            println!("[send] accepted at offset {offset}, streaming");
-            let app = app.clone();
-            let dc = dc.clone();
-            let id = v["id"].clone();
-            tokio::spawn(async move {
-                if let Err(e) = stream_file(&app, &dc, id, offset).await {
-                    println!("[send] stream failed: {e}");
+                Some("file-end") => {
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    if let Some(mut inc) = by_sid.remove(&sid) {
+                        inc.file.flush()?;
+                        drop(inc.file);
+                        let final_path = unique_path(&dir, &inc.name);
+                        std::fs::rename(&inc.part_path, &final_path)?;
+                        let _ = std::fs::remove_file(dir.join(format!("{}.part.meta", inc.name)));
+                        let rate = inc.received as f64 / inc.started.elapsed().as_secs_f64().max(0.001);
+                        let ok = inc.received == inc.size;
+                        eprintln!(
+                            "received {} ({}{}) -> {} ({}/s)",
+                            inc.name,
+                            human(inc.received),
+                            if ok { "" } else { ", SIZE MISMATCH" },
+                            final_path.display(),
+                            human(rate as u64),
+                        );
+                        completed += 1;
+                    }
                 }
-            });
+                _ => {}
+            },
+            Ev::Chunk(sid, data) => {
+                if let Some(inc) = by_sid.get_mut(&sid) {
+                    inc.file.write_all(&data)?;
+                    inc.received += data.len() as u64;
+                    if last_progress.elapsed() > Duration::from_secs(2) {
+                        last_progress = Instant::now();
+                        let rate = inc.received as f64 / inc.started.elapsed().as_secs_f64().max(0.001);
+                        eprintln!(
+                            "{}: {:.0}% ({}/s)",
+                            inc.name,
+                            inc.received as f64 / inc.size.max(1) as f64 * 100.0,
+                            human(rate as u64)
+                        );
+                    }
+                }
+            }
+            Ev::PcState(s) => {
+                if s == "failed" {
+                    // Partials stay on disk: a re-offer resumes from them.
+                    bail!("connection failed (partial files kept for resume)");
+                }
+            }
+            Ev::PeerLeft(v) => {
+                if let Some(p) = &peer {
+                    if v["id"].as_str() == Some(p.id.as_str()) {
+                        if by_sid.is_empty() && completed > 0 && !keep_open {
+                            eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+                            let _ = sio.disconnect().await;
+                            return Ok(());
+                        }
+                        if !by_sid.is_empty() {
+                            bail!("sender left mid-transfer (partial files kept for resume)");
+                        }
+                        peer = None;
+                        transport = None;
+                    }
+                }
+            }
+            _ => {}
         }
-        Some("file-end") if app.role == Role::Recv => {
-            let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-            let bytes = app.recv_bufs.lock().await.remove(&sid).unwrap_or_default();
-            let (name, size) = app
-                .recv_meta
-                .lock()
-                .await
-                .remove(&sid)
-                .unwrap_or(("file.bin".into(), 0));
-            let ok = bytes.len() as u64 == size;
-            let out = std::env::temp_dir().join(format!("filament-recv-{name}"));
-            let _ = std::fs::write(&out, &bytes);
-            let _ = app.done.send(format!(
-                "[recv] COMPLETE {} bytes (expected {size}, match={ok}) sha256={} -> {}",
-                bytes.len(),
-                sha256_hex(&bytes),
-                out.display()
-            ));
-        }
-        other => println!("[ctrl] unhandled {other:?}"),
     }
 }
 
-async fn handle_chunk(app: &Arc<App>, data: &Bytes) {
-    if data.len() < 4 {
-        return;
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
     }
-    let sid = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    let mut bufs = app.recv_bufs.lock().await;
-    if let Some(buf) = bufs.get_mut(&sid) {
-        buf.extend_from_slice(&data[4..]);
-        let len = buf.len();
-        drop(bufs);
-        if len % (CHUNK * 64) < CHUNK {
-            println!("[recv] {len} bytes...");
+    for i in 1..1000 {
+        let c = dir.join(format!("{name}.{i}"));
+        if !c.exists() {
+            return c;
         }
     }
+    dir.join(format!("{name}.dup"))
 }
 
-async fn stream_file(app: &Arc<App>, dc: &Arc<RTCDataChannel>, id: Value, start: usize) -> Result<()> {
-    let (_name, bytes) = app.file.as_ref().ok_or_else(|| anyhow!("no file"))?;
-    let sid: u32 = 1;
-    let mut offset = start.min(bytes.len());
-    while offset < bytes.len() {
-        let end = (offset + CHUNK).min(bytes.len());
-        let mut framed = Vec::with_capacity(4 + end - offset);
-        framed.extend_from_slice(&sid.to_be_bytes());
-        framed.extend_from_slice(&bytes[offset..end]);
-        // Backpressure: same high-water idea as the browser's bufferedAmount check.
-        while dc.buffered_amount().await > HIGH_WATER {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        dc.send(&Bytes::from(framed)).await?;
-        offset = end;
+async fn prompt_accept(name: &str, size: u64) -> bool {
+    if !std::io::stdin().is_terminal() {
+        eprintln!("declining {name} (no tty for confirmation — use -y to auto-accept)");
+        return false;
     }
-    let end_msg = json!({ "type": "file-end", "id": id, "sid": sid });
-    dc.send_text(end_msg.to_string()).await?;
-    while dc.buffered_amount().await > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let _ = app
-        .done
-        .send(format!("[send] COMPLETE {} bytes streamed from offset {start}", bytes.len()));
-    Ok(())
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        eprint!("accept {name} ({})? [y/N] ", human(size));
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    })
+    .await
+    .unwrap_or(false)
 }
