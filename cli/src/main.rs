@@ -38,8 +38,10 @@ const REJOIN_WINDOW: Duration = Duration::from_secs(120);
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
+const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
+
 #[derive(Parser)]
-#[command(name = "filament", version, about = "P2P file transfer between terminals and browsers — no upload, no account")]
+#[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers — no upload, no account")]
 struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
     #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
@@ -93,6 +95,19 @@ enum Cmd {
         #[arg(long)]
         keep_open: bool,
     },
+    /// Update filament to the latest release
+    Update {
+        /// Check only; don't install
+        #[arg(long)]
+        check: bool,
+    },
+    /// Generate shell completions (bash, zsh, fish, elvish, powershell)
+    Completions {
+        shell: clap_complete::Shell,
+    },
+    /// Print the man page (roff) to stdout
+    #[command(hide = true)]
+    Man,
 }
 
 // --------------------------------------------------------------- utilities --
@@ -117,6 +132,12 @@ fn display_name() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "cli".into());
     format!("{user}@{host}")
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn human(bytes: u64) -> String {
@@ -383,7 +404,123 @@ async fn main() -> Result<()> {
         Cmd::Recv { code, dir, yes, room, to, keep_open } => {
             recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay).await
         }
+        Cmd::Update { check } => update_cmd(check).await,
+        Cmd::Completions { shell } => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "filament", &mut std::io::stdout());
+            Ok(())
+        }
+        Cmd::Man => {
+            use clap::CommandFactory;
+            clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
+            Ok(())
+        }
     }
+}
+
+// ----------------------------------------------------------------- update --
+// Self-update against GitHub releases (tags cli-vX.Y.Z). Downloads the
+// archive for this platform, verifies it against SHA256SUMS, and atomically
+// replaces the current executable.
+
+const REPO: &str = "Abdk4Moura/filament";
+
+fn release_target() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-musl"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
+        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
+async fn update_cmd(check_only: bool) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .user_agent(format!("filament/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    // Latest cli-v* release via the API (releases/latest may point at a web
+    // release tag, so filter explicitly).
+    let releases: Value = client
+        .get(format!("https://api.github.com/repos/{REPO}/releases?per_page=20"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let latest = releases
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .find(|r| r["tag_name"].as_str().is_some_and(|t| t.starts_with("cli-v")))
+        })
+        .ok_or_else(|| anyhow!("no CLI release found"))?;
+    let tag = latest["tag_name"].as_str().unwrap_or_default().to_string();
+    let latest_ver = tag.trim_start_matches("cli-v").to_string();
+    let current = env!("CARGO_PKG_VERSION");
+    if latest_ver == current {
+        println!("filament {current} is already the latest");
+        return Ok(());
+    }
+    println!("update available: {current} -> {latest_ver}");
+    if check_only {
+        return Ok(());
+    }
+
+    let target = release_target().ok_or_else(|| anyhow!("no prebuilt binary for this platform; build from source"))?;
+    let (asset, inner) = if cfg!(windows) {
+        (format!("filament-{target}.zip"), "filament.exe")
+    } else {
+        (format!("filament-{target}.tar.gz"), "filament")
+    };
+    let base = format!("https://github.com/{REPO}/releases/download/{tag}");
+
+    eprintln!("downloading {asset} ...");
+    let bytes = client.get(format!("{base}/{asset}")).send().await?.error_for_status()?.bytes().await?;
+    let sums = client.get(format!("{base}/SHA256SUMS")).send().await?.error_for_status()?.text().await?;
+    let got = sha256_hex(&bytes);
+    let expected = sums
+        .lines()
+        .find(|l| l.contains(&asset))
+        .and_then(|l| l.split_whitespace().next())
+        .ok_or_else(|| anyhow!("{asset} missing from SHA256SUMS"))?;
+    if got != expected {
+        bail!("checksum mismatch for {asset}: got {got}, expected {expected}");
+    }
+    eprintln!("checksum ok");
+
+    // Unpack the single binary.
+    let new_bin: Vec<u8> = if asset.ends_with(".tar.gz") {
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(&bytes[..]));
+        let mut ar = tar::Archive::new(gz);
+        let mut out = None;
+        for entry in ar.entries()? {
+            let mut e = entry?;
+            if e.path()?.file_name().map(|n| n == inner).unwrap_or(false) {
+                let mut v = Vec::new();
+                e.read_to_end(&mut v)?;
+                out = Some(v);
+                break;
+            }
+        }
+        out.ok_or_else(|| anyhow!("{inner} not found in archive"))?
+    } else {
+        bail!("zip self-update not supported yet; download {base}/{asset} manually");
+    };
+
+    // Atomic replace: write next to the current exe, then rename over it.
+    let me = std::env::current_exe()?;
+    let staging = me.with_extension("update-staging");
+    std::fs::write(&staging, &new_bin)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+    }
+    std::fs::rename(&staging, &me).with_context(|| format!("replacing {}", me.display()))?;
+    println!("updated to {latest_ver} -> {}", me.display());
+    Ok(())
 }
 
 // ------------------------------------------------------------------- send --

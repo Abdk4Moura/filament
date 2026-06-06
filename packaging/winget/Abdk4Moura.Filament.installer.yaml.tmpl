@@ -1,0 +1,14 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: Abdk4Moura.Filament
+PackageVersion: "@VERSION@"
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: filament.exe
+    PortableCommandAlias: filament
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Abdk4Moura/filament/releases/download/cli-v@VERSION@/filament-x86_64-pc-windows-msvc.zip
+    InstallerSha256: "@SHA_WINDOWS@"
+ManifestType: installer
+ManifestVersion: 1.6.0

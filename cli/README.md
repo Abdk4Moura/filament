@@ -42,11 +42,38 @@ filament send x.bin --server https://your-instance.example
   selected ICE candidate pair, same taxonomy as the peer-tile badges.
 - TURN fallback via the same `/api/config` ephemeral credentials.
 
-## Build
+## Install
 
 ```
-cargo build --release        # → target/release/filament
+# Linux / macOS — verifies checksums, installs to ~/.local/bin, no sudo
+curl -fsSL https://filament.autumated.com/install | sh
+
+# Windows
+winget install Abdk4Moura.Filament
+
+# Homebrew / Cargo
+brew install abdk4moura/tap/filament
+cargo install filament-cli
 ```
+
+Already installed? `filament update` fetches and checksum-verifies the latest
+release and swaps itself atomically. Shell completions: `filament completions
+<bash|zsh|fish>` (the installer wires them up automatically). Releases carry
+SHA256SUMS + GitHub build provenance attestations; the Linux binary is fully
+static. No telemetry — the binary talks to the signaling server you point it
+at and to your peer, nothing else.
+
+## Build from source
+
+```
+cargo build --release                                          # -> target/release/filament
+cargo build --release --target x86_64-unknown-linux-musl --features static   # fully static
+```
+
+Releasing (maintainer): `git tag cli-vX.Y.Z && git push origin cli-vX.Y.Z` —
+CI builds the matrix, checksums, attests, and publishes; then
+`packaging/release-followup.sh cli-vX.Y.Z --pr` refreshes the Homebrew tap and
+opens the winget PR.
 
 ## Architecture notes
 

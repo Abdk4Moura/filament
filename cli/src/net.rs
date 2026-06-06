@@ -546,7 +546,12 @@ impl Peer {
         }
         // Same address on both ends = same machine (loopback via any of its
         // IPs, public included) — bytes never leave the host.
-        let same_host = pair.local.address == pair.remote.address;
+        // "local" when bytes can't leave the machine/network: identical
+        // addresses, the remote address being one of THIS host's own
+        // addresses (multi-homed same-host pairs select different interfaces
+        // nondeterministically), or both ends private.
+        let same_host =
+            pair.local.address == pair.remote.address || is_own_addr(&pair.remote.address);
         let both_private = is_private_addr(&pair.local.address) && is_private_addr(&pair.remote.address);
         Some(if same_host || both_private { "local" } else { "direct" })
     }
@@ -570,6 +575,24 @@ fn advertise_max_message_size(desc: &RTCSessionDescription) -> Value {
         sdp.push_str(&format!("a=max-message-size:{ADVERTISED_MAX_MESSAGE}\r\n"));
     }
     json!({ "type": desc.sdp_type.to_string(), "sdp": sdp })
+}
+
+/// Is this address one of this host's own? Std-only trick: a UDP socket
+/// "connected" to one of our own IPs reports that same IP as its local
+/// address (the kernel routes it locally); a genuinely remote IP yields our
+/// interface address instead. No packets are sent.
+pub fn is_own_addr(addr: &str) -> bool {
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    std::net::UdpSocket::bind(bind)
+        .and_then(|s| {
+            s.connect((ip, 9))?;
+            s.local_addr()
+        })
+        .map(|la| la.ip() == ip)
+        .unwrap_or(false)
 }
 
 /// RFC1918/4193 + loopback + link-local — "on your network" for the route badge.

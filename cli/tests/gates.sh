@@ -51,14 +51,11 @@ if timeout 90 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-recv.
    && wait $SP && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ]; then
   ok "code transfer, hashes match, clean exits"
 else bad "code transfer"; tail -n 3 "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
-# C2: no end may misreport a non-relayed path as relayed, and the loopback
-# path must be detected as local by at least one end. (On a multi-homed host
-# with a PUBLIC IP on the NIC — like a droplet running both test peers — ICE
-# can legitimately select different interface addresses per side, so strict
-# local/local symmetry only holds across two distinct machines.)
-if grep -hq "route: local" "$WORK/g1-send.log" "$WORK/g1-recv.log" \
+# C2: same-machine peers must BOTH report local (is_own_addr handles the
+# multi-homed case), and nothing may misreport relayed.
+if [ "$(grep -hc 'route: local' "$WORK/g1-send.log" "$WORK/g1-recv.log" | paste -sd+ | bc)" -ge 2 ] \
    && ! grep -hq "route: relayed" "$WORK/g1-send.log" "$WORK/g1-recv.log"; then
-  ok "route detection: local seen, no false relayed"
+  ok "route detection: local on both ends, no false relayed"
 else bad "route detection"; grep -h "route:" "$WORK/g1-send.log" "$WORK/g1-recv.log"; fi
 if timeout 30 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g1-burn.log" 2>&1; then
   bad "code burn (second claim was accepted!)"
@@ -122,10 +119,11 @@ wait $R 2>/dev/null
 # ---------------------------------------------------------------- gate 5 ----
 say "5: CLI -> browser (playwright)"
 if [ -d "$HERE/node_modules/playwright" ]; then
-  ( cd "$HERE" && node browser-receiver.js "$SERVER/" >"$WORK/g5-pw.log" 2>&1 ) &
+  RM5="g5room$$"
+  ( cd "$HERE" && node browser-receiver.js "$SERVER/rooms/$RM5" >"$WORK/g5-pw.log" 2>&1 ) &
   PW=$!; pids+=($PW); sleep 6
   G5=0
-  timeout 120 "$BIN" send "$SMALL" --server "$SERVER" >"$WORK/g5-send.log" 2>&1 || G5=1
+  timeout 120 "$BIN" send "$SMALL" --room "$RM5" --server "$SERVER" >"$WORK/g5-send.log" 2>&1 || G5=1
   wait $PW || G5=1
   if [ $G5 -eq 0 ] && grep -q "RECEIVE COMPLETE" "$WORK/g5-pw.log"; then
     ok "browser received from CLI"
@@ -141,10 +139,11 @@ if [ -d "$HERE/node_modules/playwright" ]; then
   FA="$WORK/g6-a.bin"; FB="$WORK/g6-b.bin"
   head -c $((4 * 1024 * 1024)) /dev/urandom > "$FA"
   head -c $((1024 * 1024)) /dev/urandom > "$FB"
-  timeout 240 "$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g6-recv.log" 2>&1 &
+  RM6="g6room$$"
+  timeout 240 "$BIN" recv -y --dir "$D" --room "$RM6" --server "$SERVER" >"$WORK/g6-recv.log" 2>&1 &
   R=$!; pids+=($R); sleep 2
   G6=0
-  ( cd "$HERE" && timeout 200 node browser-sender.js "$SERVER/" "$FA" "$FB" >"$WORK/g6-pw.log" 2>&1 ) || G6=1
+  ( cd "$HERE" && timeout 200 node browser-sender.js "$SERVER/rooms/$RM6" "$FA" "$FB" >"$WORK/g6-pw.log" 2>&1 ) || G6=1
   wait $R || G6=1
   if [ $G6 -eq 0 ] && [ "$(hashof "$D/g6-a.bin")" = "$(hashof "$FA")" ] \
      && [ "$(hashof "$D/g6-b.bin")" = "$(hashof "$FB")" ] \

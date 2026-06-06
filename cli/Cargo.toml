@@ -1,7 +1,18 @@
 [package]
-name = "filament"
+name = "filament-cli"
 version = "0.1.0"
 edition = "2024"
+description = "P2P file transfer between terminals and browsers — no upload, no account. The terminal end of filament.autumated.com."
+license = "MIT"
+repository = "https://github.com/Abdk4Moura/filament"
+homepage = "https://filament.autumated.com"
+readme = "README.md"
+keywords = ["p2p", "file-transfer", "webrtc", "cli", "airdrop"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "filament"
+path = "src/main.rs"
 
 [features]
 # Fully static builds (musl): compile OpenSSL from source instead of linking
@@ -25,3 +36,11 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 tokio = { version = "1.52.3", features = ["full"] }
 webrtc = "0.17.1"
+clap_complete = "4.6.5"
+clap_mangen = "0.3.0"
+flate2 = "1.1.9"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
