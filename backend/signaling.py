@@ -91,6 +91,38 @@ class _MemRegistry:
             if v["room"] == room and s != exclude
         ]
 
+    def meta(self, sid):
+        m = self._m.get(sid)
+        return {"id": sid, "name": m["name"], "uid": m.get("uid")} if m else None
+
+    # -- persistent-pair presence channels (C12): a channel id is a hash of an
+    # E2E-shared secret; two sids in the same channel are mutually-trusted
+    # devices and get told about each other regardless of room.
+    def subscribe(self, sid, channels):
+        chans = getattr(self, "_chan", None)
+        if chans is None:
+            chans = self._chan = {}
+        bysid = getattr(self, "_sidchan", None)
+        if bysid is None:
+            bysid = self._sidchan = {}
+        bysid.setdefault(sid, set()).update(channels)
+        out = {}
+        for ch in channels:
+            members = chans.setdefault(ch, set())
+            out[ch] = [s for s in members if s != sid]
+            members.add(sid)
+        return out  # channel -> other sids already present
+
+    def unsubscribe_all(self, sid):
+        affected = {}
+        for ch in getattr(self, "_sidchan", {}).pop(sid, set()):
+            members = getattr(self, "_chan", {}).get(ch, set())
+            members.discard(sid)
+            others = list(members)
+            if others:
+                affected[ch] = others
+        return affected  # channel -> remaining sids to notify
+
     # -- one-time pairing codes (#11) --
     def pair_create(self, code, sid, ttl=600):
         pairs = getattr(self, "_pairs", None)
@@ -163,6 +195,53 @@ class _RedisRegistry:
             p.delete(self._lk(sid))
             p.execute()
         return room
+
+    def meta(self, sid):
+        import json
+
+        room = self.r.get(self._sk(sid))
+        if not room:
+            return None
+        raw = self.r.hget(self._rk(room), sid)
+        try:
+            v = json.loads(raw) if raw else {}
+        except (TypeError, ValueError):
+            v = {"name": raw}
+        return {"id": sid, "name": v.get("name"), "uid": v.get("uid")}
+
+    def _ck(self, channel):
+        return f"filament:chan:{channel}"
+
+    def _sck(self, sid):
+        return f"filament:sidchan:{sid}"
+
+    def subscribe(self, sid, channels):
+        out = {}
+        p = self.r.pipeline()
+        for ch in channels:
+            p.smembers(self._ck(ch))
+        existing = p.execute()
+        p = self.r.pipeline()
+        for ch, members in zip(channels, existing):
+            # lease-filter (#10): only live sids count
+            live = [s for s in members if s != sid and self.r.exists(self._lk(s))]
+            out[ch] = live
+            p.sadd(self._ck(ch), sid)
+            p.expire(self._ck(ch), self.TTL)
+            p.sadd(self._sck(sid), ch)
+            p.expire(self._sck(sid), self.TTL)
+        p.execute()
+        return out
+
+    def unsubscribe_all(self, sid):
+        affected = {}
+        for ch in self.r.smembers(self._sck(sid)):
+            self.r.srem(self._ck(ch), sid)
+            others = [s for s in self.r.smembers(self._ck(ch)) if self.r.exists(self._lk(s))]
+            if others:
+                affected[ch] = others
+        self.r.delete(self._sck(sid))
+        return affected
 
     # -- one-time pairing codes (#11): SET NX EX to create, GETDEL to consume
     # atomically — a code can be claimed exactly once, ever.
@@ -308,6 +387,30 @@ def register(socketio, registry):
         emit("pair-used", {"code": code}, to=creator)  # clear the displayed code
         emit("pair-matched", {"room": room})  # claimer crosses over
 
+    # -- persistent-pair presence (C12). The client subscribes with channel
+    # ids derived from E2E-shared pair secrets (sha256, hex). The server never
+    # sees a secret — only meeting points. Mutual presence is symmetric:
+    # both sides get `known-peer`. Trust is NOT asserted here; clients verify
+    # each other with an HMAC proof over the secret after connecting.
+    CHAN_RE = re.compile(r"^[0-9a-f]{64}$")
+    MAX_CHANNELS = 64
+
+    @socketio.on("subscribe")
+    def on_subscribe(data=None):
+        sid = request.sid
+        chans = [c for c in ((data or {}).get("channels") or [])[:MAX_CHANNELS]
+                 if isinstance(c, str) and CHAN_RE.match(c)]
+        if not chans:
+            return
+        me = registry.meta(sid)
+        for ch, others in registry.subscribe(sid, chans).items():
+            for other in others:
+                om = registry.meta(other)
+                if om:
+                    emit("known-peer", {**om, "channel": ch})
+                if me:
+                    emit("known-peer", {**me, "channel": ch}, to=other)
+
     @socketio.on("signal")
     def on_signal(data):
         sid = request.sid
@@ -325,7 +428,13 @@ def register(socketio, registry):
     def on_disconnect():
         _do_leave(request.sid)
 
+    def _channel_goodbye(sid):
+        for ch, others in registry.unsubscribe_all(sid).items():
+            for other in others:
+                emit("known-peer-left", {"id": sid, "channel": ch}, to=other)
+
     def _do_leave(sid):
+        _channel_goodbye(sid)
         local_sids.discard(sid)
         room = registry.remove(sid)
         if not room:

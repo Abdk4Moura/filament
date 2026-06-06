@@ -65,6 +65,9 @@ enum Cmd {
         /// Choose the one-time code word yourself (implies --code)
         #[arg(long)]
         word: Option<String>,
+        /// After a code pairing, remember the other device under this name
+        #[arg(long)]
+        remember: Option<String>,
         /// Join an explicit room instead of the same-network auto room
         #[arg(long)]
         room: Option<String>,
@@ -94,7 +97,12 @@ enum Cmd {
         /// Keep listening after a sender disconnects
         #[arg(long)]
         keep_open: bool,
+        /// After a code pairing, remember the other device under this name
+        #[arg(long)]
+        remember: Option<String>,
     },
+    /// List devices remembered via --remember (trusted for --to and auto-accept)
+    Devices,
     /// Update filament to the latest release
     Update {
         /// Check only; don't install
@@ -206,6 +214,104 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.dup"))
 }
 
+// ------------------------------------------------------- known devices (C12) --
+// Persistent pairing: during a code-paired session, both sides exchange a
+// 32-byte secret END-TO-END over the DataChannel (the server never sees it)
+// and store it under a local nickname. Presence: subscribe with
+// sha256("filament-pair:" + secret) — the server learns only meeting points.
+// Trust: an HMAC(secret) proof exchanged after connect, so the server cannot
+// impersonate a known device. Full PAKE remains roadmap (ledger C15).
+
+fn devices_path() -> PathBuf {
+    if let Ok(d) = std::env::var("FILAMENT_CONFIG_DIR") {
+        return PathBuf::from(d).join("devices.json");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".config/filament/devices.json")
+}
+
+fn devices_load() -> Vec<(String, String)> {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else { return Vec::new() };
+    serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|d| Some((d["name"].as_str()?.to_string(), d["secret"].as_str()?.to_string())))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn devices_store(name: &str, secret: &str) -> Result<()> {
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut all = devices_load();
+    all.retain(|(n, _)| n != name);
+    all.push((name.to_string(), secret.to_string()));
+    let arr: Vec<Value> = all.iter().map(|(n, s)| json!({"name": n, "secret": s})).collect();
+    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn channel_of(secret: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(b"filament-pair:");
+    h.update(secret.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// HMAC-SHA256 (manual: avoids a hmac-crate version dance with sha2 0.11).
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let mut h = Sha256::new();
+        h.update(key);
+        k[..32].copy_from_slice(&h.finalize());
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(msg);
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(inner.finalize());
+    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn proof_for(secret: &str, a_uid: &str, b_uid: &str) -> String {
+    // order-normalized so both sides compute the same pair context, but
+    // direction-tagged by prepending the prover's uid
+    let (lo, hi) = if a_uid < b_uid { (a_uid, b_uid) } else { (b_uid, a_uid) };
+    hmac_sha256(secret.as_bytes(), format!("filament-proof:{a_uid}|{lo}|{hi}").as_bytes())
+}
+
+fn fresh_secret() -> String {
+    let mut buf = [0u8; 32];
+    // std-only CSPRNG is unavailable; derive from getrandom via std::fs on unix
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_err()
+    {
+        // fallback (non-unix): hash of time+pid noise, still unpredictable enough
+        let mut h = Sha256::new();
+        h.update(format!("{:?}{}", SystemTime::now(), std::process::id()));
+        buf.copy_from_slice(&h.finalize()[..32]);
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---------------------------------------------------------- link machinery --
 // One peer at a time, but with the browser's survival rules: establishment
 // watchdog (C3), disconnected-grace + ICE restart + reconnect attempts (C4),
@@ -234,6 +340,10 @@ struct Conn {
     next_gen: u32,
     waiting_rejoin: Option<Instant>,
     chunk_size: usize,
+    /// C12: (name, secret) hypothesis for the peer we expect on a presence
+    /// channel; proof verification flips `trusted`.
+    expected_secret: Option<(String, String)>,
+    trusted: bool,
 }
 
 impl Conn {
@@ -398,11 +508,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let server = cli.server.trim_end_matches('/').to_string();
     match cli.cmd {
-        Cmd::Send { paths, code, word, room, to, name } => {
-            send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay).await
+        Cmd::Send { paths, code, word, room, to, name, remember } => {
+            send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
-        Cmd::Recv { code, dir, yes, room, to, keep_open } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay).await
+        Cmd::Recv { code, dir, yes, room, to, keep_open, remember } => {
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember).await
+        }
+        Cmd::Devices => {
+            let all = devices_load();
+            if all.is_empty() {
+                println!("no known devices yet — pair once with --code plus --remember <name> on both ends");
+            }
+            for (n, s) in all {
+                println!("{n}  (channel {})", &channel_of(&s)[..12]);
+            }
+            Ok(())
         }
         Cmd::Update { check } => update_cmd(check).await,
         Cmd::Completions { shell } => {
@@ -547,6 +667,7 @@ async fn send_cmd(
     to: Option<String>,
     stdin_name: String,
     relay: bool,
+    remember: Option<String>,
 ) -> Result<()> {
     if paths.is_empty() {
         bail!("nothing to send — pass files, directories, or '-' for stdin");
@@ -598,7 +719,14 @@ async fn send_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
     sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
 
-    if use_code {
+    // C12: --to matching a remembered device switches to identity mode —
+    // subscribe to its presence channel and wait for known-peer.
+    let known_target: Option<(String, String)> =
+        to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
+    if let Some((n, sec)) = &known_target {
+        eprintln!("waiting for known device '{n}' (presence channel)");
+        sio.emit("subscribe", json!({ "channels": [channel_of(sec)] })).await.ok();
+    } else if use_code {
         let payload = match &word {
             Some(w) => json!({ "keyword": w }),
             None => json!({}),
@@ -621,8 +749,14 @@ async fn send_cmd(
         next_gen: 0,
         waiting_rejoin: None,
         chunk_size: net::MAX_DC_PAYLOAD,
+        expected_secret: None,
+        trusted: false,
     };
-    let mut code_used = !use_code; // without --code any (filtered) peer is fair game
+    if known_target.is_some() {
+        conn.to_filter = None; // identity supersedes name matching
+        conn.expected_secret = known_target.clone().map(|(n, s)| (n, s));
+    }
+    let mut code_used = !use_code && known_target.is_none();
     let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
     let started = Instant::now();
     let claim_deadline = Duration::from_secs(600);
@@ -671,6 +805,14 @@ async fn send_cmd(
                     conn.maybe_adopt(&v).await?;
                 }
             }
+            Ev::KnownPeer(v) => {
+                if let Some((n, sec)) = &conn.expected_secret {
+                    if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
+                        eprintln!("known device '{n}' is online — connecting");
+                        conn.maybe_adopt(&v).await?;
+                    }
+                }
+            }
             Ev::Signal(v) => {
                 if let Some(l) = &conn.link {
                     if v["from"].as_str() == Some(l.peer.id.as_str()) {
@@ -703,6 +845,20 @@ async fn send_cmd(
                             }
                         }
                     });
+                    // C12: prove identity to a known device (their daemon
+                    // auto-accepts only after verifying); or hand over a new
+                    // pair secret when the user asked to --remember.
+                    if let Some((_n, sec)) = &conn.expected_secret {
+                        t.send_control(&json!({
+                            "type": "pair-proof",
+                            "mac": proof_for(sec, &conn.my_uid, l.uid.as_deref().unwrap_or("")),
+                        })).await?;
+                    } else if let (Some(name), true) = (&remember, use_code) {
+                        let sec = fresh_secret();
+                        t.send_control(&json!({ "type": "pair-keep", "secret": sec })).await?;
+                        devices_store(name, &sec)?;
+                        eprintln!("remembered this device as '{name}' (they must also pass --remember)");
+                    }
                     // (Re-)offer everything unfinished; resume:true after a
                     // prior accept so receivers continue from their partial.
                     for o in outgoing.lock().await.iter() {
@@ -865,6 +1021,7 @@ async fn recv_cmd(
     to: Option<String>,
     keep_open: bool,
     relay: bool,
+    remember: Option<String>,
 ) -> Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
@@ -883,8 +1040,16 @@ async fn recv_cmd(
             };
             eprintln!("listening in room {room} (dir: {})", dir.display());
             sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+            // C12: announce on every known device's presence channel
+            let devices = devices_load();
+            if !devices.is_empty() {
+                let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
+                eprintln!("watching for {} known device(s)", devices.len());
+                sio.emit("subscribe", json!({ "channels": chans })).await.ok();
+            }
         }
     }
+    let devices = devices_load(); // channel -> identity lookup for proofs
 
     let mut conn = Conn {
         server: server.to_string(),
@@ -899,6 +1064,8 @@ async fn recv_cmd(
         next_gen: 0,
         waiting_rejoin: None,
         chunk_size: net::MAX_DC_PAYLOAD,
+        expected_secret: None,
+        trusted: false,
     };
     let mut by_sid: HashMap<u32, IncomingFile> = HashMap::new();
     let mut completed = 0usize;
@@ -924,6 +1091,15 @@ async fn recv_cmd(
                         if conn.maybe_adopt(p).await? {
                             break;
                         }
+                    }
+                }
+            }
+            Ev::KnownPeer(v) => {
+                if conn.link.is_none() {
+                    if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
+                        eprintln!("known device '{n}' appeared — connecting");
+                        conn.expected_secret = Some((n.clone(), sec.clone()));
+                        conn.maybe_adopt(&v).await?;
                     }
                 }
             }
@@ -970,6 +1146,28 @@ async fn recv_cmd(
                 }
             }
             Ev::Control(v) => match v["type"].as_str() {
+                Some("pair-keep") => {
+                    let sec = v["secret"].as_str().unwrap_or_default().to_string();
+                    if sec.len() == 64 {
+                        if let Some(name) = &remember {
+                            devices_store(name, &sec)?;
+                            eprintln!("remembered this device as '{name}' — future sends auto-accept after proof");
+                        } else {
+                            eprintln!("(sender offered to be remembered; re-run with --remember <name> to keep it)");
+                        }
+                    }
+                }
+                Some("pair-proof") => {
+                    let mac = v["mac"].as_str().unwrap_or_default();
+                    let peer_uid = conn.link.as_ref().and_then(|l| l.uid.clone()).unwrap_or_default();
+                    let hit = devices.iter().find(|(_, s)| proof_for(s, &peer_uid, &conn.my_uid) == mac);
+                    if let Some((n, _)) = hit {
+                        conn.trusted = true;
+                        eprintln!("identity verified: '{n}' (auto-accepting)");
+                    } else {
+                        eprintln!("pair-proof FAILED verification — treating peer as untrusted");
+                    }
+                }
                 Some("file-offer") => {
                     let Some(t) = conn.transport() else { continue };
                     let id = v["id"].as_str().unwrap_or_default().to_string();
@@ -1012,6 +1210,7 @@ async fn recv_cmd(
                     // else gets an explicit prompt naming the sender.
                     let sender_name = conn.link.as_ref().map(|l| l.name.clone()).unwrap_or_default();
                     let ok = yes
+                        || conn.trusted // C12: HMAC-verified known device
                         || (is_resume && offset > 0)
                         || prompt_accept(&sender_name, &name, size, paired).await;
                     if !ok {

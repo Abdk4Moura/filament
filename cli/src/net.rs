@@ -55,6 +55,9 @@ pub enum Ev {
     #[allow(dead_code)] // payload is {code}; senders only need the wake-up
     PairUsed(Value),
     PairError(Value),
+    /// C12: a mutually-known device appeared on a shared presence channel.
+    KnownPeer(Value),
+    KnownPeerLeft(Value),
     ChannelReady(Arc<dyn Transport>),
     Control(Value),
     Chunk(u32, Bytes),
@@ -266,6 +269,8 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         .on("pair-matched", fwd(Ev::PairMatched, tx.clone()))
         .on("pair-used", fwd(Ev::PairUsed, tx.clone()))
         .on("pair-error", fwd(Ev::PairError, tx.clone()))
+        .on("known-peer", fwd(Ev::KnownPeer, tx.clone()))
+        .on("known-peer-left", fwd(Ev::KnownPeerLeft, tx.clone()))
         .connect()
         .await
         .with_context(|| format!("socket.io connect to {server}"))?;
