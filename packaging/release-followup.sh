@@ -33,8 +33,15 @@ render() { sed -e "s/@VERSION@/$VERSION/g" -e "s/@SHA_LINUX@/$SHA_LINUX/g" \
                -e "s/@SHA_WINDOWS@/$SHA_WINDOWS/g" "$1"; }
 
 # ------------------------------------------------------------------ homebrew
+# The tap lives INSIDE this repo (Formula/) — no extra repo needed:
+#   brew tap abdk4moura/filament https://github.com/Abdk4Moura/filament
+#   brew install abdk4moura/filament/filament
+# (If a dedicated Abdk4Moura/homebrew-tap repo exists, it is updated too.)
 render "$HERE/brew/filament.rb.tmpl" > "$OUT/filament.rb"
-echo "rendered $OUT/filament.rb"
+ROOT="$(cd "$HERE/.." && pwd)"
+mkdir -p "$ROOT/Formula"
+cp "$OUT/filament.rb" "$ROOT/Formula/filament.rb"
+echo "rendered Formula/filament.rb (commit it in the main repo)"
 if gh auth status >/dev/null 2>&1; then
   TAPDIR=$(mktemp -d)
   if gh repo clone Abdk4Moura/homebrew-tap "$TAPDIR" -- -q 2>/dev/null; then
@@ -45,11 +52,7 @@ if gh auth status >/dev/null 2>&1; then
       git -C "$TAPDIR" commit -q -m "filament $VERSION"
       git -C "$TAPDIR" push -q
       echo "homebrew-tap updated -> brew install abdk4moura/tap/filament"
-    else
-      echo "homebrew-tap already current"
     fi
-  else
-    echo "NOTE: Abdk4Moura/homebrew-tap not found — create it: gh repo create Abdk4Moura/homebrew-tap --public"
   fi
   rm -rf "$TAPDIR"
 fi

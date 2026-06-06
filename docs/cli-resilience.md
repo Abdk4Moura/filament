@@ -179,17 +179,24 @@ to the DTLS cert fingerprints is the design. Until then this is a disclosed
 limitation — never claim "the server can never read files" beyond the passive
 case.
 
-### C16. Distribution — **FIXED (linux); macOS/Windows = gap G-e**
-A fully static linux binary now builds and works: `cargo build --release
---target x86_64-unknown-linux-musl --features static` (the `static` feature
-vendors OpenSSL, since rust_socketio hard-depends on native-tls and a pure
-rustls tree would require forking it). Verified: `ldd` reports statically
-linked, 28 MB, and the binary completed a real transfer through the backend.
-Release CI exists at `.github/workflows/cli-release.yml` (tag `cli-v*` →
-linux-musl static + macOS arm64 artifacts attached to the release). Remaining:
-the macOS job is written but has never run (fires on first tag), Windows is
-not built — tracked as gap G-e and still gates announcing the CLI to
-Windows/macOS users.
+### C16. Distribution — **VERIFIED (Linux/macOS/Windows shipped); winget PR = operator step**
+Release **cli-v0.1.0 is published** (GitHub Actions, run 27075331708): four
+platform binaries (linux-musl static, macOS arm64, macOS x86_64 cross-built on
+arm64, Windows MSVC), SHA256SUMS, and build-provenance attestations. Verified
+end-to-end against the LIVE release:
+- `curl -fsSL https://filament.autumated.com/install | sh` downloads,
+  checksum-verifies, installs, and the installed binary completed a real
+  transfer through production.
+- `filament update`: a 0.0.9 build detected 0.1.0, downloaded, verified the
+  checksum, and atomically replaced itself.
+- Homebrew tap (Abdk4Moura/homebrew-tap) pushed with real hashes +
+  `Formula/filament.rb` committed in-repo; `cargo publish --dry-run` clean.
+- winget manifests rendered with the real Windows-zip SHA and schema-validated
+  (`packaging/winget/0.1.0/`). The only remaining step is the PR to
+  microsoft/winget-pkgs — an external submission under the maintainer's
+  identity, run `packaging/release-followup.sh cli-v0.1.0 --pr` with operator
+  consent. Gap G-e (macOS/Windows never built) is **closed** — both built and
+  released this run.
 
 ### C17. Never run against production — **VERIFIED (2026-06-06)**
 - Hermetic relay: gate 10 — local coturn, relay-only ICE policy, transfer
