@@ -17,14 +17,18 @@ Drafts land in `docs/launch/` ready to paste.
 - [ ] Blog post draft: "Eleven ways WebRTC file transfer fails (and the fixes)" → `docs/launch/blog-webrtc-failures.md`
 - [ ] AlternativeTo listing copy → `docs/launch/alternativeto.md`
 - [ ] r/selfhosted post draft → `docs/launch/reddit-selfhosted.md`
-- [ ] awesome-selfhosted entry prepared → `docs/launch/awesome-selfhosted.md`
+- [x] awesome-selfhosted entry prepared → `docs/launch/awesome-selfhosted.md`
+- [x] MIT LICENSE added to the repo
+- [x] **v1.0.0 release** cut (required: awesome-selfhosted needs a release ≥ 4 months old)
 
 ## Phase 2 — Launch (A executes, C's drafts in hand)
 - [ ] Publish the blog post on Abdk4Moura.github.io (C can push after approval)
 - [ ] Show HN — Tue–Thu, 8–10am ET; stay 2–3h for comments
 - [ ] r/selfhosted post (different week than HN)
 - [ ] AlternativeTo listing (alternative to Snapdrop / PairDrop / AirDrop / WeTransfer)
-- [ ] awesome-selfhosted PR (C prepares; A approves opening it)
+- [ ] awesome-selfhosted PR — **gated until 2026-10-06** (their rule: first release
+      must be > 4 months old; v1.0.0 released 2026-06-06). Branch is staged at
+      `Abdk4Moura/awesome-selfhosted-data@add-filament` — opening it is one command.
 - [ ] GSC: Request Indexing for `/`, `/about`, `/faq` (after OG image ships)
 
 ## Phase 3 — Evergreen (ongoing)
