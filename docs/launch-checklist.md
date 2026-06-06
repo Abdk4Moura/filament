@@ -14,7 +14,7 @@ Drafts land in `docs/launch/` ready to paste.
 ## Phase 1 — Assets (C drafts)
 - [x] OG card image (1200×630) at `/og.png`, wired into `og:image` + `summary_large_image`
 - [x] Show HN draft → `docs/launch/show-hn.md`
-- [ ] Blog post draft: "Eleven ways WebRTC file transfer fails (and the fixes)" → `docs/launch/blog-webrtc-failures.md`
+- [x] Blog post draft: "Eleven ways WebRTC file transfer fails (and the fixes)" → `docs/launch/blog-webrtc-failures.md`
 - [x] AlternativeTo listing copy → `docs/launch/alternativeto.md`
 - [x] r/selfhosted post draft → `docs/launch/reddit-selfhosted.md`
 - [x] awesome-selfhosted entry prepared → `docs/launch/awesome-selfhosted.md`
@@ -26,9 +26,11 @@ Drafts land in `docs/launch/` ready to paste.
 - [ ] Show HN — Tue–Thu, 8–10am ET; stay 2–3h for comments
 - [ ] r/selfhosted post (different week than HN)
 - [ ] AlternativeTo listing (alternative to Snapdrop / PairDrop / AirDrop / WeTransfer)
-- [ ] awesome-selfhosted PR — **gated until 2026-10-06** (their rule: first release
-      must be > 4 months old; v1.0.0 released 2026-06-06). Branch is staged at
-      `Abdk4Moura/awesome-selfhosted-data@add-filament` — opening it is one command.
+- [ ] awesome-selfhosted PR — **scheduled**: a remote routine ("Open awesome-selfhosted
+      PR for Filament") fires 2026-10-07 09:00 UTC and opens the PR from the staged
+      branch `Abdk4Moura/awesome-selfhosted-data@add-filament` (Oct 7, not Oct 6,
+      for one day of buffer past the exactly-4-months mark; v1.0.0 released 2026-06-06).
+      Manage at https://claude.ai/code/routines
 - [ ] GSC: Request Indexing for `/`, `/about`, `/faq` (after OG image ships)
 
 ## Phase 3 — Evergreen (ongoing)
