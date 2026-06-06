@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://filament.autumated.com/sitemap.xml

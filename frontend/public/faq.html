@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Filament FAQ — sending files between devices without uploading</title>
+<meta name="description" content="How to send files from Android to iPhone without an app, whether Filament uploads your files, what LAN/P2P/RELAY mean, transfer resume, and self-hosting." />
+<link rel="canonical" href="https://filament.autumated.com/faq.html" />
+<style>
+  body{background:#0A0B0C;color:#D9DEE3;font:15px/1.7 ui-monospace,'JetBrains Mono',monospace;max-width:680px;margin:0 auto;padding:40px 20px}
+  h1,h2{color:#fff} a{color:#7CF6C8} h2{font-size:17px;margin-top:34px}
+</style>
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[
+{"@type":"Question","name":"How do I send a file from Android to iPhone without an app?","acceptedAnswer":{"@type":"Answer","text":"Open filament.autumated.com on both phones. On the same WiFi they see each other automatically; otherwise tap 'create code' on one phone and type the spoken code on the other. Then tap the device tile and pick the file — it transfers directly, peer-to-peer."}},
+{"@type":"Question","name":"Does Filament upload my files to a server?","acceptedAnswer":{"@type":"Answer","text":"No. Files travel browser-to-browser over an encrypted WebRTC data channel. On hard networks an encrypted relay forwards packets but cannot read them. Nothing is ever stored."}},
+{"@type":"Question","name":"Is there a file size limit?","acceptedAnswer":{"@type":"Answer","text":"No fixed limit — there is no storage involved. Both devices must stay online for the duration of the transfer."}},
+{"@type":"Question","name":"What do the LAN, P2P and RELAY badges mean?","acceptedAnswer":{"@type":"Answer","text":"They show the real path your bytes take: LAN means straight across your local network (never touching the internet), P2P means direct between devices over the internet, RELAY means forwarded through an encrypted relay because the networks block direct connections."}},
+{"@type":"Question","name":"What happens if the connection drops mid-transfer?","acceptedAnswer":{"@type":"Answer","text":"The transfer pauses and resumes automatically from the same byte once the devices reconnect, as long as the sender keeps the tab open."}},
+{"@type":"Question","name":"Can I self-host Filament?","acceptedAnswer":{"@type":"Answer","text":"Yes — it is open source (MIT-style personal project). The backend is a small Flask signaling server plus an optional coturn relay; see github.com/Abdk4Moura/filament for the deploy guide."}}
+]}
+</script>
+</head>
+<body>
+<h1>Filament — FAQ</h1>
+<h2>How do I send a file from Android to iPhone without an app?</h2>
+<p>Open <a href="/">filament.autumated.com</a> on both phones. On the same WiFi they detect each other automatically. On different networks, tap <em>create code</em> on one phone, say the code aloud (e.g. <code>clever-lynx-63</code>), and type it on the other. Tap the tile, pick the file, done.</p>
+<h2>Does Filament upload my files anywhere?</h2>
+<p>No. The file streams directly between the two browsers over an encrypted WebRTC data channel. When networks force a relay, the relay forwards encrypted packets it cannot read. Nothing is stored, ever.</p>
+<h2>Is there a size limit?</h2>
+<p>No fixed limit — there's no storage to fill. Both devices stay online during the transfer; interrupted transfers pause and resume from the same byte.</p>
+<h2>What do LAN / P2P / RELAY mean?</h2>
+<p>The badge on each device shows the real route: <strong>LAN</strong> — straight across your WiFi, the bytes never touch the internet; <strong>P2P</strong> — direct between devices across the internet; <strong>RELAY</strong> — via an encrypted relay when both networks block direct connections.</p>
+<h2>How do the one-time codes work?</h2>
+<p>A code like <code>quiet-lynx-42</code> admits exactly one person and burns on first use — overhearing it afterwards gives an attacker nothing. Mint another code to add another person.</p>
+<h2>Can I self-host it?</h2>
+<p>Yes — the whole stack is open source: a small Flask signaling server, Redis, and an optional coturn relay. Deploy guide in the repo: <a href="https://github.com/Abdk4Moura/filament">github.com/Abdk4Moura/filament</a>.</p>
+<p><a href="/about.html">← About Filament</a> · <a href="/">Open the app →</a></p>
+</body>
+</html>

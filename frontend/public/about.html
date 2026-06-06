@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>About Filament — peer-to-peer file sharing in the browser</title>
+<meta name="description" content="How Filament works: WebRTC peer-to-peer transfer, no upload, no account. Send files between Android, iPhone, Mac, Windows and Linux from a browser tab. Open source and self-hostable." />
+<link rel="canonical" href="https://filament.autumated.com/about.html" />
+<style>
+  body{background:#0A0B0C;color:#D9DEE3;font:15px/1.7 ui-monospace,'JetBrains Mono',monospace;max-width:680px;margin:0 auto;padding:40px 20px}
+  h1,h2{color:#fff;letter-spacing:-.01em} h1 span{display:inline-block;width:10px;height:16px;background:#7CF6C8;box-shadow:0 0 10px #7CF6C888;margin-right:8px}
+  a{color:#7CF6C8} .pill{font-size:11px;border:1px solid #1E2227;padding:2px 8px;color:#9AA1A8}
+  .cta{display:inline-block;border:1px solid #7CF6C8;color:#7CF6C8;padding:10px 18px;text-decoration:none;margin:18px 0}
+</style>
+</head>
+<body>
+<h1><span></span>filament</h1>
+<p><strong>Filament sends files directly between two devices</strong> — phone to phone, Android to iPhone, laptop to phone — from a normal browser tab. There is no app to install, no account to create, and <strong>your files are never uploaded to a server</strong>: they travel peer-to-peer over an encrypted WebRTC connection.</p>
+<a class="cta" href="/">Open Filament →</a>
+<h2>How it works</h2>
+<p>Devices on the same WiFi find each other automatically — like AirDrop, but it works across every platform. Devices on different networks pair with a one-time spoken code (say <span class="pill">clever-lynx-63</span> across the table) or a shared link. The file then streams directly between the two browsers; a tiny signaling server only performs the introduction. A route badge shows you exactly how the bytes travel: <span class="pill">LAN</span> straight across your WiFi, <span class="pill">P2P</span> direct over the internet, or <span class="pill">RELAY</span> through our relay when networks are strict — encrypted in every case.</p>
+<h2>Why people use it</h2>
+<ul>
+<li><strong>AirDrop alternative for Android ↔ iPhone</strong> — no ecosystem walls.</li>
+<li><strong>No size limit, no compression</strong> — send the original video, not the WhatsApp-crushed copy.</li>
+<li><strong>Private by architecture</strong> — there is no server copy to leak, expire, or be subpoenaed.</li>
+<li><strong>Resumes interrupted transfers</strong> — a dropped connection pauses and continues, instead of starting over.</li>
+<li><strong>Open source & self-hostable</strong> — run your own instance: <a href="https://github.com/Abdk4Moura/filament">github.com/Abdk4Moura/filament</a>.</li>
+</ul>
+<h2>Compared to the alternatives</h2>
+<p><strong>WeTransfer / email / Drive</strong> upload your file to someone else's storage first. <strong>WhatsApp</strong> recompresses media. <strong>AirDrop / Quick Share</strong> only work inside one vendor's ecosystem. <strong>Snapdrop-style sites</strong> inspired Filament — we added cross-network pairing codes, transfer resume, visible routing, and a self-hostable relay.</p>
+<p><a href="/faq.html">Frequently asked questions →</a></p>
+</body>
+</html>

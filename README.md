@@ -1,5 +1,7 @@
 # Filament
 
+**Live: [filament.autumated.com](https://filament.autumated.com)** — send files directly between Android, iPhone and desktop from a browser tab. An open, self-hostable AirDrop alternative.
+
 Peer-to-peer file sharing in the browser. Files travel **directly between
 browsers** over a WebRTC data channel — the server only helps two peers find
 each other (signaling). No uploads, no size cap, no account.
