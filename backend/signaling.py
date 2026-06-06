@@ -16,17 +16,48 @@ Event contract (kept in sync with CONTRACT.md):
 """
 import re
 import secrets as _secrets
+import time as _time
+from collections import defaultdict, deque
 
 from flask import request
 from flask_socketio import emit, join_room, leave_room
 
 # Speakable one-time codes: easy to say across a table, unique by NX semantics.
-_ADJ = ["brave", "calm", "clever", "eager", "gentle", "jolly", "keen", "lucky", "mellow", "swift"]
-_ANIMAL = ["otter", "panda", "falcon", "lynx", "koala", "heron", "fox", "ibex", "marten", "tapir"]
+#
+# Entropy budget (see the variance analysis repo): 64 adjectives x 64 animals
+# x 900 numbers = 3,686,400 codes (~21.8 bits). Combined with the claim rate
+# limit below, sweeping the space inside a code's 10-minute TTL is infeasible;
+# the 10x10x90 = 9,000-code (~13.1 bit) original was not. Words are chosen to
+# be short, common, and phonetically distinct so codes stay easy to SAY.
+# Keep these lists in sync with frontend/src/lib/useFilament.js (peer names
+# draw from the same vocabulary).
+_ADJ = [
+    "amber", "bold", "brave", "brisk", "calm", "cheery", "chill", "civil",
+    "clever", "cosy", "crisp", "daring", "deft", "dewy", "eager", "early",
+    "fancy", "fiery", "fleet", "fond", "frank", "free", "fresh", "gentle",
+    "giddy", "glad", "golden", "grand", "happy", "hardy", "hasty", "honest",
+    "humble", "jolly", "keen", "kind", "lively", "loyal", "lucky", "lunar",
+    "mellow", "merry", "mighty", "misty", "neat", "noble", "perky", "plucky",
+    "polar", "proud", "quick", "quiet", "rapid", "rosy", "royal", "shiny",
+    "snappy", "solid", "spry", "stout", "sunny", "swift", "tidy", "witty",
+]
+_ANIMAL = [
+    "otter", "panda", "falcon", "lynx", "koala", "heron", "fox", "ibex",
+    "marten", "tapir", "badger", "beaver", "bison", "bongo", "camel", "civet",
+    "condor", "crane", "dingo", "dove", "eland", "ermine", "ferret", "finch",
+    "gecko", "gibbon", "hare", "hawk", "hyrax", "jackal", "kestrel", "kiwi",
+    "lemur", "llama", "macaw", "magpie", "mole", "moose", "murre", "newt",
+    "ocelot", "okapi", "oriole", "osprey", "owl", "pika", "plover", "puffin",
+    "quokka", "rabbit", "raven", "robin", "seal", "shrew", "skink", "sparrow",
+    "stoat", "swan", "tern", "toucan", "vole", "wombat", "wren", "zebra",
+]
+assert len(_ADJ) == 64 and len(set(_ADJ)) == 64, "adjective list must be 64 unique words"
+assert len(_ANIMAL) == 64 and len(set(_ANIMAL)) == 64, "animal list must be 64 unique words"
 
 
 def _mint_pair_code():
-    return f"{_secrets.choice(_ADJ)}-{_secrets.choice(_ANIMAL)}-{_secrets.randbelow(90) + 10}"
+    """CSPRNG-minted speakable code: adj-animal-NNN, ~21.8 bits."""
+    return f"{_secrets.choice(_ADJ)}-{_secrets.choice(_ANIMAL)}-{_secrets.randbelow(900) + 100}"
 
 
 def _norm_code(raw):
@@ -239,8 +270,32 @@ def register(socketio, registry):
                 return
         emit("pair-error", {"error": "exhausted"})
 
+    # Claim rate limit: 21.8 bits of code entropy only holds if nobody can
+    # sweep the space. 5 attempts/min per connection (and per client IP, so
+    # reconnecting doesn't reset it) makes an exhaustive sweep of 3.7M codes
+    # take years instead of the minutes the unthrottled 9,000-code space took.
+    CLAIM_LIMIT = 5
+    CLAIM_WINDOW = 60.0
+    _claim_log = defaultdict(deque)  # key -> recent claim timestamps
+
+    def _claim_allowed(sid):
+        ip = request.headers.get("CF-Connecting-IP") or request.remote_addr or "?"
+        now = _time.monotonic()
+        for key in (f"sid:{sid}", f"ip:{ip}"):
+            q = _claim_log[key]
+            while q and now - q[0] > CLAIM_WINDOW:
+                q.popleft()
+            if len(q) >= CLAIM_LIMIT:
+                return False
+        for key in (f"sid:{sid}", f"ip:{ip}"):
+            _claim_log[key].append(now)
+        return True
+
     @socketio.on("pair-claim")
     def on_pair_claim(data=None):
+        if not _claim_allowed(request.sid):
+            emit("pair-error", {"error": "slow-down"})
+            return
         code = _norm_code((data or {}).get("code"))
         creator = registry.pair_claim(code) if code else None
         room = registry.room_of(creator) if creator else None

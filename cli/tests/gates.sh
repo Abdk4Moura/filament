@@ -41,6 +41,12 @@ H_SMALL=$(hashof "$SMALL"); H_BIG=$(hashof "$BIG")
 # ---------------------------------------------------------------- gate 0 ----
 say "0: unit tests"
 if ( cd "$CLI_DIR" && cargo test -q ) >"$WORK/g0.log" 2>&1; then ok "unit tests"; else bad "unit tests"; tail -n 5 "$WORK/g0.log"; fi
+PYV="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+if [ -x "$PYV" ]; then
+  if ( cd "$CLI_DIR/.." && "$PYV" -m unittest backend.tests.test_pair_codes ) >"$WORK/g0b.log" 2>&1; then
+    ok "pair-code variance/security tests"
+  else bad "pair-code tests"; tail -n 5 "$WORK/g0b.log"; fi
+fi
 
 # ---------------------------------------------------------------- gate 1 ----
 say "1: one-time code transfer + code burn"

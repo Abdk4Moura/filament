@@ -11,12 +11,53 @@ import { createSignaling } from './signaling.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 
-const ADJ = ['brave', 'calm', 'clever', 'eager', 'gentle', 'jolly', 'keen', 'lucky', 'mellow', 'swift']
-const ANIMALS = ['otter', 'panda', 'falcon', 'lynx', 'koala', 'heron', 'fox', 'ibex', 'marten', 'tapir']
+// Peer display names draw from the same 64x64 vocabulary as the server's
+// one-time codes (backend/signaling.py — keep in sync). 4,096 combinations
+// picked via crypto.getRandomValues, persisted per tab: a device KEEPS its
+// name on purpose (stable identity, like the uid below) — recurrence across
+// visits is sessionStorage, not a small or biased RNG. See the variance
+// analysis repo for the entropy/birthday math.
+const ADJ = [
+  'amber', 'bold', 'brave', 'brisk', 'calm', 'cheery', 'chill', 'civil',
+  'clever', 'cosy', 'crisp', 'daring', 'deft', 'dewy', 'eager', 'early',
+  'fancy', 'fiery', 'fleet', 'fond', 'frank', 'free', 'fresh', 'gentle',
+  'giddy', 'glad', 'golden', 'grand', 'happy', 'hardy', 'hasty', 'honest',
+  'humble', 'jolly', 'keen', 'kind', 'lively', 'loyal', 'lucky', 'lunar',
+  'mellow', 'merry', 'mighty', 'misty', 'neat', 'noble', 'perky', 'plucky',
+  'polar', 'proud', 'quick', 'quiet', 'rapid', 'rosy', 'royal', 'shiny',
+  'snappy', 'solid', 'spry', 'stout', 'sunny', 'swift', 'tidy', 'witty',
+]
+const ANIMALS = [
+  'otter', 'panda', 'falcon', 'lynx', 'koala', 'heron', 'fox', 'ibex',
+  'marten', 'tapir', 'badger', 'beaver', 'bison', 'bongo', 'camel', 'civet',
+  'condor', 'crane', 'dingo', 'dove', 'eland', 'ermine', 'ferret', 'finch',
+  'gecko', 'gibbon', 'hare', 'hawk', 'hyrax', 'jackal', 'kestrel', 'kiwi',
+  'lemur', 'llama', 'macaw', 'magpie', 'mole', 'moose', 'murre', 'newt',
+  'ocelot', 'okapi', 'oriole', 'osprey', 'owl', 'pika', 'plover', 'puffin',
+  'quokka', 'rabbit', 'raven', 'robin', 'seal', 'shrew', 'skink', 'sparrow',
+  'stoat', 'swan', 'tern', 'toucan', 'vole', 'wombat', 'wren', 'zebra',
+]
+
+function cryptoPick(a) {
+  const buf = new Uint32Array(1)
+  // rejection sampling: no modulo bias even for non-power-of-two lists
+  const limit = Math.floor(0xffffffff / a.length) * a.length
+  do {
+    crypto.getRandomValues(buf)
+  } while (buf[0] >= limit)
+  return a[buf[0] % a.length]
+}
 
 function randomName() {
-  const pick = (a) => a[Math.floor(Math.random() * a.length)]
-  return `${pick(ADJ)}-${pick(ANIMALS)}`
+  try {
+    const saved = sessionStorage.getItem('filament.name')
+    if (saved) return saved
+    const name = `${cryptoPick(ADJ)}-${cryptoPick(ANIMALS)}`
+    sessionStorage.setItem('filament.name', name)
+    return name
+  } catch {
+    return `${cryptoPick(ADJ)}-${cryptoPick(ANIMALS)}`
+  }
 }
 
 // Deterministic hue so a peer keeps the same color everywhere it appears.
