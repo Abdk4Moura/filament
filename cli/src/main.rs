@@ -568,7 +568,6 @@ async fn recv_cmd(
                         received: offset,
                         file: std::io::BufWriter::with_capacity(1 << 20, file),
                         part_path,
-                        final_path: PathBuf::new(),
                         started: Instant::now(),
                     });
                     t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
