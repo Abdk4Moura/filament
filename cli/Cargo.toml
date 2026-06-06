@@ -3,7 +3,14 @@ name = "filament"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Fully static builds (musl): compile OpenSSL from source instead of linking
+# the system one. rust_socketio hard-depends on native-tls, so a rustls-only
+# tree is not possible without forking it upstream (ledger C16).
+static = ["dep:openssl-sys"]
+
 [dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 bytes = "1.11.1"

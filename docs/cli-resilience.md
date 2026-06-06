@@ -17,8 +17,9 @@ Statuses: **OPEN** (known, unfixed) · **FIXED** (code landed) ·
 
 The standing gates live in `cli/tests/gates.sh` (gates 0–10; browser gates via
 Playwright, relay gate via a local coturn container). Last full run:
-**13/13, twice consecutively, 2026-06-06**, plus live-production direct and
-forced-relay transfers through `api.filament.autumated.com`.
+**14/14, 2026-06-06** (13/13 twice before gate 11 was added), plus
+live-production direct and forced-relay transfers through
+`api.filament.autumated.com`.
 
 ---
 
@@ -35,7 +36,7 @@ forced-relay transfers through `api.filament.autumated.com`.
 | 7 | Don't trust stray signal senders | **VERIFIED** | signals filtered to the linked peer's sid; gate 7 (third parties in room) |
 | 8 | Establishment watchdog | **FIXED** (C3) | 15 s watchdog, generation-tagged, retries ×3 with fresh config; observed firing in gate logs; no deterministic swallowed-offer gate yet (gap G-b) |
 | 9 | TURN credential refresh | **FIXED** (C5) | config re-fetched before EVERY connection attempt (+ HTTP retry ×3); no TTL-expiry end-to-end gate (gap G-c) |
-| 10 | Zombie presence / uid supersede | **FIXED** (C6) | same-uid supersede in `maybe_adopt`; rejoin window covers socket death (gate 2 covers replacement-peer; same-uid rejoin lacks a dedicated gate — gap G-d) |
+| 10 | Zombie presence / uid supersede | **VERIFIED** (C6) | same-uid supersede in `maybe_adopt`; gate 11 (frozen receiver, same-uid replacement, resume + hash); gate 2 covers the different-peer flavor |
 | 11 | One-time pairing | **VERIFIED** | gate 1 (transfer + second-claim-rejected burn check) |
 
 ## Part 2 — CLI failure modes (C-series)
@@ -50,6 +51,13 @@ runtime, no rebuild needed) and the CLI clamps to 60 KiB on send.
 64 KiB for up to ~10 minutes after the backend deploy (config refreshes every
 10 min and on every reconnect); a transfer attempted in that window against a
 CLI fails and succeeds on retry. Accepted as a transient deploy window.
+**Production rollout:** the frontend (head hash + F5 flush) auto-deployed via
+the Cloudflare build on push — verified live in the served bundle. The backend
+side is a one-line env change (`FIL_CHUNK_SIZE=61440` in
+`/opt/filament/deploy/.env` + `docker compose up -d --no-deps api`); applying
+it requires operator consent (production changes are permission-gated for the
+agent), so browser→CLI against production stays on 64 KiB frames until the
+operator runs it. CLI↔CLI and CLI→browser are unaffected.
 
 ### C2. Route label disagreement — **VERIFIED** (with documented residual)
 **Fix:** route now reads the agent's actual selected pair
@@ -90,11 +98,13 @@ credential anywhere left to go stale. Gap G-c: no end-to-end gate ages a
 credential past its TTL (would need a >TTL-long test run or a short-TTL
 backend fixture).
 
-### C6. Reconnecting peer ignored (no uid supersede) — **FIXED**
+### C6. Reconnecting peer ignored (no uid supersede) — **VERIFIED**
 `maybe_adopt`: a peer-joined carrying the SAME uid as the current link
-replaces it (close old, fresh connect, transfers re-offered). Socket-death +
-*different*-uid replacement is gate-2-verified; the same-uid rejoin path lacks
-its own gate (gap G-d).
+replaces it (mark old closed, spawn teardown, fresh connect, transfers
+re-offered with resume). **Verified by:** gate 11 — receiver SIGSTOPped
+mid-transfer (socket alive, lease alive), replacement with the SAME uid
+(`FILAMENT_UID` test hook) joins, sender logs "superseding old link", resume
+completes, hash matches. Gate 2 covers the different-uid replacement flavor.
 
 ### C7. Resume trusted name+size — silent corruption — **VERIFIED**
 `file-offer` now carries `head`: sha256 of the first 256 KiB. The receiver's
@@ -139,13 +149,16 @@ also upgrades C13's `--to` from name-matching to identity, and enables daemon
 auto-accept-from-trusted-only. Not a defect: resume works without it (C7
 guards the seam).
 
-### C13. Peer selection — **MITIGATED, full fix ROADMAP (C12)**
-`--to <name>` on both commands filters by display name (gate 7: two receivers,
-`--to bob`, file lands only in bob's dir). Same-role CLI peers never adopt
-each other (uid `cli-s-*`/`cli-r-*` prefix check) — a receiver can no longer
-wedge itself on another idle receiver. Remaining: an idle *browser* in the
-auto-room can still be adopted by an unfiltered CLI receiver; identity-based
-selection (C12) is the real fix.
+### C13. Peer selection — **VERIFIED** (enhancement tracked under C12)
+The failure modes — a receiver wedging itself on another idle receiver, and a
+sender delivering to the wrong device — are fixed and gated: `--to <name>`
+filters by display name (gate 7: two receivers + a bystander, file lands only
+in bob's dir), and same-role CLI peers never adopt each other (uid
+`cli-s-*`/`cli-r-*` prefix check). What remains is an *enhancement*, not a
+defect: identity-based addressing (pick a device, not a name substring),
+which arrives with C12's pairing layer. Until then an idle browser in the
+auto-room can occupy an unfiltered receiver — use `--to`/`--code` to
+disambiguate, as documented.
 
 ### C14. Code claim auto-accepted without consent — **VERIFIED**
 Claiming a code no longer implies accepting arbitrary files. Acceptance now:
@@ -161,10 +174,17 @@ to the DTLS cert fingerprints is the design. Until then this is a disclosed
 limitation — never claim "the server can never read files" beyond the passive
 case.
 
-### C16. Distribution — **OPEN (release gate, not a runtime defect)**
-Still dynamic-OpenSSL, no musl static build, macOS/Windows unbuilt/untested,
-no release CI. Gates any public CLI announcement. First step: move
-reqwest/rust_socketio onto rustls and add a musl + macos release workflow.
+### C16. Distribution — **FIXED (linux); macOS/Windows = gap G-e**
+A fully static linux binary now builds and works: `cargo build --release
+--target x86_64-unknown-linux-musl --features static` (the `static` feature
+vendors OpenSSL, since rust_socketio hard-depends on native-tls and a pure
+rustls tree would require forking it). Verified: `ldd` reports statically
+linked, 28 MB, and the binary completed a real transfer through the backend.
+Release CI exists at `.github/workflows/cli-release.yml` (tag `cli-v*` →
+linux-musl static + macOS arm64 artifacts attached to the release). Remaining:
+the macOS job is written but has never run (fires on first tag), Windows is
+not built — tracked as gap G-e and still gates announcing the CLI to
+Windows/macOS users.
 
 ### C17. Never run against production — **VERIFIED (2026-06-06)**
 - Hermetic relay: gate 10 — local coturn, relay-only ICE policy, transfer
@@ -215,6 +235,16 @@ consecutively since.
 Hermetic relay tests need `--allow-loopback-peers` on coturn (both peers are
 127.0.0.1 there). Production coturn must NOT carry that flag.
 
+### F8. Inline pc.close() deadlocked the event loop — **FIXED + VERIFIED**
+Found BY gate 11: superseding a link awaited `pc.close()` inline in the event
+loop, and webrtc-rs's close can block on network teardown against a frozen
+peer — freezing the entire process (no watchdogs, no signals, nothing).
+Fix: `mark_closed()` (atomic, synchronous — callbacks silenced immediately) +
+the actual close spawned off-loop. Same hazard class: HTTP fetches from the
+loop now carry an explicit 10 s reqwest timeout (reqwest has NONE by
+default). Rule distilled: the event loop may never await anything whose
+completion depends on a remote peer behaving. Gate 11 verifies.
+
 ## Part 4 — Standing test gates (`cli/tests/gates.sh`)
 
 | Gate | Covers | Status |
@@ -230,6 +260,7 @@ Hermetic relay tests need `--allow-loopback-peers` on coturn (both peers are
 | 8 consent: no tty + no `-y` declines | C14 | green |
 | 9 throughput floor ≥8 MB/s | C8a regression | green |
 | 10 TURN relay via coturn container, `route: relayed` | C2, C17 | green (needs docker) |
+| 11 frozen receiver superseded by same-uid replacement, resume | C6, F8 | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 
 **Known coverage gaps (tracked, not hidden):**
@@ -237,9 +268,8 @@ Hermetic relay tests need `--allow-loopback-peers` on coturn (both peers are
   no deterministic local simulation; needs netem/SIGSTOP choreography.
 - **G-b** watchdog lacks a swallowed-offer fixture peer.
 - **G-c** TURN TTL expiry needs a short-TTL backend fixture.
-- **G-d** same-uid rejoin (supersede) lacks a dedicated gate (replacement-peer
-  flavor is covered by gate 2).
-- **G-e** macOS/Windows: nothing runs in CI for them yet (part of C16).
+- **G-e** macOS/Windows: the release workflow's macOS job has never executed
+  (runs on first `cli-v*` tag); Windows is not built (part of C16).
 
 A dockerized "dummy machines" topology (two isolated bridge networks forced
 through coturn) was considered and intentionally NOT built: the `--relay` flag

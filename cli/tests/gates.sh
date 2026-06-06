@@ -234,6 +234,36 @@ if [ $WITH_RELAY -eq 1 ]; then
   else bad "relay"; tail -n 3 "$WORK/g10-send.log" "$WORK/g10-recv.log"; fi
 fi
 
+# --------------------------------------------------------------- gate 11 ----
+say "11: same-uid rejoin supersede (C6) — frozen receiver replaced by same device"
+W="g11-$$-$RANDOM"; D="$WORK/g11"; mkdir -p "$D"
+"$BIN" send "$BIG" --word "$W" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
+SP=$!; pids+=($SP); sleep 3
+FILAMENT_UID="samedevice$$" "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
+R1=$!; pids+=($R1)
+for _ in $(seq 1 60); do
+  sz=$(stat -c %s "$D/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((10 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+# Freeze (don't kill): the server lease stays alive, so when the replacement
+# with the SAME uid joins, the sender must take the supersede path, not the
+# peer-left path.
+kill -STOP $R1 2>/dev/null
+sleep 1
+FILAMENT_UID="samedevice$$" timeout 180 "$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
+RC2=$?
+# bounded wait: a hung sender must fail the gate, not the whole suite
+RCS=99
+for _ in $(seq 1 60); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
+kill -9 $SP 2>/dev/null
+kill -9 $R1 2>/dev/null
+if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
+   && grep -q "superseding old link" "$WORK/g11-send.log" \
+   && grep -q "resuming at" "$WORK/g11-recv2.log"; then
+  ok "same-uid supersede: sender swapped links, transfer resumed, hash matches"
+else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"

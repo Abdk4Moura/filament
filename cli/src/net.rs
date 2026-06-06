@@ -197,7 +197,13 @@ async fn http_get_json(url: &str) -> Result<Value> {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         }
-        match reqwest::get(url).await {
+        // Explicit timeout: reqwest has none by default, and this is awaited
+        // from the event loop — a hung GET must not freeze the process.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build();
+        let Ok(client) = client else { continue };
+        match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json().await {
                 Ok(v) => return Ok(v),
                 Err(e) => last = Some(anyhow!(e)),
@@ -421,10 +427,17 @@ impl Peer {
         }
     }
 
-    /// Tear down quietly: silences callbacks first so a dying pc can't spam
-    /// the event loop (browser fix #3, the CLI flavor).
-    pub async fn close(&self) {
+    /// Silence callbacks immediately (synchronous, atomic) so a dying pc
+    /// can't spam the event loop (browser fix #3, the CLI flavor).
+    pub fn mark_closed(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Tear down. May block on network teardown against an unreachable peer —
+    /// callers in the event loop must mark_closed() and spawn this, never
+    /// await it inline (gate 11 deadlock).
+    pub async fn close(&self) {
+        self.mark_closed();
         let _ = self.pc.close().await;
     }
 

@@ -98,6 +98,12 @@ enum Cmd {
 // --------------------------------------------------------------- utilities --
 
 fn mk_uid(prefix: &str) -> String {
+    // Test hook (gate 11): a pinned uid lets the harness exercise the
+    // same-device-rejoined supersede path (C6). The cli-s-/cli-r- role prefix
+    // must survive the override or same-role skip (C13) breaks.
+    if let Ok(forced) = std::env::var("FILAMENT_UID") {
+        return format!("cli-{prefix}-{forced}");
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -252,7 +258,15 @@ impl Conn {
 
     async fn establish(&mut self, info: Value) -> Result<()> {
         if let Some(old) = self.link.take() {
-            old.peer.close().await;
+            // Fire-and-forget: pc.close() can block on network teardown
+            // against a frozen/unreachable peer, and this runs in the event
+            // loop — awaiting it inline deadlocks the whole process (found by
+            // gate 11). The atomic closed-flag silences the old peer's
+            // callbacks synchronously; the actual teardown can take its time
+            // off-loop.
+            let p = old.peer.clone();
+            p.mark_closed();
+            tokio::spawn(async move { p.close().await });
         }
         self.waiting_rejoin = None;
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();

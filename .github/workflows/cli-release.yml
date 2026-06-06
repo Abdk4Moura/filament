@@ -1,0 +1,47 @@
+# Build and attach filament CLI binaries to a GitHub release.
+# Trigger: push a tag like cli-v0.1.0.
+# Ledger C16: static linux binary (musl + vendored OpenSSL) and macOS arm64.
+# Windows is untested (ledger gap G-e) and intentionally not built yet.
+
+name: cli-release
+
+on:
+  push:
+    tags: ["cli-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - name: Build static binary
+        working-directory: cli
+        run: cargo build --release --target x86_64-unknown-linux-musl --features static
+      - name: Package
+        run: |
+          cp cli/target/x86_64-unknown-linux-musl/release/filament filament-linux-x86_64
+          file filament-linux-x86_64 | grep -q "statically linked" || { echo "not static!"; exit 1; }
+          tar czf filament-linux-x86_64.tar.gz filament-linux-x86_64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: filament-linux-x86_64.tar.gz
+
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        working-directory: cli
+        run: cargo build --release
+      - name: Package
+        run: |
+          cp cli/target/release/filament filament-macos-arm64
+          tar czf filament-macos-arm64.tar.gz filament-macos-arm64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: filament-macos-arm64.tar.gz
