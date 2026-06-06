@@ -60,12 +60,23 @@ SCTP's 65535-byte default max message size (webrtc-rs enforces it strictly).
 
 Protocol reference: `../CONTRACT.md` and `../docs/resilience.md`.
 
-## Known failure modes / current limits
+## Failure modes & tests
 
-Every known flaw is tracked with a status in
-[`../docs/cli-resilience.md`](../docs/cli-resilience.md) — the rule is that
-nothing gets fixed without flipping its entry there, and nothing ships while
-a suspected-breakage item is open. Headlines as of v1: browser→CLI direction
-untested and suspected broken on chunk size (C1); no watchdog/retry/credential
-refresh yet (C3–C5); resume trusts name+size (C7); throughput is modest until
-the QUIC transport lands (C8).
+Every known failure mode is tracked with a status in
+[`../docs/cli-resilience.md`](../docs/cli-resilience.md); the standing test
+suite is `tests/gates.sh` (13 checks: code pairing + burn, kill-mid-transfer
+resume chaos, corruption guard, both browser directions via Playwright,
+`--to` selection, consent, throughput floor, TURN relay via coturn).
+Resilience now matches the browser: establishment watchdog, disconnect grace +
+ICE restart, reconnect attempts with fresh TURN credentials, uid supersede, a
+120 s rejoin window with partials parked on disk, and content-hash-guarded
+resume (`head` of first 256 KiB in every offer).
+
+Remaining by design: persistent device identity (pairing layer), QUIC bulk
+transport, PAKE — roadmap items, tracked in the ledger.
+
+```
+cd tests && npm i playwright          # once; chromium fetched on first run
+./gates.sh                            # gates 0-9
+./gates.sh --with-relay               # + gate 10 (needs docker)
+```

@@ -92,6 +92,10 @@ def public_config() -> dict:
         "iceServers": _ice_servers(),
         "firebase": firebase if signaling == "firebase" else None,
         # Tuning knobs the transfer layer reads (kept server-side so they can be
-        # changed without a rebuild).
-        "chunkSize": int(os.environ.get("FIL_CHUNK_SIZE", 64 * 1024)),
+        # changed without a rebuild). 60 KiB, NOT 64: chunks carry a 4-byte
+        # stream-id header and SCTP's default max message size is 65535 —
+        # 64 KiB + 4 overflows it. Chrome tolerates the overage between
+        # browsers, but strict stacks (webrtc-rs, i.e. the CLI) reject it.
+        # See docs/cli-resilience.md C1.
+        "chunkSize": int(os.environ.get("FIL_CHUNK_SIZE", 60 * 1024)),
     }

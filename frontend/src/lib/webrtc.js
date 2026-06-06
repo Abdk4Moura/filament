@@ -21,6 +21,22 @@ const CTRL = {
 let _tid = 0
 const nextTransferId = () => `t${++_tid}_${Math.random().toString(36).slice(2, 7)}`
 
+// Content identity for resume (docs/cli-resilience.md C7): sha256 over the
+// first 256 KiB, carried in file-offer. Disk-based receivers (the CLI) use it
+// to reject a different file wearing the same name + size before offsetting
+// into it. Returns null where crypto.subtle is unavailable (insecure origins);
+// receivers then fall back to size-only matching.
+const HEAD_BYTES = 256 * 1024
+async function headHash(file) {
+  try {
+    const buf = await file.slice(0, Math.min(HEAD_BYTES, file.size)).arrayBuffer()
+    const digest = await crypto.subtle.digest('SHA-256', buf)
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
+}
+
 // Deterministic negotiation roles (#1, hardened in #8/#10): prefer the stable
 // per-tab uid — it survives reconnects, so both sides always compare the SAME
 // pair even when one of them holds a stale sid. Fall back to sids, then to
@@ -331,7 +347,11 @@ export class PeerLink {
       })
       t._sid = sid
       this.onTransfer(t)
-      this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type })
+      // The offer ships once the head hash resolves (C7); order across
+      // concurrent offers doesn't matter — ids are independent.
+      headHash(file).then((head) =>
+        this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}) })
+      )
       ids.push(id)
     }
     return ids
@@ -349,7 +369,9 @@ export class PeerLink {
     })
     t._sid = sid
     this.onTransfer(t)
-    this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true })
+    headHash(entry.file).then((head) =>
+      this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, ...(head ? { head } : {}) })
+    )
   }
 
   // Receiver accepts an offered incoming transfer (fresh, from byte 0).
@@ -394,6 +416,12 @@ export class PeerLink {
       this._update(t, { progress: Math.min(offset / file.size, 1) })
     }
     this._control({ type: CTRL.END, id, sid })
+    // Don't declare 'complete' while bytes still sit in the SCTP buffer: the
+    // user reads 'complete' as permission to close the tab, and closing then
+    // truncates the receiver's tail (caught by CLI gate 6 — ledger F5).
+    while (!this._closed && this.channel?.readyState === 'open' && this.channel.bufferedAmount > 0) {
+      await new Promise((res) => setTimeout(res, 50))
+    }
     this._outgoingFiles.delete(id)
     this.stores.outgoing.delete(id)
     this._update(t, { status: 'complete', progress: 1 })

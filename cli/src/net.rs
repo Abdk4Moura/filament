@@ -5,6 +5,11 @@
 // binary) is transport-agnostic. DataChannelTransport is implementation #1;
 // a QUIC transport for CLI<->CLI bulk speed slots in later without touching
 // the transfer logic.
+//
+// Resilience parity with the browser (docs/cli-resilience.md):
+//   C3 establishment watchdog  -> Peer::connect spawns a 15s timer -> Ev::Stuck
+//   C4 transient 'disconnected'-> surfaced as PcState; main loop graces + retries
+//   C8a backpressure           -> event-driven via on_buffered_amount_low
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -14,22 +19,28 @@ use rust_socketio::asynchronous::{Client, ClientBuilder};
 use rust_socketio::{Event as SioEvent, Payload};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::data_channel_state::RTCDataChannelState;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
+use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
 /// SCTP default max message size is 65535; keep payload + 4-byte header under it.
 pub const MAX_DC_PAYLOAD: usize = 60 * 1024;
 const HIGH_WATER: usize = 4 * 1024 * 1024;
+const LOW_WATER: usize = 1024 * 1024;
+pub const WATCHDOG_SECS: u64 = 15;
 
 // ------------------------------------------------------------------ events --
 
@@ -50,7 +61,15 @@ pub enum Ev {
     PcState(String),
     /// A local outgoing stream finished (sent by the streaming task so the
     /// main loop re-evaluates its all-done exit condition).
+    #[allow(dead_code)] // id kept for symmetry with TransferFailed
     TransferDone(String),
+    /// A local outgoing stream failed; the transfer stays pending so it can
+    /// be re-offered (resume) on the next channel (C10: no process::exit).
+    TransferFailed { id: String, err: String },
+    /// C3: the establishment watchdog fired for (peer sid, attempt generation).
+    Stuck(String, u32),
+    /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
+    GraceExpired(String, u32),
 }
 
 impl std::fmt::Debug for dyn Transport {
@@ -73,6 +92,7 @@ pub trait Transport: Send + Sync {
 
 pub struct DataChannelTransport {
     dc: Arc<RTCDataChannel>,
+    drained: Arc<Notify>,
 }
 
 #[async_trait]
@@ -86,15 +106,33 @@ impl Transport for DataChannelTransport {
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
         framed.extend_from_slice(payload);
-        while self.dc.buffered_amount().await > HIGH_WATER {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Event-driven backpressure (C8a): park on the buffered-amount-low
+        // notification instead of sleep-polling. Re-check after registering
+        // to close the notify race. on_close also notifies, so a sender
+        // parked on a dying channel wakes up and errors instead of leaking.
+        loop {
+            if self.dc.ready_state() != RTCDataChannelState::Open {
+                return Err(anyhow!("channel closed"));
+            }
+            if self.dc.buffered_amount().await <= HIGH_WATER {
+                break;
+            }
+            let notified = self.drained.notified();
+            if self.dc.buffered_amount().await <= HIGH_WATER {
+                break;
+            }
+            notified.await;
         }
         self.dc.send(&Bytes::from(framed)).await?;
         Ok(())
     }
 
     async fn flush(&self) -> Result<()> {
+        // Tail-drain only; polling is fine for the final few buffers.
         while self.dc.buffered_amount().await > 0 {
+            if self.dc.ready_state() != RTCDataChannelState::Open {
+                return Err(anyhow!("channel closed while flushing"));
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         Ok(())
@@ -107,11 +145,14 @@ impl Transport for DataChannelTransport {
 
 // ------------------------------------------------------------- HTTP config --
 
+#[derive(Clone)]
 pub struct ServerConfig {
     pub ice_servers: Vec<RTCIceServer>,
     pub chunk_size: usize,
 }
 
+/// C5: callers fetch this fresh before EVERY peer connection — TURN
+/// credentials are expiry-stamped HMACs and go stale in long-lived processes.
 pub async fn fetch_config(server: &str) -> Result<ServerConfig> {
     let body: Value = http_get_json(&format!("{server}/api/config")).await?;
     let mut ice_servers = Vec::new();
@@ -149,11 +190,23 @@ pub async fn fetch_auto_room(server: &str) -> Result<String> {
 
 async fn http_get_json(url: &str) -> Result<Value> {
     // rust_socketio already pulls in reqwest; reuse it instead of adding a dep.
-    let resp = reqwest::get(url).await.with_context(|| format!("GET {url}"))?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("GET {url} -> {}", resp.status()));
+    // 3 quick attempts: establish() refetches config per connection attempt
+    // (C5), and one blip of the API mustn't kill a transfer in progress.
+    let mut last = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        }
+        match reqwest::get(url).await {
+            Ok(resp) if resp.status().is_success() => match resp.json().await {
+                Ok(v) => return Ok(v),
+                Err(e) => last = Some(anyhow!(e)),
+            },
+            Ok(resp) => last = Some(anyhow!("GET {url} -> {}", resp.status())),
+            Err(e) => last = Some(anyhow!(e)),
+        }
     }
-    Ok(resp.json().await?)
+    Err(last.unwrap_or_else(|| anyhow!("GET {url} failed"))).with_context(|| format!("GET {url}"))
 }
 
 // ---------------------------------------------------------------- signaling --
@@ -204,9 +257,11 @@ pub fn polite_role(my_uid: &str, peer_uid: Option<&str>, my_id: &str, peer_id: &
 
 pub struct Peer {
     pub id: String,
+    pub polite: bool,
     pub pc: Arc<RTCPeerConnection>,
     state: Mutex<PeerSignalState>,
     sio: Client,
+    closed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct PeerSignalState {
@@ -217,12 +272,16 @@ struct PeerSignalState {
 impl Peer {
     /// Build the RTCPeerConnection, wire callbacks into `tx`, and (if impolite)
     /// create the data channel + offer — exactly the browser's PeerLink dance.
+    /// `generation` tags watchdog events so stale timers from torn-down attempts are
+    /// ignored by the main loop (C3).
     pub async fn connect(
         peer_id: String,
         polite: bool,
         ice_servers: Vec<RTCIceServer>,
+        relay_only: bool,
         sio: Client,
         tx: mpsc::UnboundedSender<Ev>,
+        generation: u32,
     ) -> Result<Arc<Peer>> {
         let mut m = MediaEngine::default();
         m.register_default_codecs()?;
@@ -235,10 +294,17 @@ impl Peer {
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
                 ice_servers,
+                ice_transport_policy: if relay_only {
+                    RTCIceTransportPolicy::Relay
+                } else {
+                    RTCIceTransportPolicy::All
+                },
                 ..Default::default()
             })
             .await?,
         );
+
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Trickle ICE -> relay each candidate.
         {
@@ -264,15 +330,18 @@ impl Peer {
 
         {
             let tx = tx.clone();
+            let closed = closed.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
-                let _ = tx.send(Ev::PcState(s.to_string()));
+                if !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(Ev::PcState(s.to_string()));
+                }
                 Box::pin(async {})
             }));
         }
 
         if !polite {
             let dc = pc.create_data_channel("filament", None).await?;
-            wire_channel(dc, tx.clone());
+            wire_channel(dc, tx.clone(), closed.clone()).await;
             let offer = pc.create_offer(None).await?;
             pc.set_local_description(offer).await?;
             let ld = pc
@@ -287,21 +356,76 @@ impl Peer {
             .ok();
         } else {
             let tx = tx.clone();
+            let closed = closed.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
-                wire_channel(dc, tx.clone());
-                Box::pin(async {})
+                let tx = tx.clone();
+                let closed = closed.clone();
+                Box::pin(async move {
+                    wire_channel(dc, tx, closed).await;
+                })
             }));
+        }
+
+        // C3: establishment watchdog. ICE only times out once descriptions are
+        // exchanged; a lost offer would otherwise mean 'connecting' forever.
+        {
+            let pc = pc.clone();
+            let tx = tx.clone();
+            let pid = peer_id.clone();
+            let closed = closed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_SECS)).await;
+                if !closed.load(std::sync::atomic::Ordering::Relaxed)
+                    && pc.connection_state() != RTCPeerConnectionState::Connected
+                {
+                    let _ = tx.send(Ev::Stuck(pid, generation));
+                }
+            });
         }
 
         Ok(Arc::new(Peer {
             id: peer_id,
+            polite,
             pc,
             state: Mutex::new(PeerSignalState {
                 pending_candidates: Vec::new(),
                 has_remote: false,
             }),
             sio,
+            closed,
         }))
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.pc.connection_state() == RTCPeerConnectionState::Connected
+    }
+
+    /// C4: nudge ICE recovery after a transient 'disconnected' (impolite side
+    /// only, mirroring the browser).
+    pub async fn restart_ice(&self) {
+        let _ = self.pc.restart_ice().await;
+        // restart_ice marks negotiation needed; drive the new offer ourselves
+        // (webrtc-rs has no negotiationneeded auto-loop in this setup).
+        if let Ok(offer) = self.pc.create_offer(None).await {
+            if self.pc.set_local_description(offer).await.is_ok() {
+                if let Some(ld) = self.pc.local_description().await {
+                    let _ = self
+                        .sio
+                        .emit(
+                            "signal",
+                            json!({ "to": self.id, "data": { "type": "description", "description": ld } }),
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Tear down quietly: silences callbacks first so a dying pc can't spam
+    /// the event loop (browser fix #3, the CLI flavor).
+    pub async fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.pc.close().await;
     }
 
     /// Apply one relayed signal (description or candidate), browser-equivalent
@@ -364,63 +488,104 @@ impl Peer {
         Ok(())
     }
 
-    /// Which physical path did ICE pick? Mirrors the browser's route badge.
+    /// Which physical path did ICE pick? Same taxonomy as the browser badge.
+    /// C2 fix: read the agent's actual selected pair, and classify
+    /// local-vs-direct by ADDRESS rather than candidate type — the answering
+    /// side often sees its peer as prflx even on the same LAN, and what the
+    /// badge promises is "bytes never leave your network", which is an
+    /// address property.
     pub async fn route(&self) -> Option<&'static str> {
-        let stats = self.pc.get_stats().await;
-        let mut local_type = None;
-        let mut remote_type = None;
-        for (_k, v) in stats.reports {
-            if let webrtc::stats::StatsReportType::CandidatePair(p) = v {
-                if p.state == webrtc::ice::candidate::CandidatePairState::Succeeded && p.nominated
-                {
-                    local_type = Some(p.local_candidate_id.clone());
-                    remote_type = Some(p.remote_candidate_id.clone());
-                }
-            }
+        let pair = self
+            .pc
+            .sctp()
+            .transport()
+            .ice_transport()
+            .get_selected_candidate_pair()
+            .await?;
+        if pair.local.typ == RTCIceCandidateType::Relay
+            || pair.remote.typ == RTCIceCandidateType::Relay
+        {
+            return Some("relayed");
         }
-        // Candidate ids encode nothing useful by themselves; do a second pass
-        // mapping ids -> candidate types.
-        if let (Some(lid), Some(rid)) = (local_type, remote_type) {
-            let stats = self.pc.get_stats().await;
-            let mut lt = String::new();
-            let mut rt = String::new();
-            for (k, v) in stats.reports {
-                match v {
-                    webrtc::stats::StatsReportType::LocalCandidate(c) if k == lid => {
-                        lt = c.candidate_type.to_string()
-                    }
-                    webrtc::stats::StatsReportType::RemoteCandidate(c) if k == rid => {
-                        rt = c.candidate_type.to_string()
-                    }
-                    _ => {}
-                }
-            }
-            let route = if lt == "relay" || rt == "relay" {
-                "relayed"
-            } else if lt == "host" && rt == "host" {
-                "local"
-            } else {
-                "direct"
-            };
-            return Some(route);
-        }
-        None
+        // Same address on both ends = same machine (loopback via any of its
+        // IPs, public included) — bytes never leave the host.
+        let same_host = pair.local.address == pair.remote.address;
+        let both_private = is_private_addr(&pair.local.address) && is_private_addr(&pair.remote.address);
+        Some(if same_host || both_private { "local" } else { "direct" })
     }
 }
 
-fn wire_channel(dc: Arc<RTCDataChannel>, tx: mpsc::UnboundedSender<Ev>) {
+/// RFC1918/4193 + loopback + link-local — "on your network" for the route badge.
+pub fn is_private_addr(addr: &str) -> bool {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                // 100.64/10 (RFC6598 shared/CGNAT): in practice these are
+                // overlay networks like Tailscale — bytes stay on your wire.
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            v6.is_loopback()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+        Err(_) => false,
+    }
+}
+
+async fn wire_channel(
+    dc: Arc<RTCDataChannel>,
+    tx: mpsc::UnboundedSender<Ev>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let drained = Arc::new(Notify::new());
+
+    // C8a: one persistent buffered-amount-low subscription wakes all parked
+    // senders (the browser's #4 fix, event-driven flavor).
+    dc.set_buffered_amount_low_threshold(LOW_WATER).await;
+    {
+        let drained = drained.clone();
+        dc.on_buffered_amount_low(Box::new(move || {
+            drained.notify_waiters();
+            Box::pin(async {})
+        }))
+        .await;
+    }
+
     {
         let tx = tx.clone();
         let dc2 = dc.clone();
+        let closed = closed.clone();
+        let drained = drained.clone();
         dc.on_open(Box::new(move || {
-            let transport: Arc<dyn Transport> = Arc::new(DataChannelTransport { dc: dc2.clone() });
-            let _ = tx.send(Ev::ChannelReady(transport));
+            if !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                let transport: Arc<dyn Transport> = Arc::new(DataChannelTransport {
+                    dc: dc2.clone(),
+                    drained: drained.clone(),
+                });
+                let _ = tx.send(Ev::ChannelReady(transport));
+            }
+            Box::pin(async {})
+        }));
+    }
+    {
+        // Wake any sender parked on backpressure when the channel dies, so it
+        // errors out (-> TransferFailed -> resume on reconnect) instead of
+        // parking forever.
+        let drained = drained.clone();
+        dc.on_close(Box::new(move || {
+            drained.notify_waiters();
             Box::pin(async {})
         }));
     }
     {
         let tx = tx.clone();
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
+            if closed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Box::pin(async {});
+            }
             if msg.is_string {
                 if let Ok(v) = serde_json::from_slice::<Value>(&msg.data) {
                     let _ = tx.send(Ev::Control(v));
