@@ -17,9 +17,10 @@ Statuses: **OPEN** (known, unfixed) · **FIXED** (code landed) ·
 
 The standing gates live in `cli/tests/gates.sh` (gates 0–10; browser gates via
 Playwright, relay gate via a local coturn container). Last full run:
-**14/14, 2026-06-06** (13/13 twice before gate 11 was added), plus
-live-production direct and forced-relay transfers through
-`api.filament.autumated.com`.
+**15/15, 2026-06-06**, plus live-production runs through
+`api.filament.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
+(`route: relayed` both ends), and the real `filament.autumated.com` site
+sending 64 KiB-framed files to `filament recv`.
 
 ---
 
@@ -41,23 +42,27 @@ live-production direct and forced-relay transfers through
 
 ## Part 2 — CLI failure modes (C-series)
 
-### C1. Browser → CLI chunk overflow — **VERIFIED**
-The browser framed 64 KiB + 4-byte header = 65,540 bytes; SCTP's default max
-message is 65,535. Chrome tolerates it between browsers; webrtc-rs doesn't.
-**Fix:** `/api/config` now serves `chunkSize: 61440` (the browser honors it at
-runtime, no rebuild needed) and the CLI clamps to 60 KiB on send.
-**Verified by:** gate 6 (browser → CLI, hash-compared).
-**Residual:** a browser tab holding a cached pre-deploy config can still frame
-64 KiB for up to ~10 minutes after the backend deploy (config refreshes every
-10 min and on every reconnect); a transfer attempted in that window against a
-CLI fails and succeeds on retry. Accepted as a transient deploy window.
-**Production rollout:** the frontend (head hash + F5 flush) auto-deployed via
-the Cloudflare build on push — verified live in the served bundle. The backend
-side is a one-line env change (`FIL_CHUNK_SIZE=61440` in
-`/opt/filament/deploy/.env` + `docker compose up -d --no-deps api`); applying
-it requires operator consent (production changes are permission-gated for the
-agent), so browser→CLI against production stays on 64 KiB frames until the
-operator runs it. CLI↔CLI and CLI→browser are unaffected.
+### C1. Browser → CLI chunk overflow — **VERIFIED IN PRODUCTION (no deploy needed)**
+The browser frames 64 KiB + 4-byte header = 65,540 bytes. TWO independent
+limits broke this against the CLI: (a) Chrome refuses to send messages larger
+than the peer's advertised `a=max-message-size`, and webrtc-rs never writes
+that attribute, so Chrome assumed the RFC 8841 default of 64 K — 4 bytes too
+small; (b) even when told to send, webrtc-rs's managed read loop has a
+HARDCODED 65,535-byte buffer (`DATA_CHANNEL_BUFFER_SIZE: u16::MAX`) and the
+oversized message kills the channel.
+**Fix, entirely client-side:** the CLI appends `a=max-message-size:262144` to
+the application m-section of every description it relays
+(`advertise_max_message_size`), and uses DETACHED data channels
+(`SettingEngine::detach_data_channels`) with its own 1 MiB read loop. The
+backend also now serves `chunkSize: 61440` by default (belt-and-suspenders;
+optional one-line env on the droplet — `FIL_CHUNK_SIZE=61440` — tightens prod
+the same way, but is no longer required for correctness).
+**Verified by:** gate 6 (61440 framing), gate 12 (a fixture backend serving
+chunkSize 65536 — the exact production config — browser sends two 65,540-byte-
+framed files, hashes match), and a LIVE run against the real production site:
+headless Chromium on `https://filament.autumated.com` sent 4 MB to
+`filament recv` through `api.filament.autumated.com`, hash identical,
+10.3 MB/s (2026-06-06). The failure mode no longer occurs in the live system.
 
 ### C2. Route label disagreement — **VERIFIED** (with documented residual)
 **Fix:** route now reads the agent's actual selected pair
@@ -260,6 +265,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 8 consent: no tty + no `-y` declines | C14 | green |
 | 9 throughput floor ≥8 MB/s | C8a regression | green |
 | 10 TURN relay via coturn container, `route: relayed` | C2, C17 | green (needs docker) |
+| 12 browser with PROD config (65536 framing) → CLI | C1 | green |
 | 11 frozen receiver superseded by same-uid replacement, resume | C6, F8 | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 

@@ -198,11 +198,42 @@ if [ $RC -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] && python3 -c "exit(
 else bad "throughput ($RATE MB/s)"; fi
 
 # --------------------------------------------------------------- gate 10 ----
-kill_8078() { # the gate-10 backend (werkzeug reloader forks; kill by port)
-  for pid in $(ss -tlnp 2>/dev/null | grep :8078 | grep -oP 'pid=\K[0-9]+' | sort -u); do
+kill_port() { # fixture backends (werkzeug reloader forks; kill by port)
+  for pid in $(ss -tlnp 2>/dev/null | grep ":$1 " | grep -oP 'pid=\K[0-9]+' | sort -u); do
     kill "$pid" 2>/dev/null
   done
 }
+kill_8078() { kill_port 8078; }
+VENV_PY="${FILAMENT_TEST_VENV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+
+# --------------------------------------------------------------- gate 12 ----
+# C1 against PRODUCTION's config: a backend serving chunkSize 65536 makes the
+# browser frame 64 KiB + 4 = 65540-byte messages. The CLI must advertise
+# a=max-message-size and read with a >64K buffer (detached channel) or the
+# first chunk kills the channel. This is the live-prod scenario, no deploy
+# of the backend required.
+say "12: browser with 64 KiB prod framing -> CLI (C1)"
+if [ -d "$HERE/node_modules/playwright" ] && [ -x "$VENV_PY" ]; then
+  kill_port 8079; sleep 1
+  ( cd "$CLI_DIR/../backend" && PORT=8079 FIL_CHUNK_SIZE=65536 "$VENV_PY" app.py >"$WORK/g12-backend.log" 2>&1 ) &
+  BK12=$!; pids+=($BK12); sleep 4
+  D="$WORK/g12"; mkdir -p "$D"
+  FA="$WORK/g12-a.bin"; FB="$WORK/g12-b.bin"
+  head -c $((4 * 1024 * 1024)) /dev/urandom > "$FA"; head -c $((1024 * 1024)) /dev/urandom > "$FB"
+  RM="g12room$$"
+  timeout 240 "$BIN" recv -y --dir "$D" --room "$RM" --server http://127.0.0.1:8079 >"$WORK/g12-recv.log" 2>&1 &
+  R=$!; pids+=($R); sleep 2
+  G12=0
+  ( cd "$HERE" && timeout 200 node browser-sender.js "http://127.0.0.1:8079/rooms/$RM" "$FA" "$FB" >"$WORK/g12-pw.log" 2>&1 ) || G12=1
+  wait $R || G12=1
+  kill $BK12 2>/dev/null; kill_port 8079
+  if [ $G12 -eq 0 ] && [ "$(hashof "$D/g12-a.bin")" = "$(hashof "$FA")" ] \
+     && [ "$(hashof "$D/g12-b.bin")" = "$(hashof "$FB")" ]; then
+    ok "CLI received 65540-byte browser frames (prod config, no backend deploy)"
+  else bad "prod-framing browser->CLI"; tail -n 3 "$WORK/g12-pw.log" "$WORK/g12-recv.log"; fi
+else
+  echo "SKIP (needs playwright + backend venv)"
+fi
 
 if [ $WITH_RELAY -eq 1 ]; then
   say "10: TURN relay path + route detection (C2/C17, docker coturn)"

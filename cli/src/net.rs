@@ -22,9 +22,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, Notify};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::data_channel_state::RTCDataChannelState;
+use webrtc::data::data_channel::DataChannel as RawDataChannel;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_candidate::{RTCIceCandidate, RTCIceCandidateInit};
 use webrtc::ice_transport::ice_candidate_type::RTCIceCandidateType;
@@ -90,15 +90,34 @@ pub trait Transport: Send + Sync {
     fn max_payload(&self) -> usize;
 }
 
+// The channel is DETACHED (SettingEngine::detach_data_channels): webrtc-rs's
+// managed read loop has a hardcoded 65535-byte buffer (DATA_CHANNEL_BUFFER_SIZE)
+// that an inbound browser frame of 64 KiB + 4 overflows, killing the channel
+// (ledger C1). Detaching lets us read with our own 1 MiB buffer, matching the
+// `a=max-message-size` we advertise.
+const READ_BUF: usize = 1 << 20;
+
 pub struct DataChannelTransport {
-    dc: Arc<RTCDataChannel>,
+    raw: Arc<RawDataChannel>,
     drained: Arc<Notify>,
+    dead: Arc<std::sync::atomic::AtomicBool>, // set by the read loop on EOF/error
+}
+
+impl DataChannelTransport {
+    fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[async_trait]
 impl Transport for DataChannelTransport {
     async fn send_control(&self, msg: &Value) -> Result<()> {
-        self.dc.send_text(msg.to_string()).await?;
+        if self.is_dead() {
+            return Err(anyhow!("channel closed"));
+        }
+        self.raw
+            .write_data_channel(&Bytes::from(msg.to_string()), true)
+            .await?;
         Ok(())
     }
 
@@ -108,29 +127,31 @@ impl Transport for DataChannelTransport {
         framed.extend_from_slice(payload);
         // Event-driven backpressure (C8a): park on the buffered-amount-low
         // notification instead of sleep-polling. Re-check after registering
-        // to close the notify race. on_close also notifies, so a sender
-        // parked on a dying channel wakes up and errors instead of leaking.
+        // to close the notify race. The read loop notifies on death, so a
+        // sender parked on a dying channel wakes up and errors out.
         loop {
-            if self.dc.ready_state() != RTCDataChannelState::Open {
+            if self.is_dead() {
                 return Err(anyhow!("channel closed"));
             }
-            if self.dc.buffered_amount().await <= HIGH_WATER {
+            if self.raw.buffered_amount() <= HIGH_WATER {
                 break;
             }
             let notified = self.drained.notified();
-            if self.dc.buffered_amount().await <= HIGH_WATER {
+            if self.raw.buffered_amount() <= HIGH_WATER {
                 break;
             }
             notified.await;
         }
-        self.dc.send(&Bytes::from(framed)).await?;
+        self.raw
+            .write_data_channel(&Bytes::from(framed), false)
+            .await?;
         Ok(())
     }
 
     async fn flush(&self) -> Result<()> {
         // Tail-drain only; polling is fine for the final few buffers.
-        while self.dc.buffered_amount().await > 0 {
-            if self.dc.ready_state() != RTCDataChannelState::Open {
+        while self.raw.buffered_amount() > 0 {
+            if self.is_dead() {
                 return Err(anyhow!("channel closed while flushing"));
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -293,9 +314,12 @@ impl Peer {
         m.register_default_codecs()?;
         let mut registry = Registry::new();
         registry = register_default_interceptors(registry, &mut m)?;
+        let mut se = SettingEngine::default();
+        se.detach_data_channels(); // C1: we run our own read loop (see READ_BUF)
         let api = APIBuilder::new()
             .with_media_engine(m)
             .with_interceptor_registry(registry)
+            .with_setting_engine(se)
             .build();
         let pc = Arc::new(
             api.new_peer_connection(RTCConfiguration {
@@ -356,7 +380,7 @@ impl Peer {
                 .ok_or_else(|| anyhow!("no local description"))?;
             sio.emit(
                 "signal",
-                json!({ "to": peer_id, "data": { "type": "description", "description": ld } }),
+                json!({ "to": peer_id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
             )
             .await
             .ok();
@@ -419,7 +443,7 @@ impl Peer {
                         .sio
                         .emit(
                             "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "description": ld } }),
+                            json!({ "to": self.id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
                         )
                         .await;
                 }
@@ -472,7 +496,7 @@ impl Peer {
                     self.sio
                         .emit(
                             "signal",
-                            json!({ "to": self.id, "data": { "type": "description", "description": ld } }),
+                            json!({ "to": self.id, "data": { "type": "description", "description": advertise_max_message_size(&ld) } }),
                         )
                         .await
                         .ok();
@@ -528,6 +552,26 @@ impl Peer {
     }
 }
 
+/// C1: webrtc-rs never writes `a=max-message-size` into its SDP, so browsers
+/// assume the RFC 8841 default of 64K (65536) — and the browser's frame is
+/// 64 KiB payload + 4-byte header = 65540, four bytes over, making Chrome's
+/// send() throw against a CLI peer. Advertise a roomy limit in the
+/// application m-section of every description we relay; datachannel-only SDP
+/// has exactly one m-section, so appending is safe. Our own sends stay at
+/// 60 KiB regardless.
+pub const ADVERTISED_MAX_MESSAGE: u32 = 262144;
+
+fn advertise_max_message_size(desc: &RTCSessionDescription) -> Value {
+    let mut sdp = desc.sdp.clone();
+    if !sdp.contains("max-message-size") && sdp.contains("m=application") {
+        if !sdp.ends_with('\n') {
+            sdp.push_str("\r\n");
+        }
+        sdp.push_str(&format!("a=max-message-size:{ADVERTISED_MAX_MESSAGE}\r\n"));
+    }
+    json!({ "type": desc.sdp_type.to_string(), "sdp": sdp })
+}
+
 /// RFC1918/4193 + loopback + link-local — "on your network" for the route badge.
 pub fn is_private_addr(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
@@ -553,61 +597,80 @@ async fn wire_channel(
     tx: mpsc::UnboundedSender<Ev>,
     closed: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let drained = Arc::new(Notify::new());
-
-    // C8a: one persistent buffered-amount-low subscription wakes all parked
-    // senders (the browser's #4 fix, event-driven flavor).
-    dc.set_buffered_amount_low_threshold(LOW_WATER).await;
-    {
-        let drained = drained.clone();
-        dc.on_buffered_amount_low(Box::new(move || {
-            drained.notify_waiters();
-            Box::pin(async {})
-        }))
-        .await;
-    }
-
-    {
+    // With detach_data_channels(), on_open still fires but webrtc-rs's
+    // managed (65535-byte-buffer) read loop never starts — we detach and run
+    // our own with a buffer matching the max-message-size we advertise (C1).
+    let dc2 = dc.clone();
+    dc.on_open(Box::new(move || {
+        let dc2 = dc2.clone();
         let tx = tx.clone();
-        let dc2 = dc.clone();
         let closed = closed.clone();
-        let drained = drained.clone();
-        dc.on_open(Box::new(move || {
-            if !closed.load(std::sync::atomic::Ordering::Relaxed) {
-                let transport: Arc<dyn Transport> = Arc::new(DataChannelTransport {
-                    dc: dc2.clone(),
-                    drained: drained.clone(),
+        Box::pin(async move {
+            let raw = match dc2.detach().await {
+                Ok(raw) => raw,
+                Err(e) => {
+                    eprintln!("filament: data channel detach failed: {e}");
+                    return;
+                }
+            };
+            let drained = Arc::new(Notify::new());
+            let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            // C8a: one persistent buffered-amount-low subscription wakes all
+            // parked senders.
+            raw.set_buffered_amount_low_threshold(LOW_WATER);
+            {
+                let drained = drained.clone();
+                raw.on_buffered_amount_low(Box::new(move || {
+                    let drained = drained.clone();
+                    Box::pin(async move {
+                        drained.notify_waiters();
+                    })
+                }));
+            }
+
+            // Our read loop: text -> Control, binary -> [u32 sid][payload].
+            {
+                let raw = raw.clone();
+                let tx = tx.clone();
+                let closed = closed.clone();
+                let dead = dead.clone();
+                let drained = drained.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; READ_BUF];
+                    loop {
+                        match raw.read_data_channel(&mut buf).await {
+                            Ok((0, _)) | Err(_) => {
+                                dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                                drained.notify_waiters(); // wake parked senders
+                                break;
+                            }
+                            Ok((n, true)) => {
+                                if !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                                    if let Ok(v) = serde_json::from_slice::<Value>(&buf[..n]) {
+                                        let _ = tx.send(Ev::Control(v));
+                                    }
+                                }
+                            }
+                            Ok((n, false)) => {
+                                if n >= 4 && !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                                    let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                                    let _ = tx.send(Ev::Chunk(
+                                        sid,
+                                        Bytes::copy_from_slice(&buf[4..n]),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 });
+            }
+
+            if !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                let transport: Arc<dyn Transport> =
+                    Arc::new(DataChannelTransport { raw, drained, dead });
                 let _ = tx.send(Ev::ChannelReady(transport));
             }
-            Box::pin(async {})
-        }));
-    }
-    {
-        // Wake any sender parked on backpressure when the channel dies, so it
-        // errors out (-> TransferFailed -> resume on reconnect) instead of
-        // parking forever.
-        let drained = drained.clone();
-        dc.on_close(Box::new(move || {
-            drained.notify_waiters();
-            Box::pin(async {})
-        }));
-    }
-    {
-        let tx = tx.clone();
-        dc.on_message(Box::new(move |msg: DataChannelMessage| {
-            if closed.load(std::sync::atomic::Ordering::Relaxed) {
-                return Box::pin(async {});
-            }
-            if msg.is_string {
-                if let Ok(v) = serde_json::from_slice::<Value>(&msg.data) {
-                    let _ = tx.send(Ev::Control(v));
-                }
-            } else if msg.data.len() >= 4 {
-                let sid = u32::from_be_bytes([msg.data[0], msg.data[1], msg.data[2], msg.data[3]]);
-                let _ = tx.send(Ev::Chunk(sid, msg.data.slice(4..)));
-            }
-            Box::pin(async {})
-        }));
-    }
+        })
+    }));
 }
