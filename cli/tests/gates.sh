@@ -370,24 +370,35 @@ if [ $RC -ne 0 ] && grep -q "holding the line" "$WORK/g15-recv.log" \
   ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"
 else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
 
-say "16: known-device rendezvous — browser remembers, CLI --to finds it (C12/C20 web)"
+say "16: known-device rendezvous + remember consent (C12/C20/C27 web)"
 if [ -d "$HERE/node_modules/playwright" ]; then
   G16=0
   W16="g16-$$-$RANDOM"
+  W16B="g16b-$$-$RANDOM"
   C16="$WORK/g16cfg"; mkdir -p "$C16"
-  # phase 1 sender: mints the word code, hands over a pair-keep secret
+  # phase 1 sender: mints the word code, offers a pair-keep secret (the
+  # browser must NOT store it until the human clicks 'remember' — C27)
   FILAMENT_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$W16" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
   S16=$!; pids+=($S16); sleep 3
-  ( cd "$HERE" && node known-device.js "$SERVER" "$W16" >"$WORK/g16-pw.log" 2>&1 ) &
+  ( cd "$HERE" && node known-device.js "$SERVER" "$W16" "$W16B" >"$WORK/g16-pw.log" 2>&1 ) &
   PW16=$!; pids+=($PW16)
   wait $S16 || G16=1   # phase 1 transfer done; browser must now hold the secret
   # phase 2: fresh session, ISOLATED room, no code — only the secret-derived
   # channel can find the browser. The same config dir holds 'pwdev'.
   FILAMENT_CONFIG_DIR="$C16" timeout 120 "$BIN" send "$SMALL" --to pwdev --room "g16iso$$" --server "$SERVER" >"$WORK/g16-s2.log" 2>&1 || G16=1
+  # phase 3 (C27 decline): a new sender offers; the browser clicks 'not now';
+  # the ack must make this sender DISCARD its stored half.
+  FILAMENT_CONFIG_DIR="$C16" timeout 60 "$BIN" send "$SMALL" --word "$W16B" --remember declinedev --server "$SERVER" >"$WORK/g16-s3.log" 2>&1 &
+  S16B=$!; pids+=($S16B)
   wait $PW16 || G16=1
-  if [ $G16 -eq 0 ] && grep -q "SECRET STORED" "$WORK/g16-pw.log" && grep -q "PHASE2 COMPLETE" "$WORK/g16-pw.log"; then
-    ok "browser stored the pair secret; --to found it cross-room via channel, no code"
-  else bad "known-device"; tail -n 4 "$WORK/g16-pw.log" "$WORK/g16-s1.log" "$WORK/g16-s2.log"; fi
+  kill $S16B 2>/dev/null; wait $S16B 2>/dev/null
+  if [ $G16 -eq 0 ] && grep -q "SECRET STORED" "$WORK/g16-pw.log" \
+     && grep -q "PHASE2 COMPLETE" "$WORK/g16-pw.log" \
+     && grep -q "PHASE3 DECLINED" "$WORK/g16-pw.log" \
+     && grep -q "declined to be remembered" "$WORK/g16-s3.log" \
+     && ! grep -rq "declinedev" "$C16"; then
+    ok "consent-gated store; --to found it cross-room; decline purged the sender's half"
+  else bad "known-device"; tail -n 4 "$WORK/g16-pw.log" "$WORK/g16-s1.log" "$WORK/g16-s2.log" "$WORK/g16-s3.log"; fi
 else
   echo "SKIP (run: cd $HERE && npm i playwright && npx playwright install chromium)"
 fi

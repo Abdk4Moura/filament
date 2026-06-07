@@ -162,6 +162,16 @@ Control messages over the DataChannel; the browser implements both sides
   MITM'd by anyone — including the signaling server — fails verification.
   Both sides prove; each verifies against every stored secret. Cross-impl
   parity is pinned by test vectors (cli `proof_matches_browser`, gate 16).
+- `{ type: "pair-keep-ack", ok }` — C27: the HUMAN's answer to pair-keep.
+  Remembering is a trust grant, so the browser asks (consent banner) instead
+  of auto-storing; the CLI answers from its `--remember` flag. On `ok:false`
+  the offering sender DISCARDS its stored half ("declined to be remembered")
+  — a kept-but-unreciprocated secret is exactly the one-sided dead weight
+  C12 cured. Silence (old clients) keeps legacy sender-stores behavior.
+- `{ type: "pair-proof-ack", ok }` — C27: the verifier's verdict on a proof.
+  `ok:false` means "never met you" — the prover drops its expectation for
+  that link and tells the user to re-pair, instead of forever claiming an
+  acquaintance the other side has no memory of.
 
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or

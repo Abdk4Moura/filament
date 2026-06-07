@@ -384,6 +384,19 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
     Ok(())
 }
 
+/// C27: a declined remember offer must not leave one-sided dead weight.
+fn devices_remove(name: &str) -> Result<()> {
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut all = devices_load();
+    all.retain(|(n, _)| n != name);
+    let arr: Vec<Value> = all.iter().map(|(n, s)| json!({"name": n, "secret": s})).collect();
+    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    Ok(())
+}
+
 fn channel_of(secret: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"filament-pair:");
@@ -1584,6 +1597,29 @@ async fn send_cmd(
                         ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
                     }
                 }
+                // C27: the human on the other side answered our remember offer.
+                Some("pair-keep-ack") => {
+                    if let Some(name) = &remember {
+                        let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        if v["ok"].as_bool() == Some(false) {
+                            devices_remove(name)?;
+                            ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "declined to be remembered — nothing stored", &n));
+                        } else {
+                            ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "mutually remembered — you'll reconnect automatically", &n));
+                        }
+                    }
+                }
+                // C27: their verdict on our identity proof. false = they have
+                // no memory of us — stop acting like a known device.
+                Some("pair-proof-ack") => {
+                    if v["ok"].as_bool() == Some(false) {
+                        let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        if let Some(l) = conn.link_mut(&pid) {
+                            l.expected_secret = None;
+                        }
+                        ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "doesn't recognize this device — re-pair with --remember", &n));
+                    }
+                }
                 Some("file-accept") => {
                     let Some(t) = conn.transport() else { continue };
                     let offset = v["offset"].as_u64().unwrap_or(0);
@@ -2027,11 +2063,18 @@ async fn recv_cmd(
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
-                        if let Some(name) = &remember {
+                        let kept = if let Some(name) = &remember {
                             devices_store(name, &sec)?;
                             eprintln!("remembered this device as '{name}' — future sends auto-accept after proof");
+                            true
                         } else {
                             eprintln!("(sender offered to be remembered; re-run with --remember <name> to keep it)");
+                            false
+                        };
+                        // C27: answer either way — a declined sender discards
+                        // its half instead of waving at a dead meeting point.
+                        if let Some(t) = conn.transport_of(&pid) {
+                            t.send_control(&json!({ "type": "pair-keep-ack", "ok": kept })).await.ok();
                         }
                     }
                 }
@@ -2049,13 +2092,20 @@ async fn recv_cmd(
                     let hit = devices
                         .iter()
                         .find(|(_, s)| proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp) == mac);
-                    if let Some((n, _)) = hit {
+                    let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
                         }
                         eprintln!("identity verified: '{n}' (auto-accepting)");
+                        true
                     } else {
                         eprintln!("pair-proof FAILED verification — treating peer as untrusted");
+                        false
+                    };
+                    // C27: tell the prover the verdict — a rejected prover
+                    // learns we never met and stops claiming acquaintance.
+                    if let Some(t) = conn.transport_of(&pid) {
+                        t.send_control(&json!({ "type": "pair-proof-ack", "ok": ok })).await.ok();
                     }
                 }
                 Some("pair-intro") => {

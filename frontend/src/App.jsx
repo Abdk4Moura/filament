@@ -49,6 +49,8 @@ export default function App() {
       onPairWithCode={qs.pairWithCode}
       onGenerateCode={qs.generateCode}
       onUseAutoRoom={qs.useAutoRoom}
+      onAcceptKeep={qs.acceptKeep}
+      onDeclineKeep={qs.declineKeep}
     />
   )
 }

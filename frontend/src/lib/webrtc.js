@@ -19,7 +19,9 @@ const CTRL = {
   BRB: 'brb', // C21: "I'm stepping away (file picker / tab hidden), hold the line"
   BACK: 'back',
   PAIR_KEEP: 'pair-keep', // C12: here's a secret — remember me as a known device
+  PAIR_KEEP_ACK: 'pair-keep-ack', // C27: the human's answer — sender keeps only confirmed secrets
   PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
+  PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict — a rejected prover stops claiming acquaintance
 }
 
 let _tid = 0
@@ -63,7 +65,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairProof }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -73,7 +75,9 @@ export class PeerLink {
     this.onRoute = onRoute || (() => {})
     this.onChannelOpen = onChannelOpen || (() => {})
     this.onPairKeep = onPairKeep || (() => {}) // C12: peer handed us a pair secret
+    this.onPairKeepAck = onPairKeepAck || (() => {}) // C27: peer answered our remember offer
     this.onPairProof = onPairProof || (() => {}) // C20: peer claims to be a known device
+    this.onPairProofAck = onPairProofAck || (() => {}) // C27: peer judged our proof
     this.route = null // 'local' | 'direct' | 'relayed'
 
     // Resume support: a stable per-tab identity for the remote peer, plus
@@ -310,6 +314,16 @@ export class PeerLink {
     this._control({ type: CTRL.PAIR_PROOF, mac })
   }
 
+  // C27: answer a remember offer — the sender discards its half on false.
+  sendPairKeepAck(ok) {
+    this._control({ type: CTRL.PAIR_KEEP_ACK, ok: !!ok })
+  }
+
+  // C27: judge a received proof — false tells a stale prover we never met.
+  sendPairProofAck(ok) {
+    this._control({ type: CTRL.PAIR_PROOF_ACK, ok: !!ok })
+  }
+
   /// Both DTLS fingerprints of THIS link, parsed like the CLI does
   /// (a=fingerprint: value, trimmed, uppercased) — the proof binds to them.
   fingerprints() {
@@ -382,10 +396,17 @@ export class PeerLink {
       }
       case CTRL.PAIR_KEEP:
         // C12: the peer minted a pair secret and asked us to remember them.
+        // C27: the hook asks the HUMAN before storing — never automatic.
         if (typeof msg.secret === 'string' && /^[0-9a-f]{64}$/.test(msg.secret)) this.onPairKeep(msg.secret)
+        break
+      case CTRL.PAIR_KEEP_ACK:
+        this.onPairKeepAck(!!msg.ok)
         break
       case CTRL.PAIR_PROOF:
         if (typeof msg.mac === 'string') this.onPairProof(msg.mac)
+        break
+      case CTRL.PAIR_PROOF_ACK:
+        this.onPairProofAck(!!msg.ok)
         break
     }
   }

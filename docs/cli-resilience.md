@@ -321,6 +321,24 @@ all peers side by side, the changed one carrying the note:
 history, no repaint tricks; "recovered" only fires on a link that was
 previously up (presence-gated, not attempt-gated).
 
+### C27. Trust handshakes were one-way streets — **FIXED (gate 16)**
+Two maintainer-diagnosed asymmetries, same disease as C12's:
+(1) the browser auto-stored any pair-keep secret — a silent trust grant the
+receiving human never approved. Now a consent banner asks ("remember /
+not now") and the answer flows back as `pair-keep-ack`; a declined sender
+REMOVES its stored half instead of waving at a dead meeting point forever.
+(2) a prover whose proof failed never learned it — it kept saying "oh, I
+know you" to a peer that never met it (cleared store, re-paired browser).
+`pair-proof-ack {ok:false}` tells it; the CLI drops the link's expectation
+and says "doesn't recognize this device — re-pair with --remember".
+Bonus fix found live mid-build ("connecting and then gotcha… it
+disappears"): every `welcome` wiped ALL links and rebuilt from the ROOM
+roster — channel-introduced known devices are in no room roster, so the
+rejoin belt's second welcome erased them moments after `known-peer` created
+them. Welcome now preserves channel peers and re-raises subscriptions.
+Gate 16 covers all three: consent-gated store, channel rendezvous, decline
+purge.
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**
@@ -391,7 +409,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 13 multi-link: CLI + two browsers, transfer with bystander, nobody wedges | C18 | green |
 | 14 daemon: pair `--remember`, verified identity, room-less `up` receive | C19, C20, C12 | green |
 | 15 paired recv holds the line on sender vanish, fails honestly after window | C21 | green |
-| 16 known-device rendezvous: browser stores pair-keep secret, `--to` finds it cross-room via channel (no code) | C12, C20 web half | green |
+| 16 known-device rendezvous: consent-gated pair-keep store, `--to` finds the browser cross-room via channel (no code), decline purges the sender's half | C12, C20 web half, C27 | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 
 **Known coverage gaps (tracked, not hidden):**

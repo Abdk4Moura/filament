@@ -186,6 +186,36 @@ export function useFilament() {
     setKnownDevices(devicesForget(name))
   }, [])
 
+  // C27: remembering is a TRUST GRANT (the holder can find and auto-connect
+  // to this browser forever) — so the human decides, never the protocol.
+  // pair-keep offers queue here until answered; the answer goes back as
+  // pair-keep-ack so a declined sender discards its half too (a kept-but-
+  // unreciprocated secret is exactly the one-sided dead weight C12 cured).
+  const [pendingKeeps, setPendingKeeps] = useState([]) // [{peerId, name, secret}]
+
+  const acceptKeep = useCallback((peerId) => {
+    setPendingKeeps((prev) => {
+      const k = prev.find((x) => x.peerId === peerId)
+      if (k) {
+        setKnownDevices(devicesStore(k.name, k.secret))
+        tel('pair-keep-stored', { peer: peerId.slice(-6) })
+        subscribeKnown()
+        linksRef.current.get(peerId)?.sendPairKeepAck(true)
+      }
+      return prev.filter((x) => x.peerId !== peerId)
+    })
+  }, [subscribeKnown])
+
+  const declineKeep = useCallback((peerId) => {
+    setPendingKeeps((prev) => {
+      if (prev.some((x) => x.peerId === peerId)) {
+        tel('pair-keep-declined', { peer: peerId.slice(-6) })
+        linksRef.current.get(peerId)?.sendPairKeepAck(false)
+      }
+      return prev.filter((x) => x.peerId !== peerId)
+    })
+  }, [])
+
   // ---- create a PeerLink for one remote peer -------------------------------
   const makeLink = useCallback(
     ({ id, name, uid }) => {
@@ -251,16 +281,20 @@ export function useFilament() {
             }
           }
         },
-        // C12: the peer handed us a pair secret ("remember me"). Store it
-        // under their display name and raise the channel immediately — from
-        // now on either side coming online finds the other, no codes.
+        // C12/C27: the peer asked to be remembered. That's a trust grant —
+        // queue it for the HUMAN; the banner answers with pair-keep-ack.
         onPairKeep: (secret) => {
-          devicesStore(name, secret)
-          tel('pair-keep-stored', { peer: id.slice(-6) })
-          subscribeKnown()
+          tel('pair-keep-offered', { peer: id.slice(-6) })
+          setPendingKeeps((prev) => (prev.some((k) => k.peerId === id) ? prev : [...prev, { peerId: id, name, secret }]))
+        },
+        // C27: our own remember offer was answered (browser-initiated
+        // remembering is Phase B — handled for protocol completeness).
+        onPairKeepAck: (ok) => {
+          tel(ok ? 'keep-ack-ok' : 'keep-ack-declined', { peer: id.slice(-6) })
         },
         // C20: the peer claims to be a known device — verify against every
-        // stored secret, bound to this link's fingerprints.
+        // stored secret, bound to this link's fingerprints. C27: ANSWER
+        // either way, so a stale prover learns we never met and stops trying.
         onPairProof: async (mac) => {
           const fps = link.fingerprints()
           const theirUid = link.peerUid
@@ -270,11 +304,22 @@ export function useFilament() {
               if ((await proofFor(d.secret, theirUid, theirUid, uidRef.current, fps.mine, fps.theirs)) === mac) {
                 updatePeer(id, { verified: d.name })
                 tel('proof-ok', { peer: id.slice(-6) })
+                link.sendPairProofAck(true)
                 return
               }
             } catch {}
           }
           tel('proof-fail', { peer: id.slice(-6) })
+          link.sendPairProofAck(false)
+        },
+        // C27: they answered OUR proof. false = "never met a fella like you"
+        // — drop the expectation so we stop claiming acquaintance.
+        onPairProofAck: (ok) => {
+          if (!ok) {
+            expectedSecretRef.current.delete(id)
+            updatePeer(id, { verified: null })
+            tel('proof-rejected', { peer: id.slice(-6) })
+          }
         },
         // Watchdog (#8): nothing connected within 15s ⇒ a signaling message was
         // lost (dead-sid relay, suspended peer, swallowed SDP error). Tear down
@@ -348,17 +393,24 @@ export function useFilament() {
       myNameRef.current = myName
 
       sig.on('welcome', ({ id, peers: existing }) => {
-        // Idempotent — also fires on every reconnect (a reconnect gives us a
-        // fresh sid). Tear down stale peer links from the previous session,
-        // then rebuild from the fresh roster.
+        // Idempotent — also fires on every reconnect AND every room switch
+        // (and the rejoin belt adds a second one). Tear down stale ROOM links
+        // and rebuild from the fresh roster — but keep channel-introduced
+        // known devices: they're in no room roster, so wiping them here made
+        // the tile flash in (subscribe → known-peer) and out (next welcome),
+        // observed live ("connecting and then gotcha… it disappears").
         myIdRef.current = id // set before makeLink so politeness can be computed (#1)
-        linksRef.current.forEach((l) => l.close())
-        linksRef.current.clear()
-        setPeers([])
+        for (const [pid, l] of [...linksRef.current]) {
+          if (expectedSecretRef.current.has(pid)) continue // known device — room-independent
+          l.close()
+          linksRef.current.delete(pid)
+          removePeer(pid)
+        }
         setMe({ id, name: myName, color: colorFor(id) })
         setConnected(true)
         connectedRef.current = true
         existing.forEach((p) => makeLink({ id: p.id, name: p.name, uid: p.uid }))
+        subscribeKnown() // re-introduce any known device the wipe-era logic lost
       })
       sig.on('peer-joined', ({ id, name, uid }) => {
         makeLink({ id, name, uid })
@@ -367,6 +419,7 @@ export function useFilament() {
         linksRef.current.get(id)?.close()
         linksRef.current.delete(id)
         removePeer(id)
+        setPendingKeeps((prev) => prev.filter((k) => k.peerId !== id)) // moot now (C27)
       })
       // C12: a known device came online (matched one of our secret-derived
       // channels) — link to it regardless of rooms. Both sides receive this;
@@ -691,5 +744,8 @@ export function useFilament() {
     useAutoRoom, // go back to the 'people near you' auto room
     knownDevices, // C12: [{name, secret, addedAt}] — remembered devices
     forgetDevice, // C12: drop a remembered device by name
+    pendingKeeps, // C27: [{peerId, name}] — peers asking to be remembered
+    acceptKeep, // C27: store the secret + ack; auto-connect from now on
+    declineKeep, // C27: refuse; the sender discards its half too
   }
 }

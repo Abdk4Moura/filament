@@ -332,7 +332,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
 
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
-    onPairWithCode, onGenerateCode, onUseAutoRoom, ui = {} } = props
+    onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep, ui = {} } = props
   const mode = ui.theme === 'light' ? 'light' : 'dark'
   const accentSet = ACCENTS[ui.accent] || ACCENTS.green
   const accent = accentSet[mode === 'light' ? 'l' : 'd']
@@ -406,9 +406,29 @@ export default function Filament(props) {
       state.transfers.map((t) => <TransferRow key={t.id} t={t} onAccept={onAccept} onDecline={onDecline} onSave={onSave} onClear={onClear} T={T} D={D} accent={accent} />)
     )
 
+  // C27: remembering is a trust grant — surface each pair-keep offer as an
+  // explicit question; the answer flows back so a declined sender forgets too.
+  const keepBanners = (state.pendingKeeps || []).map((k) => (
+    <div key={k.peerId} style={{
+      border: '1px solid ' + accent, background: T.panel, padding: '10px ' + D.tilePad + 'px',
+      marginBottom: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: 12, color: T.text }}>
+        <b>{k.name}</b> asks to be remembered on this device — you'd reconnect automatically, no codes
+      </span>
+      <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+        <button onClick={() => onAcceptKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: accent, color: T.onAccent, border: '1px solid ' + accent }}>remember</button>
+        <button onClick={() => onDeclineKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>not now</button>
+      </span>
+    </div>
+  ))
+
   const discovery = (
-    <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
-      onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
+    <>
+      {keepBanners}
+      <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
+        onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
+    </>
   )
 
   const rootStyle = {
