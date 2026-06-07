@@ -188,7 +188,11 @@ export function useFilament() {
           attemptsRef.current.delete(id) // established — reset watchdog retries
           if (!uid) return
           for (const [tid, entry] of outgoingRef.current) {
-            if (entry.peerUid === uid && transferStatusRef.current.get(tid) === 'paused') {
+            // 'paused' = dropped mid-transfer; 'offered' = the offer fired
+            // into a dead link (#12: file picked while the tab was suspended)
+            // — both must re-offer on the fresh channel.
+            const st = transferStatusRef.current.get(tid)
+            if (entry.peerUid === uid && (st === 'paused' || st === 'offered')) {
               link.resumeSend(tid)
             }
           }

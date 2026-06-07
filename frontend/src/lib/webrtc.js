@@ -129,12 +129,16 @@ export class PeerLink {
           } catch {}
         }
         clearTimeout(this._dcTimer)
+        // Dynamic grace (#12): 6s mid-transfer (fail fast, resume covers it),
+        // 45s idle — long enough to survive a mobile file-picker backgrounding
+        // the tab (Android suspends the page while the picker is up).
+        const midTransfer = [...this.transfers.values()].some((t) => t.status === 'transferring')
         this._dcTimer = setTimeout(() => {
           if (this.pc.connectionState !== 'connected') {
             this.onStatus('failed')
             this._failActive()
           }
-        }, 6000)
+        }, midTransfer ? 6000 : 45000)
       } else if (s === 'failed') {
         clearTimeout(this._dcTimer)
         this.onStatus('failed')
