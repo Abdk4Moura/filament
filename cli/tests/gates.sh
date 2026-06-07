@@ -403,6 +403,20 @@ else
   echo "SKIP (run: cd $HERE && npm i playwright && npx playwright install chromium)"
 fi
 
+say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
+DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
+FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
+P17=$!; pids+=($P17); sleep 4
+C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
+G17=0
+FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" pair "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
+wait $P17 || G17=1
+CHA=$(FILAMENT_CONFIG_DIR="$DA17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
+CHB=$(FILAMENT_CONFIG_DIR="$DB17" "$BIN" devices | grep -oE 'channel [0-9a-f]+' | head -1)
+if [ $G17 -eq 0 ] && [ -n "$CHA" ] && [ "$CHA" = "$CHB" ]; then
+  ok "pair ceremony: both exited clean; channel ids match (one mutual secret)"
+else bad "pair-ceremony"; tail -n 3 "$WORK/g17-a.log" "$WORK/g17-b.log"; fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"

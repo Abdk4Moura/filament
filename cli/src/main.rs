@@ -57,6 +57,7 @@ EXAMPLES:
   filament clever-lynx-63            claim a code and receive
   filament send ./photos --code      directories tar on the fly
   filament recv <code> -o - | tar x  stream straight into a pipe
+  filament pair --name phone         remember a device — a ceremony, no file needed
   filament send big.iso --to laptop  no code: a remembered device, verified by proof
   filament up --install              always-on drop target (trusted devices only)
   filament introduce laptop phone    vouch two of your devices to each other
@@ -129,6 +130,15 @@ enum Cmd {
         /// Rename the (single) received file; '-' streams it to stdout
         #[arg(long, short = 'o')]
         output: Option<String>,
+    },
+    /// Remember a device — a pairing ceremony, no file needed. Mints a code
+    /// (or claims one) and exchanges the pair secret with consent on both ends
+    Pair {
+        /// A code from the other device; omit to mint one for them
+        code: Option<String>,
+        /// What to call them (asked interactively if omitted)
+        #[arg(long)]
+        name: Option<String>,
     },
     /// List devices remembered via --remember (trusted for --to and auto-accept)
     Devices {
@@ -702,6 +712,238 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     }
 }
 
+// ----------------------------------------------------------------- pair ----
+// C29: remembering a device is a first-class ceremony — no file transfer to
+// pretend through. Mint (or claim) a one-time code, connect, hand the pair
+// secret over the encrypted link (pair-keep; C27 consent applies on the far
+// side), confirm mutuality, exit. Initiation rule: the code CREATOR sends the
+// keep; a claimer falls back after 3 s of silence (browsers never initiate).
+
+async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, relay: bool) -> Result<()> {
+    let my_uid = mk_uid("p");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    // Meta must exist for pairing; an unguessable solo room keeps strangers
+    // out (the daemon's trick) — the pair-claim moves people, not the room.
+    let solo = format!("pairc-{}", fresh_secret());
+    sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
+    let creator = code.is_none();
+    match &code {
+        Some(c) => {
+            ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, c)));
+            sio.emit("pair-claim", json!({ "code": c.to_lowercase() })).await.ok();
+        }
+        None => {
+            sio.emit("pair-create", json!({})).await.ok();
+        }
+    }
+
+    let mut conn = Conn {
+        server: server.to_string(),
+        sio: sio.clone(),
+        tx: tx.clone(),
+        my_uid: my_uid.clone(),
+        my_id: String::new(),
+        relay_only: relay,
+        to_filter: None,
+        links: HashMap::new(),
+        roster: HashMap::new(),
+        active: None,
+        next_gen: 0,
+        waiting_rejoin: None,
+        rejoin_window: REJOIN_WINDOW,
+        away: None,
+        chunk_size: net::MAX_DC_PAYLOAD,
+    };
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
+
+    let secret = fresh_secret(); // ours, if WE end up initiating
+    let mut petname = name; // resolved --name, prompt answer, or peer's display name
+    let mut their_secret: Option<String> = None; // a received keep (we claimed)
+    let mut ack_ok = false; // our keep was consented to
+    let mut initiated = false;
+    let mut prompted = false;
+    let mut peer: Option<(String, String)> = None; // (pid, display name)
+    let deadline = Instant::now() + Duration::from_secs(600); // code TTL
+
+    loop {
+        // Done when the petname is settled AND a secret is mutual: either we
+        // received theirs (claimer path) or ours was consented to (ack).
+        if let Some(n) = petname.clone() {
+            if let Some(sec) = their_secret.clone().or(if ack_ok { Some(secret.clone()) } else { None }) {
+                devices_store(&n, &sec)?;
+                ui::say(&format!(
+                    "  {} {} mutually remembered — either device now finds the other automatically, no codes",
+                    ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                    ui::paint(ui::Tone::Bold, &n),
+                ));
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  try: filament send <file> --to {n}   ·   filament up")));
+                tokio::time::sleep(Duration::from_millis(300)).await; // let acks flush
+                let _ = sio.disconnect().await;
+                return Ok(());
+            }
+        }
+        if Instant::now() > deadline {
+            bail!("timed out — the code was never used (codes expire after 10 minutes)");
+        }
+        let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => bail!("signaling closed"),
+            Err(_) => continue,
+        };
+        match ev {
+            Ev::Welcome(v) => {
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers {
+                        conn.maybe_adopt(p, true).await?;
+                    }
+                }
+            }
+            Ev::PairCode(v) => {
+                let c = v["code"].as_str().unwrap_or("?");
+                ui::clipboard(c);
+                ui::say("");
+                ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &c.to_uppercase())));
+                ui::say("");
+                ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament pair <code>`"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  one claim · expires in 10 min · waiting…"));
+            }
+            Ev::PairUsed(_) => {
+                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
+            }
+            Ev::PairMatched(v) => {
+                let room = v["room"].as_str().unwrap_or_default().to_string();
+                ui::say(&format!("  {} code accepted — connecting", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+            }
+            Ev::PairError(v) => {
+                let hint = match v["why"].as_str() {
+                    Some("sender-gone") => "that code's creator already left — ask them for a fresh one".to_string(),
+                    _ => format!("{} — codes burn after one use and expire after 10 min", v["error"].as_str().unwrap_or("?")),
+                };
+                bail!("code rejected: {hint}");
+            }
+            Ev::PeerJoined(v) => {
+                conn.maybe_adopt(&v, true).await?;
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                if let Some(l) = conn.link(&from) {
+                    if let Err(e) = l.peer.handle_signal(data).await {
+                        eprintln!("signal failed to apply: {e} (recovering)");
+                    }
+                }
+            }
+            Ev::ChannelReady(pid, t) => {
+                let display = match conn.link_mut(&pid) {
+                    Some(l) => {
+                        l.transport = Some(t.clone());
+                        l.presence = Presence::Ready;
+                        l.name.clone()
+                    }
+                    None => continue,
+                };
+                ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &display)));
+                peer = Some((pid.clone(), display.clone()));
+                if creator && !initiated {
+                    t.send_control(&json!({ "type": "pair-keep", "secret": secret })).await?;
+                    initiated = true;
+                } else if !creator {
+                    // Fallback: browsers (and legacy peers) never initiate —
+                    // give the creator 3 s, then hand over OUR secret.
+                    let tx = tx.clone();
+                    let pid = pid.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        let _ = tx.send(Ev::Control(pid, json!({ "type": "__pair_fallback" })));
+                    });
+                }
+                // Settle the petname: --name wins; otherwise ask (tty) or
+                // default to their display name (scripts, pipes).
+                if petname.is_none() && !prompted {
+                    prompted = true;
+                    if std::io::stdin().is_terminal() {
+                        eprint!("  remember this device as [{display}]: ");
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            use tokio::io::AsyncBufReadExt;
+                            let mut line = String::new();
+                            let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+                            if reader.read_line(&mut line).await.is_ok() {
+                                let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
+                            }
+                        });
+                    } else {
+                        petname = Some(display.clone());
+                    }
+                }
+            }
+            Ev::StdinLine(line) => {
+                if petname.is_none() && prompted {
+                    let n = if line.is_empty() {
+                        peer.as_ref().map(|(_, d)| d.clone()).unwrap_or_else(|| "device".into())
+                    } else {
+                        line
+                    };
+                    petname = Some(n);
+                }
+            }
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                Some("pair-keep") => {
+                    let sec = v["secret"].as_str().unwrap_or_default().to_string();
+                    if sec.len() == 64 && !initiated {
+                        // Running `filament pair` IS consent — ack and keep.
+                        their_secret = Some(sec);
+                        if let Some(t) = conn.transport_of(&pid) {
+                            t.send_control(&json!({ "type": "pair-keep-ack", "ok": true })).await.ok();
+                        }
+                    }
+                }
+                Some("pair-keep-ack") => {
+                    if v["ok"].as_bool() == Some(false) {
+                        bail!("they declined to be remembered — nothing stored on either side");
+                    }
+                    ack_ok = true;
+                }
+                Some("__pair_fallback") => {
+                    if !creator && !initiated && their_secret.is_none() {
+                        if let Some(t) = conn.transport_of(&pid) {
+                            t.send_control(&json!({ "type": "pair-keep", "secret": secret })).await?;
+                            initiated = true;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ev::Stuck(pid, g) => {
+                conn.on_stuck(&pid, g, "stuck").await?;
+            }
+            Ev::GraceExpired(pid, g) => {
+                conn.on_stuck(&pid, g, "lost").await?;
+            }
+            Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
+            Ev::PeerLeft(v) => {
+                let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
+                if conn.on_peer_left(&v) {
+                    let n = gone.unwrap_or_else(|| "they".into());
+                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} stepped away — holding the line (their client rejoins)")));
+                }
+            }
+            Ev::Interrupted => bail!("interrupted"),
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------- link machinery --
 // One peer at a time, but with the browser's survival rules: establishment
 // watchdog (C3), disconnected-grace + ICE restart + reconnect attempts (C4),
@@ -1187,6 +1429,7 @@ async fn main() -> Result<()> {
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
+        Cmd::Pair { code, name } => pair_cmd(&server, code, name, cli.relay).await,
         Cmd::Devices { action } => {
             match action {
                 None => {
@@ -1836,6 +2079,14 @@ async fn recv_cmd(
     // C24: at most one typed claim in flight — a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
+    // C29: an in-session pairing ceremony (daemon mode): typed code or a
+    // minted one — exactly ONE side hands over a fresh secret (creator
+    // initiates; a claimer waits 3 s for the creator, then takes over —
+    // browsers never initiate). Some(true) = we minted; Some(false) = we
+    // claimed; None = no ceremony pending.
+    let mut ceremony: Option<bool> = None;
+    let mut ceremony_pid: Option<String> = None;
+    let mut ceremony_secret = fresh_secret();
     // C25: when the current question appeared (answers sooner than 300ms are
     // buffered keystrokes, not decisions)
     let mut question_shown = Instant::now();
@@ -1851,8 +2102,9 @@ async fn recv_cmd(
             // our meta for known-peer events, but nobody else can land there.)
             let solo = format!("up-{}", fresh_secret());
             sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
-            if devices.is_empty() {
-                bail!("no known devices — pair once with --code + --remember first");
+            // C29: an interactive up can START empty and pair in-session.
+            if devices.is_empty() && !std::io::stdin().is_terminal() {
+                bail!("no known devices — run `filament pair` once, or `filament up` in a terminal to pair interactively");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             sio.emit("subscribe", json!({ "channels": chans })).await.ok();
@@ -1865,6 +2117,14 @@ async fn recv_cmd(
                 ui::paint(ui::Tone::Bold, &dir.display().to_string()),
             ));
             ui::say(&ui::paint(ui::Tone::Dim, "  trusted devices only · invisible to strangers · Ctrl-C or `filament down` to stop"));
+            // C29: this is a SESSION, like a browser tab — pairing and petname
+            // management happen right here.
+            if std::io::stdin().is_terminal() {
+                ui::say(&ui::paint(
+                    ui::Tone::Dim,
+                    "  type a code to pair a new device · `pair` mints one · `devices` · `forget <name>`",
+                ));
+            }
         }
         None => {
             let room = match &room {
@@ -1932,8 +2192,12 @@ async fn recv_cmd(
     // outside a question, bytes accumulate into lines (echoed manually since
     // raw mode disables terminal echo).
     let question_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let tty_guard = if !daemon && std::io::stdin().is_terminal() { Some(TtyGuard::raw()) } else { None };
-    if !daemon {
+    // C29: the stdin owner also runs for an INTERACTIVE daemon (a terminal-
+    // attached `filament up` is a session); `up --install` under systemd has
+    // no tty, so headless daemons stay stdin-free.
+    let interactive = !daemon || std::io::stdin().is_terminal();
+    let tty_guard = if interactive && std::io::stdin().is_terminal() { Some(TtyGuard::raw()) } else { None };
+    if interactive {
         let tx = tx.clone();
         let q = question_open.clone();
         tokio::spawn(async move {
@@ -2006,6 +2270,18 @@ async fn recv_cmd(
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 ui::say(&format!("  {} code accepted — joining sender", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+            }
+            // C29: a code minted in-session (`pair` typed into up).
+            Ev::PairCode(v) => {
+                let c = v["code"].as_str().unwrap_or("?");
+                ui::clipboard(c);
+                ui::say("");
+                ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &c.to_uppercase())));
+                ui::say("");
+                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud — they type it in the web app or `filament pair <code>` · one claim · 10 min"));
+            }
+            Ev::PairUsed(_) => {
+                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
             }
             Ev::PairError(v) => {
                 let why = v["error"].as_str().unwrap_or("?").to_string();
@@ -2081,7 +2357,7 @@ async fn recv_cmd(
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
-                    l.transport = Some(t);
+                    l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
                     let p = l.peer.clone();
                     tokio::spawn(async move {
@@ -2096,6 +2372,31 @@ async fn recv_cmd(
                             }
                         }
                     });
+                }
+                // C29: an in-session pairing — exactly one side hands over a
+                // secret; consent (pair-keep-ack / our store) completes it.
+                // Only links that aren't ALREADY known are candidates.
+                let fresh_link = conn.link(&pid).map(|l| l.expected_secret.is_none()).unwrap_or(false);
+                if fresh_link {
+                    match ceremony {
+                        Some(true) => {
+                            // we minted the code — initiate now
+                            ceremony = None;
+                            ceremony_pid = Some(pid.clone());
+                            t.send_control(&json!({ "type": "pair-keep", "secret": ceremony_secret })).await.ok();
+                        }
+                        Some(false) => {
+                            // we claimed — give a CLI creator 3 s to initiate
+                            // (browsers never do), then take over.
+                            let tx = tx.clone();
+                            let pid = pid.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                                let _ = tx.send(Ev::Control(pid, json!({ "type": "__pair_fallback" })));
+                            });
+                        }
+                        None => {}
+                    }
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
@@ -2123,6 +2424,20 @@ async fn recv_cmd(
                             devices_store(name, &sec)?;
                             eprintln!("remembered this device as '{name}' — future sends auto-accept after proof");
                             true
+                        } else if ceremony == Some(false) {
+                            // C29: we typed their code into this session — the
+                            // creator initiated first; that's our ceremony.
+                            ceremony = None;
+                            let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "device".into());
+                            devices_store(&n, &sec)?;
+                            devices.push((n.clone(), sec.clone()));
+                            sio.emit("subscribe", json!({ "channels": [channel_of(&sec)] })).await.ok();
+                            ui::say(&format!(
+                                "  {} {} mutually remembered — rename anytime: filament devices rename {n} <new>",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                ui::paint(ui::Tone::Bold, &n),
+                            ));
+                            true
                         } else {
                             eprintln!("(sender offered to be remembered; re-run with --remember <name> to keep it)");
                             false
@@ -2131,6 +2446,37 @@ async fn recv_cmd(
                         // its half instead of waving at a dead meeting point.
                         if let Some(t) = conn.transport_of(&pid) {
                             t.send_control(&json!({ "type": "pair-keep-ack", "ok": kept })).await.ok();
+                        }
+                    }
+                }
+                // C29: claimer fallback — the creator never initiated
+                // (browsers don't); hand over OUR secret instead.
+                Some("__pair_fallback") => {
+                    if ceremony == Some(false) {
+                        ceremony = None;
+                        ceremony_pid = Some(pid.clone());
+                        if let Some(t) = conn.transport_of(&pid) {
+                            t.send_control(&json!({ "type": "pair-keep", "secret": ceremony_secret })).await.ok();
+                        }
+                    }
+                }
+                // C29: their answer to OUR in-session remember offer.
+                Some("pair-keep-ack") => {
+                    if ceremony_pid.as_deref() == Some(pid.as_str()) {
+                        ceremony_pid = None;
+                        let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "device".into());
+                        if v["ok"].as_bool() == Some(false) {
+                            ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "declined to be remembered — nothing stored", &n));
+                        } else {
+                            devices_store(&n, &ceremony_secret)?;
+                            devices.push((n.clone(), ceremony_secret.clone()));
+                            sio.emit("subscribe", json!({ "channels": [channel_of(&ceremony_secret)] })).await.ok();
+                            ceremony_secret = fresh_secret(); // never reuse across devices
+                            ui::say(&format!(
+                                "  {} {} mutually remembered — rename anytime: filament devices rename {n} <new>",
+                                ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                                ui::paint(ui::Tone::Bold, &n),
+                            ));
                         }
                     }
                 }
@@ -2402,6 +2748,30 @@ async fn recv_cmd(
                     } else {
                         question_open.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
+                } else if ans == "devices" {
+                    // C29: session commands — `up` is a place you live in.
+                    if devices.is_empty() {
+                        ui::say(&ui::paint(ui::Tone::Dim, "  no known devices yet — type a code or `pair` to add one"));
+                    }
+                    for (n, s) in &devices {
+                        ui::say(&format!("  {}  {}", ui::paint(ui::Tone::Bold, n), ui::paint(ui::Tone::Dim, &format!("(channel {})", &channel_of(s)[..12]))));
+                    }
+                } else if let Some(n) = ans.strip_prefix("forget ") {
+                    let n = n.trim();
+                    if devices.iter().any(|(dn, _)| dn == n) {
+                        devices_remove(n)?;
+                        devices.retain(|(dn, _)| dn != n);
+                        ui::say(&format!("  {} forgot '{n}' — it can no longer find this machine", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                    } else {
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  no device named '{n}' (try `devices`)")));
+                    }
+                } else if ans == "pair" || ans == "code" {
+                    // C29: mint a code; whoever claims it gets the remember
+                    // ceremony on connect (we created it, so WE initiate).
+                    if daemon {
+                        ceremony = Some(true);
+                    }
+                    sio.emit("pair-create", json!({})).await.ok();
                 } else if regex_lite_code(&line) {
                     if claim_in_flight {
                         ui::say(&ui::paint(ui::Tone::Dim, "  (a claim is already in flight — wait for it to resolve)"));
@@ -2409,10 +2779,13 @@ async fn recv_cmd(
                         ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
                         paired = true;
                         claim_in_flight = true;
+                        if daemon {
+                            ceremony = Some(false); // C29: in a session, pairing means remembering
+                        }
                         sio.emit("pair-claim", json!({ "code": line.to_lowercase() })).await.ok();
                     }
                 } else if !line.is_empty() {
-                    ui::say(&ui::paint(ui::Tone::Dim, "  (type a code like brave-otter-123 to claim it)"));
+                    ui::say(&ui::paint(ui::Tone::Dim, "  (type a code like brave-otter-123 to claim it · `pair` · `devices` · `forget <name>`)"));
                 }
             }
             Ev::Interrupted => {

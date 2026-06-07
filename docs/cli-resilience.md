@@ -355,6 +355,21 @@ tick: self-healing, no reload, no restart. (3) CLI flavor: every `welcome`
 (fresh sid) re-subscribes in all three subscribing loops (up/recv,
 send --to, introduce) — `up`'s subscribe-once-at-startup had the same hole.
 
+### C29. Pairing required pretending to transfer a file — **FIXED (gate 17)**
+Maintainer: "I should be able to simply add a device and remember it
+without having to pretend to send something." Two additions:
+`filament pair [code] [--name X]` — a first-class ceremony: mint or claim,
+connect, hand the secret over the encrypted link (C27 consent applies),
+confirm mutuality, exit. And `filament up` became a SESSION (the CLI's
+browser tab): with a terminal attached, type a code to pair (remember
+ceremony runs in-session, device usable immediately — channel raised
+live), `pair` mints a code, `devices`/`forget <name>` manage petnames.
+Initiation discipline (no double secrets): the code CREATOR initiates;
+a claimer waits 3 s (browsers never initiate), then takes over. Headless
+`up --install` (no tty) is unchanged — stdin-free. Gate 17 asserts the
+sharp invariant: after the ceremony, both stores' channel ids are EQUAL
+(one mutual secret, not two halves of nothing).
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**
@@ -426,6 +441,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 14 daemon: pair `--remember`, verified identity, room-less `up` receive | C19, C20, C12 | green |
 | 15 paired recv holds the line on sender vanish, fails honestly after window | C21 | green |
 | 16 known-device rendezvous: consent-gated pair-keep store, `--to` finds the browser cross-room via channel (no code), decline purges the sender's half | C12, C20 web half, C27 | green |
+| 17 pair ceremony: no file, both exit clean, both stores' channel ids EQUAL (one mutual secret) | C29 | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 
 **Known coverage gaps (tracked, not hidden):**
