@@ -173,6 +173,25 @@ Control messages over the DataChannel; the browser implements both sides
   that link and tells the user to re-pair, instead of forever claiming an
   acquaintance the other side has no memory of.
 
+#### The `filament pair` ceremony
+A dedicated pairing-only flow (`filament pair [code] [--name X]`) that runs the
+`pair-keep`/`pair-keep-ack` exchange and exits — no file moves. One side mints a
+one-time code (the **creator**); the other **claims** it. On connect exactly one
+fresh 64-hex secret crosses the link, by a single rule layered on the line-50
+WebRTC convention:
+- the **creator** sends `{type:"pair-keep", secret}` the moment the peer is
+  ready — it is always the one that hands the secret over;
+- the **claimer** waits **3 s** and only then hands over ITS secret as a
+  fallback, because browsers (and legacy peers) never initiate the keep. So a
+  CLI↔CLI pair settles on the creator's secret; a browser-creator pair settles
+  on the claimer's after the 3 s window.
+Consent is mutual per C27: the browser asks (banner); a running `filament pair`
+IS consent and acks `{type:"pair-keep-ack", ok:true}` automatically. On `ok`
+both sides store `{name, secret}` (CLI: `devices.json`; browser: localStorage
+`filament-known-devices`) and subscribe the derived channel — "mutually
+remembered". `--name` sets the local petname (a local alias; the secret is the
+identity).
+
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side

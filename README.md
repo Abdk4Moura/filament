@@ -24,6 +24,9 @@ curl -fsSL https://filament.autumated.com/install | sh
 winget install Abdk4Moura.Filament
 
 # or just open https://filament.autumated.com on both devices
+
+filament pair --name phone     # remember a device — no file needed
+filament up                    # interactive session: pair / devices / forget in-session
 ```
 
 ## Why Filament over the alternatives

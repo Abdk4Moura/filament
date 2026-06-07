@@ -176,6 +176,16 @@ export function useFilament() {
     const devs = devicesLoad()
     setKnownDevices(devs)
     if (!devs.length || !sigRef.current?.subscribe) return
+    // Debounce the boot storm (bootstrap + socket-up + welcome ×2 + belt all
+    // call this within ~1 s; each subscribe makes the server re-introduce
+    // every pair — observed 5× bursts live). One assert per window is plenty;
+    // the 45 s reconcile is the safety net. A CHANGED device set always goes
+    // through — a freshly stored secret must raise its channel immediately.
+    const now = Date.now()
+    const setKey = devs.map((d) => d.secret.slice(0, 8)).join(',')
+    if (setKey === subscribeKnown._key && now - (subscribeKnown._last || 0) < 1500) return
+    subscribeKnown._last = now
+    subscribeKnown._key = setKey
     try {
       const entries = await Promise.all(devs.map(async (d) => [await channelOf(d.secret), d]))
       channelMapRef.current = new Map(entries)
@@ -184,7 +194,9 @@ export function useFilament() {
         let acked = false
         sigRef.current.subscribe(chans, () => {
           acked = true
-          tel('subscribe-ack', { n: chans.length, attempt })
+          // NB: payload keys must not collide with the envelope ('n' is the
+          // beacon seq — a 'n: chans.length' here overwrote it, observed live)
+          tel('subscribe-ack', { chans: chans.length, attempt })
         })
         setTimeout(() => {
           if (!acked && attempt < 3) {
