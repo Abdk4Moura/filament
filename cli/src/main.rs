@@ -936,8 +936,8 @@ async fn send_cmd(
                     }
                 }
             }
-            Ev::ChannelReady(t) => {
-                if let Some(l) = &mut conn.link {
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link.as_mut().filter(|l| l.peer.id == pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t.clone());
                     let p = l.peer.clone();
@@ -987,7 +987,8 @@ async fn send_cmd(
                     }
                 }
             }
-            Ev::Control(v) => match v["type"].as_str() {
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                _ if conn.link.as_ref().map(|l| l.peer.id != pid).unwrap_or(true) => {}
                 Some("file-accept") => {
                     let Some(t) = conn.transport() else { continue };
                     let offset = v["offset"].as_u64().unwrap_or(0);
@@ -1036,7 +1037,11 @@ async fn send_cmd(
             }
             Ev::Stuck(pid, generation) => conn.on_stuck(&pid, generation, "stuck while connecting").await?,
             Ev::GraceExpired(pid, generation) => conn.on_stuck(&pid, generation, "lost").await?,
-            Ev::PcState(s) => conn.on_pc_state(&s).await,
+            Ev::PcState(pid, s) => {
+                if conn.link.as_ref().map(|l| l.peer.id == pid).unwrap_or(false) {
+                    conn.on_pc_state(&s).await;
+                }
+            }
             Ev::PeerLeft(v) => {
                 if conn.on_peer_left(&v) {
                     let all_done = outgoing.lock().await.iter().all(|o| o.done);
@@ -1240,8 +1245,8 @@ async fn recv_cmd(
                     }
                 }
             }
-            Ev::ChannelReady(t) => {
-                if let Some(l) = &mut conn.link {
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link.as_mut().filter(|l| l.peer.id == pid) {
                     eprintln!("peer: {}", l.name);
                     l.transport = Some(t);
                     let p = l.peer.clone();
@@ -1259,7 +1264,8 @@ async fn recv_cmd(
                     });
                 }
             }
-            Ev::Control(v) => match v["type"].as_str() {
+            Ev::Control(pid, v) => match v["type"].as_str() {
+                _ if conn.link.as_ref().map(|l| l.peer.id != pid).unwrap_or(true) => {}
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
@@ -1374,7 +1380,10 @@ async fn recv_cmd(
                 }
                 _ => {}
             },
-            Ev::Chunk(sid, data) => {
+            Ev::Chunk(pid, sid, data) => {
+                if conn.link.as_ref().map(|l| l.peer.id != pid).unwrap_or(true) {
+                    continue;
+                }
                 if let Some(inc) = by_sid.get_mut(&sid) {
                     inc.file.write_all(&data).await?;
                     inc.received += data.len() as u64;
@@ -1389,7 +1398,11 @@ async fn recv_cmd(
             }
             Ev::Stuck(pid, generation) => conn.on_stuck(&pid, generation, "stuck while connecting").await?,
             Ev::GraceExpired(pid, generation) => conn.on_stuck(&pid, generation, "lost").await?,
-            Ev::PcState(s) => conn.on_pc_state(&s).await,
+            Ev::PcState(pid, s) => {
+                if conn.link.as_ref().map(|l| l.peer.id == pid).unwrap_or(false) {
+                    conn.on_pc_state(&s).await;
+                }
+            }
             Ev::PeerLeft(v) => {
                 if conn.on_peer_left(&v) {
                     if !by_sid.is_empty() {

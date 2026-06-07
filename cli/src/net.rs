@@ -58,10 +58,12 @@ pub enum Ev {
     /// C12: a mutually-known device appeared on a shared presence channel.
     KnownPeer(Value),
     KnownPeerLeft(Value),
-    ChannelReady(Arc<dyn Transport>),
-    Control(Value),
-    Chunk(u32, Bytes),
-    PcState(String),
+    /// (peer sid, ...) — every channel event is attributed to its link so
+    /// the loops can hold many links at once (C18 multi-link).
+    ChannelReady(String, Arc<dyn Transport>),
+    Control(String, Value),
+    Chunk(String, u32, Bytes),
+    PcState(String, String),
     /// A local outgoing stream finished (sent by the streaming task so the
     /// main loop re-evaluates its all-done exit condition).
     #[allow(dead_code)] // id kept for symmetry with TransferFailed
@@ -368,9 +370,10 @@ impl Peer {
         {
             let tx = tx.clone();
             let closed = closed.clone();
+            let pid = peer_id.clone();
             pc.on_peer_connection_state_change(Box::new(move |s| {
                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
-                    let _ = tx.send(Ev::PcState(s.to_string()));
+                    let _ = tx.send(Ev::PcState(pid.clone(), s.to_string()));
                 }
                 Box::pin(async {})
             }));
@@ -378,7 +381,7 @@ impl Peer {
 
         if !polite {
             let dc = pc.create_data_channel("filament", None).await?;
-            wire_channel(dc, tx.clone(), closed.clone()).await;
+            wire_channel(peer_id.clone(), dc, tx.clone(), closed.clone()).await;
             let offer = pc.create_offer(None).await?;
             pc.set_local_description(offer).await?;
             let ld = pc
@@ -394,11 +397,13 @@ impl Peer {
         } else {
             let tx = tx.clone();
             let closed = closed.clone();
+            let pid = peer_id.clone();
             pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
                 let tx = tx.clone();
                 let closed = closed.clone();
+                let pid = pid.clone();
                 Box::pin(async move {
-                    wire_channel(dc, tx, closed).await;
+                    wire_channel(pid, dc, tx, closed).await;
                 })
             }));
         }
@@ -623,6 +628,7 @@ pub fn is_private_addr(addr: &str) -> bool {
 }
 
 async fn wire_channel(
+    peer_id: String,
     dc: Arc<RTCDataChannel>,
     tx: mpsc::UnboundedSender<Ev>,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -666,6 +672,7 @@ async fn wire_channel(
                 let closed = closed.clone();
                 let dead = dead.clone();
                 let drained = drained.clone();
+                let peer_id = peer_id.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; READ_BUF];
                     loop {
@@ -678,7 +685,7 @@ async fn wire_channel(
                             Ok((n, true)) => {
                                 if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                                     if let Ok(v) = serde_json::from_slice::<Value>(&buf[..n]) {
-                                        let _ = tx.send(Ev::Control(v));
+                                        let _ = tx.send(Ev::Control(peer_id.clone(), v));
                                     }
                                 }
                             }
@@ -686,6 +693,7 @@ async fn wire_channel(
                                 if n >= 4 && !closed.load(std::sync::atomic::Ordering::Relaxed) {
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                                     let _ = tx.send(Ev::Chunk(
+                                        peer_id.clone(),
                                         sid,
                                         Bytes::copy_from_slice(&buf[4..n]),
                                     ));
@@ -699,7 +707,7 @@ async fn wire_channel(
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 let transport: Arc<dyn Transport> =
                     Arc::new(DataChannelTransport { raw, drained, dead });
-                let _ = tx.send(Ev::ChannelReady(transport));
+                let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
             }
         })
     }));
