@@ -363,6 +363,12 @@ def register(socketio, registry):
     @socketio.on("pair-create")
     def on_pair_create(data=None):
         sid = request.sid
+        # C24: this event proves the creator's socket is alive RIGHT NOW —
+        # refresh its liveness lease so a code can never be minted by a
+        # creator the claim-side lease check would call dead (the zombie-tab
+        # failure observed live).
+        if hasattr(registry, "refresh"):
+            registry.refresh([sid])
         keyword = _norm_code((data or {}).get("keyword"))
         for _ in range(4):
             code = keyword or _mint_pair_code()

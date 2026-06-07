@@ -101,6 +101,9 @@ export function useFilament() {
   const [localHelper, setLocalHelper] = useState({ available: false, peers: [] }) // Part C
 
   const sigRef = useRef(null)
+  // Live socket truth for non-render code paths (state in closures goes
+  // stale). Set everywhere setConnected is.
+  const connectedRef = useRef(false)
   const linksRef = useRef(new Map()) // peerId -> PeerLink
   const transferOwner = useRef(new Map()) // transferId -> peerId
   const cfgRef = useRef(null)
@@ -262,6 +265,7 @@ export function useFilament() {
         setPeers([])
         setMe({ id, name: myName, color: colorFor(id) })
         setConnected(true)
+        connectedRef.current = true
         existing.forEach((p) => makeLink({ id: p.id, name: p.name, uid: p.uid }))
       })
       sig.on('peer-joined', ({ id, name, uid }) => {
@@ -309,6 +313,7 @@ export function useFilament() {
         tel(up ? 'socket-up' : 'socket-down', {})
         if (!up) telFlush()
         setConnected(up)
+        connectedRef.current = up
         if (up) fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
       })
 
@@ -392,16 +397,52 @@ export function useFilament() {
     if (!sig) return null
     const kw = typeof keyword === 'string' ? keyword : null // UI passes the click event
     const t0 = Date.now()
-    tel('pair-create-click', {})
-    const watchdog = setTimeout(() => {
-      // no pair-code after 5s = the emit very likely died in a zombie socket
-      tel('pair-create-timeout', { afterMs: Date.now() - t0 })
-      telFlush()
-    }, 5000)
+    tel('pair-create-click', { up: connectedRef.current })
+    // C24 zombie fix, measured live: a hidden mobile tab's socket dies ~5s
+    // after hiding and takes ~4.3s to recover after refocus — exactly when
+    // people tap CREATE CODE. So: if the socket is known-dead, reconnect and
+    // wait for it first; and if the mint gets no answer in 5s anyway (stale
+    // 'connected' flag after a freeze), reconnect and retry ONCE.
+    const waitUp = (ms) =>
+      new Promise((res) => {
+        const iv = setInterval(() => {
+          if (connectedRef.current || Date.now() - t0 > ms) {
+            clearInterval(iv)
+            res(connectedRef.current)
+          }
+        }, 150)
+      })
+    if (!connectedRef.current) {
+      tel('pair-create-wait-reconnect', {})
+      sig.reconnect?.()
+      if (!(await waitUp(6000))) {
+        tel('pair-create-blocked', { afterMs: Date.now() - t0 })
+        telFlush()
+        return null
+      }
+    }
     return new Promise((resolve) => {
+      let retried = false
+      const arm = () =>
+        setTimeout(() => {
+          if (!retried) {
+            retried = true
+            tel('pair-create-retry', { afterMs: Date.now() - t0 })
+            sig.reconnect?.()
+            waitUp(6000).then(() => {
+              watchdog = arm()
+              sig.pairCreate(kw)
+            })
+          } else {
+            tel('pair-create-timeout', { afterMs: Date.now() - t0 })
+            telFlush()
+            resolve(null)
+          }
+        }, 5000)
+      let watchdog = arm()
       sig.on('pair-code', function onCode({ code }) {
         clearTimeout(watchdog)
-        tel('pair-create-ok', { rttMs: Date.now() - t0 })
+        tel('pair-create-ok', { rttMs: Date.now() - t0, retried })
         setRoomCode(code)
         setRoomScope((s) => {
           if (s !== 'code') prevScopeRef.current = s
