@@ -212,8 +212,26 @@ export function useFilament() {
           link.close()
           const n = (attemptsRef.current.get(id) || 0) + 1
           attemptsRef.current.set(id, n)
-          if (n <= 2) makeLinkRef.current?.({ id, name, uid })
-          else updatePeer(id, { status: 'failed' })
+          if (n <= 2) {
+            makeLinkRef.current?.({ id, name, uid })
+          } else {
+            updatePeer(id, { status: 'failed' })
+            // #13 second wind (measured: refocus-time revival ran while the
+            // links still read healthy; they decayed to failed seconds later
+            // with nothing left to catch them). If we're VISIBLE when a peer
+            // finally fails, grant ONE delayed fresh start — covers the
+            // "both tabs finally awake but budgets exhausted" rendezvous.
+            if (document.visibilityState === 'visible' && !attemptsRef.current.get(id + ':sw')) {
+              attemptsRef.current.set(id + ':sw', 1)
+              tel('second-wind', { peer: id.slice(-6) })
+              setTimeout(() => {
+                attemptsRef.current.delete(id)
+                if (!linksRef.current.has(id) && document.visibilityState === 'visible') {
+                  makeLinkRef.current?.({ id, name, uid })
+                }
+              }, 2500)
+            }
+          }
         },
       })
       linksRef.current.set(id, link)
@@ -486,7 +504,8 @@ export function useFilament() {
         for (const link of linksRef.current.values()) link.sendBack?.()
         // #13 (measured live): two mobile tabs rarely negotiate while both
         // awake — links that failed while WE were frozen stay failed forever.
-        // On refocus: reset retry budgets and rebuild every dead link.
+        // On refocus: reset retry budgets (incl. second-wind markers — they
+        // share this map) and rebuild every dead link.
         attemptsRef.current.clear()
         for (const [id, link] of [...linksRef.current.entries()]) {
           const st = link.pc?.connectionState
