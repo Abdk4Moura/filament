@@ -166,6 +166,7 @@ export function useFilament() {
   const [knownDevices, setKnownDevices] = useState(() => devicesLoad())
   const channelMapRef = useRef(new Map()) // channel -> {name, secret}
   const expectedSecretRef = useRef(new Map()) // peerId -> {name, secret} (matched via known-peer)
+  const digestAbsentRef = useRef(new Map()) // peerId -> consecutive digests it was absent from (C30 ph2)
 
   /// (Re)derive our known-device channels and hand them to the convergent
   /// session (C30). The session's level-triggered loop owns the repair — the
@@ -308,6 +309,7 @@ export function useFilament() {
             try {
               if ((await proofFor(d.secret, theirUid, theirUid, uidRef.current, fps.mine, fps.theirs)) === mac) {
                 updatePeer(id, { verified: d.name })
+                link._verified = true // C30 ph3: the link's state ping carries this
                 tel('proof-ok', { peer: id.slice(-6) })
                 link.sendPairProofAck(true)
                 return
@@ -316,6 +318,23 @@ export function useFilament() {
           }
           tel('proof-fail', { peer: id.slice(-6) })
           link.sendPairProofAck(false)
+        },
+        // C30 ph3: a state ping exposed a one-sided belief on this link.
+        onPeerStateDiverged: (kind) => {
+          tel('state-diverged', { kind, peer: id.slice(-6) })
+          // trust divergence: they don't recognize us but we hold a secret
+          // for them — re-prove ONCE per link (webrtc re-offers transfers
+          // itself; trust needs the hook, which owns secrets + uids).
+          if (kind === 'trust' && !link._reproved) {
+            link._reproved = true
+            const exp = expectedSecretRef.current.get(id)
+            const fps = link.fingerprints()
+            if (exp && uid && fps) {
+              proofFor(exp.secret, uidRef.current, uidRef.current, uid, fps.mine, fps.theirs)
+                .then((mac) => link.sendPairProof(mac))
+                .catch(() => {})
+            }
+          }
         },
         // C27: they answered OUR proof. false = "never met a fella like you"
         // — drop the expectation so we stop claiming acquaintance.
@@ -402,7 +421,36 @@ export function useFilament() {
       // rejoin belt (#14), subscribeKnown's ack-retry/45s-reconcile, and the
       // pair-create lease refresh. The explicit sig.join below stays for instant
       // welcome UX; the loop is the guarantee underneath.
-      const session = createSession(sig, tel)
+      const session = createSession(sig, tel, (digestPeers) => {
+        // C30 phase 2: the server's roster rode in on the sync digest — a
+        // missed peer-joined/left self-corrects here. Channel-introduced
+        // links are exempt (room-independent); absence must hold for TWO
+        // consecutive digests (one can race a join in flight).
+        const present = new Set(digestPeers.map((p) => p.id))
+        for (const p of digestPeers) {
+          if (p.id && !linksRef.current.has(p.id)) {
+            tel('digest-adopt', { peer: String(p.id).slice(-6) })
+            makeLinkRef.current?.({ id: p.id, name: p.name, uid: p.uid })
+          }
+        }
+        for (const [pid] of [...linksRef.current]) {
+          if (expectedSecretRef.current.has(pid)) continue // channel link
+          if (present.has(pid)) {
+            digestAbsentRef.current.delete(pid)
+            continue
+          }
+          const n = (digestAbsentRef.current.get(pid) || 0) + 1
+          digestAbsentRef.current.set(pid, n)
+          if (n >= 2) {
+            digestAbsentRef.current.delete(pid)
+            tel('digest-drop', { peer: pid.slice(-6) })
+            linksRef.current.get(pid)?.close()
+            linksRef.current.delete(pid)
+            removePeer(pid)
+            setPendingKeeps((prev) => prev.filter((k) => k.peerId !== pid))
+          }
+        }
+      })
       sessionRef.current = session
 
       sig.on('welcome', ({ id, peers: existing }) => {

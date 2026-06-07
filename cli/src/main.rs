@@ -666,7 +666,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 // C30 (dissolves the C28 belt): fresh sid — re-assert via session.
                 sess.invalidate();
             }
-            Ev::Synced(v) => sess.on_synced(&v),
+            Ev::Synced(v) => { sess.on_synced(&v); }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own processes share these channels
@@ -832,7 +832,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 }
                 sess.invalidate(); // C30: fresh sid — re-assert next tick
             }
-            Ev::Synced(v) => sess.on_synced(&v),
+            Ev::Synced(v) => { sess.on_synced(&v); }
             Ev::PairCode(v) => {
                 let c = v["code"].as_str().unwrap_or("?");
                 ui::clipboard(c);
@@ -1771,6 +1771,9 @@ async fn send_cmd(
         conn.to_filter = None; // identity supersedes name matching
     }
     let mut code_used = !use_code && known_target.is_none();
+    // C30 phase 3: link mini-sync — pings out, divergence corrections in.
+    let mut last_state_ping = Instant::now();
+    let mut reproved: std::collections::HashSet<String> = Default::default();
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -1803,6 +1806,24 @@ async fn send_cmd(
         };
         // C30: converge session state every iteration (incl. ticks).
         sess.tick(&sio).await;
+        // C30 phase 3: tell every link our truth every ~10s (sender side has
+        // no receive-partials; the ping mainly carries trusted/away and keeps
+        // the peer's away-mark honest).
+        if last_state_ping.elapsed() >= Duration::from_secs(10) {
+            last_state_ping = Instant::now();
+            for l in conn.links.values() {
+                if let Some(t) = &l.transport {
+                    let _ = t
+                        .send_control(&json!({
+                            "type": "state", "v": 1,
+                            "transfers": {},
+                            "trusted": l.trusted,
+                            "away": false,
+                        }))
+                        .await;
+                }
+            }
+        }
         let Some(ev) = ev else { continue };
 
         match ev {
@@ -1818,7 +1839,7 @@ async fn send_cmd(
                 sess.invalidate();
             }
             // C30: server confirmed our session digest.
-            Ev::Synced(v) => sess.on_synced(&v),
+            Ev::Synced(v) => { sess.on_synced(&v); }
             Ev::PairCode(v) => {
                 let code = v["code"].as_str().unwrap_or("?");
                 let ttl = v["ttl"].as_u64().unwrap_or(600);
@@ -1950,6 +1971,65 @@ async fn send_cmd(
                     if was_away {
                         let n = conn.link_presence(&pid, Presence::Ready);
                         ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                    }
+                }
+                // C30 phase 3: the peer's periodic truth — correct one-sided
+                // beliefs instead of letting them persist.
+                Some("state") => {
+                    let was_away = conn.is_away(&pid);
+                    conn.note_alive(&pid); // a state ping proves they're not frozen
+                    if was_away {
+                        let n = conn.link_presence(&pid, Presence::Ready);
+                        ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                    }
+                    // Transfer divergence: I believe it complete; the peer
+                    // holds fewer bytes — the END/tail was lost. Re-offer.
+                    if let Some(obj) = v["transfers"].as_object() {
+                        let mut out = outgoing.lock().await;
+                        for o in out.iter_mut() {
+                            if let Some(b) = obj.get(&o.id).and_then(|x| x.as_u64()) {
+                                if o.done && b < o.size {
+                                    o.done = false; // not actually done
+                                    eprintln!(
+                                        "{}",
+                                        ui::paint(ui::Tone::Warn, &format!("  state-diverged: {} — peer holds {b}/{}; re-offering", o.name, o.size))
+                                    );
+                                    if let Some(t) = conn.transport_of(&pid) {
+                                        let mut offer = json!({
+                                            "type": "file-offer", "id": o.id, "sid": o.sid,
+                                            "name": o.name, "size": o.size, "mime": "application/octet-stream",
+                                            "resume": true,
+                                        });
+                                        if let Some(h) = &o.head {
+                                            offer["head"] = json!(h);
+                                        }
+                                        let _ = t.send_control(&offer).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Trust divergence: they don't recognize us but we hold a
+                    // pair secret for them — re-prove ONCE per link.
+                    if v["trusted"].as_bool() == Some(false) && !reproved.contains(&pid) {
+                        let proof = match conn.link(&pid) {
+                            Some(l) => match &l.expected_secret {
+                                Some((_n, sec)) => l
+                                    .peer
+                                    .fingerprints()
+                                    .await
+                                    .map(|(my_fp, their_fp)| proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp)),
+                                None => None,
+                            },
+                            None => None,
+                        };
+                        if let Some(mac) = proof {
+                            if let Some(t) = conn.transport_of(&pid) {
+                                let _ = t.send_control(&json!({ "type": "pair-proof", "mac": mac })).await;
+                                reproved.insert(pid.clone());
+                                eprintln!("{}", ui::paint(ui::Tone::Dim, "  state-diverged: re-proving identity"));
+                            }
+                        }
                     }
                 }
                 // C27: the human on the other side answered our remember offer.
@@ -2315,6 +2395,13 @@ async fn recv_cmd(
     // exit cleanly instead of idling to the connect-timeout.
     let mut last_quiet: Option<Instant> = None;
     let quiet_window = quiet_exit_window();
+    // C30 phase 2: roster reconciliation from sync digests — a missed
+    // peer-joined/left self-corrects. Absence must hold for TWO consecutive
+    // digests before a drop (one digest can race a join in flight).
+    let mut digest_absent: HashMap<String, u8> = HashMap::new();
+    let mut digest_alone = false;
+    // C30 phase 3: link mini-sync — state pings every ~10s per link.
+    let mut last_state_ping = Instant::now();
 
     loop {
         let ev = match tokio::time::timeout(
@@ -2330,11 +2417,39 @@ async fn recv_cmd(
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
         sess.tick(&sio).await;
 
+        // C30 phase 3: state pings — each open link hears our transfer/away
+        // truth every ~10s, so one-sided beliefs between PEERS can't persist.
+        if last_state_ping.elapsed() >= Duration::from_secs(10) {
+            last_state_ping = Instant::now();
+            for (pid, l) in &conn.links {
+                if let Some(t) = &l.transport {
+                    let mut transfers = serde_json::Map::new();
+                    for ((p0, _), inc) in &by_sid {
+                        if p0 == pid {
+                            transfers.insert(inc.id.clone(), json!(inc.received));
+                        }
+                    }
+                    let _ = t
+                        .send_control(&json!({
+                            "type": "state", "v": 1,
+                            "transfers": Value::Object(transfers),
+                            "trusted": l.trusted,
+                            "away": false,
+                        }))
+                        .await;
+                }
+            }
+        }
+
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding — if that holds quietly for the quiet-exit window (10s
         // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
-        // counting on for a clean exit never arrived; exit anyway.
-        if completed > 0 && !keep_open && by_sid.is_empty() && conn.links.is_empty() && pending.is_empty() {
+        // counting on for a clean exit never arrived; exit anyway. C30 ph2:
+        // ALSO satisfied when the server's digest says the room is empty and
+        // no room-independent (channel) link remains — lingering dead links
+        // can't block the exit when the server knows nobody's there.
+        let digest_says_alone = digest_alone && conn.links.values().all(|l| l.expected_secret.is_none());
+        if completed > 0 && !keep_open && by_sid.is_empty() && (conn.links.is_empty() || digest_says_alone) && pending.is_empty() {
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
                 Some(since) if since.elapsed() > quiet_window => {
@@ -2382,8 +2497,46 @@ async fn recv_cmd(
                 sess.touch();
                 sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             }
-            // C30: server confirmed our session digest.
-            Ev::Synced(v) => sess.on_synced(&v),
+            // C30: server confirmed our session digest. Phase 2: reconcile
+            // the roster it carries — missed peer-joined/left self-correct.
+            Ev::Synced(v) => {
+                if let Some(peers) = sess.on_synced(&v) {
+                    digest_alone = peers.is_empty();
+                    let present: std::collections::HashSet<String> = peers
+                        .iter()
+                        .filter_map(|p| p["id"].as_str().map(String::from))
+                        .collect();
+                    // unknown in digest → a peer-joined we never received
+                    for p in &peers {
+                        let id = p["id"].as_str().unwrap_or_default();
+                        if !id.is_empty() && !conn.links.contains_key(id) {
+                            eprintln!("{}", ui::paint(ui::Tone::Dim, "  (digest: adopting a peer we never heard join)"));
+                            conn.maybe_adopt(p, true).await?;
+                        }
+                    }
+                    // known room-sourced link absent ×2 → a peer-left we
+                    // never received (channel-introduced links are exempt:
+                    // room-independent by design)
+                    let mut gone: Vec<String> = Vec::new();
+                    for (pid, l) in &conn.links {
+                        if l.expected_secret.is_none() && !present.contains(pid) {
+                            let c = digest_absent.entry(pid.clone()).or_insert(0);
+                            *c += 1;
+                            if *c >= 2 {
+                                gone.push(pid.clone());
+                            }
+                        } else {
+                            digest_absent.remove(pid);
+                        }
+                    }
+                    for pid in gone {
+                        digest_absent.remove(&pid);
+                        let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        conn.drop_link(&pid);
+                        ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left (digest reconcile) — still listening", &name));
+                    }
+                }
+            }
             // C29: a code minted in-session (`pair` typed into up).
             Ev::PairCode(v) => {
                 let c = v["code"].as_str().unwrap_or("?");
@@ -2519,6 +2672,16 @@ async fn recv_cmd(
                     ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away — choosing a file · holding the line", &n));
                 }
                 Some("back") => {
+                    let was_away = conn.is_away(&pid);
+                    conn.note_alive(&pid);
+                    if was_away {
+                        let n = conn.link_presence(&pid, Presence::Ready);
+                        ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                    }
+                }
+                // C30 phase 3: a state ping proves the peer is alive — clear
+                // any away-mark (the receiver side has no sender corrections).
+                Some("state") => {
                     let was_away = conn.is_away(&pid);
                     conn.note_alive(&pid);
                     if was_away {

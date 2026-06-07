@@ -67,10 +67,14 @@ impl Session {
     /// The server confirmed our state (Ev::Synced) — record its digest.
     /// The digest we store is OUR desire at confirm time: the server applies
     /// what we sent, so a later desire change diffs against it correctly.
-    pub fn on_synced(&mut self, v: &Value) {
-        if v["ok"].as_bool() == Some(true) {
-            self.confirmed = Some((self.desired_digest(), Instant::now()));
+    /// Phase 2: the digest may carry the server's roster (`peers`) — the
+    /// loops reconcile against it (missed peer-joined/left self-correct).
+    pub fn on_synced(&mut self, v: &Value) -> Option<Vec<Value>> {
+        if v["ok"].as_bool() != Some(true) {
+            return None; // error digests carry no roster (server contract)
         }
+        self.confirmed = Some((self.desired_digest(), Instant::now()));
+        v["peers"].as_array().cloned()
     }
 
     /// Any local change to desire invalidates confirmation timing so the next

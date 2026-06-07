@@ -67,7 +67,7 @@ function readLossConfig() {
 //      getter (true when session-state emits can land).
 // tel: telemetry fn (ev, data) — kept LOW volume: we only emit when state
 //      actually changed or an ack was missed.
-export function createSession(sig, tel = () => {}) {
+export function createSession(sig, tel = () => {}, onDigest = null) {
   const desired = { room: null, name: null, uid: null, channels: new Set() }
   let confirmed = { snapshot: null, at: 0 }
 
@@ -127,12 +127,15 @@ export function createSession(sig, tel = () => {}) {
     // retries on the next tick, and the missed-ack path fires above.
     if (shouldDrop()) return
 
-    sig.sync(wire, () => {
+    sig.sync(wire, (resp) => {
       // Stale ack guard: only the ack for the snapshot we're awaiting counts.
       if (pendingDigest !== digest(snapshot)) return
       confirmed = { snapshot, at: Date.now() }
       pendingSince = 0
       pendingDigest = null
+      // C30 phase 2: the digest may carry the server's roster — hand it to
+      // the reconciler (ok:true only; error digests carry no roster).
+      if (onDigest && resp && resp.ok === true && Array.isArray(resp.peers)) onDigest(resp.peers)
     })
   }
 

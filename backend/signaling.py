@@ -500,9 +500,15 @@ def register(socketio, registry):
         n = _do_subscribe(sid, data.get("channels"))
 
         _tel("sync", sid=sid, room_changed=room_changed, channels=n)
+        # Roster (C30 phase 2): the digest carries everyone the server holds in
+        # the caller's room (welcome-shaped, self excluded). registry.peers_in
+        # already lease-filters on Redis. Sort by sid THEN cap at 32 so an
+        # unchanged room yields a byte-identical digest across repeated syncs
+        # (the client's idempotency/reconciliation depends on it).
+        peers = sorted(registry.peers_in(room, exclude=sid), key=lambda p: p["id"])[:32]
         # Ack carries the server's resulting beliefs for this sid; the client
         # compares (digest) instead of assuming any single emit landed.
-        digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True}
+        digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True, "peers": peers}
         # Also emit the digest as a plain event: the Rust client consumes
         # events through one channel (Ev enum) and skips ack plumbing.
         emit("synced", digest)

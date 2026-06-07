@@ -57,7 +57,8 @@ class SyncAckShape(unittest.TestCase):
     def test_valid_sync_ack(self):
         _app, _sio, c = _make()
         ack = _ack(c, {"v": 1, "room": "r1", "name": "alice", "uid": "u1", "channels": [C1]})
-        self.assertEqual(ack, {"v": 1, "ok": True, "room": "r1", "channels": 1, "lease": True})
+        self.assertEqual(ack, {"v": 1, "ok": True, "room": "r1", "channels": 1,
+                               "lease": True, "peers": []})
 
     def test_missing_room_rejected(self):
         _app, _sio, c = _make()
@@ -156,6 +157,72 @@ class SyncChannelUnion(unittest.TestCase):
         # B subscribing to C1 (where A already is) tells B about A, and A about B.
         self.assertIn("known-peer", _names(b.get_received()))
         self.assertIn("known-peer", _names(a.get_received()))
+
+
+class SyncRoster(unittest.TestCase):
+    """C30 phase 2: the digest GROWS a `peers` field — everyone in the
+    caller's room (welcome-shaped {id,name,uid}, self excluded), capped at 32,
+    deterministically ordered so repeated syncs are byte-identical."""
+
+    def test_empty_room_yields_empty_peers(self):
+        """A lone sid's digest lists no peers."""
+        _app, _sio, c = _make()
+        ack = _ack(c, {"room": "r1", "name": "alice", "uid": "ua"})
+        self.assertEqual(ack["peers"], [])
+
+    def test_digest_includes_co_roomed_peer(self):
+        """A digest carries a co-roomed peer with id/name/uid, welcome-shaped."""
+        app, sio, a = _make()
+        b = sio.test_client(app)
+        b.get_received()
+
+        # B syncs in first so it is present when A syncs.
+        _ack(b, {"room": "r1", "name": "bob", "uid": "ub"})
+        b.get_received()
+        ack = _ack(a, {"room": "r1", "name": "alice", "uid": "ua"})
+
+        self.assertEqual(len(ack["peers"]), 1)
+        peer = ack["peers"][0]
+        self.assertEqual(peer["name"], "bob")
+        self.assertEqual(peer["uid"], "ub")
+        self.assertIn("id", peer)
+        # welcome-shaped: exactly id/name/uid, nothing else.
+        self.assertEqual(set(peer), {"id", "name", "uid"})
+
+    def test_digest_excludes_self(self):
+        """The caller never appears in its own roster."""
+        app, sio, a = _make()
+        b = sio.test_client(app)
+        b.get_received()
+        _ack(b, {"room": "r1", "name": "bob", "uid": "ua-other"})
+        ack_a = _ack(a, {"room": "r1", "name": "alice", "uid": "ua"})
+
+        # A's own name/uid must never appear in A's roster — only B does.
+        self.assertEqual({p["name"] for p in ack_a["peers"]}, {"bob"})
+        self.assertNotIn("ua", {p["uid"] for p in ack_a["peers"]})
+
+    def test_peers_identical_across_repeated_syncs(self):
+        """An unchanged room yields a byte-identical `peers` list every sync —
+        with TWO peers, this also proves the order is stably sorted."""
+        app, sio, a = _make()
+        b = sio.test_client(app)
+        c = sio.test_client(app)
+        b.get_received()
+        c.get_received()
+
+        _ack(b, {"room": "r1", "name": "bob", "uid": "ub"})
+        _ack(c, {"room": "r1", "name": "carol", "uid": "uc"})
+
+        ack1 = _ack(a, {"room": "r1", "name": "alice", "uid": "ua"})
+        a.get_received()
+        ack2 = _ack(a, {"room": "r1", "name": "alice", "uid": "ua"})
+
+        self.assertEqual(len(ack1["peers"]), 2)
+        self.assertEqual(ack1["peers"], ack2["peers"],
+                         "repeated sync of an unchanged room must be byte-identical")
+        # Explicitly sorted by sid (deterministic cap).
+        ids = [p["id"] for p in ack1["peers"]]
+        self.assertEqual(ids, sorted(ids))
 
 
 class RegistryLevelConvergence(unittest.TestCase):

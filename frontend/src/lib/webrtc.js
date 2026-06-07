@@ -22,6 +22,7 @@ const CTRL = {
   PAIR_KEEP_ACK: 'pair-keep-ack', // C27: the human's answer — sender keeps only confirmed secrets
   PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
   PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict — a rejected prover stops claiming acquaintance
+  STATE: 'state', // C30 ph3: periodic link truth {transfers, trusted, away} — divergence repair
 }
 
 let _tid = 0
@@ -65,7 +66,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -78,6 +79,7 @@ export class PeerLink {
     this.onPairKeepAck = onPairKeepAck || (() => {}) // C27: peer answered our remember offer
     this.onPairProof = onPairProof || (() => {}) // C20: peer claims to be a known device
     this.onPairProofAck = onPairProofAck || (() => {}) // C27: peer judged our proof
+    this.onPeerStateDiverged = onPeerStateDiverged || (() => {}) // C30 ph3: one-sided belief detected
     this.route = null // 'local' | 'direct' | 'relayed'
 
     // Resume support: a stable per-tab identity for the remote peer, plus
@@ -274,6 +276,11 @@ export class PeerLink {
       clearTimeout(this._watchdog) // established — watchdog stands down (#8)
       this.onStatus('ready')
       this.onChannelOpen() // the hook re-offers any paused sends to this peer
+      // C30 ph3: tell this peer our truth every ~10s — transfers we hold,
+      // whether we verified them, whether our tab is hidden. One-sided
+      // beliefs (lost END, lost proof, stale away) self-correct.
+      clearInterval(this._stateTimer)
+      this._stateTimer = setInterval(() => this._sendState(), 10000)
     }
     channel.onmessage = (e) => this._onMessage(e.data)
     // One persistent drain handler feeds ALL concurrent senders — never
@@ -408,6 +415,24 @@ export class PeerLink {
       case CTRL.PAIR_PROOF_ACK:
         this.onPairProofAck(!!msg.ok)
         break
+      case CTRL.STATE: {
+        // (the first switch's default already cleared any away-mark — a
+        // state ping is proof of life.) Corrections:
+        const tr = msg.transfers || {}
+        for (const [id, bytes] of Object.entries(tr)) {
+          const t = this.transfers.get(id)
+          // I believe this send is COMPLETE; the peer holds fewer bytes —
+          // the tail/END was lost. Re-offer with resume.
+          if (t && t.direction === 'send' && t.status === 'complete' && bytes < t.size) {
+            this.onPeerStateDiverged('transfer')
+            this.resumeSend(id)
+          }
+        }
+        // They say they don't recognize us; the hook may hold a secret for
+        // them — let it re-prove (once per link, hook-gated).
+        if (msg.trusted === false) this.onPeerStateDiverged('trust')
+        break
+      }
     }
   }
 
@@ -544,7 +569,22 @@ export class PeerLink {
     waiters.forEach((r) => r()) // unblock parked sender loops so they exit
   }
 
+  _sendState() {
+    const transfers = {}
+    for (const t of this.transfers.values()) {
+      if (t.direction !== 'receive') continue
+      const p = this.stores.partials.get(t.id)
+      transfers[t.id] = t.status === 'complete' ? t.size : p ? p.received : 0
+    }
+    this._control({
+      type: CTRL.STATE, v: 1, transfers,
+      trusted: !!this._verified, // set by the hook on proof-ok
+      away: typeof document !== 'undefined' && document.visibilityState === 'hidden',
+    })
+  }
+
   close() {
+    clearInterval(this._stateTimer)
     if (this._closed) return
     this._closed = true
     clearTimeout(this._dcTimer)
