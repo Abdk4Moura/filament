@@ -104,6 +104,11 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          # A tag with a hyphen (cli-v0.2.1-beta.1) is a PRERELEASE: GitHub
+          # hides it from /releases/latest, and the installer + self-update
+          # skip it unless explicitly opted in (FILAMENT_CHANNEL=beta /
+          # `filament update --beta`).
+          prerelease: ${{ contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') }}
           files: |
             filament-*
             SHA256SUMS

@@ -168,6 +168,9 @@ enum Cmd {
         /// Check only; don't install
         #[arg(long)]
         check: bool,
+        /// Include prerelease (beta) builds
+        #[arg(long)]
+        beta: bool,
     },
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     Completions {
@@ -1466,7 +1469,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Update { check } => update_cmd(check).await,
+        Cmd::Update { check, beta } => update_cmd(check, beta).await,
         Cmd::Completions { shell } => {
             use clap::CommandFactory;
             clap_complete::generate(shell, &mut Cli::command(), "filament", &mut std::io::stdout());
@@ -1497,14 +1500,17 @@ fn release_target() -> Option<&'static str> {
     }
 }
 
-async fn update_cmd(check_only: bool) -> Result<()> {
+async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(format!("filament/{}", env!("CARGO_PKG_VERSION")))
         .build()?;
 
     // Latest cli-v* release via the API (releases/latest may point at a web
-    // release tag, so filter explicitly).
+    // release tag, so filter explicitly). Prereleases are SKIPPED unless the
+    // user opted in (--beta) or is already running a prerelease — a beta tag
+    // must never be pushed onto stable users.
+    let beta_ok = beta || env!("CARGO_PKG_VERSION").contains('-');
     let releases: Value = client
         .get(format!("https://api.github.com/repos/{REPO}/releases?per_page=20"))
         .send()
@@ -1514,8 +1520,10 @@ async fn update_cmd(check_only: bool) -> Result<()> {
     let latest = releases
         .as_array()
         .and_then(|a| {
-            a.iter()
-                .find(|r| r["tag_name"].as_str().is_some_and(|t| t.starts_with("cli-v")))
+            a.iter().find(|r| {
+                r["tag_name"].as_str().is_some_and(|t| t.starts_with("cli-v"))
+                    && (beta_ok || !r["prerelease"].as_bool().unwrap_or(false))
+            })
         })
         .ok_or_else(|| anyhow!("no CLI release found"))?;
     let tag = latest["tag_name"].as_str().unwrap_or_default().to_string();

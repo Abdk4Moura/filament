@@ -10,13 +10,11 @@
 
 name: Deploy backend
 
+# Manual-only: droplet SSH secrets (DROPLET_HOST/USER/SSH_KEY/DEPLOY_PATH) are
+# unset, so push-triggered runs failed every time ("missing server host").
+# Deploys currently happen on the droplet via `docker compose`. Re-add the
+# `push:` trigger once those repo secrets are configured.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'backend/**'
-      - 'deploy/**'
-      - '.github/workflows/deploy-backend.yml'
   workflow_dispatch: {}
 
 concurrency:
