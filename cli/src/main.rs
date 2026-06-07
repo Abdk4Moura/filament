@@ -131,7 +131,10 @@ enum Cmd {
         output: Option<String>,
     },
     /// List devices remembered via --remember (trusted for --to and auto-accept)
-    Devices,
+    Devices {
+        #[command(subcommand)]
+        action: Option<DevicesAction>,
+    },
     /// Always-on receiver: trusted known devices only, invisible to strangers
     Up {
         /// Install + start a systemd user service instead of running attached
@@ -163,6 +166,16 @@ enum Cmd {
     /// Print the man page (roff) to stdout
     #[command(hide = true)]
     Man,
+}
+
+/// Petname management (C12): names are LOCAL aliases for pair secrets — the
+/// secret is the identity, the name is yours to fix when you mislabel one.
+#[derive(Subcommand)]
+enum DevicesAction {
+    /// Forget a device: deletes the secret; it can no longer find you
+    Forget { name: String },
+    /// Rename your local alias (the other side is unaffected)
+    Rename { old: String, new: String },
 }
 
 /// Looks like a speakable code: word-word-digits.
@@ -1174,13 +1187,39 @@ async fn main() -> Result<()> {
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
-        Cmd::Devices => {
-            let all = devices_load();
-            if all.is_empty() {
-                println!("no known devices yet — pair once with --code plus --remember <name> on both ends");
-            }
-            for (n, s) in all {
-                println!("{n}  (channel {})", &channel_of(&s)[..12]);
+        Cmd::Devices { action } => {
+            match action {
+                None => {
+                    let all = devices_load();
+                    if all.is_empty() {
+                        println!("no known devices yet — pair once with --code plus --remember <name> on both ends");
+                    }
+                    for (n, s) in all {
+                        println!("{n}  (channel {})", &channel_of(&s)[..12]);
+                    }
+                }
+                Some(DevicesAction::Forget { name }) => {
+                    let had = devices_load().iter().any(|(n, _)| n == &name);
+                    if !had {
+                        bail!("no device named '{name}' — see `filament devices`");
+                    }
+                    devices_remove(&name)?;
+                    println!("forgot '{name}' — it can no longer find or auto-connect to this machine");
+                    println!("(their side still holds its half; it will hear \"never met you\" on the next proof)");
+                }
+                Some(DevicesAction::Rename { old, new }) => {
+                    let all = devices_load();
+                    let Some((_, sec)) = all.iter().find(|(n, _)| n == &old) else {
+                        bail!("no device named '{old}' — see `filament devices`");
+                    };
+                    if all.iter().any(|(n, _)| n == &new) {
+                        bail!("'{new}' already exists — forget it first or pick another name");
+                    }
+                    let sec = sec.clone();
+                    devices_remove(&old)?;
+                    devices_store(&new, &sec)?;
+                    println!("renamed '{old}' -> '{new}' (local alias only — the secret, and the other side, are unchanged)");
+                }
             }
             Ok(())
         }
