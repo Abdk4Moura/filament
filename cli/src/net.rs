@@ -298,6 +298,17 @@ pub struct Peer {
     state: Mutex<PeerSignalState>,
     sio: Client,
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// C20: DTLS cert fingerprints (ours, theirs) parsed from the SDP we
+    /// exchange — pair-proofs are bound to them so a MITM'd channel (even by
+    /// the signaling server) fails verification.
+    fps: Mutex<(Option<String>, Option<String>)>,
+}
+
+/// Extract `a=fingerprint:...` from an SDP (normalized uppercase hex).
+fn sdp_fingerprint(sdp: &str) -> Option<String> {
+    sdp.lines()
+        .find_map(|l| l.strip_prefix("a=fingerprint:"))
+        .map(|v| v.trim().to_uppercase())
 }
 
 struct PeerSignalState {
@@ -425,7 +436,7 @@ impl Peer {
             });
         }
 
-        Ok(Arc::new(Peer {
+        let peer = Arc::new(Peer {
             id: peer_id,
             polite,
             pc,
@@ -435,7 +446,14 @@ impl Peer {
             }),
             sio,
             closed,
-        }))
+            fps: Mutex::new((None, None)),
+        });
+        // local fingerprint from whatever description we already sent (offer
+        // path emits before Peer exists; capture lazily on first access too)
+        if let Some(ld) = peer.pc.local_description().await {
+            peer.fps.lock().await.0 = sdp_fingerprint(&ld.sdp);
+        }
+        Ok(peer)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -486,6 +504,7 @@ impl Peer {
                     serde_json::from_value(data["description"].clone())
                         .context("parse remote description")?;
                 let is_offer = desc.sdp_type.to_string() == "offer";
+                self.fps.lock().await.1 = sdp_fingerprint(&desc.sdp);
                 self.pc.set_remote_description(desc).await?;
                 let pending = {
                     let mut st = self.state.lock().await;
@@ -505,6 +524,7 @@ impl Peer {
                         .local_description()
                         .await
                         .ok_or_else(|| anyhow!("no local description"))?;
+                    self.fps.lock().await.0 = sdp_fingerprint(&ld.sdp);
                     self.sio
                         .emit(
                             "signal",
@@ -535,6 +555,27 @@ impl Peer {
             _ => {}
         }
         Ok(())
+    }
+
+    /// C20: (our fp, their fp) once the handshake exchanged descriptions.
+    pub async fn fingerprints(&self) -> Option<(String, String)> {
+        {
+            let mut f = self.fps.lock().await;
+            if f.0.is_none() {
+                if let Some(ld) = self.pc.local_description().await {
+                    f.0 = sdp_fingerprint(&ld.sdp);
+                }
+            }
+            if f.1.is_none() {
+                if let Some(rd) = self.pc.remote_description().await {
+                    f.1 = sdp_fingerprint(&rd.sdp);
+                }
+            }
+            if let (Some(a), Some(b)) = (&f.0, &f.1) {
+                return Some((a.clone(), b.clone()));
+            }
+        }
+        None
     }
 
     /// Which physical path did ICE pick? Same taxonomy as the browser badge.

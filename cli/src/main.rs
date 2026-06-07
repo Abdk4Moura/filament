@@ -342,11 +342,18 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
     outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn proof_for(secret: &str, a_uid: &str, b_uid: &str) -> String {
-    // order-normalized so both sides compute the same pair context, but
-    // direction-tagged by prepending the prover's uid
+/// C20: the proof binds the pair secret to the DTLS session. uids are
+/// order-normalized (direction-tagged by the prover's uid prefix) and BOTH
+/// certificate fingerprints are mixed in sorted order — a channel MITM'd by
+/// anyone (including the signaling server) has different fingerprints, so
+/// the proof fails and auto-accept refuses.
+fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str, fp1: &str, fp2: &str) -> String {
     let (lo, hi) = if a_uid < b_uid { (a_uid, b_uid) } else { (b_uid, a_uid) };
-    hmac_sha256(secret.as_bytes(), format!("filament-proof:{a_uid}|{lo}|{hi}").as_bytes())
+    let (f_lo, f_hi) = if fp1 < fp2 { (fp1, fp2) } else { (fp2, fp1) };
+    hmac_sha256(
+        secret.as_bytes(),
+        format!("filament-proof2:{prover_uid}|{lo}|{hi}|{f_lo}|{f_hi}").as_bytes(),
+    )
 }
 
 fn fresh_secret() -> String {
@@ -1060,10 +1067,14 @@ async fn send_cmd(
                     // auto-accepts only after verifying); or hand over a new
                     // pair secret when the user asked to --remember.
                     if let Some((_n, sec)) = &l.expected_secret {
-                        t.send_control(&json!({
-                            "type": "pair-proof",
-                            "mac": proof_for(sec, &conn.my_uid, l.uid.as_deref().unwrap_or("")),
-                        })).await?;
+                        if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                            t.send_control(&json!({
+                                "type": "pair-proof",
+                                "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
+                            })).await?;
+                        } else {
+                            eprintln!("{}", ui::paint(ui::Tone::Warn, "no DTLS fingerprints available — skipping identity proof"));
+                        }
                     } else if let (Some(name), true) = (&remember, use_code) {
                         let sec = fresh_secret();
                         t.send_control(&json!({ "type": "pair-keep", "secret": sec })).await?;
@@ -1384,7 +1395,17 @@ async fn recv_cmd(
                 Some("pair-proof") => {
                     let mac = v["mac"].as_str().unwrap_or_default();
                     let peer_uid = conn.link(&pid).and_then(|l| l.uid.clone()).unwrap_or_default();
-                    let hit = devices.iter().find(|(_, s)| proof_for(s, &peer_uid, &conn.my_uid) == mac);
+                    let fps = match conn.link(&pid) {
+                        Some(l) => l.peer.fingerprints().await,
+                        None => None,
+                    };
+                    let Some((my_fp, their_fp)) = fps else {
+                        eprintln!("pair-proof received before fingerprints known — ignoring");
+                        continue;
+                    };
+                    let hit = devices
+                        .iter()
+                        .find(|(_, s)| proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp) == mac);
                     if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
