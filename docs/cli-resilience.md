@@ -339,6 +339,22 @@ them. Welcome now preserves channel peers and re-raises subscriptions.
 Gate 16 covers all three: consent-gated store, channel rendezvous, decline
 purge.
 
+### C28. Presence was fire-and-forget — **FIXED**
+Field report: `filament up` couldn't see a known browser until a page
+reload. Third instance of one disease: an emit dying in a half-open socket
+(join → rejoin belt #14; create-code → C24; now `subscribe`). The channel
+registry is sid-keyed, and `known-peer` is only emitted AT subscribe time —
+one lost subscribe = mutual invisibility with no retry path. The cure is a
+system, not a patch: **assert presence, verify the assertion, reconcile
+periodically.** (1) `subscribe` is now ACKed (socket.io ack = handler
+return); the browser re-emits up to 3× on a missing ack. (2) The browser
+re-asserts channels every 45 s and on every tab-visible — and since the
+server re-introduces BOTH parties on every subscribe, a daemon that
+exhausted its dial budget against a frozen tab gets re-told within one
+tick: self-healing, no reload, no restart. (3) CLI flavor: every `welcome`
+(fresh sid) re-subscribes in all three subscribing loops (up/recv,
+send --to, introduce) — `up`'s subscribe-once-at-startup had the same hole.
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**

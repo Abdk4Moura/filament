@@ -74,8 +74,10 @@ class SocketIOSignaling extends Emitter {
   }
   // C12: raise known-device presence channels (sha256 meeting points — the
   // server never sees a secret). Idempotent; safe to re-send on reconnect.
-  subscribe(channels) {
-    if (channels?.length) this.socket.emit('subscribe', { channels })
+  // C28: onAck fires with the server's reply — callers verify the emit landed
+  // (an unverified subscribe lost in a half-open socket = invisible devices).
+  subscribe(channels, onAck) {
+    if (channels?.length) this.socket.emit('subscribe', { channels }, (resp) => onAck?.(resp))
   }
   // Force a reconnect attempt (e.g. when a suspended mobile tab resumes).
   reconnect() {

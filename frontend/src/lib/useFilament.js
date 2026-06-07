@@ -166,8 +166,12 @@ export function useFilament() {
   const expectedSecretRef = useRef(new Map()) // peerId -> {name, secret} (matched via known-peer)
 
   /// (Re)raise our channels. Safe to call repeatedly: on boot, on every
-  /// socket-up (a fresh sid lost its subscriptions), and after storing a new
-  /// secret mid-session.
+  /// socket-up (a fresh sid lost its subscriptions), after storing a new
+  /// secret mid-session, and on the C28 reconcile tick.
+  /// C28: VERIFIED, not fire-and-forget — the same half-open-socket failure
+  /// that ate room joins (#14) ate subscribes too (observed live: `filament
+  /// up` couldn't see a known browser until a page reload). No ack within
+  /// 4 s ⇒ re-emit, up to 3 tries.
   const subscribeKnown = useCallback(async () => {
     const devs = devicesLoad()
     setKnownDevices(devs)
@@ -175,12 +179,37 @@ export function useFilament() {
     try {
       const entries = await Promise.all(devs.map(async (d) => [await channelOf(d.secret), d]))
       channelMapRef.current = new Map(entries)
-      sigRef.current.subscribe(entries.map(([ch]) => ch))
-      tel('subscribe-known', { n: entries.length })
+      const chans = entries.map(([ch]) => ch)
+      const fire = (attempt) => {
+        let acked = false
+        sigRef.current.subscribe(chans, () => {
+          acked = true
+          tel('subscribe-ack', { n: chans.length, attempt })
+        })
+        setTimeout(() => {
+          if (!acked && attempt < 3) {
+            tel('subscribe-retry', { attempt })
+            fire(attempt + 1)
+          }
+        }, 4000)
+      }
+      fire(1)
     } catch {
       /* crypto.subtle unavailable (insecure origin) — known devices dormant */
     }
   }, [])
+
+  // C28 reconcile: presence must not depend on any single emit surviving.
+  // Every 45 s (and on every tab-visible) re-assert our channels; the server
+  // answers each subscribe by re-introducing both sides, so a daemon that
+  // exhausted its dial budget against a frozen tab gets re-told we exist —
+  // self-healing within one tick, no reload.
+  useEffect(() => {
+    const t = setInterval(() => {
+      if (connectedRef.current) subscribeKnown()
+    }, 45000)
+    return () => clearInterval(t)
+  }, [subscribeKnown])
 
   const forgetDevice = useCallback((name) => {
     setKnownDevices(devicesForget(name))
@@ -317,7 +346,7 @@ export function useFilament() {
         onPairProofAck: (ok) => {
           if (!ok) {
             expectedSecretRef.current.delete(id)
-            updatePeer(id, { verified: null })
+            updatePeer(id, { verified: null, known: null }) // drop the badge too
             tel('proof-rejected', { peer: id.slice(-6) })
           }
         },
@@ -430,8 +459,10 @@ export function useFilament() {
         if (!dev) return
         expectedSecretRef.current.set(id, dev)
         tel('known-peer', { peer: id.slice(-6) })
-        if (linksRef.current.has(id)) return // already linked via room roster
-        makeLink({ id, name: name || dev.name, uid })
+        if (!linksRef.current.has(id)) makeLink({ id, name: name || dev.name, uid })
+        // Mark the tile as a remembered device — the UI renders it distinctly
+        // (room-independent: it's here because of the pairing, not the room).
+        updatePeer(id, { known: dev.name })
       })
       sig.on('known-peer-left', ({ id }) => {
         expectedSecretRef.current.delete(id)
@@ -664,6 +695,7 @@ export function useFilament() {
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
         sigRef.current?.reconnect?.()
+        subscribeKnown() // C28: re-assert channels the freeze may have eaten
         for (const link of linksRef.current.values()) link.sendBack?.()
         // #13 (measured live): two mobile tabs rarely negotiate while both
         // awake — links that failed while WE were frozen stay failed forever.
@@ -690,7 +722,7 @@ export function useFilament() {
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onVisibility)
     }
-  }, [])
+  }, [subscribeKnown])
 
   // ---- Part C: optional native LAN-discovery helper ------------------------
   // If the Filament Local helper (experiments/localsend-discovery) is running,

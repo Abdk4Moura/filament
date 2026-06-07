@@ -445,7 +445,7 @@ def register(socketio, registry):
         chans = [c for c in ((data or {}).get("channels") or [])[:MAX_CHANNELS]
                  if isinstance(c, str) and CHAN_RE.match(c)]
         if not chans:
-            return
+            return {"ok": False, "n": 0}
         me = registry.meta(sid)
         for ch, others in registry.subscribe(sid, chans).items():
             for other in others:
@@ -454,6 +454,10 @@ def register(socketio, registry):
                     emit("known-peer", {**om, "channel": ch})
                 if me:
                     emit("known-peer", {**me, "channel": ch}, to=other)
+        # C28: the return value is the socket.io ACK — subscribers VERIFY the
+        # emit landed instead of assuming (a subscribe that dies in a half-open
+        # socket left devices mutually invisible until a page reload).
+        return {"ok": True, "n": len(chans)}
 
     @socketio.on("signal")
     def on_signal(data):

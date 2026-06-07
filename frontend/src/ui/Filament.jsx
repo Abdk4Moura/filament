@@ -122,6 +122,9 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
   // 'away' (C21): the peer announced a benign absence (e.g. it is choosing a
   // file on a phone) — amber, calm, explicitly not an error.
   const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
+  // C12: a remembered device — here because of the PAIRING, not the room.
+  // Dashed accent border + chip distinguish it; the hint line says why.
+  const known = !!peer.known
   return (
     <div
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
@@ -129,10 +132,11 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
       onDragOver={(e) => { if (ready) { e.preventDefault(); setOver(true) } }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); setOver(false); if (ready && e.dataTransfer.files.length) onSendFiles(peer.id, e.dataTransfer.files) }}
+      title={known ? 'Remembered device — you two reconnect automatically, in any room. No shared room or code needed.' : undefined}
       style={{
         position: 'relative', aspectRatio: '1 / 1', minWidth: 0,
         background: over ? (T.mode === 'light' ? '#EAF7F1' : '#0E1A16') : T.panel,
-        border: '1px solid ' + (over ? accent : hov && ready ? T.text : T.line),
+        border: over ? '1px solid ' + accent : hov && ready ? '1px solid ' + T.text : known ? '1px dashed ' + accent : '1px solid ' + T.line,
         padding: D.tilePad, display: 'flex', flexDirection: 'column', justifyContent: 'space-between',
         cursor: ready ? 'pointer' : 'default', opacity: ready ? 1 : 0.4,
         transition: 'border-color .12s, background .12s, transform .12s',
@@ -144,6 +148,11 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
         <span style={{ width: 14, height: 14, background: peer.color, display: 'block', flexShrink: 0 }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+          {known && (
+            <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap' }}>
+              REMEMBERED
+            </span>
+          )}
           {peer.route && <RouteBadge route={peer.route} T={T} />}
           <StatusDot color={sc} glow={ready} />
         </div>
@@ -155,7 +164,9 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
           <span>{peer.lastSeen}</span>
         </div>
         <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, height: 12, transition: 'color .12s' }}>
-          {ready ? (over ? 'release to send' : hov ? '↳ drop or click to send' : 'click · drop to send') : '—'}
+          {ready
+            ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
+            : known ? 'remembered · reaches you in any room' : '—'}
         </div>
       </div>
     </div>

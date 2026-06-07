@@ -618,7 +618,11 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
             Err(_) => continue,
         };
         match ev {
-            Ev::Welcome(v) => conn.my_id = v["id"].as_str().unwrap_or_default().to_string(),
+            Ev::Welcome(v) => {
+                conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                // C28: re-assert both parties' channels on every (re)connect.
+                sio.emit("subscribe", json!({ "channels": [channel_of(&a_sec), channel_of(&b_sec)] })).await.ok();
+            }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own processes share these channels
@@ -1463,6 +1467,11 @@ async fn send_cmd(
                         conn.maybe_adopt(p, code_used).await?;
                     }
                 }
+                // C28: fresh sid = dead subscriptions; re-assert the target's
+                // channel or a blip strands `send --to` waiting forever.
+                if let Some((_, sec)) = &known_target {
+                    sio.emit("subscribe", json!({ "channels": [channel_of(sec)] })).await.ok();
+                }
             }
             Ev::PairCode(v) => {
                 let code = v["code"].as_str().unwrap_or("?");
@@ -1985,6 +1994,14 @@ async fn recv_cmd(
                     for p in peers {
                         conn.maybe_adopt(p, true).await?;
                     }
+                }
+                // C28: a welcome means a (re)connect with a FRESH sid — every
+                // channel subscription died with the old one. Re-assert, or a
+                // socket blip makes this daemon invisible to known devices
+                // until restart (the browser-reload bug, CLI flavor).
+                if !devices.is_empty() {
+                    let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
+                    sio.emit("subscribe", json!({ "channels": chans })).await.ok();
                 }
             }
             Ev::KnownPeer(v) => {
