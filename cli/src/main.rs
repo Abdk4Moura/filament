@@ -41,8 +41,20 @@ const MAX_ATTEMPTS: u32 = 3;
 
 const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 
+const EXAMPLES: &str = "\
+EXAMPLES:
+  filament video.mp4                 send it; mints a speakable one-time code + QR
+  filament clever-lynx-63            claim a code and receive
+  filament send ./photos --code      directories tar on the fly
+  filament recv <code> -o - | tar x  stream straight into a pipe
+  filament send big.iso --to laptop  no code: a remembered device, verified by proof
+  filament up --install              always-on drop target (trusted devices only)
+  filament introduce laptop phone    vouch two of your devices to each other
+
+  The other end never needs anything installed: https://filament.autumated.com";
+
 #[derive(Parser)]
-#[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers — no upload, no account")]
+#[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers — no upload, no account", after_help = EXAMPLES)]
 struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
     #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
@@ -104,6 +116,9 @@ enum Cmd {
         /// After a code pairing, remember the other device under this name
         #[arg(long)]
         remember: Option<String>,
+        /// Rename the (single) received file; '-' streams it to stdout
+        #[arg(long, short = 'o')]
+        output: Option<String>,
     },
     /// List devices remembered via --remember (trusted for --to and auto-accept)
     Devices,
@@ -488,7 +503,7 @@ async fn up_cmd(server: &str, install: bool, dir: Option<PathBuf>, relay: bool) 
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(pidfile(), std::process::id().to_string())?;
-    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true).await;
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None).await;
     let _ = std::fs::remove_file(pidfile());
     res
 }
@@ -580,6 +595,9 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         match ev {
             Ev::Welcome(v) => conn.my_id = v["id"].as_str().unwrap_or_default().to_string(),
             Ev::KnownPeer(v) => {
+                if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
+                    continue; // our own processes share these channels
+                }
                 let ch = v["channel"].as_str().unwrap_or_default().to_string();
                 let pid = v["id"].as_str().unwrap_or_default().to_string();
                 let is_b = if ch == channel_of(&a_sec) { false } else if ch == channel_of(&b_sec) { true } else { continue };
@@ -731,11 +749,10 @@ impl Conn {
         if peer_id.is_empty() || peer_id == self.my_id {
             return Ok(false);
         }
-        // Our own daemon shares this device's store and therefore its
-        // presence channels — never adopt yourself.
-        if is_self_uid(&self.my_uid, peer_uid.as_deref()) {
-            return Ok(false);
-        }
+        // NOTE: same-install peers (our own daemon) are filtered at the
+        // KnownPeer call sites, NOT here — room discovery must keep working
+        // between two processes of one machine (loopback self-send is the
+        // first thing every new user tries).
         self.roster.insert(peer_id.clone(), v.clone());
 
         // C6: same device on a NEW sid — supersede the stale link.
@@ -970,8 +987,8 @@ async fn main() -> Result<()> {
         Cmd::Send { paths, code, word, room, to, name, remember } => {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
-        Cmd::Recv { code, dir, yes, room, to, keep_open, remember } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false).await
+        Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output).await
         }
         Cmd::Config { key, value } => {
             match (key, value) {
@@ -1059,8 +1076,15 @@ async fn update_cmd(check_only: bool) -> Result<()> {
     let tag = latest["tag_name"].as_str().unwrap_or_default().to_string();
     let latest_ver = tag.trim_start_matches("cli-v").to_string();
     let current = env!("CARGO_PKG_VERSION");
-    if latest_ver == current {
-        println!("filament {current} is already the latest");
+    // semver-aware: never "update" to an older or equal release (betas of
+    // the next version outrank the previous release; -pre < its release).
+    fn key(v: &str) -> (u64, u64, u64, bool) {
+        let (core, pre) = v.split_once('-').map(|(c, _)| (c, true)).unwrap_or((v, false));
+        let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0), !pre)
+    }
+    if key(&latest_ver) <= key(current) {
+        println!("filament {current} is already the latest (released: {latest_ver})");
         return Ok(());
     }
     println!("update available: {current} -> {latest_ver}");
@@ -1215,6 +1239,17 @@ async fn send_cmd(
     } else {
         eprintln!("waiting for a peer in room {room} (same network auto-discovers; or use --code)");
     }
+    // Live spinner while nothing is connected yet (tty only; stops at adopt).
+    let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let waiting = waiting.clone();
+        tokio::spawn(async move {
+            while waiting.load(std::sync::atomic::Ordering::Relaxed) {
+                ui::status(&format!("  {} waiting…", ui::spinner_frame()));
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+        });
+    }
 
     let mut conn = Conn {
         server: server.to_string(),
@@ -1252,7 +1287,7 @@ async fn send_cmd(
             match tokio::time::timeout(claim_deadline.saturating_sub(started.elapsed()), rx.recv()).await {
                 Ok(Some(ev)) => Some(ev),
                 Ok(None) => bail!("signaling channel closed"),
-                Err(_) => bail!("timed out waiting for a peer"),
+                Err(_) => bail!("timed out waiting for a peer — is the other device online and on the same server? (--code makes pairing explicit)"),
             }
         } else {
             next_ev(&mut rx, &conn).await?
@@ -1293,6 +1328,9 @@ async fn send_cmd(
                 conn.maybe_adopt(&v, code_used).await?;
             }
             Ev::KnownPeer(v) => {
+                if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
+                    continue; // our own daemon shares this channel
+                }
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
                         eprintln!("known device '{n}' is online — connecting");
@@ -1327,6 +1365,7 @@ async fn send_cmd(
                 if !conn.is_active(&pid) {
                     continue;
                 }
+                waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(l) = conn.link(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     let p = l.peer.clone();
@@ -1517,7 +1556,6 @@ struct IncomingFile {
     received: u64,
     file: tokio::io::BufWriter<tokio::fs::File>,
     part_path: PathBuf,
-    started: Instant,
     bar: ui::Progress,
 }
 
@@ -1533,7 +1571,9 @@ async fn recv_cmd(
     relay: bool,
     remember: Option<String>,
     daemon: bool,
+    output: Option<String>,
 ) -> Result<()> {
+    let to_stdout = output.as_deref() == Some("-");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
@@ -1640,6 +1680,9 @@ async fn recv_cmd(
                 }
             }
             Ev::KnownPeer(v) => {
+                if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
+                    continue; // our own sender/daemon shares these channels
+                }
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
                     eprintln!("known device '{n}' appeared — connecting");
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
@@ -1803,6 +1846,34 @@ async fn recv_cmd(
                         continue;
                     }
 
+                    if to_stdout {
+                        // Pipe mode: no part files, no resume — pure stream.
+                        // Write through a dup'd stdout fd so dropping the
+                        // writer never closes the process's real fd 1; the
+                        // /dev/stdout open is the portable-unix way to dup.
+                        // (Windows: -o - is not supported yet; see G-e.)
+                        #[cfg(unix)]
+                        let out = tokio::fs::OpenOptions::new().write(true).open("/dev/stdout").await?;
+                        #[cfg(not(unix))]
+                        {
+                            bail!("-o - (stdout streaming) is not supported on this platform yet");
+                        }
+                        #[cfg(unix)]
+                        {
+                            by_sid.insert((pid.clone(), sid), IncomingFile {
+                                id: id.clone(),
+                                name,
+                                size,
+                                received: 0,
+                                file: tokio::io::BufWriter::with_capacity(1 << 20, out),
+                                part_path: PathBuf::new(),
+
+                                bar: ui::Progress::new("(stdout)", size),
+                            });
+                            t.send_control(&json!({ "type": "file-accept", "id": id, "offset": 0 })).await?;
+                            continue;
+                        }
+                    }
                     let file = if offset > 0 {
                         eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
                         tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
@@ -1818,7 +1889,7 @@ async fn recv_cmd(
                         received: offset,
                         file: tokio::io::BufWriter::with_capacity(1 << 20, file),
                         part_path,
-                        started: Instant::now(),
+
                         bar,
                     });
                     t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
@@ -1827,8 +1898,13 @@ async fn recv_cmd(
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     if let Some(mut inc) = by_sid.remove(&(pid.clone(), sid)) {
                         inc.file.flush().await?;
+                        if to_stdout {
+                            completed += 1;
+                            continue;
+                        }
                         drop(inc.file);
-                        let final_path = unique_path(&dir, &inc.name);
+                        let rename_to = if completed == 0 { output.clone() } else { None };
+                        let final_path = unique_path(&dir, rename_to.as_deref().unwrap_or(&inc.name));
                         tokio::fs::rename(&inc.part_path, &final_path).await?;
                         let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
                         let ok = inc.received == inc.size;

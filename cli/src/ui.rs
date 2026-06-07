@@ -71,6 +71,7 @@ pub fn paint(tone: Tone, s: &str) -> String {
 pub fn glyph_ok() -> &'static str {
     if caps().unicode { "✓" } else { "ok" }
 }
+#[allow(dead_code)] // part of the glyph set; error paths adopt it next
 pub fn glyph_err() -> &'static str {
     if caps().unicode { "✗" } else { "x" }
 }

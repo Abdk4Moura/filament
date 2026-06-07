@@ -57,6 +57,7 @@ pub enum Ev {
     PairError(Value),
     /// C12: a mutually-known device appeared on a shared presence channel.
     KnownPeer(Value),
+    #[allow(dead_code)] // payload is {id,channel}; presence UIs will want it
     KnownPeerLeft(Value),
     /// (peer sid, ...) — every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).

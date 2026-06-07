@@ -321,6 +321,25 @@ else
   echo "SKIP (playwright not installed)"
 fi
 
+# --------------------------------------------------------------- gate 14 ----
+say "14: daemon — pair, introduce-grade trust, room-less up receives (C19/C20/C12)"
+DA="$WORK/g14a"; DB="$WORK/g14b"; DD="$WORK/g14drop"; mkdir -p "$DA" "$DB" "$DD"
+W="g14-$$-$RANDOM"
+FILAMENT_CONFIG_DIR="$DA" "$BIN" send "$SMALL" --word "$W" --remember boxB --server "$SERVER" >"$WORK/g14-s1.log" 2>&1 &
+SP=$!; pids+=($SP); sleep 3
+FILAMENT_CONFIG_DIR="$DB" timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$DB" --server "$SERVER" >"$WORK/g14-r1.log" 2>&1
+wait $SP
+FILAMENT_CONFIG_DIR="$DB" timeout 90 "$BIN" up --dir "$DD" --server "$SERVER" >"$WORK/g14-up.log" 2>&1 &
+UP=$!; pids+=($UP); sleep 3
+G14=0
+FILAMENT_CONFIG_DIR="$DA" timeout 60 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$WORK/g14-s2.log" 2>&1 || G14=1
+sleep 1; kill $UP 2>/dev/null
+if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
+   && grep -q "identity verified" "$WORK/g14-up.log" \
+   && ! grep -q "listening in room" "$WORK/g14-up.log"; then
+  ok "daemon: verified identity, room-less, received + hash match"
+else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"
