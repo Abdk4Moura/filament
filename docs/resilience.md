@@ -233,6 +233,25 @@ event object crashed the handler and the button silently did nothing.
 *Files:* `backend/signaling.py` (`pair_create`/`pair_claim`, events),
 `signaling.js`, `useFilament.js`, `Filament.jsx` ('pair' scope).
 
+## 12. Mobile file-picker backgrounding kills the peer link
+
+**Symptom.** Android: tapping a peer tile opens the system file picker, which
+backgrounds the tab; by the time a file is chosen, the other device (iPad)
+has watched the connection die — and the chosen file's offer fires into a
+dead link.
+
+**Problem.** Two compounding rules tuned for the wrong case: (a) the
+6-second disconnected-grace (#6) is right mid-transfer but far too short for
+an IDLE link surviving a file-pick round-trip; (b) offers sent while the
+channel is down are silently dropped, and the channel-open resume pass must
+re-offer never-accepted sends, not only paused ones.
+
+**Solution.** (a) Dynamic grace: 6 s while a transfer is active, 45 s when
+idle. (b) The reconnect path (visibilitychange nudge -> rejoin -> uid
+supersede -> onChannelOpen) re-offers every unfinished outgoing transfer for
+that peer, including status 'offered'.
+*Files:* `webrtc.js` (grace), `useFilament.js` (onChannelOpen re-offer).
+
 ---
 
 ## Testing

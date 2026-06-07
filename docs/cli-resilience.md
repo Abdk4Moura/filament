@@ -207,6 +207,35 @@ end-to-end against the LIVE release:
   verified). TURN ephemeral credentials, the Cloudflare tunnel, and the :3478
   relay all exercised end to end.
 
+### C18. Single-link CLI wedges multi-peer rooms — **OPEN (fix in progress)**
+Found by the maintainer on a real network: browsers are MESH peers (they
+connect to every room member), but the CLI holds ONE link and ignores signals
+from everyone else. With a CLI + >=2 browsers in a room, the unanswered
+browsers sit at "connecting" forever, retry storms tear down and re-offer,
+and the room degenerates into nobody-connects. **Fix:** multi-link (browser
+parity): a links map keyed by sid; every offer gets answered politely; one
+peer is the active transfer target; per-link trust/state. Also the
+prerequisite for the daemon (C19), pairing-while-paired, and introductions.
+**Verify with:** gate: CLI + two headless browsers in one room, all three
+pairwise connections reach connected, transfer still completes.
+
+### C19. Daemon (`filament up`) hardening — **OPEN (design locked)**
+A standing auto-accept receiver is a remote-write primitive. Locked-in
+mitigations from the security assessment (2026-06-07): join NO room
+(presence-channel subscriptions only — invisible to strangers); dedicated
+drop dir, 0644, never executable/auto-opened/auto-extracted; config caps
+(max size, daily quota, free-space floor, max links ~32); per-device
+auto/ask policy; receive notifications; `devices revoke`. Service management
+delegated to systemd-user/launchd via `up --install` (no hand-rolled forks).
+
+### C20. pair-proof not bound to the channel — **OPEN (upgrade designed)**
+Today's HMAC proof binds secret + uids but not the DTLS session, so a
+malicious signaling server could MITM the handshake (C15) and relay proofs.
+**Fix:** include both DTLS certificate fingerprints (already present in the
+relayed SDP) in the HMAC: a MITM'd channel has different fingerprints, the
+proof fails, auto-accept refuses. Closes active-MITM for known devices
+without full PAKE; C15 remains for code-pairing and the web app.
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**
