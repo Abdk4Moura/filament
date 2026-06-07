@@ -41,6 +41,7 @@ pub fn caps() -> &'static Caps {
 
 // ------------------------------------------------------------------ paint --
 
+#[derive(Clone, Copy)]
 pub enum Tone {
     /// the brand: filament green (#7CF6C8)
     Brand,

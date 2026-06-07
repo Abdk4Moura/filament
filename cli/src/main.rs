@@ -632,6 +632,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
                     l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
                 }
                 let Some(&is_b) = who.get(&pid) else { continue };
                 let (dev_name, sec) = if is_b { (&b_name, &b_sec) } else { (&a_name, &a_sec) };
@@ -689,6 +690,26 @@ struct Link {
     trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     expected_secret: Option<(String, String)>,
+    /// C26: what the status roster shows for this peer
+    presence: Presence,
+}
+
+/// C26: per-peer presence for the static status roster.
+#[derive(Clone, Copy, PartialEq)]
+enum Presence {
+    Connecting,
+    Ready,
+    Away,
+    Reconnecting,
+}
+
+fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
+    match p {
+        Presence::Ready => (ui::glyph_ok(), ui::Tone::Ok, ""),
+        Presence::Away => ("●", ui::Tone::Warn, "away"),
+        Presence::Reconnecting => ("◌", ui::Tone::Warn, "reconnecting…"),
+        Presence::Connecting => ("◌", ui::Tone::Dim, "connecting…"),
+    }
 }
 
 /// C18: browsers are mesh peers — they connect to EVERY room member. The CLI
@@ -852,6 +873,7 @@ impl Conn {
                 attempts: 0,
                 trusted: false,
                 expected_secret: None,
+                presence: Presence::Connecting,
             },
         );
         Ok(())
@@ -883,11 +905,18 @@ impl Conn {
         eprintln!("connection {why} — retrying ({}/{})", attempts + 1, MAX_ATTEMPTS);
         let info = l.info.clone();
         let secret = l.expected_secret.clone();
+        // C26: a link that was ever up is *re*connecting; one that never
+        // connected is still just connecting — keeps "recovered" honest.
+        let prev = match l.presence {
+            Presence::Connecting => Presence::Connecting,
+            _ => Presence::Reconnecting,
+        };
         let was_active = self.is_active(pid);
         self.establish(info).await?;
         if let Some(nl) = self.links.get_mut(pid) {
             nl.attempts = attempts;
             nl.expected_secret = secret;
+            nl.presence = prev;
         }
         if was_active {
             self.active = Some(pid.to_string());
@@ -902,19 +931,28 @@ impl Conn {
     async fn on_pc_state(&mut self, pid: &str, s: &str) {
         let away = self.is_away(pid);
         let Some(l) = self.links.get_mut(pid) else { return };
+        // C26: collect the announcement, print after the borrow ends so the
+        // roster can read every link.
+        let mut announce: Option<(&'static str, ui::Tone, &'static str)> = None;
         match s {
             "connected" => {
+                if l.presence == Presence::Reconnecting {
+                    announce = Some((ui::glyph_ok(), ui::Tone::Ok, "recovered"));
+                }
+                l.presence = Presence::Ready;
                 l.attempts = 0;
             }
             "disconnected" => {
                 let grace = if away {
+                    l.presence = Presence::Away;
                     if let Some((_, until)) = &self.away {
                         until.duration_since(Instant::now()) + Duration::from_secs(15)
                     } else {
                         Duration::from_secs(6)
                     }
                 } else {
-                    ui::say(&ui::paint(ui::Tone::Dim, "  connection blip — attempting recovery"));
+                    l.presence = Presence::Reconnecting;
+                    announce = Some(("◌", ui::Tone::Warn, "reconnecting…"));
                     Duration::from_secs(6)
                 };
                 if !l.peer.polite && !away {
@@ -929,6 +967,9 @@ impl Conn {
                 });
             }
             _ => {}
+        }
+        if let Some((mark, tone, note)) = announce {
+            ui::say(&self.roster(pid, mark, tone, note, "peer"));
         }
     }
 
@@ -966,8 +1007,42 @@ impl Conn {
         }
     }
 
+    /// C26: set a link's roster presence; returns its name for the announce.
+    fn link_presence(&mut self, pid: &str, p: Presence) -> String {
+        match self.links.get_mut(pid) {
+            Some(l) => {
+                l.presence = p;
+                l.name.clone()
+            }
+            None => String::new(),
+        }
+    }
+
     fn is_away(&self, pid: &str) -> bool {
         matches!(&self.away, Some((apid, until)) if apid == pid && *until > Instant::now())
+    }
+
+    /// C26: one static colored status line showing EVERY peer, the changed
+    /// one carrying the note — `✓ daring-wombat   ● deft-gibbon  away…`.
+    /// `fallback_name` covers a peer already dropped from the map (peer-left).
+    fn roster(&self, pid: &str, mark: &str, tone: ui::Tone, note: &str, fallback_name: &str) -> String {
+        let mut links: Vec<(&String, &Link)> = self.links.iter().collect();
+        links.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+        let mut parts = Vec::new();
+        let mut seen = false;
+        for (id, l) in links {
+            if id == pid {
+                seen = true;
+                parts.push(peer_entry(&l.name, mark, tone, note));
+            } else {
+                let (m, t, n) = presence_glyph(l.presence);
+                parts.push(peer_entry(&l.name, m, t, n));
+            }
+        }
+        if !seen {
+            parts.push(peer_entry(fallback_name, mark, tone, note));
+        }
+        format!("  {}", parts.join("   "))
     }
 
     /// #7 for the CLI: an offer from a roster peer we haven't linked yet
@@ -1432,6 +1507,7 @@ async fn send_cmd(
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
                     l.transport = Some(t.clone());
+                    l.presence = Presence::Ready;
                 }
                 // Responder links stop here: connected, polite, idle. Only
                 // the active target gets announcements + offers.
@@ -1497,9 +1573,17 @@ async fn send_cmd(
                 Some("brb") => {
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
                     conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
-                    ui::say(&ui::paint(ui::Tone::Dim, "  peer stepped away — holding the line"));
+                    let n = conn.link_presence(&pid, Presence::Away);
+                    ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away — holding the line", &n));
                 }
-                Some("back") => conn.note_alive(&pid),
+                Some("back") => {
+                    let was_away = conn.is_away(&pid);
+                    conn.note_alive(&pid);
+                    if was_away {
+                        let n = conn.link_presence(&pid, Presence::Ready);
+                        ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                    }
+                }
                 Some("file-accept") => {
                     let Some(t) = conn.transport() else { continue };
                     let offset = v["offset"].as_u64().unwrap_or(0);
@@ -1558,10 +1642,16 @@ async fn send_cmd(
             }
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
             Ev::PeerLeft(v) => {
+                let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
                 if conn.on_peer_left(&v) {
                     let all_done = outgoing.lock().await.iter().all(|o| o.done);
                     if !all_done {
-                        eprintln!("peer disconnected — waiting up to {}s for them to come back", REJOIN_WINDOW.as_secs());
+                        let secs = REJOIN_WINDOW.as_secs();
+                        let gid = v["id"].as_str().unwrap_or_default();
+                        match gone {
+                            Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, &format!("disconnected — waiting up to {secs}s"), &n)),
+                            None => eprintln!("peer disconnected — waiting up to {secs}s for them to come back"),
+                        }
                     }
                 }
             }
@@ -1894,6 +1984,7 @@ async fn recv_cmd(
                 if let Some(l) = conn.link_mut(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t);
+                    l.presence = Presence::Ready;
                     let p = l.peer.clone();
                     tokio::spawn(async move {
                         // ICE may renominate; retry briefly (mirrors the
@@ -1916,9 +2007,17 @@ async fn recv_cmd(
                     // picker suspends the tab). Hold the line that long.
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
                     conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
-                    ui::say(&ui::paint(ui::Tone::Dim, "  peer is choosing a file — holding the line"));
+                    let n = conn.link_presence(&pid, Presence::Away);
+                    ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away — choosing a file · holding the line", &n));
                 }
-                Some("back") => conn.note_alive(&pid),
+                Some("back") => {
+                    let was_away = conn.is_away(&pid);
+                    conn.note_alive(&pid);
+                    if was_away {
+                        let n = conn.link_presence(&pid, Presence::Ready);
+                        ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
+                    }
+                }
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
@@ -2225,6 +2324,7 @@ async fn recv_cmd(
             }
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
             Ev::PeerLeft(v) => {
+                let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
                 if conn.on_peer_left(&v) {
                     let secs = conn.rejoin_window.as_secs();
                     if !by_sid.is_empty() {
@@ -2240,13 +2340,16 @@ async fn recv_cmd(
                         // C21: NOT fatal — a phone opening its file picker
                         // suspends the whole tab and drops the socket. Hold
                         // the line; their client rejoins on refocus.
-                        ui::say(&ui::paint(
-                            ui::Tone::Dim,
-                            &format!("  sender stepped away — holding the line up to {secs}s (Ctrl-C to stop)"),
-                        ));
+                        let gid = v["id"].as_str().unwrap_or_default();
+                        let n = gone.unwrap_or_else(|| "sender".into());
+                        ui::say(&conn.roster(gid, "●", ui::Tone::Warn, &format!("stepped away — holding the line up to {secs}s (Ctrl-C to stop)"), &n));
                     } else {
                         conn.waiting_rejoin = None; // open listener: keep going
-                        ui::say(&ui::paint(ui::Tone::Dim, "  peer left — still listening"));
+                        let gid = v["id"].as_str().unwrap_or_default();
+                        match gone {
+                            Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, "left — still listening", &n)),
+                            None => ui::say(&ui::paint(ui::Tone::Dim, "  peer left — still listening")),
+                        }
                     }
                 }
             }
@@ -2311,6 +2414,19 @@ impl Drop for TtyGuard {
 fn consent_token() -> &'static str {
     static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     T.get_or_init(fresh_secret)
+}
+
+/// C26: one-line colored peer status — static scrollback lines, the CLI's
+/// equivalent of the web UI's amber 'away' tile.
+///   ✓ deft-gibbon                    (connected)
+///   ● deft-gibbon  away — choosing a file
+///   ◌ deft-gibbon  reconnecting…
+fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
+    let mut s = format!("{} {}", ui::paint(tone, mark), ui::paint(ui::Tone::Bold, name));
+    if !note.is_empty() {
+        s.push_str(&format!("  {}", ui::paint(ui::Tone::Dim, note)));
+    }
+    s
 }
 
 fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {

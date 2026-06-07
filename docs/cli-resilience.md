@@ -268,6 +268,48 @@ the user actually tried). Gate 15 verifies the hold-the-line path
 deterministically; the browser-driven `brb` path is gap G-h (needs a
 visibility-state mock in Playwright).
 
+### C22. Two stdin readers raced for one terminal — **FIXED**
+The remote-input claimer and the consent prompt both read stdin; whichever
+grabbed the line first won, so a typed `y` could vanish into a transfer
+stream. One owner now: a single raw-mode reader (`stty cbreak`, RAII guard
+restores the tty) emits `StdinLine` events; consent questions queue
+(`pending`) and answers route by a per-process `consent_token` a remote peer
+cannot forge. Single-keypress y/n — no Enter needed, answer echoed (`↳ y`).
+
+### C23. Ghost questions + duplicate streams into one `.part` — **FIXED**
+A superseded link could leave its consent question on screen (answering it
+did nothing) and a re-offer could open a second stream into the same `.part`
+mid-write. Questions are purged when their link dies; one stream per `.part`
+enforced; finalize errors are non-fatal (the file is re-offerable).
+
+### C24. Create-code zombie mints — **FIXED + MEASURED (web/server)**
+Field report: a phone tab alive "for a few minutes" mints codes nobody can
+claim. Telemetry (server `TEL` lines + browser beacons) measured the cause:
+the hidden tab's socket dies ~5 s after hiding and recovery takes ~4.3 s
+after refocus — the mint raced the dead socket. Fix: client waits for
+socket-up and auto-retries once; server refreshes the creator's lease at
+`pair-create`; `peek_pair` diagnoses stale claims (`existed`/`creator_alive`).
+The same instrumentation later proved the rejoin-belt (#14) and second-wind
+(#13) web fixes live.
+
+### C25. Questions could be invisibly declined — **FIXED**
+A question rendered only as a sticky line could be missed entirely, and a
+stray Enter (queued before the question appeared) declined it silently —
+a destructive default. Questions now print as permanent lines too, empty
+input never declines, and keystrokes buffered before the question was shown
+(300 ms guard) are discarded instead of consumed as answers.
+
+### C26. Peer presence invisible in the CLI — **FIXED**
+The browser shows an amber "away" tile; the CLI only had transient dim
+notes. Every link now tracks a `Presence` (connecting/ready/away/
+reconnecting) and each state change prints a static colored ROSTER line —
+all peers side by side, the changed one carrying the note:
+`✓ daring-wombat   ● deft-gibbon  away — holding the line`. Glyphs:
+`✓` ready/back/recovered (green), `●` away (amber), `◌` reconnecting
+(amber), `○` left (dim). One line per transition — readable scrollback
+history, no repaint tricks; "recovered" only fires on a link that was
+previously up (presence-gated, not attempt-gated).
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**
@@ -335,6 +377,9 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 10 TURN relay via coturn container, `route: relayed` | C2, C17 | green (needs docker) |
 | 12 browser with PROD config (65536 framing) → CLI | C1 | green |
 | 11 frozen receiver superseded by same-uid replacement, resume | C6, F8 | green |
+| 13 multi-link: CLI + two browsers, transfer with bystander, nobody wedges | C18 | green |
+| 14 daemon: pair `--remember`, verified identity, room-less `up` receive | C19, C20, C12 | green |
+| 15 paired recv holds the line on sender vanish, fails honestly after window | C21 | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 
 **Known coverage gaps (tracked, not hidden):**
@@ -342,6 +387,13 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   no deterministic local simulation; needs netem/SIGSTOP choreography.
 - **G-b** watchdog lacks a swallowed-offer fixture peer.
 - **G-c** TURN TTL expiry needs a short-TTL backend fixture.
+- **G-i** stale-answer glare can strand a link through all 3 retries: observed
+  once (gate 12, 2026-06-07, machine under load) — browser socket dropped
+  pre-link, its stale answer hit the fresh link ("invalid transition from
+  stable applying remote answer", F6 recovered), then every rebuild ran
+  against a browser already wedged waiting; 19/19 on re-run. Needs a
+  deterministic delayed-answer fixture to decide whether re-establish should
+  also bump some glare-breaking state (e.g. force a new uid-tiebreak round).
 - **G-e** macOS/Windows: the release workflow's macOS job has never executed
   (runs on first `cli-v*` tag); Windows is not built (part of C16).
 
