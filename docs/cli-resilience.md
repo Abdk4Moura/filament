@@ -16,7 +16,10 @@ Statuses: **OPEN** (known, unfixed) · **FIXED** (code landed) ·
 **N/A** (doesn't apply to the CLI).
 
 The standing gates live in `cli/tests/gates.sh` (gates 0–10; browser gates via
-Playwright, relay gate via a local coturn container). Last full run:
+Playwright, relay gate via a local coturn container; gates must not run
+concurrently — two suites share the auto-room and contaminate each other).
+Last full run: **18/18, 2026-06-07** (incl. gate 13 multi-link and gate 14
+daemon). Earlier milestone runs:
 **15/15, 2026-06-06**, plus live-production runs through
 `api.filament.autumated.com`: CLI↔CLI direct, CLI↔CLI forced-relay
 (`route: relayed` both ends), and the real `filament.autumated.com` site
@@ -147,12 +150,16 @@ Receive path is `tokio::fs` + async `BufWriter` end to end (create/append/
 write/flush/rename). Send-side reads remain std (chunk-sized, sequential —
 revisit with QUIC speeds).
 
-### C12. No stable device identity across invocations — **ROADMAP**
-A fresh uid per run is by design until the persistent-pairing layer
-(E2E-exchanged pair secret, `subscribe` presence, KNOWN DEVICES). That feature
-also upgrades C13's `--to` from name-matching to identity, and enables daemon
-auto-accept-from-trusted-only. Not a defect: resume works without it (C7
-guards the seam).
+### C12. No stable device identity across invocations — **VERIFIED (shipped in 0.2.0)**
+The persistent-pairing layer landed: `--remember` exchanges a pair secret
+END-TO-END over the DataChannel; presence via `subscribe` with hashed
+channels; `--to <device>` resolves by identity; `filament introduce A B`
+vouches two known devices to each other over C20-verified links; per-install
+`device.id` keeps a sender from adopting its own daemon (presence-channel
+scope only — room loopback still works). **Verified by:** gate 14 plus the
+live 3-device introduce flow (hub pairs B and C, introduces them, B sends
+`--to deviceC` with no code ever exchanged between them, proof verifies as
+'deviceB', hash match).
 
 ### C13. Peer selection — **VERIFIED** (enhancement tracked under C12)
 The failure modes — a receiver wedging itself on another idle receiver, and a
@@ -219,19 +226,27 @@ prerequisite for the daemon (C19), pairing-while-paired, and introductions.
 **Verify with:** gate: CLI + two headless browsers in one room, all three
 pairwise connections reach connected, transfer still completes.
 
-### C19. Daemon (`filament up`) hardening — **OPEN (design locked)**
-A standing auto-accept receiver is a remote-write primitive. Locked-in
-mitigations from the security assessment (2026-06-07): join NO room
-(presence-channel subscriptions only — invisible to strangers); dedicated
-drop dir, 0644, never executable/auto-opened/auto-extracted; config caps
-(max size, daily quota, free-space floor, max links ~32); per-device
-auto/ask policy; receive notifications; `devices revoke`. Service management
-delegated to systemd-user/launchd via `up --install` (no hand-rolled forks).
+### C19. Daemon (`filament up`) — **VERIFIED (shipped in 0.2.0)**
+Implemented per the locked design: joins NO room (presence subscriptions
+only — invisible to strangers; the gate asserts no "listening in room" line);
+accepts solely fingerprint-verified known devices, silent-declines everything
+else; receive ledger (`up.log`), pidfile, SIGTERM-clean exit; `status`/`down`
+manage it; `up --install` writes a systemd user unit (no hand-rolled forks).
+**Verified by:** gate 14 (pair → up → `--to` send: identity verified,
+room-less, hash match) and the live 3-device flow. Remaining hardening from
+the assessment, tracked open: config caps (max size / daily quota /
+free-space floor), per-device auto/ask policy, desktop notifications,
+`devices revoke` (gap G-g).
 
-### C20. pair-proof not bound to the channel — **OPEN (upgrade designed)**
-Today's HMAC proof binds secret + uids but not the DTLS session, so a
-malicious signaling server could MITM the handshake (C15) and relay proofs.
-**Fix:** include both DTLS certificate fingerprints (already present in the
+### C20. pair-proof not bound to the channel — **VERIFIED (shipped in 0.2.0)**
+Implemented: `proof2 = HMAC(secret, prover_uid | sorted uids | sorted DTLS
+cert fingerprints)` — fingerprints parsed from the exchanged SDP. A channel
+MITM'd by anyone, the signaling server included, has different fingerprints,
+so verification fails and auto-accept refuses. **Verified by:** gate 14 (the
+daemon's accept requires it) + tamper test (corrupted stored secret yields
+zero verifications and silent decline). Closes active-MITM for known devices
+without full PAKE; the original design note follows for the record.
+Original: include both DTLS certificate fingerprints (already present in the
 relayed SDP) in the HMAC: a MITM'd channel has different fingerprints, the
 proof fails, auto-accept refuses. Closes active-MITM for known devices
 without full PAKE; C15 remains for code-pairing and the web app.
