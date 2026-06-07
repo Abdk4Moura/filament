@@ -914,7 +914,7 @@ impl Conn {
                         Duration::from_secs(6)
                     }
                 } else {
-                    eprintln!("connection blip — attempting recovery");
+                    ui::say(&ui::paint(ui::Tone::Dim, "  connection blip — attempting recovery"));
                     Duration::from_secs(6)
                 };
                 if !l.peer.polite && !away {
@@ -1299,7 +1299,7 @@ async fn send_cmd(
     let known_target: Option<(String, String)> =
         to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
     if let Some((n, sec)) = &known_target {
-        eprintln!("waiting for known device '{n}' (presence channel)");
+        ui::say(&format!("  waiting for known device {}", ui::paint(ui::Tone::Bold, n)));
         sio.emit("subscribe", json!({ "channels": [channel_of(sec)] })).await.ok();
     } else if use_code {
         let payload = match &word {
@@ -1764,7 +1764,7 @@ async fn recv_cmd(
             while stdin.read(&mut buf).await.map(|n| n == 1).unwrap_or(false) {
                 let c = buf[0] as char;
                 if q.load(std::sync::atomic::Ordering::Relaxed) && "yYnN".contains(c) && line.is_empty() {
-                    eprintln!("{c}"); // echo the answer (raw mode is no-echo)
+                    ui::answer_echo(c); // raw mode is no-echo; land it cleanly (C23)
                     let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
                     continue;
                 }
@@ -1798,14 +1798,31 @@ async fn recv_cmd(
     loop {
         let Some(ev) = next_ev(&mut rx, &conn, !pending.is_empty()).await? else { continue };
 
+        // C23: questions from links that died (supersede/peer-left) are
+        // moot — the sender re-offers on its new link. Purge them so a 'y'
+        // can never accept a ghost (the duplicate-stream ENOENT crash).
+        if !pending.is_empty() {
+            let front_id = pending.front().map(|(_, v)| v["id"].clone());
+            pending.retain(|(p, _)| conn.links.contains_key(p));
+            if pending.front().map(|(_, v)| v["id"].clone()) != front_id {
+                ui::clear_sticky();
+                if let Some((qpid, qv)) = pending.front() {
+                    let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
+                    ui::sticky(&offer_question(&s, qv["name"].as_str().unwrap_or("file"), qv["size"].as_u64().unwrap_or(0), paired));
+                } else {
+                    question_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
         match ev {
             Ev::PairMatched(v) => {
                 let room = v["room"].as_str().unwrap_or_default().to_string();
-                eprintln!("code accepted — joining sender");
+                ui::say(&format!("  {} code accepted — joining sender", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
             }
             Ev::PairError(v) => bail!(
-                "code rejected: {} (one-time codes burn after a single use)",
+                "code rejected: {} — one-time codes burn after a single use and expire after 10 minutes; ask the sender for a fresh one",
                 v["error"].as_str().unwrap_or("?")
             ),
             Ev::Welcome(v) => {
@@ -1853,7 +1870,7 @@ async fn recv_cmd(
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
-                    eprintln!("peer: {}", l.name);
+                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t);
                     let p = l.peer.clone();
                     tokio::spawn(async move {
@@ -2001,6 +2018,18 @@ async fn recv_cmd(
                         continue;
                     }
 
+                    // C23: never run two streams into one .part — a rejoin
+                    // can re-offer a file whose first stream is still live;
+                    // accepting both corrupted the path and crashed on the
+                    // second rename. First stream wins.
+                    if !to_stdout
+                        && by_sid.values().any(|inc| inc.part_path == dir.join(format!("{name}.part")))
+                    {
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  (duplicate offer for {name} ignored — already receiving it)")));
+                        t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
+                        continue;
+                    }
+
                     if to_stdout {
                         // Pipe mode: no part files, no resume — pure stream.
                         // Write through a dup'd stdout fd so dropping the
@@ -2060,7 +2089,12 @@ async fn recv_cmd(
                         drop(inc.file);
                         let rename_to = if completed == 0 { output.clone() } else { None };
                         let final_path = unique_path(&dir, rename_to.as_deref().unwrap_or(&inc.name));
-                        tokio::fs::rename(&inc.part_path, &final_path).await?;
+                        if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
+                            // C23: a duplicate stream's partial may already be
+                            // finalized — discard quietly instead of dying.
+                            ui::say(&ui::paint(ui::Tone::Dim, &format!("  (stream for {} already finalized — duplicate discarded: {e})", inc.name)));
+                            continue;
+                        }
                         let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
                         let ok = inc.received == inc.size;
                         inc.bar.done(inc.received);
@@ -2153,7 +2187,7 @@ async fn recv_cmd(
                     if !by_sid.is_empty() {
                         // Keep partials writable-but-parked; resume comes via
                         // rejoin (C6) or a later re-offer against the .part.
-                        eprintln!("sender disconnected mid-transfer — waiting up to {secs}s for them to come back");
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  sender disconnected mid-transfer — waiting up to {secs}s")));
                         flush_inflight(&mut by_sid).await;
                     } else if completed > 0 && !keep_open {
                         eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
@@ -2169,7 +2203,7 @@ async fn recv_cmd(
                         ));
                     } else {
                         conn.waiting_rejoin = None; // open listener: keep going
-                        eprintln!("peer left — still listening");
+                        ui::say(&ui::paint(ui::Tone::Dim, "  peer left — still listening"));
                     }
                 }
             }

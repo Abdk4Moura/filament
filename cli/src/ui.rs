@@ -152,12 +152,26 @@ pub fn say(line: &str) {
 }
 
 /// Transient line: replaced by the next say()/status()/bar tick. No-op noise
-/// on pipes (suppressed entirely).
+/// on pipes (suppressed entirely). An open STICKY (a question awaiting its
+/// keypress) outranks transients — progress bars wait their turn rather than
+/// hiding the question (C23: users answered questions they couldn't see).
 pub fn status(line: &str) {
     if !caps().tty {
         return;
     }
+    if let Ok(s) = STICKY.lock() {
+        if s.is_some() {
+            return;
+        }
+    }
     paint_live(line);
+}
+
+/// Echo a single-key answer cleanly (raw mode disables terminal echo, and a
+/// bare eprint would land inside whatever transient line is on screen).
+pub fn answer_echo(c: char) {
+    clear_live();
+    eprintln!("  {} {}", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string()));
 }
 
 /// A status line that survives interleaved say()s until cleared — for open
