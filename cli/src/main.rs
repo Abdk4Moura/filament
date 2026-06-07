@@ -1438,7 +1438,7 @@ async fn main() -> Result<()> {
                 None => {
                     let all = devices_load();
                     if all.is_empty() {
-                        println!("no known devices yet — pair once with --code plus --remember <name> on both ends");
+                        println!("no known devices yet — run `filament pair` to add one");
                     }
                     for (n, s) in all {
                         println!("{n}  (channel {})", &channel_of(&s)[..12]);
@@ -2246,9 +2246,42 @@ async fn recv_cmd(
     // blocking read racing for the user's "y".
     let mut pending: std::collections::VecDeque<(String, Value)> = Default::default();
     let mut completed = 0usize;
+    // G-k: peer-left delivery is best-effort — a browser can close having
+    // delivered every byte yet never emit its leave (observed under load,
+    // gate 6). Tick the loop on a 2s timeout so a fallback quiet-check can
+    // exit cleanly instead of idling to the connect-timeout.
+    let mut last_quiet: Option<Instant> = None;
 
     loop {
-        let Some(ev) = next_ev(&mut rx, &conn, !pending.is_empty()).await? else { continue };
+        let ev = match tokio::time::timeout(
+            Duration::from_secs(2),
+            next_ev(&mut rx, &conn, !pending.is_empty()),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => None, // 2s tick — run the fallback quiet-check below
+        };
+
+        // G-k fallback: everything done, nobody attached, no questions
+        // outstanding — if that holds quietly for 10s, the peer-left we were
+        // counting on for a clean exit never arrived; exit anyway.
+        if completed > 0 && !keep_open && by_sid.is_empty() && conn.links.is_empty() && pending.is_empty() {
+            match last_quiet {
+                None => last_quiet = Some(Instant::now()),
+                Some(since) if since.elapsed() > Duration::from_secs(10) => {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  (peer-left never arrived — exiting on quiet)"));
+                    eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+                    let _ = sio.disconnect().await;
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+        } else {
+            last_quiet = None;
+        }
+
+        let Some(ev) = ev else { continue };
 
         // C23: questions from links that died (supersede/peer-left) are
         // moot — the sender re-offers on its new link. Purge them so a 'y'

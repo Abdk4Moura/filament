@@ -455,12 +455,19 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   localStorage: the secret won't persist, console.warn flags it) and the
   reverse direction (browser sending to a `filament up` daemon, where the
   daemon must verify the BROWSER's proof to auto-accept).
-- **G-k** recv's clean exit depends on `peer-left` DELIVERY: observed once
-  (gate 6 under load, 2026-06-07) — both transfers completed, hashes matched,
-  the browser closed, but the peer-left event never reached recv (no `○ left`
-  line) so it idled to timeout instead of exiting "done (2 files)". Same
-  emit-mortality disease as C28, inbound flavor. Candidate fix: a fallback
-  tick — completed>0 ∧ !keep_open ∧ links+roster empty for N s ⇒ exit.
+- **G-k — CLOSED** recv's clean exit no longer depends on `peer-left`
+  DELIVERY. Observed once (gate 6 under load, 2026-06-07) — both transfers
+  completed, hashes matched, the browser closed, but the peer-left event never
+  reached recv (no `○ left` line) so it idled to timeout instead of exiting
+  "done (2 files)"; same emit-mortality disease as C28, inbound flavor.
+  **Fix:** the recv event loop now ticks on a 2 s `tokio::time::timeout`
+  wrapping `next_ev` (call-site only — the `up`/rejoin paths are untouched),
+  and a fallback quiet-check runs every iteration: if `completed > 0 &&
+  !keep_open && by_sid.is_empty() && conn.links.is_empty() && pending.is_empty()`
+  holds quietly for 10 s, recv prints the same `done (N files).` line the
+  peer-left path emits (preceded by a dim "(peer-left never arrived — exiting
+  on quiet)" note) and disconnects cleanly. Any attaching link / new question
+  resets the timer.
 - **G-i** stale-answer glare can strand a link through all 3 retries: observed
   once (gate 12, 2026-06-07, machine under load) — browser socket dropped
   pre-link, its stale answer hit the fresh link ("invalid transition from
