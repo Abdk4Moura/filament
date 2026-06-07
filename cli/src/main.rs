@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod net;
+mod ui;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -49,6 +50,9 @@ struct Cli {
     /// Force TURN relay (testing/privacy; hides your IP from the peer)
     #[arg(long, global = true)]
     relay: bool,
+    /// Display name shown to peers (default: config file, then user@host)
+    #[arg(long, global = true)]
+    name_as: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -103,6 +107,8 @@ enum Cmd {
     },
     /// List devices remembered via --remember (trusted for --to and auto-accept)
     Devices,
+    /// Get or set config (keys: name, server, dir) in ~/.config/filament/config
+    Config { key: Option<String>, value: Option<String> },
     /// Update filament to the latest release
     Update {
         /// Check only; don't install
@@ -116,6 +122,18 @@ enum Cmd {
     /// Print the man page (roff) to stdout
     #[command(hide = true)]
     Man,
+}
+
+/// Looks like a speakable code: word-word-digits.
+fn regex_lite_code(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 3
+        && parts[0].chars().all(|c| c.is_ascii_lowercase())
+        && parts[1].chars().all(|c| c.is_ascii_lowercase())
+        && !parts[0].is_empty()
+        && !parts[1].is_empty()
+        && parts[2].len() >= 2
+        && parts[2].chars().all(|c| c.is_ascii_digit())
 }
 
 // --------------------------------------------------------------- utilities --
@@ -134,7 +152,41 @@ fn mk_uid(prefix: &str) -> String {
     format!("cli-{prefix}-{:x}{:x}", std::process::id(), nanos)
 }
 
+fn config_path() -> PathBuf {
+    devices_path().with_file_name("config")
+}
+
+/// Tiny `key value` per-line config; no toml dependency for three keys.
+fn config_get(key: &str) -> Option<String> {
+    std::fs::read_to_string(config_path()).ok()?.lines().find_map(|l| {
+        let (k, v) = l.split_once(char::is_whitespace)?;
+        (k == key && !v.trim().is_empty()).then(|| v.trim().to_string())
+    })
+}
+
+fn config_set(key: &str, value: &str) -> Result<()> {
+    let p = config_path();
+    if let Some(d) = p.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut lines: Vec<String> = std::fs::read_to_string(&p)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.split_whitespace().next() != Some(key))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("{key} {value}"));
+    std::fs::write(&p, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 fn display_name() -> String {
+    if let Ok(n) = std::env::var("FILAMENT_NAME") {
+        return n;
+    }
+    if let Some(n) = config_get("name") {
+        return n;
+    }
     let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
     let host = std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
@@ -148,7 +200,7 @@ fn sha256_hex(data: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut v = bytes as f64;
     let mut i = 0;
@@ -505,14 +557,55 @@ async fn main() -> Result<()> {
     // rustls refuses to guess between two providers, so pick ring explicitly
     // BEFORE anything touches TLS.
     rustls::crypto::ring::default_provider().install_default().ok();
-    let cli = Cli::parse();
-    let server = cli.server.trim_end_matches('/').to_string();
+    // Bare-arg comfort dispatch: `filament <path>` sends it with a code;
+    // `filament <something-like-a-code>` claims it. Subcommands still win.
+    let mut argv: Vec<String> = std::env::args().collect();
+    if let Some(first) = argv.get(1) {
+        const CMDS: [&str; 8] = ["send", "recv", "devices", "update", "completions", "man", "config", "help"];
+        let code_re = regex_lite_code(first);
+        if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
+            if std::path::Path::new(first).exists() {
+                argv.insert(1, "send".into());
+                argv.push("--code".into());
+            } else if code_re {
+                argv.insert(1, "recv".into());
+            }
+        }
+    }
+    let cli = Cli::parse_from(argv);
+    if let Some(n) = &cli.name_as {
+        // single-threaded at this point (before the runtime spawns workers)
+        unsafe { std::env::set_var("FILAMENT_NAME", n) };
+    }
+    let server = if cli.server == DEFAULT_SERVER {
+        config_get("server").unwrap_or(cli.server.clone())
+    } else {
+        cli.server.clone()
+    };
+    let server = server.trim_end_matches('/').to_string();
     match cli.cmd {
         Cmd::Send { paths, code, word, room, to, name, remember } => {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember } => {
             recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember).await
+        }
+        Cmd::Config { key, value } => {
+            match (key, value) {
+                (Some(k), Some(v)) => {
+                    config_set(&k, &v)?;
+                    println!("{k} = {v}");
+                }
+                (Some(k), None) => println!("{}", config_get(&k).unwrap_or_default()),
+                (None, _) => {
+                    for k in ["name", "server", "dir"] {
+                        if let Some(v) = config_get(k) {
+                            println!("{k} {v}");
+                        }
+                    }
+                }
+            }
+            Ok(())
         }
         Cmd::Devices => {
             let all = devices_load();
@@ -757,6 +850,13 @@ async fn send_cmd(
         conn.expected_secret = known_target.clone().map(|(n, s)| (n, s));
     }
     let mut code_used = !use_code && known_target.is_none();
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
     let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
     let started = Instant::now();
     let claim_deadline = Duration::from_secs(600);
@@ -790,10 +890,18 @@ async fn send_cmd(
             Ev::PairCode(v) => {
                 let code = v["code"].as_str().unwrap_or("?");
                 let ttl = v["ttl"].as_u64().unwrap_or(600);
-                eprintln!("\n  code: {code}\n");
-                eprintln!("on the other machine:  filament recv {code}");
-                eprintln!("or in a browser:       https://filament.autumated.com (PAIR WITH CODE)");
-                eprintln!("one claim only; expires in {} min", ttl / 60);
+                let site = if server == DEFAULT_SERVER { "https://filament.autumated.com".to_string() } else { server.to_string() };
+                let room_url = format!("{site}/rooms/{room}");
+                ui::clipboard(code);
+                ui::say("");
+                ui::say(&format!("  code   {}   {}", ui::paint(ui::Tone::Brand, code), ui::paint(ui::Tone::Dim, "(copied to clipboard)")));
+                ui::say(&format!("         {}", ui::paint(ui::Tone::Dim, &format!("terminal: filament recv {code}   browser: {} (PAIR WITH CODE)", ui::link(&site, &site.replace("https://", ""))))));
+                let q = ui::qr(&room_url);
+                if !q.is_empty() {
+                    ui::say(&format!("\n{}", q.trim_end_matches('\n')));
+                    ui::say(&format!("         {}", ui::paint(ui::Tone::Dim, &format!("or scan to join instantly · one claim · {} min", ttl / 60))));
+                }
+                ui::say("");
             }
             Ev::PairError(v) => bail!("pairing failed: {}", v["error"].as_str().unwrap_or("?")),
             Ev::PairUsed(_) => {
@@ -830,7 +938,7 @@ async fn send_cmd(
             }
             Ev::ChannelReady(t) => {
                 if let Some(l) = &mut conn.link {
-                    eprintln!("connected to {}", l.name);
+                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t.clone());
                     let p = l.peer.clone();
                     tokio::spawn(async move {
@@ -840,7 +948,7 @@ async fn send_cmd(
                         for _ in 0..6 {
                             tokio::time::sleep(Duration::from_millis(400)).await;
                             if let Some(r) = p.route().await {
-                                eprintln!("route: {r}");
+                                ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                 break;
                             }
                         }
@@ -921,6 +1029,11 @@ async fn send_cmd(
                 let name = out.iter().find(|o| o.id == id).map(|o| o.name.as_str()).unwrap_or("?");
                 eprintln!("{name}: interrupted ({err}) — will resume on reconnect");
             }
+            Ev::Interrupted => {
+                ui::say(&format!("  {} interrupted — the receiver keeps its partial; re-run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                let _ = sio.disconnect().await;
+                std::process::exit(130);
+            }
             Ev::Stuck(pid, generation) => conn.on_stuck(&pid, generation, "stuck while connecting").await?,
             Ev::GraceExpired(pid, generation) => conn.on_stuck(&pid, generation, "lost").await?,
             Ev::PcState(s) => conn.on_pc_state(&s).await,
@@ -972,8 +1085,7 @@ async fn stream_one(
     f.seek(SeekFrom::Start(offset))?;
     let mut sent = offset;
     let mut buf = vec![0u8; chunk];
-    let start = Instant::now();
-    let mut last = Instant::now();
+    let mut bar = ui::Progress::new(&name, size);
     loop {
         let n = f.read(&mut buf)?;
         if n == 0 {
@@ -981,16 +1093,11 @@ async fn stream_one(
         }
         t.send_frame(sid, &buf[..n]).await?;
         sent += n as u64;
-        if last.elapsed() > Duration::from_secs(2) {
-            last = Instant::now();
-            let rate = (sent - offset) as f64 / start.elapsed().as_secs_f64();
-            eprintln!("{name}: {:.0}% ({}/s)", sent as f64 / size.max(1) as f64 * 100.0, human(rate as u64));
-        }
+        bar.tick(sent);
     }
     t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await?;
     t.flush().await?;
-    let rate = (sent - offset) as f64 / start.elapsed().as_secs_f64().max(0.001);
-    eprintln!("{name}: complete ({}, {}/s)", human(size), human(rate as u64));
+    bar.done(sent - offset);
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
         o.done = true;
@@ -1009,6 +1116,7 @@ struct IncomingFile {
     file: tokio::io::BufWriter<tokio::fs::File>,
     part_path: PathBuf,
     started: Instant,
+    bar: ui::Progress,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1067,9 +1175,15 @@ async fn recv_cmd(
         expected_secret: None,
         trusted: false,
     };
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Ev::Interrupted);
+        });
+    }
     let mut by_sid: HashMap<u32, IncomingFile> = HashMap::new();
     let mut completed = 0usize;
-    let mut last_progress = Instant::now();
 
     loop {
         let Some(ev) = next_ev(&mut rx, &conn).await? else { continue };
@@ -1138,7 +1252,7 @@ async fn recv_cmd(
                         for _ in 0..6 {
                             tokio::time::sleep(Duration::from_millis(400)).await;
                             if let Some(r) = p.route().await {
-                                eprintln!("route: {r}");
+                                ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                 break;
                             }
                         }
@@ -1225,7 +1339,7 @@ async fn recv_cmd(
                         PartMeta { size, head: offer_head }.store(&meta_path)?;
                         tokio::fs::File::create(&part_path).await?
                     };
-                    eprintln!("receiving {name} ({})", human(size));
+                    let bar = ui::Progress::new(&name, size);
                     by_sid.insert(sid, IncomingFile {
                         id: id.clone(),
                         name,
@@ -1234,6 +1348,7 @@ async fn recv_cmd(
                         file: tokio::io::BufWriter::with_capacity(1 << 20, file),
                         part_path,
                         started: Instant::now(),
+                        bar,
                     });
                     t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
                 }
@@ -1245,16 +1360,15 @@ async fn recv_cmd(
                         let final_path = unique_path(&dir, &inc.name);
                         tokio::fs::rename(&inc.part_path, &final_path).await?;
                         let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
-                        let rate = inc.received as f64 / inc.started.elapsed().as_secs_f64().max(0.001);
                         let ok = inc.received == inc.size;
-                        eprintln!(
-                            "received {} ({}{}) -> {} ({}/s)",
-                            inc.name,
-                            human(inc.received),
-                            if ok { "" } else { ", SIZE MISMATCH" },
-                            final_path.display(),
-                            human(rate as u64),
-                        );
+                        inc.bar.done(inc.received);
+                        let shown = final_path.display().to_string();
+                        ui::say(&format!(
+                            "    {} {}{}",
+                            ui::paint(ui::Tone::Dim, ui::glyph_arrow()),
+                            ui::link(&format!("file://{shown}"), &shown),
+                            if ok { String::new() } else { ui::paint(ui::Tone::Err, "  SIZE MISMATCH") },
+                        ));
                         completed += 1;
                     }
                 }
@@ -1264,17 +1378,14 @@ async fn recv_cmd(
                 if let Some(inc) = by_sid.get_mut(&sid) {
                     inc.file.write_all(&data).await?;
                     inc.received += data.len() as u64;
-                    if last_progress.elapsed() > Duration::from_secs(2) {
-                        last_progress = Instant::now();
-                        let rate = inc.received as f64 / inc.started.elapsed().as_secs_f64().max(0.001);
-                        eprintln!(
-                            "{}: {:.0}% ({}/s)",
-                            inc.name,
-                            inc.received as f64 / inc.size.max(1) as f64 * 100.0,
-                            human(rate as u64)
-                        );
-                    }
+                    inc.bar.tick(inc.received);
                 }
+            }
+            Ev::Interrupted => {
+                flush_inflight(&mut by_sid).await;
+                ui::say(&format!("  {} interrupted — partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                let _ = sio.disconnect().await;
+                std::process::exit(130);
             }
             Ev::Stuck(pid, generation) => conn.on_stuck(&pid, generation, "stuck while connecting").await?,
             Ev::GraceExpired(pid, generation) => conn.on_stuck(&pid, generation, "lost").await?,

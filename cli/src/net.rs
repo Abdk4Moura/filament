@@ -73,6 +73,8 @@ pub enum Ev {
     Stuck(String, u32),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
+    /// Ctrl-C: park state, print the resume hint, leave cleanly.
+    Interrupted,
 }
 
 impl std::fmt::Debug for dyn Transport {
