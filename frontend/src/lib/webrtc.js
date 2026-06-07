@@ -122,9 +122,10 @@ export class PeerLink {
         this.onStatus('ready')
         this._detectRoute() // which physical path did ICE actually pick?
       } else if (s === 'disconnected') {
-        // Usually a transient blip (#6): show 'connecting', nudge an ICE restart
-        // from the impolite side, and only fail if it doesn't recover in time.
-        this.onStatus('connecting')
+        // Usually a transient blip (#6): show 'connecting' (or keep 'away' if
+        // they announced the absence), nudge an ICE restart from the impolite
+        // side, and only fail if it doesn't recover in time.
+        this.onStatus((this._awayUntil || 0) > Date.now() ? 'away' : 'connecting')
         if (!this.polite) {
           try {
             this.pc.restartIce()
@@ -303,12 +304,17 @@ export class PeerLink {
     switch (msg.type) {
       case CTRL.BRB:
         this._awayUntil = Date.now() + Math.min(msg.ttl || 120, 300) * 1000
+        this.onStatus('away') // surfaced on the peer tile (C21 UX)
         return
       case CTRL.BACK:
         this._awayUntil = 0
+        this.onStatus(this.pc.connectionState === 'connected' ? 'ready' : 'connecting')
         return
       default:
-        this._awayUntil = 0 // any real traffic means they're back
+        if (this._awayUntil) {
+          this._awayUntil = 0 // any real traffic means they're back
+          this.onStatus(this.pc.connectionState === 'connected' ? 'ready' : 'connecting')
+        }
     }
     switch (msg.type) {
       case CTRL.OFFER: {

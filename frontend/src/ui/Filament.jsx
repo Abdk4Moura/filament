@@ -32,7 +32,7 @@ const STATUS_LABEL = {
   declined: 'declined',
   failed: 'failed',
 }
-const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable' }
+const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away — be right back' }
 
 // ---- theme system ----------------------------------------------------------
 const MONOS = {
@@ -119,7 +119,9 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
   const [over, setOver] = useState(false)
   const [hov, setHov] = useState(false)
   const inp = useRef(null)
-  const sc = ready ? T.ok : peer.status === 'connecting' ? T.warn : T.bad
+  // 'away' (C21): the peer announced a benign absence (e.g. it is choosing a
+  // file on a phone) — amber, calm, explicitly not an error.
+  const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
   return (
     <div
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}

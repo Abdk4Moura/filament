@@ -69,7 +69,7 @@ touch the socket, Firestore, or RTCPeerConnection directly.
     id: string,
     name: string,
     color: string,                   // stable hsl() per peer
-    status: "connecting" | "ready" | "failed",
+    status: "connecting" | "ready" | "failed" | "away",  // away = declared brb (C21)
     route: "local" | "direct" | "relayed" | null,  // PATH the data takes (Part A)
     uid: string | null,              // stable per-tab identity (survives reconnects)
   }>,
