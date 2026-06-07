@@ -107,6 +107,22 @@ enum Cmd {
     },
     /// List devices remembered via --remember (trusted for --to and auto-accept)
     Devices,
+    /// Always-on receiver: trusted known devices only, invisible to strangers
+    Up {
+        /// Install + start a systemd user service instead of running attached
+        #[arg(long)]
+        install: bool,
+        /// Drop directory (default: `filament config dir`, else ~/Filament)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Show whether the daemon runs and what it received recently
+    Status,
+    /// Stop the daemon
+    Down,
+    /// Vouch between two known devices: mints a fresh secret and delivers it
+    /// to both over verified channels (run on the device that knows both)
+    Introduce { a: String, b: String },
     /// Get or set config (keys: name, server, dir) in ~/.config/filament/config
     Config { key: Option<String>, value: Option<String> },
     /// Update filament to the latest release
@@ -138,6 +154,25 @@ fn regex_lite_code(s: &str) -> bool {
 
 // --------------------------------------------------------------- utilities --
 
+/// Persistent per-install identity (shared by every process using this
+/// config dir). Lets a sender recognize — and never target — its OWN daemon
+/// when both sit on the same pair-presence channels.
+fn install_id() -> String {
+    let p = devices_path().with_file_name("device.id");
+    if let Ok(id) = std::fs::read_to_string(&p) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id: String = fresh_secret()[..8].to_string();
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = std::fs::write(&p, &id);
+    id
+}
+
 fn mk_uid(prefix: &str) -> String {
     // Test hook (gate 11): a pinned uid lets the harness exercise the
     // same-device-rejoined supersede path (C6). The cli-s-/cli-r- role prefix
@@ -149,7 +184,17 @@ fn mk_uid(prefix: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    format!("cli-{prefix}-{:x}{:x}", std::process::id(), nanos)
+    format!("cli-{prefix}-{}-{:x}{:x}", install_id(), std::process::id(), nanos)
+}
+
+/// Same install (our own daemon / another process of this device)?
+fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
+    if std::env::var("FILAMENT_UID").is_ok() {
+        return false; // test hook pins uids; don't second-guess it
+    }
+    let id = install_id();
+    let _ = my_uid;
+    peer_uid.map(|p| p.contains(&format!("-{id}-"))).unwrap_or(false)
 }
 
 fn config_path() -> PathBuf {
@@ -371,6 +416,231 @@ fn fresh_secret() -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+// ------------------------------------------------------------- daemon (C19) --
+
+fn drop_dir(flag: Option<PathBuf>) -> PathBuf {
+    flag.or_else(|| config_get("dir").map(PathBuf::from)).unwrap_or_else(|| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join("Filament")
+    })
+}
+
+/// Minimal `YYYY-MM-DD HH:MM` UTC stamp (civil-from-days; avoids chrono).
+fn chrono_now() -> String {
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let (days, rem) = (secs / 86400, secs % 86400);
+    let (hh, mm) = (rem / 3600, (rem % 3600) / 60);
+    // Howard Hinnant's civil_from_days
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+fn pidfile() -> PathBuf {
+    devices_path().with_file_name("up.pid")
+}
+fn up_log() -> PathBuf {
+    devices_path().with_file_name("up.log")
+}
+
+fn daemon_alive() -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
+    let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
+    cmd.contains("filament").then_some(pid)
+}
+
+async fn up_cmd(server: &str, install: bool, dir: Option<PathBuf>, relay: bool) -> Result<()> {
+    if install {
+        let exe = std::env::current_exe()?;
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
+        std::fs::create_dir_all(&unit_dir)?;
+        let unit = unit_dir.join("filament.service");
+        std::fs::write(&unit, format!(
+            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={} up\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            exe.display()
+        ))?;
+        ui::say(&format!("  {} wrote {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), unit.display()));
+        let enabled = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .status()
+            .and_then(|_| std::process::Command::new("systemctl").args(["--user", "enable", "--now", "filament"]).status())
+            .map(|st| st.success())
+            .unwrap_or(false);
+        if enabled {
+            ui::say(&format!("  {} service enabled and started — logs: journalctl --user -u filament", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+        } else {
+            ui::say(&format!("  start it with: {}", ui::paint(ui::Tone::Bold, "systemctl --user enable --now filament")));
+        }
+        return Ok(());
+    }
+    if let Some(pid) = daemon_alive() {
+        bail!("already up (pid {pid}) — `filament status` / `filament down`");
+    }
+    let dir = drop_dir(dir);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(pidfile(), std::process::id().to_string())?;
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true).await;
+    let _ = std::fs::remove_file(pidfile());
+    res
+}
+
+fn status_cmd() -> Result<()> {
+    match daemon_alive() {
+        Some(pid) => ui::say(&format!("  {} up (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
+        None => ui::say(&format!("  {} not running — start with: filament up", ui::paint(ui::Tone::Dim, "·"))),
+    }
+    let n = devices_load().len();
+    ui::say(&format!("  {} known device{}", n, if n == 1 { "" } else { "s" }));
+    if let Ok(log) = std::fs::read_to_string(up_log()) {
+        let recent: Vec<&str> = log.lines().rev().take(8).collect();
+        if !recent.is_empty() {
+            ui::say(&ui::paint(ui::Tone::Dim, "  recent receives:"));
+            for l in recent.iter().rev() {
+                ui::say(&format!("    {l}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn down_cmd() -> Result<()> {
+    match daemon_alive() {
+        Some(pid) => {
+            std::process::Command::new("kill").arg(pid.to_string()).status()?;
+            let _ = std::fs::remove_file(pidfile());
+            ui::say(&format!("  {} stopped (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            Ok(())
+        }
+        None => {
+            ui::say("  not running");
+            Ok(())
+        }
+    }
+}
+
+// ------------------------------------------------------------ introduce ----
+// Vouched pairing: the hub (which already trusts A and B) mints a fresh
+// secret and delivers it to both over channels it has PROVEN itself on
+// (fingerprint-bound, C20). Receivers only honor pair-intro from a verified
+// link, so a stranger — or the server — can't inject trust.
+
+async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()> {
+    let store = devices_load();
+    let find = |n: &str| store.iter().find(|(name, _)| name.eq_ignore_ascii_case(n)).cloned();
+    let (a_name, a_sec) = find(a).ok_or_else(|| anyhow!("'{a}' is not a known device (see: filament devices)"))?;
+    let (b_name, b_sec) = find(b).ok_or_else(|| anyhow!("'{b}' is not a known device"))?;
+
+    let my_uid = mk_uid("s");
+    let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
+    let sio = net::connect_signaling(server, tx.clone()).await?;
+    let solo = format!("intro-{}", fresh_secret());
+    sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
+    sio.emit("subscribe", json!({ "channels": [channel_of(&a_sec), channel_of(&b_sec)] })).await.ok();
+    ui::say(&format!("  waiting for {} and {} to be online…", ui::paint(ui::Tone::Bold, &a_name), ui::paint(ui::Tone::Bold, &b_name)));
+
+    let mut conn = Conn {
+        server: server.to_string(),
+        sio: sio.clone(),
+        tx: tx.clone(),
+        my_uid: my_uid.clone(),
+        my_id: String::new(),
+        relay_only: relay,
+        to_filter: None,
+        links: HashMap::new(),
+        roster: HashMap::new(),
+        active: None,
+        next_gen: 0,
+        waiting_rejoin: None,
+        chunk_size: net::MAX_DC_PAYLOAD,
+    };
+    // sid -> which device (false = a, true = b)
+    let mut who: HashMap<String, bool> = HashMap::new();
+    let mut sent: [bool; 2] = [false, false];
+    let fresh = fresh_secret();
+    let deadline = Instant::now() + Duration::from_secs(120);
+
+    loop {
+        if Instant::now() > deadline {
+            bail!("timed out — both devices must be online (e.g. running `filament up`)");
+        }
+        let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(ev)) => ev,
+            Ok(None) => bail!("signaling closed"),
+            Err(_) => continue,
+        };
+        match ev {
+            Ev::Welcome(v) => conn.my_id = v["id"].as_str().unwrap_or_default().to_string(),
+            Ev::KnownPeer(v) => {
+                let ch = v["channel"].as_str().unwrap_or_default().to_string();
+                let pid = v["id"].as_str().unwrap_or_default().to_string();
+                let is_b = if ch == channel_of(&a_sec) { false } else if ch == channel_of(&b_sec) { true } else { continue };
+                conn.maybe_adopt(&v, false).await?;
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.expected_secret = Some(if is_b { (b_name.clone(), b_sec.clone()) } else { (a_name.clone(), a_sec.clone()) });
+                }
+                who.insert(pid, is_b);
+            }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                conn.ensure_responder(&from, &data).await?;
+                if let Some(l) = conn.link(&from) {
+                    if let Err(e) = l.peer.handle_signal(data).await {
+                        eprintln!("signal failed to apply: {e} (recovering)");
+                    }
+                }
+            }
+            Ev::ChannelReady(pid, t) => {
+                if let Some(l) = conn.link_mut(&pid) {
+                    l.transport = Some(t.clone());
+                }
+                let Some(&is_b) = who.get(&pid) else { continue };
+                let (dev_name, sec) = if is_b { (&b_name, &b_sec) } else { (&a_name, &a_sec) };
+                let other_name = if is_b { &a_name } else { &b_name };
+                if let Some(l) = conn.link(&pid) {
+                    if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                        // prove ourselves, then vouch
+                        t.send_control(&json!({
+                            "type": "pair-proof",
+                            "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
+                        })).await?;
+                        t.send_control(&json!({
+                            "type": "pair-intro", "name": other_name, "secret": fresh,
+                        })).await?;
+                        sent[is_b as usize] = true;
+                        ui::say(&format!("  {} vouched to {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, dev_name)));
+                    }
+                }
+                if sent[0] && sent[1] {
+                    tokio::time::sleep(Duration::from_millis(800)).await; // let intros flush
+                    ui::say(&format!(
+                        "  {} {} and {} now know each other (no codes needed)",
+                        ui::paint(ui::Tone::Ok, ui::glyph_ok()),
+                        a_name, b_name,
+                    ));
+                    let _ = sio.disconnect().await;
+                    return Ok(());
+                }
+            }
+            Ev::Stuck(pid, g) => { conn.on_stuck(&pid, g, "stuck").await?; }
+            Ev::GraceExpired(pid, g) => { conn.on_stuck(&pid, g, "lost").await?; }
+            Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
+            Ev::PeerLeft(v) => { conn.on_peer_left(&v); }
+            Ev::Interrupted => bail!("interrupted"),
+            _ => {}
+        }
+    }
+}
+
 // ---------------------------------------------------------- link machinery --
 // One peer at a time, but with the browser's survival rules: establishment
 // watchdog (C3), disconnected-grace + ICE restart + reconnect attempts (C4),
@@ -459,6 +729,11 @@ impl Conn {
         let peer_uid = v["uid"].as_str().map(|s| s.to_string());
         let name = v["name"].as_str().unwrap_or("peer").to_string();
         if peer_id.is_empty() || peer_id == self.my_id {
+            return Ok(false);
+        }
+        // Our own daemon shares this device's store and therefore its
+        // presence channels — never adopt yourself.
+        if is_self_uid(&self.my_uid, peer_uid.as_deref()) {
             return Ok(false);
         }
         self.roster.insert(peer_id.clone(), v.clone());
@@ -669,7 +944,7 @@ async fn main() -> Result<()> {
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
-        const CMDS: [&str; 8] = ["send", "recv", "devices", "update", "completions", "man", "config", "help"];
+        const CMDS: [&str; 12] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce"];
         let code_re = regex_lite_code(first);
         if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
             if std::path::Path::new(first).exists() {
@@ -696,7 +971,7 @@ async fn main() -> Result<()> {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false).await
         }
         Cmd::Config { key, value } => {
             match (key, value) {
@@ -715,6 +990,10 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Up { install, dir } => up_cmd(&server, install, dir, cli.relay).await,
+        Cmd::Status => status_cmd(),
+        Cmd::Down => down_cmd(),
+        Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
         Cmd::Devices => {
             let all = devices_load();
             if all.is_empty() {
@@ -1253,6 +1532,7 @@ async fn recv_cmd(
     keep_open: bool,
     relay: bool,
     remember: Option<String>,
+    daemon: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
@@ -1260,9 +1540,32 @@ async fn recv_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
     let paired = code.is_some();
+    let mut devices = devices_load(); // channel -> identity lookup for proofs
     match &code {
         Some(c) => {
             sio.emit("pair-claim", json!({ "code": c.trim().to_lowercase() })).await.ok();
+        }
+        None if daemon => {
+            // C19: the daemon joins NO room. Presence-channel subscriptions
+            // only — strangers can't see it, probe it, or offer to it.
+            // (We still `join` an unguessable solo room so the registry holds
+            // our meta for known-peer events, but nobody else can land there.)
+            let solo = format!("up-{}", fresh_secret());
+            sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
+            if devices.is_empty() {
+                bail!("no known devices — pair once with --code + --remember first");
+            }
+            let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
+            sio.emit("subscribe", json!({ "channels": chans })).await.ok();
+            ui::say(&format!(
+                "  {} filament up — {} known device{} {} {}",
+                ui::paint(ui::Tone::Brand, "●"),
+                devices.len(),
+                if devices.len() == 1 { "" } else { "s" },
+                ui::glyph_arrow(),
+                ui::paint(ui::Tone::Bold, &dir.display().to_string()),
+            ));
+            ui::say(&ui::paint(ui::Tone::Dim, "  trusted devices only · invisible to strangers · Ctrl-C or `filament down` to stop"));
         }
         None => {
             let room = match &room {
@@ -1272,7 +1575,6 @@ async fn recv_cmd(
             eprintln!("listening in room {room} (dir: {})", dir.display());
             sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
             // C12: announce on every known device's presence channel
-            let devices = devices_load();
             if !devices.is_empty() {
                 let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
                 eprintln!("watching for {} known device(s)", devices.len());
@@ -1280,7 +1582,6 @@ async fn recv_cmd(
             }
         }
     }
-    let devices = devices_load(); // channel -> identity lookup for proofs
 
     let mut conn = Conn {
         server: server.to_string(),
@@ -1302,6 +1603,16 @@ async fn recv_cmd(
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
             let _ = tx.send(Ev::Interrupted);
+        });
+    }
+    #[cfg(unix)]
+    {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                term.recv().await;
+                let _ = tx.send(Ev::Interrupted);
+            }
         });
     }
     let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
@@ -1415,6 +1726,25 @@ async fn recv_cmd(
                         eprintln!("pair-proof FAILED verification — treating peer as untrusted");
                     }
                 }
+                Some("pair-intro") => {
+                    // C19/C20: only a fingerprint-verified known device may
+                    // vouch new trust into this store.
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let iname = v["name"].as_str().unwrap_or_default().to_string();
+                    let isec = v["secret"].as_str().unwrap_or_default().to_string();
+                    let hub = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    if trusted && isec.len() == 64 && !iname.is_empty() {
+                        devices_store(&iname, &isec)?;
+                        devices.push((iname.clone(), isec.clone()));
+                        sio.emit("subscribe", json!({ "channels": [channel_of(&isec)] })).await.ok();
+                        ui::say(&format!(
+                            "  {} introduced to '{}' by {} — now a known device",
+                            ui::paint(ui::Tone::Ok, ui::glyph_ok()), iname, hub
+                        ));
+                    } else {
+                        ui::say(&ui::paint(ui::Tone::Warn, &format!("  ignored pair-intro from unverified peer {hub}")));
+                    }
+                }
                 Some("file-offer") => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
                     let id = v["id"].as_str().unwrap_or_default().to_string();
@@ -1456,10 +1786,18 @@ async fn recv_cmd(
                     // partial we already said yes to auto-accepts; everything
                     // else gets an explicit prompt naming the sender.
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                    let ok = yes
-                        || conn.link(&pid).map(|l| l.trusted).unwrap_or(false) // C12: HMAC-verified
-                        || (is_resume && offset > 0)
-                        || prompt_accept(&sender_name, &name, size, paired).await;
+                    let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let ok = if daemon {
+                        link_trusted || (is_resume && offset > 0 && link_trusted)
+                    } else {
+                        yes
+                            || link_trusted // C12: HMAC-verified
+                            || (is_resume && offset > 0)
+                            || prompt_accept(&sender_name, &name, size, paired).await
+                    };
+                    if daemon && !ok {
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  declined {name} from unverified peer {sender_name}")));
+                    }
                     if !ok {
                         t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
                         continue;
@@ -1503,6 +1841,13 @@ async fn recv_cmd(
                             if ok { String::new() } else { ui::paint(ui::Tone::Err, "  SIZE MISMATCH") },
                         ));
                         completed += 1;
+                        if daemon {
+                            use std::io::Write as _;
+                            let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(up_log()) {
+                                let _ = writeln!(f, "{}  {}  {}  from {}", chrono_now(), inc.name, human(inc.received), from);
+                            }
+                        }
                     }
                 }
                 _ => {}
