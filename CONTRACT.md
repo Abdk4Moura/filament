@@ -44,6 +44,14 @@ Firebase mode mirrors these exact events client-side via Firestore.
   ack and as a `synced` event (the Rust client consumes events only). The
   old events above remain the fast path; clients re-sync whenever desired ≠
   confirmed or confirmed is stale (30 s) — no single emit is load-bearing.
+  Phase 2: the digest also carries `peers` (welcome-shaped roster of the
+  caller's room, excluding self, sorted by sid, capped 32; only on ok:true)
+  — clients reconcile it so missed peer-joined/left self-correct.
+- DataChannel control `{ type:"state", v:1, transfers:{id:bytes}, trusted,
+  away }` — C30 phase 3, sent every ~10 s per open link by both ends.
+  Receivers correct divergence: re-offer (resume) a "complete" transfer the
+  peer holds short; re-prove once on trusted:false; clear away-marks on any
+  state ping (frozen peers can't ping). Additive — unknown types ignored.
 
 **server → client**
 - `welcome`     `{ id, peers: [{ id, name }] }` — your id + who's already here

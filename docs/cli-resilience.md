@@ -387,8 +387,17 @@ bugs BEFORE becoming a gate: (1) `send --to`'s full-deadline blocking read
 starved the tick — a dropped subscribe could never be repaired and the wait
 never succeeded; (2) both client modules initially treated a fast reconnect
 as still-confirmed (fresh sid, dead subscriptions) — fixed with
-invalidate-on-welcome. Phases 2 (roster digest) and 3 (link mini-sync)
-remain ROADMAP.
+invalidate-on-welcome. **Phases 2+3 LANDED same day:** the digest carries
+the room roster (welcome-shaped, deterministic sort-cap-32) and both
+clients reconcile it — adopt a peer we never heard join, drop a room peer
+absent from two consecutive digests (channel links exempt); recv's
+quiet-exit is also satisfied when the digest says the room is empty (the
+G-k class, answered level-triggered). Link mini-sync: every open link
+exchanges {type:"state", transfers, trusted, away} every ~10 s — a sender
+re-offers (resume) when it believes a transfer complete that the peer
+holds short (the lost-END repair), a secret-holder re-proves once on
+trusted:false, and any state ping clears a stale away-mark. All additive;
+old clients ignore unknown types and digests without `peers`.
 
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
