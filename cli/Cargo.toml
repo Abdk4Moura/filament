@@ -1,6 +1,6 @@
 [package]
 name = "filament-cli"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2024"
 description = "P2P file transfer between terminals and browsers — no upload, no account. The terminal end of filament.autumated.com."
 license = "MIT"
