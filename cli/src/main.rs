@@ -1925,15 +1925,21 @@ async fn recv_cmd(
             }
             Ev::PairError(v) => {
                 let why = v["error"].as_str().unwrap_or("?").to_string();
+                // The server distinguishes (additively) a dead creator from a
+                // typo'd/expired code — say the actionable thing for each.
+                let hint = match v["why"].as_str() {
+                    Some("sender-gone") => "the sender who made that code already left — ask them for a fresh one".to_string(),
+                    _ => format!("{why} — codes burn after one use and expire after 10 min"),
+                };
                 if code.is_some() && conn.links.is_empty() && completed == 0 {
                     // started WITH a code that failed: nothing else to do
-                    bail!("code rejected: {why} — one-time codes burn after a single use and expire after 10 minutes; ask the sender for a fresh one");
+                    bail!("code rejected: {hint}");
                 }
                 // a TYPED claim failing must not kill a listening session
                 paired = false;
                 claim_in_flight = false;
                 ui::say(&format!(
-                    "  {} code rejected: {why} — codes burn after one use and expire after 10 min; still listening",
+                    "  {} code rejected: {hint}; still listening",
                     ui::paint(ui::Tone::Err, ui::glyph_err()),
                 ));
             }

@@ -418,7 +418,11 @@ def register(socketio, registry):
             # phone tab), vs creator alive but roomless.
             _tel("pair-claim-fail", sid=request.sid, code=code, existed=existed,
                  creator=peek_creator, creator_alive=creator_alive)
-            emit("pair-error", {"error": "invalid"})
+            # Tell the claimer WHICH failure this was (additive field — old
+            # clients ignore it): a code whose creator is gone reads very
+            # differently from a typo'd/expired one.
+            why = "sender-gone" if existed and peek_creator else "unknown"
+            emit("pair-error", {"error": "invalid", "why": why})
             return
         _tel("pair-claim-ok", sid=request.sid, code=code, creator=creator, room=room)
         # Code BURNED (atomic claim). Pairing is ADDITIVE: the claimer joins the
