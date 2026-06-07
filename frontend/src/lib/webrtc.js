@@ -16,6 +16,8 @@ const CTRL = {
   ACCEPT: 'file-accept',
   DECLINE: 'file-decline',
   END: 'file-end',
+  BRB: 'brb', // C21: "I'm stepping away (file picker / tab hidden), hold the line"
+  BACK: 'back',
 }
 
 let _tid = 0
@@ -129,16 +131,18 @@ export class PeerLink {
           } catch {}
         }
         clearTimeout(this._dcTimer)
-        // Dynamic grace (#12): 6s mid-transfer (fail fast, resume covers it),
-        // 45s idle — long enough to survive a mobile file-picker backgrounding
-        // the tab (Android suspends the page while the picker is up).
+        // Dynamic grace (#12/C21): 6s mid-transfer (fail fast, resume covers
+        // it); a peer that declared `brb` gets its announced window; 45s for
+        // an unannounced idle drop (mobile pickers suspend the whole tab).
         const midTransfer = [...this.transfers.values()].some((t) => t.status === 'transferring')
+        const awayMs = Math.max(0, (this._awayUntil || 0) - Date.now())
+        const grace = midTransfer ? 6000 : awayMs > 0 ? awayMs + 15000 : 45000
         this._dcTimer = setTimeout(() => {
           if (this.pc.connectionState !== 'connected') {
             this.onStatus('failed')
             this._failActive()
           }
-        }, midTransfer ? 6000 : 45000)
+        }, grace)
       } else if (s === 'failed') {
         clearTimeout(this._dcTimer)
         this.onStatus('failed')
@@ -286,7 +290,26 @@ export class PeerLink {
     this._update(this.transfers.get(id), { progress: entry.size ? entry.received / entry.size : 0 })
   }
 
+  // C21: declared absences make waits informed — the peer holds the line for
+  // the announced ttl instead of failing on the picker-induced disconnect.
+  sendBrb(ttl = 120) {
+    this._control({ type: CTRL.BRB, ttl })
+  }
+  sendBack() {
+    this._control({ type: CTRL.BACK })
+  }
+
   _onControl(msg) {
+    switch (msg.type) {
+      case CTRL.BRB:
+        this._awayUntil = Date.now() + Math.min(msg.ttl || 120, 300) * 1000
+        return
+      case CTRL.BACK:
+        this._awayUntil = 0
+        return
+      default:
+        this._awayUntil = 0 // any real traffic means they're back
+    }
     switch (msg.type) {
       case CTRL.OFFER: {
         const t = this._track({

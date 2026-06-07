@@ -420,15 +420,23 @@ export function useFilament() {
   // ---- resilience: nudge a reconnect when a suspended tab resumes ----------
   // Mobile browsers freeze background tabs and throttle timers, so socket.io's
   // auto-reconnect can stall. When the page becomes visible again, kick it.
+  // C21 (brb): going hidden — opening a file picker hides the tab on mobile —
+  // tells every connected peer we'll be right back, so they hold the line for
+  // the declared window instead of guessing; coming back says so.
   useEffect(() => {
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') sigRef.current?.reconnect?.()
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        sigRef.current?.reconnect?.()
+        for (const link of linksRef.current.values()) link.sendBack?.()
+      } else {
+        for (const link of linksRef.current.values()) link.sendBrb?.(120)
+      }
     }
-    document.addEventListener('visibilitychange', onVisible)
-    window.addEventListener('focus', onVisible)
+    document.addEventListener('visibilitychange', onVisibility)
+    window.addEventListener('focus', onVisibility)
     return () => {
-      document.removeEventListener('visibilitychange', onVisible)
-      window.removeEventListener('focus', onVisible)
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('focus', onVisibility)
     }
   }, [])
 

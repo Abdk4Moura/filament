@@ -78,6 +78,8 @@ pub enum Ev {
     GraceExpired(String, u32),
     /// Ctrl-C: park state, print the resume hint, leave cleanly.
     Interrupted,
+    /// A line typed into a listening recv (claim-a-code convenience).
+    StdinLine(String),
 }
 
 impl std::fmt::Debug for dyn Transport {

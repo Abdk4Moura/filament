@@ -340,6 +340,24 @@ if [ $G14 -eq 0 ] && [ "$(hashof "$DD/big.bin")" = "$H_BIG" ] \
   ok "daemon: verified identity, room-less, received + hash match"
 else bad "daemon"; tail -n 3 "$WORK/g14-up.log" "$WORK/g14-s2.log"; fi
 
+# --------------------------------------------------------------- gate 15 ----
+say "15: paired recv holds the line when the sender vanishes (C21)"
+W="g15-$$-$RANDOM"; D="$WORK/g15"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$W" --server "$SERVER" >"$WORK/g15-send.log" 2>&1 &
+SP=$!; pids+=($SP); sleep 3
+T0=$(date +%s)
+# no -y and no tty -> the offer is declined -> sender exits -> peer-left with
+# nothing received; the OLD behavior bailed instantly, C21 holds the line.
+FILAMENT_REJOIN_SECS=8 timeout 60 "$BIN" recv "$W" --dir "$D" --server "$SERVER" </dev/null >"$WORK/g15-recv.log" 2>&1
+RC=$?
+T1=$(date +%s)
+wait $SP 2>/dev/null
+if [ $RC -ne 0 ] && grep -q "holding the line" "$WORK/g15-recv.log" \
+   && grep -q "did not come back within 8s" "$WORK/g15-recv.log" \
+   && [ $((T1 - T0)) -ge 8 ]; then
+  ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"
+else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"

@@ -125,6 +125,17 @@ Once a peer connects, `route` tells you the **physical path** ICE chose:
 - `"relayed"` — falling back through a TURN relay.
 Surface it on the peer tile (e.g. a small badge: `⟶ local` / `⟶ direct` / `⟶ relayed`).
 
+### Declared absences — `brb` / `back` (C21)
+Control messages over the DataChannel (additive; unknown types are ignored):
+- `{ type: "brb", ttl: 120 }` — "I'm stepping away; hold the line for ttl
+  seconds." The browser broadcasts it on `visibilitychange → hidden` (a
+  mobile file picker hides the whole tab). Receivers extend their disconnect
+  grace / rejoin window to the declared ttl (capped 300 s) and suppress
+  failure-path messaging.
+- `{ type: "back" }` — absence over; any other traffic implies it too.
+Waits become *informed*: longer when promised, shorter (45 s default) when a
+peer vanishes without a word.
+
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or
 pass a custom keyword — collisions are rejected). Say it aloud; the other side

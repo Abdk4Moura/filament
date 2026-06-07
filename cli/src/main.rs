@@ -34,8 +34,18 @@ use tokio::sync::mpsc;
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
 /// C7: content identity for resume — sha256 over the first 256 KiB.
 const HEAD_BYTES: u64 = 256 * 1024;
-/// C4/C6: how long we wait for a vanished peer to rejoin before giving up.
+/// C4/C6/C21: how long we wait for a vanished peer to rejoin. UNWARNED is the
+/// blind default; a peer that announced `brb` (e.g. the browser opening a
+/// mobile file picker suspends the whole tab) gets its declared ttl instead —
+/// informed waits are both longer when promised and shorter when not.
 const REJOIN_WINDOW: Duration = Duration::from_secs(120);
+fn rejoin_unwarned() -> Duration {
+    std::env::var("FILAMENT_REJOIN_SECS") // test knob (gate 15)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(45))
+}
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -575,6 +585,8 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         active: None,
         next_gen: 0,
         waiting_rejoin: None,
+        rejoin_window: REJOIN_WINDOW,
+        away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
     };
     // sid -> which device (false = a, true = b)
@@ -699,6 +711,11 @@ struct Conn {
     active: Option<String>,        // the transfer-target sid (send side)
     next_gen: u32,
     waiting_rejoin: Option<Instant>,
+    /// How long the current rejoin window runs (set when it opens; depends on
+    /// whether the peer declared `brb`).
+    rejoin_window: Duration,
+    /// (peer sid, until) — the peer told us it's stepping away (C21).
+    away: Option<(String, Instant)>,
     chunk_size: usize,
 }
 
@@ -844,6 +861,11 @@ impl Conn {
     /// up to MAX_ATTEMPTS, then drop it. Returns true when the exhausted link
     /// was the active transfer target (send decides whether that is fatal).
     async fn on_stuck(&mut self, pid: &str, generation: u32, why: &str) -> Result<bool> {
+        // C21: don't burn retry attempts against a peer that told us it's
+        // away — re-dialing a suspended tab is wasted attrition.
+        if self.is_away(pid) {
+            return Ok(false);
+        }
         let Some(l) = self.links.get(pid) else { return Ok(false) };
         if l.generation != generation || l.peer.is_connected() {
             return Ok(false); // stale timer from a superseded attempt
@@ -874,23 +896,35 @@ impl Conn {
     }
 
     /// C4: transient `disconnected` — nudge ICE from the impolite side and
-    /// give it 6 s of grace before treating it as failure.
+    /// give it grace before treating it as failure. C21: a peer that said
+    /// `brb` gets its declared window instead of the 6 s blip grace, and no
+    /// scary message.
     async fn on_pc_state(&mut self, pid: &str, s: &str) {
+        let away = self.is_away(pid);
         let Some(l) = self.links.get_mut(pid) else { return };
         match s {
             "connected" => {
                 l.attempts = 0;
             }
             "disconnected" => {
-                eprintln!("connection blip — attempting recovery");
-                if !l.peer.polite {
+                let grace = if away {
+                    if let Some((_, until)) = &self.away {
+                        until.duration_since(Instant::now()) + Duration::from_secs(15)
+                    } else {
+                        Duration::from_secs(6)
+                    }
+                } else {
+                    eprintln!("connection blip — attempting recovery");
+                    Duration::from_secs(6)
+                };
+                if !l.peer.polite && !away {
                     l.peer.restart_ice().await;
                 }
                 let tx = self.tx.clone();
                 let pid = pid.to_string();
                 let generation = l.generation;
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    tokio::time::sleep(grace).await;
                     let _ = tx.send(Ev::GraceExpired(pid, generation));
                 });
             }
@@ -910,9 +944,30 @@ impl Conn {
         let was_active = self.is_active(pid);
         self.drop_link(pid);
         if was_active {
+            // C21: informed waits — a peer that declared `brb` gets its
+            // promised window (plus slack); an unannounced vanish gets the
+            // short default. Their client auto-rejoins; C6 supersede or a
+            // fresh adopt completes the recovery.
+            self.rejoin_window = match &self.away {
+                Some((apid, until)) if apid == pid && *until > Instant::now() => {
+                    until.duration_since(Instant::now()) + Duration::from_secs(15)
+                }
+                _ => rejoin_unwarned(),
+            };
             self.waiting_rejoin = Some(Instant::now());
         }
         was_active
+    }
+
+    /// C21: any traffic from a peer cancels its declared absence.
+    fn note_alive(&mut self, pid: &str) {
+        if matches!(&self.away, Some((apid, _)) if apid == pid) {
+            self.away = None;
+        }
+    }
+
+    fn is_away(&self, pid: &str) -> bool {
+        matches!(&self.away, Some((apid, until)) if apid == pid && *until > Instant::now())
     }
 
     /// #7 for the CLI: an offer from a roster peer we haven't linked yet
@@ -938,8 +993,11 @@ impl Conn {
 /// the window can expire even if no events arrive.
 async fn next_ev(rx: &mut mpsc::UnboundedReceiver<Ev>, conn: &Conn) -> Result<Option<Ev>> {
     if let Some(since) = conn.waiting_rejoin {
-        if since.elapsed() > REJOIN_WINDOW {
-            bail!("peer did not come back within {}s (partial state kept for resume)", REJOIN_WINDOW.as_secs());
+        if since.elapsed() > conn.rejoin_window {
+            bail!(
+                "peer did not come back within {}s (partial state kept for resume)",
+                conn.rejoin_window.as_secs()
+            );
         }
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => Ok(Some(ev)),
@@ -1264,6 +1322,8 @@ async fn send_cmd(
         active: None,
         next_gen: 0,
         waiting_rejoin: None,
+        rejoin_window: REJOIN_WINDOW,
+        away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
     };
     if known_target.is_some() {
@@ -1421,6 +1481,12 @@ async fn send_cmd(
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 _ if !conn.is_active(&pid) => {}
+                Some("brb") => {
+                    let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
+                    conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
+                    ui::say(&ui::paint(ui::Tone::Dim, "  peer stepped away — holding the line"));
+                }
+                Some("back") => conn.note_alive(&pid),
                 Some("file-accept") => {
                     let Some(t) = conn.transport() else { continue };
                     let offset = v["offset"].as_u64().unwrap_or(0);
@@ -1579,7 +1645,7 @@ async fn recv_cmd(
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
-    let paired = code.is_some();
+    let mut paired = code.is_some();
     let mut devices = devices_load(); // channel -> identity lookup for proofs
     match &code {
         Some(c) => {
@@ -1636,6 +1702,8 @@ async fn recv_cmd(
         active: None,
         next_gen: 0,
         waiting_rejoin: None,
+        rejoin_window: REJOIN_WINDOW,
+        away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
     };
     {
@@ -1652,6 +1720,18 @@ async fn recv_cmd(
             if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
                 term.recv().await;
                 let _ = tx.send(Ev::Interrupted);
+            }
+        });
+    }
+    // A listening recv accepts a code typed straight into it — the first
+    // thing real users try (observed live).
+    if !daemon {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
             }
         });
     }
@@ -1735,6 +1815,14 @@ async fn recv_cmd(
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 _ if !conn.links.contains_key(&pid) => {}
+                Some("brb") => {
+                    // C21: the peer announces a benign absence (mobile file
+                    // picker suspends the tab). Hold the line that long.
+                    let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
+                    conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
+                    ui::say(&ui::paint(ui::Tone::Dim, "  peer is choosing a file — holding the line"));
+                }
+                Some("back") => conn.note_alive(&pid),
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
@@ -1935,6 +2023,15 @@ async fn recv_cmd(
                     inc.bar.tick(inc.received);
                 }
             }
+            Ev::StdinLine(line) => {
+                if regex_lite_code(&line) {
+                    ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
+                    paired = true;
+                    sio.emit("pair-claim", json!({ "code": line.to_lowercase() })).await.ok();
+                } else if !line.is_empty() {
+                    ui::say(&ui::paint(ui::Tone::Dim, "  (type a code like brave-otter-123 to claim it)"));
+                }
+            }
             Ev::Interrupted => {
                 flush_inflight(&mut by_sid).await;
                 ui::say(&format!("  {} interrupted — partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
@@ -1954,17 +2051,24 @@ async fn recv_cmd(
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
             Ev::PeerLeft(v) => {
                 if conn.on_peer_left(&v) {
+                    let secs = conn.rejoin_window.as_secs();
                     if !by_sid.is_empty() {
                         // Keep partials writable-but-parked; resume comes via
                         // rejoin (C6) or a later re-offer against the .part.
-                        eprintln!("sender disconnected mid-transfer — waiting up to {}s for them to come back", REJOIN_WINDOW.as_secs());
+                        eprintln!("sender disconnected mid-transfer — waiting up to {secs}s for them to come back");
                         flush_inflight(&mut by_sid).await;
                     } else if completed > 0 && !keep_open {
                         eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
                         let _ = sio.disconnect().await;
                         return Ok(());
                     } else if paired && !keep_open {
-                        bail!("sender left before sending anything");
+                        // C21: NOT fatal — a phone opening its file picker
+                        // suspends the whole tab and drops the socket. Hold
+                        // the line; their client rejoins on refocus.
+                        ui::say(&ui::paint(
+                            ui::Tone::Dim,
+                            &format!("  sender stepped away — holding the line up to {secs}s (Ctrl-C to stop)"),
+                        ));
                     } else {
                         conn.waiting_rejoin = None; // open listener: keep going
                         eprintln!("peer left — still listening");

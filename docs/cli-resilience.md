@@ -251,6 +251,23 @@ relayed SDP) in the HMAC: a MITM'd channel has different fingerprints, the
 proof fails, auto-accept refuses. Closes active-MITM for known devices
 without full PAKE; C15 remains for code-pairing and the web app.
 
+### C21. Paired recv treated a vanished sender as instantly fatal — **FIXED (gate 15)**
+Found live by the maintainer: claim a code, connect, the sender's phone opens
+its file picker → Android suspends the tab → socket dies → `peer-left` → the
+CLI bailed `sender left before sending anything` while the human was still
+choosing a file. **Fix:** never instant-fail a paired peer-left; hold a
+rejoin window (their client auto-rejoins on refocus; supersede/adopt
+completes recovery). Windows are *informed* via the new `brb`/`back` control
+messages (see CONTRACT.md): a declared absence gets its promised ttl
+(picker = 120 s), an unannounced vanish gets 45 s — shorter than the old
+blind 120 s. While a peer is `brb`: gentler messaging, disconnect grace
+extends to the declared window, and the watchdog stops burning retry
+attempts against a suspended tab. Bonus from the same field report: a
+listening `recv` now claims a code typed straight into it (the first thing
+the user actually tried). Gate 15 verifies the hold-the-line path
+deterministically; the browser-driven `brb` path is gap G-h (needs a
+visibility-state mock in Playwright).
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**
