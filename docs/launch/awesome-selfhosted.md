@@ -21,10 +21,12 @@ tags:
 ```
 
 **Prerequisites before opening the PR (their requirements):**
-- [ ] Repo must have an explicit LICENSE file (we should add MIT — currently the
-      repo has no LICENSE at root; statelet has one, filament does not!)
-- [ ] Project should be ≥ 4 months old with signs of activity — the repo's git
-      history starts Dec 2023 ✓
+- [x] Repo must have an explicit LICENSE file — MIT LICENSE at repo root
+      since 2026-06 (© 2023-2026 Abdk4Moura) ✓
+- [ ] RELEASE must be ≥ 4 months old (their bot checks the latest release
+      date, not git history) — v1.0.0 published 2026-06-06, so eligible
+      2026-10-06; a scheduled routine opens the PR then (branch staged at
+      Abdk4Moura/awesome-selfhosted-data@add-filament)
 - [ ] Demo link available ✓ (the live instance)
 
 **Action for Claude when approved:** add LICENSE to filament repo, fork

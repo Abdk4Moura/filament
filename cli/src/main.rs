@@ -46,6 +46,16 @@ fn rejoin_unwarned() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(45))
 }
+/// G-k: how long the recv quiet-check must hold (everything done, nobody
+/// attached, no questions) before exiting without a `peer-left`. The 10 s
+/// default is overridable for tests (gate 18).
+fn quiet_exit_window() -> Duration {
+    std::env::var("FILAMENT_QUIET_EXIT_SECS") // test knob (gate 18)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(10))
+}
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
@@ -2256,6 +2266,7 @@ async fn recv_cmd(
     // gate 6). Tick the loop on a 2s timeout so a fallback quiet-check can
     // exit cleanly instead of idling to the connect-timeout.
     let mut last_quiet: Option<Instant> = None;
+    let quiet_window = quiet_exit_window();
 
     loop {
         let ev = match tokio::time::timeout(
@@ -2269,12 +2280,13 @@ async fn recv_cmd(
         };
 
         // G-k fallback: everything done, nobody attached, no questions
-        // outstanding — if that holds quietly for 10s, the peer-left we were
+        // outstanding — if that holds quietly for the quiet-exit window (10s
+        // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
         // counting on for a clean exit never arrived; exit anyway.
         if completed > 0 && !keep_open && by_sid.is_empty() && conn.links.is_empty() && pending.is_empty() {
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
-                Some(since) if since.elapsed() > Duration::from_secs(10) => {
+                Some(since) if since.elapsed() > quiet_window => {
                     ui::say(&ui::paint(ui::Tone::Dim, "  (peer-left never arrived — exiting on quiet)"));
                     eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
                     let _ = sio.disconnect().await;
@@ -2843,18 +2855,29 @@ async fn recv_cmd(
                 let _ = sio.disconnect().await;
                 std::process::exit(130);
             }
+            // Losing the sender is only an ERROR when nothing completed —
+            // after a successful transfer it's just closure (the quiet-exit
+            // prints the same `done (N files).` the peer-left path would).
             Ev::Stuck(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open {
+                if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open && completed == 0 {
                     bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
                 }
             }
             Ev::GraceExpired(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
+                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open && completed == 0 {
                     bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
                 }
             }
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
             Ev::PeerLeft(v) => {
+                // Test hook (gate 18): peer-left delivery is best-effort in the
+                // real world; this simulates the loss deterministically so the
+                // quiet-exit fallback (G-k) can be exercised. SIGSTOP can't do
+                // it — engine.io's ping timeout reaps a frozen client in ~30s
+                // and the legit peer-left wins the race.
+                if std::env::var("FILAMENT_TEST_DROP_PEER_LEFT").is_ok() {
+                    continue;
+                }
                 let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
                 if conn.on_peer_left(&v) {
                     let secs = conn.rejoin_window.as_secs();

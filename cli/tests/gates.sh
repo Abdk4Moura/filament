@@ -417,6 +417,38 @@ if [ $G17 -eq 0 ] && [ -n "$CHA" ] && [ "$CHA" = "$CHB" ]; then
   ok "pair ceremony: both exited clean; channel ids match (one mutual secret)"
 else bad "pair-ceremony"; tail -n 3 "$WORK/g17-a.log" "$WORK/g17-b.log"; fi
 
+# --------------------------------------------------------------- gate 18 ----
+say "18: recv quiet-exit when peer-left never arrives (G-k)"
+# The quiet-exit fallback: a transfer completes but the peer-left event is
+# LOST (delivery is best-effort — observed live under load). recv must notice
+# everything is done + nobody attached and exit 0 on its own.
+#
+# Simulating the loss: FILAMENT_TEST_DROP_PEER_LEFT makes recv drop incoming
+# peer-left events at exactly the delivery boundary. (A SIGSTOP'd sender can't
+# do it: engine.io's ping timeout reaps the frozen client in ~30 s and the
+# legit peer-left wins the race against link teardown — measured.)
+W="g18-$$-$RANDOM"; D="$WORK/g18"; mkdir -p "$D"
+"$BIN" send "$SMALL" --word "$W" --server "$SERVER" >"$WORK/g18-send.log" 2>&1 &
+SP=$!; pids+=($SP); sleep 3
+# Drain the per-IP claim window (5/min): gates 16/17 claim several codes in
+# the final minute; a fresh window makes the claim deterministic.
+echo "(draining claim rate-limit window: 61s)"; sleep 61
+T0=$(date +%s)
+FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=3 \
+  timeout 120 "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" </dev/null >"$WORK/g18-recv.log" 2>&1
+RC=$?
+T1=$(date +%s)
+kill $SP 2>/dev/null; wait $SP 2>/dev/null
+if [ $RC -eq 0 ] \
+   && grep -q "peer-left never arrived" "$WORK/g18-recv.log" \
+   && grep -F "done (1 file" "$WORK/g18-recv.log" >/dev/null \
+   && [ "$(hashof "$D/small.bin")" = "$H_SMALL" ] \
+   && [ $((T1 - T0)) -lt 90 ]; then
+  ok "quiet-exit fired (peer-left dropped), exited 0 in $((T1 - T0))s, hash matches"
+else
+  bad "quiet-exit (G-k)"; echo "  RC=$RC walltime=$((T1 - T0))s"; tail -n 6 "$WORK/g18-recv.log"
+fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"
