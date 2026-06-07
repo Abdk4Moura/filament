@@ -93,6 +93,7 @@ export function useFilament() {
   const [peers, setPeers] = useState([]) // [{ id, name, color, status }]
   const [transfers, setTransfers] = useState([]) // see CONTRACT.md
   const [roomId, setRoomId] = useState(null)
+  const roomIdRef = useRef(null) // current room for the rejoin belt (#14)
   const [roomScope, setRoomScope] = useState(null) // 'auto' | 'code' | 'link' | 'pair'
   const [roomCode, setRoomCode] = useState(null) // the speakable one-time code while waiting
   const [network, setNetwork] = useState(null) // 'ipv4' | 'ipv6' | 'raw'
@@ -265,6 +266,7 @@ export function useFilament() {
       }
       if (cancelled) return
       setRoomId(room)
+      roomIdRef.current = room
       setRoomScope(scope)
 
       const sig = await createSignaling(cfg)
@@ -332,7 +334,18 @@ export function useFilament() {
         if (!up) telFlush()
         setConnected(up)
         connectedRef.current = up
-        if (up) fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
+        if (up) {
+          fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
+          // #14 (measured live: a reconnect produced `connect` with NO join —
+          // a roomless ghost whose offers everyone rightly ignored). The
+          // layer below has auto-rejoin, but its emit can die in a half-open
+          // socket; re-join explicitly on EVERY socket-up. Idempotent
+          // server-side.
+          if (roomIdRef.current) {
+            tel('rejoin-belt', { room: String(roomIdRef.current).slice(0, 8) })
+            sig.join(roomIdRef.current, myNameRef.current, uidRef.current)
+          }
+        }
       })
 
       sig.join(room, myName, uidRef.current)
@@ -395,6 +408,7 @@ export function useFilament() {
     setConnected(false)
     sig.leave()
     setRoomId(newRoomId)
+    roomIdRef.current = newRoomId
     setRoomScope(scope)
     sig.join(newRoomId, myNameRef.current, uidRef.current)
   }, [])
