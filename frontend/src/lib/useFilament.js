@@ -11,6 +11,7 @@ import { createSignaling } from './signaling.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
+import { devicesLoad, devicesStore, devicesForget, channelOf, proofFor } from './devices.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the server's
 // one-time codes (backend/signaling.py — keep in sync). 4,096 combinations
@@ -154,6 +155,37 @@ export function useFilament() {
     })
   }, [])
 
+  // ---- known devices (C12/C20 browser half) ---------------------------------
+  // Mutual acknowledgement is structural: presence only lights up when BOTH
+  // sides hold the pair secret and raise the same sha256 meeting-point
+  // channel. This is the half the browser was missing — it received pair-keep
+  // secrets and dropped them, leaving the CLI waving at a rendezvous nobody
+  // else knew about (one-sided acknowledgement, observed live 2026-06-07).
+  const [knownDevices, setKnownDevices] = useState(() => devicesLoad())
+  const channelMapRef = useRef(new Map()) // channel -> {name, secret}
+  const expectedSecretRef = useRef(new Map()) // peerId -> {name, secret} (matched via known-peer)
+
+  /// (Re)raise our channels. Safe to call repeatedly: on boot, on every
+  /// socket-up (a fresh sid lost its subscriptions), and after storing a new
+  /// secret mid-session.
+  const subscribeKnown = useCallback(async () => {
+    const devs = devicesLoad()
+    setKnownDevices(devs)
+    if (!devs.length || !sigRef.current?.subscribe) return
+    try {
+      const entries = await Promise.all(devs.map(async (d) => [await channelOf(d.secret), d]))
+      channelMapRef.current = new Map(entries)
+      sigRef.current.subscribe(entries.map(([ch]) => ch))
+      tel('subscribe-known', { n: entries.length })
+    } catch {
+      /* crypto.subtle unavailable (insecure origin) — known devices dormant */
+    }
+  }, [])
+
+  const forgetDevice = useCallback((name) => {
+    setKnownDevices(devicesForget(name))
+  }, [])
+
   // ---- create a PeerLink for one remote peer -------------------------------
   const makeLink = useCallback(
     ({ id, name, uid }) => {
@@ -193,6 +225,21 @@ export function useFilament() {
         // headed to this same device (matched by its stable uid).
         onChannelOpen: () => {
           attemptsRef.current.delete(id) // established — reset watchdog retries
+          // C20: if this peer was introduced via a known-device channel, prove
+          // we hold the secret — bound to THIS link's DTLS fingerprints. Both
+          // sides do this (mutual acknowledgement), each verifies the other.
+          const exp = expectedSecretRef.current.get(id)
+          if (exp && uid) {
+            const fps = link.fingerprints()
+            if (fps) {
+              proofFor(exp.secret, uidRef.current, uidRef.current, uid, fps.mine, fps.theirs)
+                .then((mac) => {
+                  link.sendPairProof(mac)
+                  tel('proof-sent', { peer: id.slice(-6) })
+                })
+                .catch(() => {})
+            }
+          }
           if (!uid) return
           for (const [tid, entry] of outgoingRef.current) {
             // 'paused' = dropped mid-transfer; 'offered' = the offer fired
@@ -203,6 +250,31 @@ export function useFilament() {
               link.resumeSend(tid)
             }
           }
+        },
+        // C12: the peer handed us a pair secret ("remember me"). Store it
+        // under their display name and raise the channel immediately — from
+        // now on either side coming online finds the other, no codes.
+        onPairKeep: (secret) => {
+          devicesStore(name, secret)
+          tel('pair-keep-stored', { peer: id.slice(-6) })
+          subscribeKnown()
+        },
+        // C20: the peer claims to be a known device — verify against every
+        // stored secret, bound to this link's fingerprints.
+        onPairProof: async (mac) => {
+          const fps = link.fingerprints()
+          const theirUid = link.peerUid
+          if (!fps || !theirUid) return tel('proof-unverifiable', { peer: id.slice(-6) })
+          for (const d of devicesLoad()) {
+            try {
+              if ((await proofFor(d.secret, theirUid, theirUid, uidRef.current, fps.mine, fps.theirs)) === mac) {
+                updatePeer(id, { verified: d.name })
+                tel('proof-ok', { peer: id.slice(-6) })
+                return
+              }
+            } catch {}
+          }
+          tel('proof-fail', { peer: id.slice(-6) })
         },
         // Watchdog (#8): nothing connected within 15s ⇒ a signaling message was
         // lost (dead-sid relay, suspended peer, swallowed SDP error). Tear down
@@ -238,7 +310,7 @@ export function useFilament() {
       linksRef.current.set(id, link)
       return link
     },
-    [addPeer, updatePeer, upsertTransfer, removePeer],
+    [addPeer, updatePeer, upsertTransfer, removePeer, subscribeKnown],
   )
   makeLinkRef.current = makeLink
 
@@ -296,6 +368,27 @@ export function useFilament() {
         linksRef.current.delete(id)
         removePeer(id)
       })
+      // C12: a known device came online (matched one of our secret-derived
+      // channels) — link to it regardless of rooms. Both sides receive this;
+      // the polite/impolite roles sort out who offers.
+      sig.on('known-peer', ({ id, name, uid, channel }) => {
+        if (!id || uid === uidRef.current) return // our own other session
+        const dev = channelMapRef.current.get(channel)
+        if (!dev) return
+        expectedSecretRef.current.set(id, dev)
+        tel('known-peer', { peer: id.slice(-6) })
+        if (linksRef.current.has(id)) return // already linked via room roster
+        makeLink({ id, name: name || dev.name, uid })
+      })
+      sig.on('known-peer-left', ({ id }) => {
+        expectedSecretRef.current.delete(id)
+        const l = linksRef.current.get(id)
+        if (l) {
+          l.close()
+          linksRef.current.delete(id)
+          removePeer(id)
+        }
+      })
       sig.on('signal', ({ from, data }) => {
         let link = linksRef.current.get(from)
         if (!link) {
@@ -345,10 +438,13 @@ export function useFilament() {
             tel('rejoin-belt', { room: String(roomIdRef.current).slice(0, 8) })
             sig.join(roomIdRef.current, myNameRef.current, uidRef.current)
           }
+          // C12: a fresh sid lost its channel subscriptions — re-raise them.
+          subscribeKnown()
         }
       })
 
       sig.join(room, myName, uidRef.current)
+      subscribeKnown()
     })()
     return () => {
       cancelled = true
@@ -356,7 +452,7 @@ export function useFilament() {
       linksRef.current.forEach((l) => l.close())
       linksRef.current.clear()
     }
-  }, [makeLink, removePeer])
+  }, [makeLink, removePeer, subscribeKnown])
 
   // ---- actions -------------------------------------------------------------
   const sendFiles = useCallback((peerId, fileList) => {
@@ -593,5 +689,7 @@ export function useFilament() {
     pairWithCode, // join a code room to pair across networks
     generateCode, // mint a fresh code and switch to it; returns the code
     useAutoRoom, // go back to the 'people near you' auto room
+    knownDevices, // C12: [{name, secret, addedAt}] — remembered devices
+    forgetDevice, // C12: drop a remembered device by name
   }
 }

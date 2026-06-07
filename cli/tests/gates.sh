@@ -37,6 +37,18 @@ trap cleanup EXIT
 curl -fsS "$SERVER/api/health" >/dev/null || { echo "no backend at $SERVER"; exit 2; }
 ( cd "$CLI_DIR" && cargo build --release -q ) || { echo "build failed"; exit 2; }
 
+# The browser gates load frontend/dist via the LOCAL backend, so the bundle
+# must be SAME-ORIGIN. `npm run build` bakes frontend/.env.production
+# (the Cloudflare prod API base) — a dist built that way signals via PROD
+# while the gate CLI sits on 127.0.0.1, and every Playwright gate times out
+# (cost: a full suite of red herrings, 2026-06-07). Rebuild with the
+# override if the poison marker is present.
+FRONT="$CLI_DIR/../frontend"
+if grep -qs "api\.filament\.autumated\.com" "$FRONT"/dist/assets/*.js 2>/dev/null; then
+  echo "dist is prod-pointing — rebuilding same-origin for gates…"
+  ( cd "$FRONT" && VITE_FILAMENT_API= npm run build >/dev/null 2>&1 ) || { echo "frontend rebuild failed"; exit 2; }
+fi
+
 # payloads
 SMALL="$WORK/small.bin"; BIG="$WORK/big.bin"
 head -c $((5 * 1024 * 1024))  /dev/urandom > "$SMALL"
@@ -357,6 +369,28 @@ if [ $RC -ne 0 ] && grep -q "holding the line" "$WORK/g15-recv.log" \
    && [ $((T1 - T0)) -ge 8 ]; then
   ok "stepped-away sender: held ${FILAMENT_REJOIN_SECS:-8}s window, then failed honestly"
 else bad "stepped-away wait"; tail -n 3 "$WORK/g15-recv.log"; fi
+
+say "16: known-device rendezvous — browser remembers, CLI --to finds it (C12/C20 web)"
+if [ -d "$HERE/node_modules/playwright" ]; then
+  G16=0
+  W16="g16-$$-$RANDOM"
+  C16="$WORK/g16cfg"; mkdir -p "$C16"
+  # phase 1 sender: mints the word code, hands over a pair-keep secret
+  FILAMENT_CONFIG_DIR="$C16" "$BIN" send "$SMALL" --word "$W16" --remember pwdev --server "$SERVER" >"$WORK/g16-s1.log" 2>&1 &
+  S16=$!; pids+=($S16); sleep 3
+  ( cd "$HERE" && node known-device.js "$SERVER" "$W16" >"$WORK/g16-pw.log" 2>&1 ) &
+  PW16=$!; pids+=($PW16)
+  wait $S16 || G16=1   # phase 1 transfer done; browser must now hold the secret
+  # phase 2: fresh session, ISOLATED room, no code — only the secret-derived
+  # channel can find the browser. The same config dir holds 'pwdev'.
+  FILAMENT_CONFIG_DIR="$C16" timeout 120 "$BIN" send "$SMALL" --to pwdev --room "g16iso$$" --server "$SERVER" >"$WORK/g16-s2.log" 2>&1 || G16=1
+  wait $PW16 || G16=1
+  if [ $G16 -eq 0 ] && grep -q "SECRET STORED" "$WORK/g16-pw.log" && grep -q "PHASE2 COMPLETE" "$WORK/g16-pw.log"; then
+    ok "browser stored the pair secret; --to found it cross-room via channel, no code"
+  else bad "known-device"; tail -n 4 "$WORK/g16-pw.log" "$WORK/g16-s1.log" "$WORK/g16-s2.log"; fi
+else
+  echo "SKIP (run: cd $HERE && npm i playwright && npx playwright install chromium)"
+fi
 
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"

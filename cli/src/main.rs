@@ -2454,6 +2454,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proof_matches_browser() {
+        // Pinned to the SAME external vector as frontend devices.js (computed
+        // with `printf 'filament-proof2:u1|u1|u2|FPA|FPB' | openssl dgst
+        // -sha256 -hmac s3cret`). If either implementation drifts, browsers
+        // and CLIs silently stop recognizing each other as known devices.
+        let want = "f98c3b6b7a70ebdf4b200680e83383881bdb1a11476283507359c55ef03a8474";
+        // deliberately unsorted inputs — proof_for must normalize
+        assert_eq!(proof_for("s3cret", "u1", "u2", "u1", "FPB", "FPA"), want);
+        assert_eq!(proof_for("s3cret", "u1", "u1", "u2", "FPA", "FPB"), want);
+        // channel derivation, same cross-check (sha256 of "filament-pair:"+secret)
+        assert_eq!(
+            channel_of("topsecret"),
+            "1e32e46e93691c29d9c0305545a10c86a00ae9f3c43d4eea3c7423c1528f9b5d"
+        );
+    }
+
+    #[test]
     fn polite_role_matches_browser() {
         // uid comparison wins, string-lexicographic, mirrors webrtc.js politeRole
         assert!(net::polite_role("b", Some("a"), "x", "y")); // myUid > peerUid -> polite

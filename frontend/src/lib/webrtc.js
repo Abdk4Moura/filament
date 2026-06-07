@@ -18,6 +18,8 @@ const CTRL = {
   END: 'file-end',
   BRB: 'brb', // C21: "I'm stepping away (file picker / tab hidden), hold the line"
   BACK: 'back',
+  PAIR_KEEP: 'pair-keep', // C12: here's a secret — remember me as a known device
+  PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
 }
 
 let _tid = 0
@@ -61,7 +63,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairProof }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -70,6 +72,8 @@ export class PeerLink {
     this.onTransfer = onTransfer || (() => {})
     this.onRoute = onRoute || (() => {})
     this.onChannelOpen = onChannelOpen || (() => {})
+    this.onPairKeep = onPairKeep || (() => {}) // C12: peer handed us a pair secret
+    this.onPairProof = onPairProof || (() => {}) // C20: peer claims to be a known device
     this.route = null // 'local' | 'direct' | 'relayed'
 
     // Resume support: a stable per-tab identity for the remote peer, plus
@@ -300,6 +304,24 @@ export class PeerLink {
     this._control({ type: CTRL.BACK })
   }
 
+  // C20: prove to the peer that we hold a secret they remembered. The mac is
+  // computed by the hook (it owns the device store and our uid).
+  sendPairProof(mac) {
+    this._control({ type: CTRL.PAIR_PROOF, mac })
+  }
+
+  /// Both DTLS fingerprints of THIS link, parsed like the CLI does
+  /// (a=fingerprint: value, trimmed, uppercased) — the proof binds to them.
+  fingerprints() {
+    const grab = (desc) => {
+      const line = (desc?.sdp || '').split(/\r?\n/).find((l) => l.startsWith('a=fingerprint:'))
+      return line ? line.slice('a=fingerprint:'.length).trim().toUpperCase() : null
+    }
+    const mine = grab(this.pc.localDescription)
+    const theirs = grab(this.pc.remoteDescription)
+    return mine && theirs ? { mine, theirs } : null
+  }
+
   _onControl(msg) {
     switch (msg.type) {
       case CTRL.BRB:
@@ -358,6 +380,13 @@ export class PeerLink {
         })
         break
       }
+      case CTRL.PAIR_KEEP:
+        // C12: the peer minted a pair secret and asked us to remember them.
+        if (typeof msg.secret === 'string' && /^[0-9a-f]{64}$/.test(msg.secret)) this.onPairKeep(msg.secret)
+        break
+      case CTRL.PAIR_PROOF:
+        if (typeof msg.mac === 'string') this.onPairProof(msg.mac)
+        break
     }
   }
 

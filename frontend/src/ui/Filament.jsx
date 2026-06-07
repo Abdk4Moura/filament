@@ -277,11 +277,29 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
 
   if (scope === 'link') {
     return (
-      <div style={wrap}>
-        <span style={{ fontSize: 12, color: T.sub, whiteSpace: 'nowrap' }}>Share room link</span>
-        <span style={{ flex: 1, minWidth: 160, fontSize: 11, color: accent, border: '1px solid ' + T.line, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.bg }}>{state.roomUrl}</span>
-        <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy link'}</button>
-        <LanChip localHelper={state.localHelper} T={T} />
+      <div style={{ ...wrap, flexDirection: 'column', flexWrap: 'nowrap', alignItems: 'stretch', gap: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 12, color: T.sub, whiteSpace: 'nowrap' }}>Share room link</span>
+          <span style={{ flex: 1, minWidth: 160, fontSize: 11, color: accent, border: '1px solid ' + T.line, padding: '7px 10px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: T.bg }}>{state.roomUrl}</span>
+          <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy link'}</button>
+          <LanChip localHelper={state.localHelper} T={T} />
+        </div>
+        {/* Codes work from ANY room — minting is additive (the claimer joins
+            THIS room) — so the affordance belongs here too, not just in auto. */}
+        {entering ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
+              placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
+                background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+            {ghostBtn('pair', submitCode, true)}
+            {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+          </div>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            {ghostBtn('pair with code', () => setEntering(true))}
+            {ghostBtn('create code', onGenerateCode, true)}
+          </div>
+        )}
       </div>
     )
   }

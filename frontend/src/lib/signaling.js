@@ -39,7 +39,7 @@ class SocketIOSignaling extends Emitter {
     this.name = null
     // API_BASE === '' → same-origin; otherwise connect to the backend origin.
     this.socket = io(API_BASE || undefined, { autoConnect: true })
-    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-matched', 'pair-error', 'pair-used']) {
+    for (const ev of ['welcome', 'peer-joined', 'peer-left', 'signal', 'pair-code', 'pair-matched', 'pair-error', 'pair-used', 'known-peer', 'known-peer-left']) {
       this.socket.on(ev, (payload) => this._emit(ev, payload))
     }
     // Resilience: on every (re)connect, rejoin the current room. A reconnect
@@ -71,6 +71,11 @@ class SocketIOSignaling extends Emitter {
   }
   pairClaim(code) {
     this.socket.emit('pair-claim', { code })
+  }
+  // C12: raise known-device presence channels (sha256 meeting points — the
+  // server never sees a secret). Idempotent; safe to re-send on reconnect.
+  subscribe(channels) {
+    if (channels?.length) this.socket.emit('subscribe', { channels })
   }
   // Force a reconnect attempt (e.g. when a suspended mobile tab resumes).
   reconnect() {

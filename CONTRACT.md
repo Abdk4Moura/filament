@@ -30,12 +30,22 @@ Firebase mode mirrors these exact events client-side via Firestore.
 - `join`   `{ room, name }`
 - `signal` `{ to, data }`  — relay `data` to peer whose id == `to`
 - `leave`  `{}`
+- `subscribe` `{ channels: [sha256hex] }` — C12: raise known-device presence
+  channels. A channel id is `sha256("filament-pair:" + secret)` — the server
+  never sees a secret, only meeting points. Re-send on every reconnect (a
+  fresh sid loses its subscriptions). Implemented by the CLI AND the browser
+  (`lib/devices.js`): acknowledgement is mutual by construction — presence
+  only lights up when both holders raise the same channel.
 
 **server → client**
 - `welcome`     `{ id, peers: [{ id, name }] }` — your id + who's already here
 - `peer-joined` `{ id, name }`
 - `peer-left`   `{ id }`
 - `signal`      `{ from, data }`
+- `known-peer`  `{ id, name, uid, channel }` — C12: a fellow subscriber of
+  `channel` is online (sent to BOTH sides, regardless of rooms). Signals to
+  that sid relay normally — links form room-lessly.
+- `known-peer-left` `{ id, channel }`
 
 Convention: the **newer** peer always initiates the WebRTC offer.
 
@@ -134,6 +144,24 @@ Control messages over the DataChannel (additive; unknown types are ignored):
 - `{ type: "back" }` — absence over; any other traffic implies it too.
 Waits become *informed*: longer when promised, shorter (45 s default) when a
 peer vanishes without a word.
+
+### Known devices — `pair-keep` / `pair-proof` (C12/C20)
+Control messages over the DataChannel; the browser implements both sides
+(`lib/devices.js`), mirroring the CLI byte-for-byte:
+- `{ type: "pair-keep", secret }` — "remember me." Sent by a `--remember`
+  sender after connect. The receiver persists `{name, secret}` (browser:
+  localStorage `filament-known-devices`) and immediately `subscribe`s the
+  derived channel — from then on either side coming online finds the other
+  through `known-peer`, no rooms, no codes. Acknowledgement is MUTUAL:
+  a stored-but-unreciprocated secret does nothing (one-sided waving was the
+  iPad↔CLI reconnect failure observed live 2026-06-07).
+- `{ type: "pair-proof", mac }` — trust, asserted per link.
+  `mac = HMAC-SHA256(secret, "filament-proof2:{proverUid}|{loUid}|{hiUid}|{loFp}|{hiFp}")`
+  where uids and the two DTLS `a=fingerprint:` values (trimmed, uppercased)
+  are sorted lexicographically. Binding to fingerprints means a channel
+  MITM'd by anyone — including the signaling server — fails verification.
+  Both sides prove; each verifies against every stored secret. Cross-impl
+  parity is pinned by test vectors (cli `proof_matches_browser`, gate 16).
 
 ### One-time pairing (#11)
 `generateCode()` mints a **speakable, single-use** code (`clever-lynx-63`; or

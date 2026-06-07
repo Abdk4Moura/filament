@@ -250,6 +250,17 @@ Original: include both DTLS certificate fingerprints (already present in the
 relayed SDP) in the HMAC: a MITM'd channel has different fingerprints, the
 proof fails, auto-accept refuses. Closes active-MITM for known devices
 without full PAKE; C15 remains for code-pairing and the web app.
+**2026-06-07 — the browser half (Phase A).** Maintainer diagnosed the
+iPad↔CLI reconnect failure as one-sided acknowledgement, and that was
+literally true: the CLI had `daft-gibbon` in its device store and subscribed
+its channel; the browser had received the pair-keep secret and DROPPED it
+(no handler). The browser now persists secrets (localStorage), re-subscribes
+on every socket-up, answers `known-peer` introductions room-lessly, and
+both sends and verifies proofs (`frontend/src/lib/devices.js`, crypto.subtle).
+Cross-impl parity pinned to an openssl-derived vector on both sides
+(`proof_matches_browser` unit test ↔ Node check). Gate 16 verifies the whole
+chain: claim+remember → secret stored → fresh CLI `--to` in an ISOLATED room
+finds the browser via the channel alone, transfers with no code.
 
 ### C21. Paired recv treated a vanished sender as instantly fatal — **FIXED (gate 15)**
 Found live by the maintainer: claim a code, connect, the sender's phone opens
@@ -380,6 +391,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 13 multi-link: CLI + two browsers, transfer with bystander, nobody wedges | C18 | green |
 | 14 daemon: pair `--remember`, verified identity, room-less `up` receive | C19, C20, C12 | green |
 | 15 paired recv holds the line on sender vanish, fails honestly after window | C21 | green |
+| 16 known-device rendezvous: browser stores pair-keep secret, `--to` finds it cross-room via channel (no code) | C12, C20 web half | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 
 **Known coverage gaps (tracked, not hidden):**
@@ -387,6 +399,12 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   no deterministic local simulation; needs netem/SIGSTOP choreography.
 - **G-b** watchdog lacks a swallowed-offer fixture peer.
 - **G-c** TURN TTL expiry needs a short-TTL backend fixture.
+- **G-j** known-device browser half (gate 16) proves Chromium and the
+  CLI→browser direction only. Untested: Safari/WebKit (the iPad — crypto.subtle
+  and fingerprint parsing should hold, but Private Browsing silently refuses
+  localStorage: the secret won't persist, console.warn flags it) and the
+  reverse direction (browser sending to a `filament up` daemon, where the
+  daemon must verify the BROWSER's proof to auto-accept).
 - **G-i** stale-answer glare can strand a link through all 3 retries: observed
   once (gate 12, 2026-06-07, machine under load) — browser socket dropped
   pre-link, its stale answer hit the fresh link ("invalid transition from
