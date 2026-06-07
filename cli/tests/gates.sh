@@ -20,6 +20,11 @@ WORK="${FILAMENT_TEST_WORK:-$(mktemp -d /tmp/filament-gates.XXXXXX)}"
 WITH_RELAY=0
 [ "${1:-}" = "--with-relay" ] && WITH_RELAY=1
 
+# Hermetic: never let the operator's real config/devices leak into gates
+# (a configured display name broke --to selection in gate 7 once).
+export FILAMENT_CONFIG_DIR="$WORK/cfg"; mkdir -p "$WORK/cfg"
+unset FILAMENT_NAME 2>/dev/null || true
+
 PASS=0; FAIL=0; FAILED_GATES=""
 say()  { printf '\n\033[1m== gate %s ==\033[0m\n' "$*"; }
 ok()   { echo "PASS: $1"; PASS=$((PASS+1)); }
@@ -165,7 +170,7 @@ say "7: --to peer selection (C13)"
 DA="$WORK/g7-alice"; DB="$WORK/g7-bob"; mkdir -p "$DA" "$DB"
 USER=alice "$BIN" recv -y --to charlie --dir "$DA" --server "$SERVER" >"$WORK/g7-alice.log" 2>&1 &
 RA=$!; pids+=($RA)
-USER=bob "$BIN" recv -y --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
+USER=bob timeout 120 "$BIN" recv -y --dir "$DB" --server "$SERVER" >"$WORK/g7-bob.log" 2>&1 &
 RB=$!; pids+=($RB); sleep 3
 G7=0
 timeout 60 "$BIN" send "$SMALL" --to bob --server "$SERVER" >"$WORK/g7-send.log" 2>&1 || G7=1
@@ -299,6 +304,22 @@ if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
    && grep -q "resuming at" "$WORK/g11-recv2.log"; then
   ok "same-uid supersede: sender swapped links, transfer resumed, hash matches"
 else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; fi
+
+# --------------------------------------------------------------- gate 13 ----
+say "13: multi-link — CLI + two browsers, nobody wedges (C18)"
+if [ -d "$HERE/node_modules/playwright" ]; then
+  RM13="g13room$$"
+  ( cd "$HERE" && timeout 180 node two-browsers.js "$RM13" >"$WORK/g13-pw.log" 2>&1 ) &
+  PW=$!; pids+=($PW); sleep 8
+  G13=0
+  timeout 120 "$BIN" send "$SMALL" --room "$RM13" --server "$SERVER" >"$WORK/g13-send.log" 2>&1 || G13=1
+  wait $PW || G13=1
+  if [ $G13 -eq 0 ] && grep -q "C18 PASS" "$WORK/g13-pw.log"; then
+    ok "CLI answered both browsers; transfer completed with bystander"
+  else bad "multi-link"; tail -n 3 "$WORK/g13-pw.log" "$WORK/g13-send.log"; fi
+else
+  echo "SKIP (playwright not installed)"
+fi
 
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"

@@ -377,7 +377,19 @@ struct Link {
     uid: Option<String>,
     transport: Option<Arc<dyn Transport>>,
     generation: u32,
+    attempts: u32,
+    /// C12: proof-verified known device (per link, not global)
+    trusted: bool,
+    /// (name, secret) hypothesis to prove/verify on this link
+    expected_secret: Option<(String, String)>,
 }
+
+/// C18: browsers are mesh peers — they connect to EVERY room member. The CLI
+/// must answer every offer politely or unanswered browsers wedge at
+/// "connecting" (and their retry storms degrade the whole room). So: a links
+/// MAP, every peer answered; SEND still aims transfers at one `active`
+/// target; RECV accepts from any link, gated per-link by consent/trust.
+const MAX_LINKS: usize = 16;
 
 struct Conn {
     server: String,
@@ -387,72 +399,112 @@ struct Conn {
     my_id: String,
     relay_only: bool,
     to_filter: Option<String>,
-    link: Option<Link>,
-    attempts: u32,
+    links: HashMap<String, Link>,
+    roster: HashMap<String, Value>, // sid -> {id,name,uid} from welcome/peer-joined
+    active: Option<String>,        // the transfer-target sid (send side)
     next_gen: u32,
     waiting_rejoin: Option<Instant>,
     chunk_size: usize,
-    /// C12: (name, secret) hypothesis for the peer we expect on a presence
-    /// channel; proof verification flips `trusted`.
-    expected_secret: Option<(String, String)>,
-    trusted: bool,
 }
 
 impl Conn {
-    /// Consider a roster entry / peer-joined for adoption. Returns true if a
-    /// (re)connection was started.
-    async fn maybe_adopt(&mut self, v: &Value) -> Result<bool> {
+    fn link(&self, pid: &str) -> Option<&Link> {
+        self.links.get(pid)
+    }
+    fn link_mut(&mut self, pid: &str) -> Option<&mut Link> {
+        self.links.get_mut(pid)
+    }
+    fn active_link(&self) -> Option<&Link> {
+        self.active.as_ref().and_then(|a| self.links.get(a))
+    }
+    fn is_active(&self, pid: &str) -> bool {
+        self.active.as_deref() == Some(pid)
+    }
+    fn transport(&self) -> Option<Arc<dyn Transport>> {
+        self.active_link().and_then(|l| l.transport.clone())
+    }
+    fn transport_of(&self, pid: &str) -> Option<Arc<dyn Transport>> {
+        self.links.get(pid).and_then(|l| l.transport.clone())
+    }
+
+    /// May this peer become the TRANSFER TARGET? (Filters gate targeting,
+    /// never answering — every peer still gets a polite link.)
+    fn targetable(&self, name: &str, peer_uid: Option<&str>) -> bool {
+        if let Some(filter) = &self.to_filter {
+            if !name.to_lowercase().contains(&filter.to_lowercase()) {
+                return false;
+            }
+        }
+        // Same-role CLI peers never transfer to each other (gate 7).
+        if let (Some(pu), Some(my_role)) = (peer_uid, self.my_uid.get(..6)) {
+            if pu.starts_with(my_role) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Track a roster entry and (re)connect to it. `want_active` marks it as
+    /// the intended transfer target if it passes the target filters and no
+    /// target exists yet. Returns true if this peer is (now) the active one.
+    async fn maybe_adopt(&mut self, v: &Value, want_active: bool) -> Result<bool> {
         let peer_id = v["id"].as_str().unwrap_or_default().to_string();
         let peer_uid = v["uid"].as_str().map(|s| s.to_string());
         let name = v["name"].as_str().unwrap_or("peer").to_string();
         if peer_id.is_empty() || peer_id == self.my_id {
             return Ok(false);
         }
-        if let Some(filter) = &self.to_filter {
-            if !name.to_lowercase().contains(&filter.to_lowercase()) {
+        self.roster.insert(peer_id.clone(), v.clone());
+
+        // C6: same device on a NEW sid — supersede the stale link.
+        let stale: Option<String> = self
+            .links
+            .iter()
+            .find(|(sid, l)| l.uid.is_some() && l.uid == peer_uid && **sid != peer_id)
+            .map(|(sid, _)| sid.clone());
+        if let Some(old_sid) = stale {
+            eprintln!("{name} reconnected — superseding old link");
+            let was_active = self.is_active(&old_sid);
+            let secret = self.links.get(&old_sid).and_then(|l| l.expected_secret.clone());
+            self.drop_link(&old_sid);
+            self.establish(v.clone()).await?;
+            if let Some(l) = self.links.get_mut(&peer_id) {
+                l.expected_secret = secret;
+            }
+            if was_active {
+                self.active = Some(peer_id.clone());
+            }
+            return Ok(self.is_active(&peer_id));
+        }
+
+        if !self.links.contains_key(&peer_id) {
+            if self.links.len() >= MAX_LINKS {
                 return Ok(false);
             }
+            self.establish(v.clone()).await?;
         }
-        // Same-role CLI peers never transfer to each other (a receiver binding
-        // to another idle receiver wedges both — gate 7). The uid encodes the
-        // role: cli-s-* sends, cli-r-* receives. Browsers (random uids) pass.
-        if let (Some(peer_uid), Some(my_role)) = (&peer_uid, self.my_uid.get(..6)) {
-            if peer_uid.starts_with(my_role) {
-                return Ok(false);
-            }
+        if want_active && self.active.is_none() && self.targetable(&name, peer_uid.as_deref()) {
+            self.active = Some(peer_id.clone());
+            self.waiting_rejoin = None;
         }
-        match &self.link {
-            Some(l) => {
-                // C6: same device, new connection — supersede the stale link.
-                if l.uid.is_some() && l.uid == peer_uid && l.peer.id != peer_id {
-                    eprintln!("{name} reconnected — superseding old link");
-                    self.attempts = 0;
-                    self.establish(v.clone()).await?;
-                    return Ok(true);
-                }
-                Ok(false)
-            }
-            None => {
-                self.establish(v.clone()).await?;
-                Ok(true)
-            }
-        }
+        Ok(self.is_active(&peer_id))
     }
 
-    async fn establish(&mut self, info: Value) -> Result<()> {
-        if let Some(old) = self.link.take() {
-            // Fire-and-forget: pc.close() can block on network teardown
-            // against a frozen/unreachable peer, and this runs in the event
-            // loop — awaiting it inline deadlocks the whole process (found by
-            // gate 11). The atomic closed-flag silences the old peer's
-            // callbacks synchronously; the actual teardown can take its time
-            // off-loop.
+    fn drop_link(&mut self, pid: &str) {
+        if let Some(old) = self.links.remove(pid) {
+            // Never await close in the event loop (F8): mark + spawn.
             let p = old.peer.clone();
             p.mark_closed();
             tokio::spawn(async move { p.close().await });
         }
-        self.waiting_rejoin = None;
+        if self.is_active(pid) {
+            self.active = None;
+        }
+    }
+
+    async fn establish(&mut self, info: Value) -> Result<()> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
+        self.drop_link(&peer_id); // re-establish replaces any same-sid link
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
         let name = info["name"].as_str().unwrap_or("peer").to_string();
         // C5: fresh ICE config (TURN creds are expiry-stamped HMACs) for
@@ -463,7 +515,7 @@ impl Conn {
         self.next_gen += 1;
         let generation = self.next_gen;
         let peer = Peer::connect(
-            peer_id,
+            peer_id.clone(),
             polite,
             cfg.ice_servers,
             self.relay_only,
@@ -472,33 +524,63 @@ impl Conn {
             generation,
         )
         .await?;
-        self.link = Some(Link { peer, info, name, uid: peer_uid, transport: None, generation });
+        self.links.insert(
+            peer_id,
+            Link {
+                peer,
+                info,
+                name,
+                uid: peer_uid,
+                transport: None,
+                generation,
+                attempts: 0,
+                trusted: false,
+                expected_secret: None,
+            },
+        );
         Ok(())
     }
 
-    /// C3/C4: watchdog or grace expiry — retry with a fresh connection (and
-    /// fresh credentials), up to MAX_ATTEMPTS, then fail honestly.
-    async fn on_stuck(&mut self, pid: &str, generation: u32, why: &str) -> Result<()> {
-        let Some(l) = &self.link else { return Ok(()) };
-        if l.peer.id != pid || l.generation != generation || l.peer.is_connected() {
-            return Ok(()); // stale timer from a superseded attempt
+    /// C3/C4: watchdog or grace expiry — retry that LINK with fresh config,
+    /// up to MAX_ATTEMPTS, then drop it. Returns true when the exhausted link
+    /// was the active transfer target (send decides whether that is fatal).
+    async fn on_stuck(&mut self, pid: &str, generation: u32, why: &str) -> Result<bool> {
+        let Some(l) = self.links.get(pid) else { return Ok(false) };
+        if l.generation != generation || l.peer.is_connected() {
+            return Ok(false); // stale timer from a superseded attempt
         }
-        self.attempts += 1;
-        if self.attempts >= MAX_ATTEMPTS {
-            bail!("connection {why} after {} attempts", self.attempts);
+        let attempts = l.attempts + 1;
+        if attempts >= MAX_ATTEMPTS {
+            let was_active = self.is_active(pid);
+            eprintln!(
+                "{}",
+                ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after {attempts} attempts)"))
+            );
+            self.drop_link(pid);
+            return Ok(was_active);
         }
-        eprintln!("connection {why} — retrying ({}/{})", self.attempts + 1, MAX_ATTEMPTS);
+        eprintln!("connection {why} — retrying ({}/{})", attempts + 1, MAX_ATTEMPTS);
         let info = l.info.clone();
-        self.establish(info).await
+        let secret = l.expected_secret.clone();
+        let was_active = self.is_active(pid);
+        self.establish(info).await?;
+        if let Some(nl) = self.links.get_mut(pid) {
+            nl.attempts = attempts;
+            nl.expected_secret = secret;
+        }
+        if was_active {
+            self.active = Some(pid.to_string());
+        }
+        Ok(false)
     }
 
     /// C4: transient `disconnected` — nudge ICE from the impolite side and
     /// give it 6 s of grace before treating it as failure.
-    async fn on_pc_state(&mut self, s: &str) {
-        let Some(l) = &self.link else { return };
+    async fn on_pc_state(&mut self, pid: &str, s: &str) {
+        let Some(l) = self.links.get_mut(pid) else { return };
         match s {
             "connected" => {
-                self.attempts = 0;
+                l.attempts = 0;
             }
             "disconnected" => {
                 eprintln!("connection blip — attempting recovery");
@@ -506,7 +588,7 @@ impl Conn {
                     l.peer.restart_ice().await;
                 }
                 let tx = self.tx.clone();
-                let pid = l.peer.id.clone();
+                let pid = pid.to_string();
                 let generation = l.generation;
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(6)).await;
@@ -517,20 +599,39 @@ impl Conn {
         }
     }
 
-    /// Our peer's socket died. Keep state and wait for a rejoin (their client
-    /// auto-rejoins on reconnect); supersede (C6) completes the recovery.
+    /// A peer's socket died. Drop its link; if it was the active target, open
+    /// the rejoin window (their client auto-rejoins; C6 supersede completes
+    /// the recovery). Returns true if the ACTIVE peer left.
     fn on_peer_left(&mut self, v: &Value) -> bool {
-        let Some(l) = &self.link else { return false };
-        if v["id"].as_str() != Some(l.peer.id.as_str()) {
+        let Some(pid) = v["id"].as_str() else { return false };
+        self.roster.remove(pid);
+        if !self.links.contains_key(pid) {
             return false;
         }
-        self.link = None;
-        self.waiting_rejoin = Some(Instant::now());
-        true
+        let was_active = self.is_active(pid);
+        self.drop_link(pid);
+        if was_active {
+            self.waiting_rejoin = Some(Instant::now());
+        }
+        was_active
     }
 
-    fn transport(&self) -> Option<Arc<dyn Transport>> {
-        self.link.as_ref().and_then(|l| l.transport.clone())
+    /// #7 for the CLI: an offer from a roster peer we haven't linked yet
+    /// creates a polite responder link. Stray signals from unknowns drop.
+    async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
+        if self.links.contains_key(from) {
+            return Ok(());
+        }
+        if data["type"].as_str() == Some("description")
+            && data["description"]["type"].as_str() == Some("offer")
+        {
+            if let Some(info) = self.roster.get(from).cloned() {
+                if self.links.len() < MAX_LINKS {
+                    self.establish(info).await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -837,17 +938,15 @@ async fn send_cmd(
         my_id: String::new(),
         relay_only: relay,
         to_filter: to,
-        link: None,
-        attempts: 0,
+        links: HashMap::new(),
+        roster: HashMap::new(),
+        active: None,
         next_gen: 0,
         waiting_rejoin: None,
         chunk_size: net::MAX_DC_PAYLOAD,
-        expected_secret: None,
-        trusted: false,
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
-        conn.expected_secret = known_target.clone().map(|(n, s)| (n, s));
     }
     let mut code_used = !use_code && known_target.is_none();
     {
@@ -863,7 +962,7 @@ async fn send_cmd(
 
     loop {
         // The wait-for-peer deadline only applies while we have no peer (F3).
-        let ev = if conn.link.is_none() && conn.waiting_rejoin.is_none() {
+        let ev = if conn.active.is_none() && conn.waiting_rejoin.is_none() {
             match tokio::time::timeout(claim_deadline.saturating_sub(started.elapsed()), rx.recv()).await {
                 Ok(Some(ev)) => Some(ev),
                 Ok(None) => bail!("signaling channel closed"),
@@ -877,13 +976,9 @@ async fn send_cmd(
         match ev {
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
-                if code_used {
-                    if let Some(peers) = v["peers"].as_array() {
-                        for p in peers {
-                            if conn.maybe_adopt(p).await? {
-                                break;
-                            }
-                        }
+                if let Some(peers) = v["peers"].as_array() {
+                    for p in peers {
+                        conn.maybe_adopt(p, code_used).await?;
                     }
                 }
             }
@@ -909,37 +1004,45 @@ async fn send_cmd(
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
-                if code_used {
-                    conn.maybe_adopt(&v).await?;
-                }
+                conn.maybe_adopt(&v, code_used).await?;
             }
             Ev::KnownPeer(v) => {
-                if let Some((n, sec)) = &conn.expected_secret {
+                if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
                         eprintln!("known device '{n}' is online — connecting");
-                        conn.maybe_adopt(&v).await?;
-                    }
-                }
-            }
-            Ev::Signal(v) => {
-                if let Some(l) = &conn.link {
-                    if v["from"].as_str() == Some(l.peer.id.as_str()) {
-                        // Never fatal: a signal that fails to apply (e.g. a
-                        // renegotiation offer landing while our agent is mid-
-                        // gather -> "can not be restarted when gathering")
-                        // leaves a connection the watchdog/grace machinery
-                        // already knows how to recover or replace. Mirrors
-                        // the browser's catch-and-log signal queue (#2).
-                        if let Err(e) = l.peer.handle_signal(v["data"].clone()).await {
-                            eprintln!("signal failed to apply: {e} (recovering)");
+                        let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        conn.maybe_adopt(&v, true).await?;
+                        if let Some(l) = conn.link_mut(&pid) {
+                            l.expected_secret = Some((n.clone(), sec.clone()));
                         }
                     }
                 }
             }
+            Ev::Signal(v) => {
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                // C18: an offer from an unlinked roster peer creates a polite
+                // responder link (browsers mesh-dial everyone, fix #7 rules).
+                conn.ensure_responder(&from, &data).await?;
+                if let Some(l) = conn.link(&from) {
+                    // Never fatal (F6): the watchdog/grace machinery owns
+                    // failed negotiations.
+                    if let Err(e) = l.peer.handle_signal(data).await {
+                        eprintln!("signal failed to apply: {e} (recovering)");
+                    }
+                }
+            }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link.as_mut().filter(|l| l.peer.id == pid) {
-                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
+                if let Some(l) = conn.link_mut(&pid) {
                     l.transport = Some(t.clone());
+                }
+                // Responder links stop here: connected, polite, idle. Only
+                // the active target gets announcements + offers.
+                if !conn.is_active(&pid) {
+                    continue;
+                }
+                if let Some(l) = conn.link(&pid) {
+                    ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     let p = l.peer.clone();
                     tokio::spawn(async move {
                         // ICE may renominate; retry briefly (mirrors the
@@ -956,7 +1059,7 @@ async fn send_cmd(
                     // C12: prove identity to a known device (their daemon
                     // auto-accepts only after verifying); or hand over a new
                     // pair secret when the user asked to --remember.
-                    if let Some((_n, sec)) = &conn.expected_secret {
+                    if let Some((_n, sec)) = &l.expected_secret {
                         t.send_control(&json!({
                             "type": "pair-proof",
                             "mac": proof_for(sec, &conn.my_uid, l.uid.as_deref().unwrap_or("")),
@@ -988,7 +1091,7 @@ async fn send_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
-                _ if conn.link.as_ref().map(|l| l.peer.id != pid).unwrap_or(true) => {}
+                _ if !conn.is_active(&pid) => {}
                 Some("file-accept") => {
                     let Some(t) = conn.transport() else { continue };
                     let offset = v["offset"].as_u64().unwrap_or(0);
@@ -1035,13 +1138,17 @@ async fn send_cmd(
                 let _ = sio.disconnect().await;
                 std::process::exit(130);
             }
-            Ev::Stuck(pid, generation) => conn.on_stuck(&pid, generation, "stuck while connecting").await?,
-            Ev::GraceExpired(pid, generation) => conn.on_stuck(&pid, generation, "lost").await?,
-            Ev::PcState(pid, s) => {
-                if conn.link.as_ref().map(|l| l.peer.id == pid).unwrap_or(false) {
-                    conn.on_pc_state(&s).await;
+            Ev::Stuck(pid, generation) => {
+                if conn.on_stuck(&pid, generation, "stuck while connecting").await? {
+                    bail!("lost the receiving peer after {} attempts", MAX_ATTEMPTS);
                 }
             }
+            Ev::GraceExpired(pid, generation) => {
+                if conn.on_stuck(&pid, generation, "lost").await? {
+                    bail!("lost the receiving peer after {} attempts", MAX_ATTEMPTS);
+                }
+            }
+            Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
             Ev::PeerLeft(v) => {
                 if conn.on_peer_left(&v) {
                     let all_done = outgoing.lock().await.iter().all(|o| o.done);
@@ -1172,13 +1279,12 @@ async fn recv_cmd(
         my_id: String::new(),
         relay_only: relay,
         to_filter: to,
-        link: None,
-        attempts: 0,
+        links: HashMap::new(),
+        roster: HashMap::new(),
+        active: None,
         next_gen: 0,
         waiting_rejoin: None,
         chunk_size: net::MAX_DC_PAYLOAD,
-        expected_secret: None,
-        trusted: false,
     };
     {
         let tx = tx.clone();
@@ -1187,7 +1293,7 @@ async fn recv_cmd(
             let _ = tx.send(Ev::Interrupted);
         });
     }
-    let mut by_sid: HashMap<u32, IncomingFile> = HashMap::new();
+    let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
     let mut completed = 0usize;
 
     loop {
@@ -1207,46 +1313,44 @@ async fn recv_cmd(
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
-                        if conn.maybe_adopt(p).await? {
-                            break;
-                        }
+                        conn.maybe_adopt(p, true).await?;
                     }
                 }
             }
             Ev::KnownPeer(v) => {
-                if conn.link.is_none() {
-                    if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
-                        eprintln!("known device '{n}' appeared — connecting");
-                        conn.expected_secret = Some((n.clone(), sec.clone()));
-                        conn.maybe_adopt(&v).await?;
+                if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
+                    eprintln!("known device '{n}' appeared — connecting");
+                    let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    conn.maybe_adopt(&v, true).await?;
+                    if let Some(l) = conn.link_mut(&pid) {
+                        l.expected_secret = Some((n.clone(), sec.clone()));
                     }
                 }
             }
             Ev::PeerJoined(v) => {
                 let had_partials = !by_sid.is_empty();
-                if conn.maybe_adopt(&v).await? && had_partials {
+                if conn.maybe_adopt(&v, true).await? && had_partials {
                     // Stale per-link sid routing dies with the old link; the
                     // .part files live on and the sender's resume re-offers.
                     flush_inflight(&mut by_sid).await;
                 }
             }
             Ev::Signal(v) => {
-                if let Some(l) = &conn.link {
-                    if v["from"].as_str() == Some(l.peer.id.as_str()) {
-                        // Never fatal: a signal that fails to apply (e.g. a
-                        // renegotiation offer landing while our agent is mid-
-                        // gather -> "can not be restarted when gathering")
-                        // leaves a connection the watchdog/grace machinery
-                        // already knows how to recover or replace. Mirrors
-                        // the browser's catch-and-log signal queue (#2).
-                        if let Err(e) = l.peer.handle_signal(v["data"].clone()).await {
-                            eprintln!("signal failed to apply: {e} (recovering)");
-                        }
+                let from = v["from"].as_str().unwrap_or_default().to_string();
+                let data = v["data"].clone();
+                // C18: an offer from an unlinked roster peer creates a polite
+                // responder link (browsers mesh-dial everyone, fix #7 rules).
+                conn.ensure_responder(&from, &data).await?;
+                if let Some(l) = conn.link(&from) {
+                    // Never fatal (F6): the watchdog/grace machinery owns
+                    // failed negotiations.
+                    if let Err(e) = l.peer.handle_signal(data).await {
+                        eprintln!("signal failed to apply: {e} (recovering)");
                     }
                 }
             }
             Ev::ChannelReady(pid, t) => {
-                if let Some(l) = conn.link.as_mut().filter(|l| l.peer.id == pid) {
+                if let Some(l) = conn.link_mut(&pid) {
                     eprintln!("peer: {}", l.name);
                     l.transport = Some(t);
                     let p = l.peer.clone();
@@ -1265,7 +1369,7 @@ async fn recv_cmd(
                 }
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
-                _ if conn.link.as_ref().map(|l| l.peer.id != pid).unwrap_or(true) => {}
+                _ if !conn.links.contains_key(&pid) => {}
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
                     if sec.len() == 64 {
@@ -1279,17 +1383,19 @@ async fn recv_cmd(
                 }
                 Some("pair-proof") => {
                     let mac = v["mac"].as_str().unwrap_or_default();
-                    let peer_uid = conn.link.as_ref().and_then(|l| l.uid.clone()).unwrap_or_default();
+                    let peer_uid = conn.link(&pid).and_then(|l| l.uid.clone()).unwrap_or_default();
                     let hit = devices.iter().find(|(_, s)| proof_for(s, &peer_uid, &conn.my_uid) == mac);
                     if let Some((n, _)) = hit {
-                        conn.trusted = true;
+                        if let Some(l) = conn.link_mut(&pid) {
+                            l.trusted = true;
+                        }
                         eprintln!("identity verified: '{n}' (auto-accepting)");
                     } else {
                         eprintln!("pair-proof FAILED verification — treating peer as untrusted");
                     }
                 }
                 Some("file-offer") => {
-                    let Some(t) = conn.transport() else { continue };
+                    let Some(t) = conn.transport_of(&pid) else { continue };
                     let id = v["id"].as_str().unwrap_or_default().to_string();
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     // Never trust a remote name with path separators.
@@ -1328,9 +1434,9 @@ async fn recv_cmd(
                     // C14: consent. -y accepts everything; a resume of a
                     // partial we already said yes to auto-accepts; everything
                     // else gets an explicit prompt naming the sender.
-                    let sender_name = conn.link.as_ref().map(|l| l.name.clone()).unwrap_or_default();
+                    let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let ok = yes
-                        || conn.trusted // C12: HMAC-verified known device
+                        || conn.link(&pid).map(|l| l.trusted).unwrap_or(false) // C12: HMAC-verified
                         || (is_resume && offset > 0)
                         || prompt_accept(&sender_name, &name, size, paired).await;
                     if !ok {
@@ -1346,7 +1452,7 @@ async fn recv_cmd(
                         tokio::fs::File::create(&part_path).await?
                     };
                     let bar = ui::Progress::new(&name, size);
-                    by_sid.insert(sid, IncomingFile {
+                    by_sid.insert((pid.clone(), sid), IncomingFile {
                         id: id.clone(),
                         name,
                         size,
@@ -1360,7 +1466,7 @@ async fn recv_cmd(
                 }
                 Some("file-end") => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    if let Some(mut inc) = by_sid.remove(&sid) {
+                    if let Some(mut inc) = by_sid.remove(&(pid.clone(), sid)) {
                         inc.file.flush().await?;
                         drop(inc.file);
                         let final_path = unique_path(&dir, &inc.name);
@@ -1381,10 +1487,7 @@ async fn recv_cmd(
                 _ => {}
             },
             Ev::Chunk(pid, sid, data) => {
-                if conn.link.as_ref().map(|l| l.peer.id != pid).unwrap_or(true) {
-                    continue;
-                }
-                if let Some(inc) = by_sid.get_mut(&sid) {
+                if let Some(inc) = by_sid.get_mut(&(pid, sid)) {
                     inc.file.write_all(&data).await?;
                     inc.received += data.len() as u64;
                     inc.bar.tick(inc.received);
@@ -1396,13 +1499,17 @@ async fn recv_cmd(
                 let _ = sio.disconnect().await;
                 std::process::exit(130);
             }
-            Ev::Stuck(pid, generation) => conn.on_stuck(&pid, generation, "stuck while connecting").await?,
-            Ev::GraceExpired(pid, generation) => conn.on_stuck(&pid, generation, "lost").await?,
-            Ev::PcState(pid, s) => {
-                if conn.link.as_ref().map(|l| l.peer.id == pid).unwrap_or(false) {
-                    conn.on_pc_state(&s).await;
+            Ev::Stuck(pid, generation) => {
+                if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open {
+                    bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
                 }
             }
+            Ev::GraceExpired(pid, generation) => {
+                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
+                    bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                }
+            }
+            Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
             Ev::PeerLeft(v) => {
                 if conn.on_peer_left(&v) {
                     if !by_sid.is_empty() {
@@ -1430,7 +1537,7 @@ async fn recv_cmd(
 /// Park in-flight receives: flush buffers so the .part files are complete up
 /// to the last byte received, then drop the per-link routing. Resume picks
 /// them up from disk.
-async fn flush_inflight(by_sid: &mut HashMap<u32, IncomingFile>) {
+async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     for (_sid, mut inc) in by_sid.drain() {
         let _ = inc.file.flush().await;
         eprintln!("{}: parked at {} for resume", inc.name, human(inc.received));
