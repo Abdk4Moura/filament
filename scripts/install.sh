@@ -48,8 +48,10 @@ if [ "${FILAMENT_CHANNEL:-stable}" = "beta" ]; then
 else
   TAG_PATTERN='"tag_name": *"cli-v[0-9.]*"'
 fi
+# Highest version, NOT first listed — the API's order is not newest-tag-first
+# (observed live). sort -V orders 0.2.0 < 0.2.1-beta.1 < 0.2.1 correctly.
 TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=20" \
-      | grep -o "$TAG_PATTERN" | head -n 1 | cut -d'"' -f4)
+      | grep -o "$TAG_PATTERN" | cut -d'"' -f4 | sort -V | tail -n 1)
 [ -n "$TAG" ] || die "could not find a CLI release"
 BASE="https://github.com/$REPO/releases/download/$TAG"
 

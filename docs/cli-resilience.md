@@ -455,7 +455,7 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   localStorage: the secret won't persist, console.warn flags it) and the
   reverse direction (browser sending to a `filament up` daemon, where the
   daemon must verify the BROWSER's proof to auto-accept).
-- **G-k — CLOSED** recv's clean exit no longer depends on `peer-left`
+- **G-k — FIXED (not yet VERIFIED)** recv's clean exit no longer depends on `peer-left`
   DELIVERY. Observed once (gate 6 under load, 2026-06-07) — both transfers
   completed, hashes matched, the browser closed, but the peer-left event never
   reached recv (no `○ left` line) so it idled to timeout instead of exiting
@@ -467,7 +467,12 @@ completion depends on a remote peer behaving. Gate 11 verifies.
   holds quietly for 10 s, recv prints the same `done (N files).` line the
   peer-left path emits (preceded by a dim "(peer-left never arrived — exiting
   on quiet)" note) and disconnects cleanly. Any attaching link / new question
-  resets the timer.
+  resets the timer. The suite passed 21/21 with the change, but every green
+  run exits via the normal peer-left path — the quiet-exit branch itself has
+  never executed under test (the bug is load-intermittent). VERIFIED needs a
+  gate that suppresses peer-left delivery (e.g. SIGSTOP the sender's process
+  after `file-end` drains, or an env-shortened window + a fixture peer that
+  exits without leaving).
 - **G-i** stale-answer glare can strand a link through all 3 retries: observed
   once (gate 12, 2026-06-07, machine under load) — browser socket dropped
   pre-link, its stale answer hit the fresh link ("invalid transition from

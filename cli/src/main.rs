@@ -1517,18 +1517,6 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         .await?
         .json()
         .await?;
-    let latest = releases
-        .as_array()
-        .and_then(|a| {
-            a.iter().find(|r| {
-                r["tag_name"].as_str().is_some_and(|t| t.starts_with("cli-v"))
-                    && (beta_ok || !r["prerelease"].as_bool().unwrap_or(false))
-            })
-        })
-        .ok_or_else(|| anyhow!("no CLI release found"))?;
-    let tag = latest["tag_name"].as_str().unwrap_or_default().to_string();
-    let latest_ver = tag.trim_start_matches("cli-v").to_string();
-    let current = env!("CARGO_PKG_VERSION");
     // semver-aware: never "update" to an older or equal release (betas of
     // the next version outrank the previous release; -pre < its release).
     fn key(v: &str) -> (u64, u64, u64, bool) {
@@ -1536,6 +1524,23 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
         (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0), !pre)
     }
+    // Pick the HIGHEST eligible version, not the first listed — the API's
+    // order is not newest-tag-first (observed live: cli-v0.2.0 listed above
+    // cli-v0.2.1-beta.1, which made --beta serve stable).
+    let latest = releases
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .filter(|r| {
+                    r["tag_name"].as_str().is_some_and(|t| t.starts_with("cli-v"))
+                        && (beta_ok || !r["prerelease"].as_bool().unwrap_or(false))
+                })
+                .max_by_key(|r| key(r["tag_name"].as_str().unwrap_or_default().trim_start_matches("cli-v")))
+        })
+        .ok_or_else(|| anyhow!("no CLI release found"))?;
+    let tag = latest["tag_name"].as_str().unwrap_or_default().to_string();
+    let latest_ver = tag.trim_start_matches("cli-v").to_string();
+    let current = env!("CARGO_PKG_VERSION");
     if key(&latest_ver) <= key(current) {
         println!("filament {current} is already the latest (released: {latest_ver})");
         return Ok(());
