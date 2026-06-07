@@ -4,6 +4,8 @@
 
 Files travel **peer to peer** over a WebRTC data channel. The server only helps the two ends find each other (signaling) and never sees a byte of your files.
 
+![filament demo: send with a speakable code + QR, receive in another terminal, remembered devices](docs/launch/demo.gif)
+
 ## Works anywhere
 
 The receiving end never needs anything installed. That is the core design decision, and it is what nothing else in this space offers:
