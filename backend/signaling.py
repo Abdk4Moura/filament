@@ -334,17 +334,10 @@ def register(socketio, registry):
 
         socketio.start_background_task(_lease_loop)
 
-    @socketio.on("join")
-    def on_join(data):
-        sid = request.sid
-        room = (data or {}).get("room")
-        name = (data or {}).get("name") or "anonymous"
-        # uid: a stable per-tab identity that survives reconnects (sids don't).
-        # It lets peers recognize "same device, new connection" — the basis for
-        # transfer resume.
-        uid = (data or {}).get("uid")
-        if not room:
-            return
+    def _do_join(sid, room, name, uid):
+        """The room-join effect: leave any prior room, join the new one, and
+        announce in both directions. Factored so `sync` can reuse the EXACT
+        same flow when (and only when) a sid's room actually changes."""
         _do_leave(sid)  # if this socket was already in a room, clean it first
 
         join_room(room)
@@ -356,6 +349,19 @@ def register(socketio, registry):
         # on every instance.
         emit("welcome", {"id": sid, "peers": registry.peers_in(room, exclude=sid)})
         emit("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
+
+    @socketio.on("join")
+    def on_join(data):
+        sid = request.sid
+        room = (data or {}).get("room")
+        name = (data or {}).get("name") or "anonymous"
+        # uid: a stable per-tab identity that survives reconnects (sids don't).
+        # It lets peers recognize "same device, new connection" — the basis for
+        # transfer resume.
+        uid = (data or {}).get("uid")
+        if not room:
+            return
+        _do_join(sid, room, name, uid)
 
     # -- one-time pairing (#11): say the code aloud; it works exactly once. --
     PAIR_TTL = 600  # unclaimed codes evaporate after 10 minutes
@@ -439,13 +445,15 @@ def register(socketio, registry):
     CHAN_RE = re.compile(r"^[0-9a-f]{64}$")
     MAX_CHANNELS = 64
 
-    @socketio.on("subscribe")
-    def on_subscribe(data=None):
-        sid = request.sid
-        chans = [c for c in ((data or {}).get("channels") or [])[:MAX_CHANNELS]
+    def _do_subscribe(sid, raw_channels):
+        """Validate + apply a channel subscription (union, idempotent) and emit
+        the symmetric known-peer pairs. Returns the count of accepted channels.
+        Factored so both `subscribe` and `sync` share one code path — no
+        duplicated validation, no duplicated emission loop."""
+        chans = [c for c in (raw_channels or [])[:MAX_CHANNELS]
                  if isinstance(c, str) and CHAN_RE.match(c)]
         if not chans:
-            return {"ok": False, "n": 0}
+            return 0
         me = registry.meta(sid)
         for ch, others in registry.subscribe(sid, chans).items():
             for other in others:
@@ -454,10 +462,51 @@ def register(socketio, registry):
                     emit("known-peer", {**om, "channel": ch})
                 if me:
                     emit("known-peer", {**me, "channel": ch}, to=other)
+        return len(chans)
+
+    @socketio.on("subscribe")
+    def on_subscribe(data=None):
+        n = _do_subscribe(request.sid, (data or {}).get("channels"))
         # C28: the return value is the socket.io ACK — subscribers VERIFY the
         # emit landed instead of assuming (a subscribe that dies in a half-open
         # socket left devices mutually invisible until a page reload).
-        return {"ok": True, "n": len(chans)}
+        return {"ok": bool(n), "n": n}
+
+    # -- C30 convergent session: ONE idempotent, full-state event that ensures
+    # membership + subscriptions + lease in a single ack'd round-trip. No emit
+    # is load-bearing; only convergence is. The old join/subscribe events
+    # remain for compat — new clients drive session state through `sync` alone.
+    @socketio.on("sync")
+    def on_sync(data=None):
+        sid = request.sid
+        data = data or {}
+        room = data.get("room")
+        name = data.get("name") or "anonymous"
+        uid = data.get("uid")
+        if not room:
+            return {"v": 1, "ok": False, "room": None, "channels": 0, "lease": False}
+
+        # Membership: re-announce ONLY when the room actually changes for this
+        # sid (idempotent — a repeated sync to the same room is silent). When
+        # the room is unchanged we deliberately do NOT re-add (a name/uid edit
+        # without a room change is not re-broadcast); we only refresh the lease.
+        room_changed = registry.room_of(sid) != room
+        if room_changed:
+            _do_join(sid, room, name, uid)
+        elif hasattr(registry, "refresh"):
+            registry.refresh([sid])  # lease refresh only (Redis); no emits
+
+        # Subscriptions: union, idempotent, emits known-peer pairs as today.
+        n = _do_subscribe(sid, data.get("channels"))
+
+        _tel("sync", sid=sid, room_changed=room_changed, channels=n)
+        # Ack carries the server's resulting beliefs for this sid; the client
+        # compares (digest) instead of assuming any single emit landed.
+        digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True}
+        # Also emit the digest as a plain event: the Rust client consumes
+        # events through one channel (Ev enum) and skips ack plumbing.
+        emit("synced", digest)
+        return digest
 
     @socketio.on("signal")
     def on_signal(data):

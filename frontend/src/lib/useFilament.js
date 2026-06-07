@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
+import { createSession } from './session.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
@@ -94,7 +95,7 @@ export function useFilament() {
   const [peers, setPeers] = useState([]) // [{ id, name, color, status }]
   const [transfers, setTransfers] = useState([]) // see CONTRACT.md
   const [roomId, setRoomId] = useState(null)
-  const roomIdRef = useRef(null) // current room for the rejoin belt (#14)
+  const roomIdRef = useRef(null) // current room (mirrors roomId for closures; C30 session owns repair)
   const [roomScope, setRoomScope] = useState(null) // 'auto' | 'code' | 'link' | 'pair'
   const [roomCode, setRoomCode] = useState(null) // the speakable one-time code while waiting
   const [network, setNetwork] = useState(null) // 'ipv4' | 'ipv6' | 'raw'
@@ -103,6 +104,7 @@ export function useFilament() {
   const [localHelper, setLocalHelper] = useState({ available: false, peers: [] }) // Part C
 
   const sigRef = useRef(null)
+  const sessionRef = useRef(null) // C30 convergent session — owns the repair loop
   // Live socket truth for non-render code paths (state in closures goes
   // stale). Set everywhere setConnected is.
   const connectedRef = useRef(false)
@@ -165,63 +167,25 @@ export function useFilament() {
   const channelMapRef = useRef(new Map()) // channel -> {name, secret}
   const expectedSecretRef = useRef(new Map()) // peerId -> {name, secret} (matched via known-peer)
 
-  /// (Re)raise our channels. Safe to call repeatedly: on boot, on every
-  /// socket-up (a fresh sid lost its subscriptions), after storing a new
-  /// secret mid-session, and on the C28 reconcile tick.
-  /// C28: VERIFIED, not fire-and-forget — the same half-open-socket failure
-  /// that ate room joins (#14) ate subscribes too (observed live: `filament
-  /// up` couldn't see a known browser until a page reload). No ack within
-  /// 4 s ⇒ re-emit, up to 3 tries.
+  /// (Re)derive our known-device channels and hand them to the convergent
+  /// session (C30). The session's level-triggered loop owns the repair — the
+  /// old C28 belt (acked subscribe + 4s retry ×3 + 1.5s debounce + 45s
+  /// reconcile) DISSOLVES into `desired.channels`: every sync re-asserts them
+  /// idempotently, so a fresh sid / frozen tab / lost emit self-heals within
+  /// one tick. We keep channelMapRef for known-peer matching, and kick() for
+  /// the immediate-raise a freshly stored secret needs.
   const subscribeKnown = useCallback(async () => {
     const devs = devicesLoad()
     setKnownDevices(devs)
-    if (!devs.length || !sigRef.current?.subscribe) return
-    // Debounce the boot storm (bootstrap + socket-up + welcome ×2 + belt all
-    // call this within ~1 s; each subscribe makes the server re-introduce
-    // every pair — observed 5× bursts live). One assert per window is plenty;
-    // the 45 s reconcile is the safety net. A CHANGED device set always goes
-    // through — a freshly stored secret must raise its channel immediately.
-    const now = Date.now()
-    const setKey = devs.map((d) => d.secret.slice(0, 8)).join(',')
-    if (setKey === subscribeKnown._key && now - (subscribeKnown._last || 0) < 1500) return
-    subscribeKnown._last = now
-    subscribeKnown._key = setKey
     try {
       const entries = await Promise.all(devs.map(async (d) => [await channelOf(d.secret), d]))
       channelMapRef.current = new Map(entries)
-      const chans = entries.map(([ch]) => ch)
-      const fire = (attempt) => {
-        let acked = false
-        sigRef.current.subscribe(chans, () => {
-          acked = true
-          // NB: payload keys must not collide with the envelope ('n' is the
-          // beacon seq — a 'n: chans.length' here overwrote it, observed live)
-          tel('subscribe-ack', { chans: chans.length, attempt })
-        })
-        setTimeout(() => {
-          if (!acked && attempt < 3) {
-            tel('subscribe-retry', { attempt })
-            fire(attempt + 1)
-          }
-        }, 4000)
-      }
-      fire(1)
+      sessionRef.current?.setChannels(entries.map(([ch]) => ch))
+      sessionRef.current?.kick() // raise immediately; the loop owns the repair
     } catch {
       /* crypto.subtle unavailable (insecure origin) — known devices dormant */
     }
   }, [])
-
-  // C28 reconcile: presence must not depend on any single emit surviving.
-  // Every 45 s (and on every tab-visible) re-assert our channels; the server
-  // answers each subscribe by re-introducing both sides, so a daemon that
-  // exhausted its dial budget against a frozen tab gets re-told we exist —
-  // self-healing within one tick, no reload.
-  useEffect(() => {
-    const t = setInterval(() => {
-      if (connectedRef.current) subscribeKnown()
-    }, 45000)
-    return () => clearInterval(t)
-  }, [subscribeKnown])
 
   const forgetDevice = useCallback((name) => {
     setKnownDevices(devicesForget(name))
@@ -433,6 +397,14 @@ export function useFilament() {
       const myName = randomName()
       myNameRef.current = myName
 
+      // C30: the convergent session. Its level-triggered loop owns session-state
+      // repair (room membership + channel subscriptions + lease) — replacing the
+      // rejoin belt (#14), subscribeKnown's ack-retry/45s-reconcile, and the
+      // pair-create lease refresh. The explicit sig.join below stays for instant
+      // welcome UX; the loop is the guarantee underneath.
+      const session = createSession(sig, tel)
+      sessionRef.current = session
+
       sig.on('welcome', ({ id, peers: existing }) => {
         // Idempotent — also fires on every reconnect AND every room switch
         // (and the rejoin belt adds a second one). Tear down stale ROOM links
@@ -525,25 +497,28 @@ export function useFilament() {
         connectedRef.current = up
         if (up) {
           fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
-          // #14 (measured live: a reconnect produced `connect` with NO join —
-          // a roomless ghost whose offers everyone rightly ignored). The
-          // layer below has auto-rejoin, but its emit can die in a half-open
-          // socket; re-join explicitly on EVERY socket-up. Idempotent
-          // server-side.
-          if (roomIdRef.current) {
-            tel('rejoin-belt', { room: String(roomIdRef.current).slice(0, 8) })
-            sig.join(roomIdRef.current, myNameRef.current, uidRef.current)
-          }
-          // C12: a fresh sid lost its channel subscriptions — re-raise them.
-          subscribeKnown()
+          // C30: a reconnect gives us a fresh sid that the server dropped from
+          // its room + subscriptions (#14 roomless ghost; C12 lost channels).
+          // The convergent session re-ensures BOTH on socket-up — room and
+          // channels are both in `desired`, one idempotent sync repairs them.
+          // No bespoke rejoin belt, no separate re-subscribe. invalidate()
+          // first: the fresh sid voids the last confirmation, so the kick emits
+          // even inside the 30s staleness window (else: roomless-ghost lag).
+          session.invalidate()
+          session.kick()
         }
       })
 
+      // Seed the convergent session with our room, then fire the initial join
+      // for instant welcome UX. From here the session loop owns the repair.
+      session.setRoom(room, myName, uidRef.current)
       sig.join(room, myName, uidRef.current)
+      session.kick() // independent of subscribeKnown (which no-ops with 0 devices)
       subscribeKnown()
     })()
     return () => {
       cancelled = true
+      sessionRef.current?.stop() // clear the 5s loop (HMR/unmount leak otherwise)
       sigRef.current?.leave()
       linksRef.current.forEach((l) => l.close())
       linksRef.current.clear()
@@ -602,7 +577,12 @@ export function useFilament() {
     setRoomId(newRoomId)
     roomIdRef.current = newRoomId
     setRoomScope(scope)
+    // C30: update the convergent session's desired room BEFORE the join, else
+    // the next 5s sync re-asserts the OLD room and the server moves us back.
+    // setRoom + kick = the deliberate switch; the loop then keeps it.
+    sessionRef.current?.setRoom(newRoomId, myNameRef.current, uidRef.current)
     sig.join(newRoomId, myNameRef.current, uidRef.current)
+    sessionRef.current?.kick()
   }, [])
 
   // One-time pairing (#11): claim a spoken code. On success the server emits
@@ -707,7 +687,8 @@ export function useFilament() {
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
         sigRef.current?.reconnect?.()
-        subscribeKnown() // C28: re-assert channels the freeze may have eaten
+        sessionRef.current?.kick() // C30: re-ensure room + channels the freeze may have eaten
+        subscribeKnown() // re-derive channels in case a secret was stored while hidden
         for (const link of linksRef.current.values()) link.sendBack?.()
         // #13 (measured live): two mobile tabs rarely negotiate while both
         // awake — links that failed while WE were frozen stay failed forever.

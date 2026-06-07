@@ -79,6 +79,19 @@ class SocketIOSignaling extends Emitter {
   subscribe(channels, onAck) {
     if (channels?.length) this.socket.emit('subscribe', { channels }, (resp) => onAck?.(resp))
   }
+  // C30: the convergent session's one idempotent emit. Carries the FULL desired
+  // session state ({v, room, name, uid, channels}); the server ensures
+  // membership + subscriptions + lease refresh and acks with its resulting
+  // digest. Mirrors subscribe's ack shape. lib/session.js owns the loop that
+  // decides WHEN to call this — here we only carry the wire.
+  sync(state, onAck) {
+    this.socket.emit('sync', state, (resp) => onAck?.(resp))
+  }
+  // Live socket truth, for the session loop's connected-gate (state captured in
+  // closures goes stale; this reads the socket directly).
+  get connected() {
+    return !!this.socket?.connected
+  }
   // Force a reconnect attempt (e.g. when a suspended mobile tab resumes).
   reconnect() {
     if (this.socket && !this.socket.connected) this.socket.connect()
@@ -142,6 +155,20 @@ class FirebaseSignaling extends Emitter {
         this.fs.deleteDoc(c.doc.ref)
       })
     })
+  }
+  // C30: Firebase has no relay-side session to converge — presence and
+  // subscriptions are modeled directly in Firestore by join(). The convergent
+  // sync is therefore a no-op that acks IMMEDIATELY: the session loop only
+  // re-emits while confirmed stays unconfirmed, so an instant ack lets it go
+  // dormant (room/channels already converge via the snapshot listeners). If we
+  // never acked, the loop would emit every 5s forever.
+  sync(_state, onAck) {
+    onAck?.({ v: 1, ok: true, firebase: true })
+  }
+  // Firebase's socket is always "up" once ready — there is no half-open relay
+  // socket to gate against. Reported true so the (dormant) loop isn't blocked.
+  get connected() {
+    return true
   }
   async signal(to, data) {
     await this._ready

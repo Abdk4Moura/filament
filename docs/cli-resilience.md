@@ -370,6 +370,26 @@ a claimer waits 3 s (browsers never initiate), then takes over. Headless
 sharp invariant: after the ceremony, both stores' channel ids are EQUAL
 (one mutual secret, not two halves of nothing).
 
+### C30. The lost-emit disease class — **PHASE 1 VERIFIED (gate 19)**
+Design: `design-c30-convergent-session.md`. Five field incidents shared one
+shape — edge-triggered session emits with no convergence loop. Phase 1 lands
+the cure: a `sync` protocol (server ensures room/channels/lease idempotently,
+acks + emits its digest) and per-client session modules (browser
+`lib/session.js`, CLI `session.rs`) holding desired-vs-confirmed state with
+ONE repair loop (5 s tick / socket-up / tab-visible; invalidate on fresh sid).
+The five belts (#14 rejoin, C28 retries+reconcile+debounce, the C24 lease
+refresh client half, the CLI welcome re-subscribes ×3) are dissolved into it.
+ALL CLI session-state emits flow through the module's loss shim
+(`FILAMENT_TEST_EMIT_LOSS`/`_SEED`, deterministic xorshift), which is what
+gate 19 (gate L) attacks: seed 16 drops BOTH processes' join+subscribe; the
+rendezvous succeeds only through repair. The choreography found two real
+bugs BEFORE becoming a gate: (1) `send --to`'s full-deadline blocking read
+starved the tick — a dropped subscribe could never be repaired and the wait
+never succeeded; (2) both client modules initially treated a fast reconnect
+as still-confirmed (fresh sid, dead subscriptions) — fixed with
+invalidate-on-welcome. Phases 2 (roster digest) and 3 (link mini-sync)
+remain ROADMAP.
+
 ## Part 3 — Failure modes hit and fixed during development (F-series)
 
 ### F1. SCTP outbound frame overflow — **FIXED + VERIFIED**
@@ -442,6 +462,8 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 15 paired recv holds the line on sender vanish, fails honestly after window | C21 | green |
 | 16 known-device rendezvous: consent-gated pair-keep store, `--to` finds the browser cross-room via channel (no code), decline purges the sender's half | C12, C20 web half, C27 | green |
 | 17 pair ceremony: no file, both exit clean, both stores' channel ids EQUAL (one mutual secret) | C29 | green |
+| 18 recv quiet-exit when peer-left is dropped at the delivery boundary (test hook), exit 0, hash match | G-k | green |
+| 19 gate L: 50% session-emit loss (seed 16 drops both sides' join+subscribe) — rendezvous must converge via repair | C30 | green |
 | 18 recv quiet-exit when peer-left never arrives (SIGSTOP'd sender keeps its lease, link dies via grace, quiet branch fires, exit 0) | G-k | green |
 | — live prod direct + `--relay` | C17 | run manually 2026-06-06, both green |
 

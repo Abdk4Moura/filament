@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod net;
+mod session;
 mod ui;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -617,8 +618,13 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let solo = format!("intro-{}", fresh_secret());
-    sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
-    sio.emit("subscribe", json!({ "channels": [channel_of(&a_sec), channel_of(&b_sec)] })).await.ok();
+    // C30: the session repairs whatever these emits lose — and under gate L
+    // they are the emits the loss shim adversarially drops.
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(solo.clone());
+    sess.channels = vec![channel_of(&a_sec), channel_of(&b_sec)];
+    sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
+    sess.emit(&sio, "subscribe", json!({ "channels": [channel_of(&a_sec), channel_of(&b_sec)] })).await;
     ui::say(&format!("  waiting for {} and {} to be online…", ui::paint(ui::Tone::Bold, &a_name), ui::paint(ui::Tone::Bold, &b_name)));
 
     let mut conn = Conn {
@@ -653,12 +659,14 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
             Ok(None) => bail!("signaling closed"),
             Err(_) => continue,
         };
+        sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         match ev {
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
-                // C28: re-assert both parties' channels on every (re)connect.
-                sio.emit("subscribe", json!({ "channels": [channel_of(&a_sec), channel_of(&b_sec)] })).await.ok();
+                // C30 (dissolves the C28 belt): fresh sid — re-assert via session.
+                sess.invalidate();
             }
+            Ev::Synced(v) => sess.on_synced(&v),
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
                     continue; // our own processes share these channels
@@ -739,7 +747,10 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     // Meta must exist for pairing; an unguessable solo room keeps strangers
     // out (the daemon's trick) — the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
-    sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
+    // C30: the session repairs the solo-room membership/lease if the join dies.
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(solo.clone());
+    sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
     let creator = code.is_none();
     match &code {
         Some(c) => {
@@ -805,6 +816,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         if Instant::now() > deadline {
             bail!("timed out — the code was never used (codes expire after 10 minutes)");
         }
+        sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => bail!("signaling closed"),
@@ -818,7 +830,9 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                         conn.maybe_adopt(p, true).await?;
                     }
                 }
+                sess.invalidate(); // C30: fresh sid — re-assert next tick
             }
+            Ev::Synced(v) => sess.on_synced(&v),
             Ev::PairCode(v) => {
                 let c = v["code"].as_str().unwrap_or("?");
                 ui::clipboard(c);
@@ -834,7 +848,9 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             Ev::PairMatched(v) => {
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 ui::say(&format!("  {} code accepted — connecting", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+                sess.room = Some(room.clone()); // C30: desire moves with us
+                sess.touch();
+                sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             }
             Ev::PairError(v) => {
                 let hint = match v["why"].as_str() {
@@ -1378,7 +1394,13 @@ async fn next_ev(
             Err(_) => Ok(None), // tick
         }
     } else {
-        rx.recv().await.map(Some).ok_or_else(|| anyhow!("signaling channel closed"))
+        // C30: never block indefinitely — a 2s tick lets the convergent
+        // session repair lost emits even when no events arrive.
+        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            Ok(Some(ev)) => Ok(Some(ev)),
+            Ok(None) => Err(anyhow!("signaling channel closed")),
+            Err(_) => Ok(None), // tick
+        }
     }
 }
 
@@ -1692,7 +1714,12 @@ async fn send_cmd(
     };
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
-    sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+    // C30: the convergent session repairs room/channel/lease state the
+    // one-shot emits lose (the fast path stays for old servers + latency);
+    // under gate L these initial emits are exactly what the shim drops.
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.room = Some(room.clone());
+    sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
 
     // C12: --to matching a remembered device switches to identity mode —
     // subscribe to its presence channel and wait for known-peer.
@@ -1700,7 +1727,8 @@ async fn send_cmd(
         to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
     if let Some((n, sec)) = &known_target {
         ui::say(&format!("  waiting for known device {}", ui::paint(ui::Tone::Bold, n)));
-        sio.emit("subscribe", json!({ "channels": [channel_of(sec)] })).await.ok();
+        sess.channels = vec![channel_of(sec)];
+        sess.emit(&sio, "subscribe", json!({ "channels": [channel_of(sec)] })).await;
     } else if use_code {
         let payload = match &word {
             Some(w) => json!({ "keyword": w }),
@@ -1757,14 +1785,24 @@ async fn send_cmd(
     loop {
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.waiting_rejoin.is_none() {
-            match tokio::time::timeout(claim_deadline.saturating_sub(started.elapsed()), rx.recv()).await {
+            // C30: read in ≤2s slices — a blocking full-deadline read starves
+            // the session tick, so a dropped initial subscribe was never
+            // repaired and the wait could NEVER succeed (found by gate L's
+            // seed-16 choreography: the daemon healed, the sender starved).
+            if started.elapsed() >= claim_deadline {
+                bail!("timed out waiting for a peer — is the other device online and on the same server? (--code makes pairing explicit)");
+            }
+            let slice = Duration::from_secs(2).min(claim_deadline.saturating_sub(started.elapsed()));
+            match tokio::time::timeout(slice, rx.recv()).await {
                 Ok(Some(ev)) => Some(ev),
                 Ok(None) => bail!("signaling channel closed"),
-                Err(_) => bail!("timed out waiting for a peer — is the other device online and on the same server? (--code makes pairing explicit)"),
+                Err(_) => None, // tick
             }
         } else {
             next_ev(&mut rx, &conn, false).await?
         };
+        // C30: converge session state every iteration (incl. ticks).
+        sess.tick(&sio).await;
         let Some(ev) = ev else { continue };
 
         match ev {
@@ -1775,12 +1813,12 @@ async fn send_cmd(
                         conn.maybe_adopt(p, code_used).await?;
                     }
                 }
-                // C28: fresh sid = dead subscriptions; re-assert the target's
-                // channel or a blip strands `send --to` waiting forever.
-                if let Some((_, sec)) = &known_target {
-                    sio.emit("subscribe", json!({ "channels": [channel_of(sec)] })).await.ok();
-                }
+                // C30 (dissolves the C28 belt): fresh sid = everything
+                // sid-keyed is gone; invalidate and let the session re-assert.
+                sess.invalidate();
             }
+            // C30: server confirmed our session digest.
+            Ev::Synced(v) => sess.on_synced(&v),
             Ev::PairCode(v) => {
                 let code = v["code"].as_str().unwrap_or("?");
                 let ttl = v["ttl"].as_u64().unwrap_or(600);
@@ -2117,6 +2155,11 @@ async fn recv_cmd(
     // buffered keystrokes, not decisions)
     let mut question_shown = Instant::now();
     let mut devices = devices_load(); // channel -> identity lookup for proofs
+    // C30: the convergent session repairs whatever the one-shot emits below
+    // lose — room membership, channel subscriptions, the lease. The emits
+    // stay as the fast path (and old-server compat); the session is truth.
+    let mut sess = session::Session::new(&display_name(), &my_uid);
+    sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
     match &code {
         Some(c) => {
             sio.emit("pair-claim", json!({ "code": c.trim().to_lowercase() })).await.ok();
@@ -2127,13 +2170,14 @@ async fn recv_cmd(
             // (We still `join` an unguessable solo room so the registry holds
             // our meta for known-peer events, but nobody else can land there.)
             let solo = format!("up-{}", fresh_secret());
-            sio.emit("join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await.ok();
+            sess.room = Some(solo.clone());
+            sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
             // C29: an interactive up can START empty and pair in-session.
             if devices.is_empty() && !std::io::stdin().is_terminal() {
                 bail!("no known devices — run `filament pair` once, or `filament up` in a terminal to pair interactively");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-            sio.emit("subscribe", json!({ "channels": chans })).await.ok();
+            sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
             ui::say(&format!(
                 "  {} filament up — {} known device{} {} {}",
                 ui::paint(ui::Tone::Brand, "●"),
@@ -2168,12 +2212,13 @@ async fn recv_cmd(
                 ui::Tone::Dim,
                 "  have a code? just type it here (like brave-otter-123) and press Enter",
             ));
-            sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+            sess.room = Some(room.clone());
+            sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             // C12: announce on every known device's presence channel
             if !devices.is_empty() {
                 let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
                 eprintln!("watching for {} known device(s)", devices.len());
-                sio.emit("subscribe", json!({ "channels": chans })).await.ok();
+                sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
             }
         }
     }
@@ -2282,6 +2327,9 @@ async fn recv_cmd(
             Err(_) => None, // 2s tick — run the fallback quiet-check below
         };
 
+        // C30: converge session state (no-op unless diverged/stale/unconfirmed).
+        sess.tick(&sio).await;
+
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding — if that holds quietly for the quiet-exit window (10s
         // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
@@ -2330,8 +2378,12 @@ async fn recv_cmd(
                 claim_in_flight = false;
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 ui::say(&format!("  {} code accepted — joining sender", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
-                sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
+                sess.room = Some(room.clone()); // C30: desire moves; session repairs if the join dies
+                sess.touch();
+                sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             }
+            // C30: server confirmed our session digest.
+            Ev::Synced(v) => sess.on_synced(&v),
             // C29: a code minted in-session (`pair` typed into up).
             Ev::PairCode(v) => {
                 let c = v["code"].as_str().unwrap_or("?");
@@ -2371,14 +2423,10 @@ async fn recv_cmd(
                         conn.maybe_adopt(p, true).await?;
                     }
                 }
-                // C28: a welcome means a (re)connect with a FRESH sid — every
-                // channel subscription died with the old one. Re-assert, or a
-                // socket blip makes this daemon invisible to known devices
-                // until restart (the browser-reload bug, CLI flavor).
-                if !devices.is_empty() {
-                    let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-                    sio.emit("subscribe", json!({ "channels": chans })).await.ok();
-                }
+                // C30 (dissolves the C28 belt): a welcome means a fresh sid —
+                // everything sid-keyed (subscriptions, lease) died with the
+                // old one. Invalidate; the next tick re-asserts everything.
+                sess.invalidate();
             }
             Ev::KnownPeer(v) => {
                 if is_self_uid(&conn.my_uid, v["uid"].as_str()) {
@@ -2492,6 +2540,8 @@ async fn recv_cmd(
                             let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "device".into());
                             devices_store(&n, &sec)?;
                             devices.push((n.clone(), sec.clone()));
+                            sess.channels.push(channel_of(&sec)); // C30: desire grows; session repairs
+                            sess.touch();
                             sio.emit("subscribe", json!({ "channels": [channel_of(&sec)] })).await.ok();
                             ui::say(&format!(
                                 "  {} {} mutually remembered — rename anytime: filament devices rename {n} <new>",
@@ -2531,6 +2581,8 @@ async fn recv_cmd(
                         } else {
                             devices_store(&n, &ceremony_secret)?;
                             devices.push((n.clone(), ceremony_secret.clone()));
+                            sess.channels.push(channel_of(&ceremony_secret)); // C30
+                            sess.touch();
                             sio.emit("subscribe", json!({ "channels": [channel_of(&ceremony_secret)] })).await.ok();
                             ceremony_secret = fresh_secret(); // never reuse across devices
                             ui::say(&format!(
@@ -2581,6 +2633,8 @@ async fn recv_cmd(
                     if trusted && isec.len() == 64 && !iname.is_empty() {
                         devices_store(&iname, &isec)?;
                         devices.push((iname.clone(), isec.clone()));
+                        sess.channels.push(channel_of(&isec)); // C30
+                        sess.touch();
                         sio.emit("subscribe", json!({ "channels": [channel_of(&isec)] })).await.ok();
                         ui::say(&format!(
                             "  {} introduced to '{}' by {} — now a known device",

@@ -36,6 +36,14 @@ Firebase mode mirrors these exact events client-side via Firestore.
   fresh sid loses its subscriptions). Implemented by the CLI AND the browser
   (`lib/devices.js`): acknowledgement is mutual by construction — presence
   only lights up when both holders raise the same channel.
+- `sync` `{ v:1, room, name, uid, channels: [sha256hex] }` — C30: the
+  convergent session's ONE idempotent emit, carrying the client's full
+  desired session state. The server ensures membership (join flow only if
+  the room changed), unions subscriptions, refreshes the lease, and replies
+  with its digest `{ v:1, ok, room, channels, lease }` BOTH as the socket.io
+  ack and as a `synced` event (the Rust client consumes events only). The
+  old events above remain the fast path; clients re-sync whenever desired ≠
+  confirmed or confirmed is stale (30 s) — no single emit is load-bearing.
 
 **server → client**
 - `welcome`     `{ id, peers: [{ id, name }] }` — your id + who's already here

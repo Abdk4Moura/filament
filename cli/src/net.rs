@@ -59,6 +59,8 @@ pub enum Ev {
     KnownPeer(Value),
     #[allow(dead_code)] // payload is {id,channel}; presence UIs will want it
     KnownPeerLeft(Value),
+    /// C30: the server's session digest (mirror of the sync ack)
+    Synced(Value),
     /// (peer sid, ...) — every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
@@ -278,6 +280,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         .on("pair-error", fwd(Ev::PairError, tx.clone()))
         .on("known-peer", fwd(Ev::KnownPeer, tx.clone()))
         .on("known-peer-left", fwd(Ev::KnownPeerLeft, tx.clone()))
+        .on("synced", fwd(Ev::Synced, tx.clone()))
         .connect()
         .await
         .with_context(|| format!("socket.io connect to {server}"))?;

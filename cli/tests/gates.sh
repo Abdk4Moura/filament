@@ -449,6 +449,33 @@ else
   bad "quiet-exit (G-k)"; echo "  RC=$RC walltime=$((T1 - T0))s"; tail -n 6 "$WORK/g18-recv.log"
 fi
 
+# --------------------------------------------------------------- gate 19 ----
+say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
+# Seed 16's drop pattern is 'DD....': BOTH processes lose their first two
+# session emits (join + subscribe). The rendezvous can then only happen via
+# the convergent session's repair loop — which is exactly what's under test.
+# Deterministic by seed; this exact choreography found two implementation
+# bugs by hand before becoming a gate (a tick starved behind a blocking
+# 600s read; see C30 in the ledger).
+DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
+FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
+P19=$!; pids+=($P19); sleep 4
+C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
+G19=0
+FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" pair "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
+wait $P19 || G19=1
+FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DB19" \
+  timeout 120 "$BIN" up --dir "$D19" --server "$SERVER" </dev/null >"$WORK/g19-up.log" 2>&1 &
+U19=$!; pids+=($U19); sleep 2
+T0=$(date +%s)
+FILAMENT_TEST_EMIT_LOSS=0.5 FILAMENT_TEST_EMIT_SEED=16 FILAMENT_CONFIG_DIR="$DA19" \
+  timeout 120 "$BIN" send "$SMALL" --to boxB --server "$SERVER" >"$WORK/g19-send.log" 2>&1 || G19=1
+T1=$(date +%s)
+kill $U19 2>/dev/null; wait $U19 2>/dev/null
+if [ $G19 -eq 0 ] && [ "$(hashof "$D19/small.bin")" = "$H_SMALL" ] && [ $((T1 - T0)) -lt 60 ]; then
+  ok "lossy rendezvous converged in $((T1 - T0))s (both sides dropped join+subscribe)"
+else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"; fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"
