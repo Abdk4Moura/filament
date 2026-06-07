@@ -25,6 +25,9 @@ fn main() {
         sha.unwrap_or_else(|| "dev".into()),
         date.unwrap_or_else(|| "unstamped".into()),
     );
+    // re-stamp on every new commit, not just env changes
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/refs/heads/main");
     println!("cargo:rerun-if-env-changed=FILAMENT_BUILD_SHA");
     println!("cargo:rerun-if-env-changed=FILAMENT_BUILD_DATE");
 }
