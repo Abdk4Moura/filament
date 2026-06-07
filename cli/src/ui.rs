@@ -125,10 +125,30 @@ fn clear_live() {
     }
 }
 
-/// Permanent line (survives in scrollback).
+// Sticky status (C22): an open question or countdown survives interleaved
+// say() lines — async events (route detection, peer chatter) print ABOVE it
+// and the sticky line is repainted, instead of clobbering a half-typed
+// prompt (observed live: "accept? [y/N]     route: direct").
+static STICKY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn paint_live(line: &str) {
+    clear_live();
+    eprint!("{line}");
+    let _ = std::io::stderr().flush();
+    LIVE.store(true, Ordering::Relaxed);
+}
+
+/// Permanent line (survives in scrollback); repaints any sticky line below.
 pub fn say(line: &str) {
     clear_live();
     eprintln!("{line}");
+    if let Ok(s) = STICKY.lock() {
+        if let Some(st) = s.as_ref() {
+            if caps().tty {
+                paint_live(st);
+            }
+        }
+    }
 }
 
 /// Transient line: replaced by the next say()/status()/bar tick. No-op noise
@@ -137,10 +157,23 @@ pub fn status(line: &str) {
     if !caps().tty {
         return;
     }
-    clear_live();
-    eprint!("{line}");
-    let _ = std::io::stderr().flush();
-    LIVE.store(true, Ordering::Relaxed);
+    paint_live(line);
+}
+
+/// A status line that survives interleaved say()s until cleared — for open
+/// questions and countdowns.
+pub fn sticky(line: &str) {
+    if let Ok(mut s) = STICKY.lock() {
+        *s = Some(line.to_string());
+    }
+    status(line);
+}
+
+pub fn clear_sticky() {
+    let had = STICKY.lock().map(|mut s| s.take().is_some()).unwrap_or(false);
+    if had && caps().tty {
+        clear_live();
+    }
 }
 
 pub fn spinner_frame() -> char {

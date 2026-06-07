@@ -989,17 +989,30 @@ impl Conn {
     }
 }
 
-/// Receive the next event; while a rejoin window is open, tick every 2 s so
-/// the window can expire even if no events arrive.
-async fn next_ev(rx: &mut mpsc::UnboundedReceiver<Ev>, conn: &Conn) -> Result<Option<Ev>> {
+/// Receive the next event; while a rejoin window is open, tick every second
+/// so the window can expire AND the countdown stays visible (C22 — "45s"
+/// frozen on screen reads as broken).
+async fn next_ev(
+    rx: &mut mpsc::UnboundedReceiver<Ev>,
+    conn: &Conn,
+    suppress_countdown: bool,
+) -> Result<Option<Ev>> {
     if let Some(since) = conn.waiting_rejoin {
         if since.elapsed() > conn.rejoin_window {
+            ui::clear_sticky();
             bail!(
                 "peer did not come back within {}s (partial state kept for resume)",
                 conn.rejoin_window.as_secs()
             );
         }
-        match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+        if !suppress_countdown {
+            let left = conn.rejoin_window.saturating_sub(since.elapsed()).as_secs();
+            ui::sticky(&ui::paint(
+                ui::Tone::Dim,
+                &format!("  {} holding the line — {left}s for them to come back (Ctrl-C to stop)", ui::spinner_frame()),
+            ));
+        }
+        match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Some(ev)) => Ok(Some(ev)),
             Ok(None) => Err(anyhow!("signaling channel closed")),
             Err(_) => Ok(None), // tick
@@ -1350,7 +1363,7 @@ async fn send_cmd(
                 Err(_) => bail!("timed out waiting for a peer — is the other device online and on the same server? (--code makes pairing explicit)"),
             }
         } else {
-            next_ev(&mut rx, &conn).await?
+            next_ev(&mut rx, &conn, false).await?
         };
         let Some(ev) = ev else { continue };
 
@@ -1678,7 +1691,17 @@ async fn recv_cmd(
                 Some(r) => r.clone(),
                 None => net::fetch_auto_room(server).await?,
             };
-            eprintln!("listening in room {room} (dir: {})", dir.display());
+            // C22: proactive affordance — tell the user what they CAN do,
+            // cargo-style gutter, before they have to guess.
+            ui::say(&format!(
+                "  {} listening — same-network devices appear automatically  {}",
+                ui::paint(ui::Tone::Brand, "●"),
+                ui::paint(ui::Tone::Dim, &format!("(room {room} · dir {})", dir.display())),
+            ));
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                "  have a code? just type it here (like brave-otter-123) and press Enter",
+            ));
             sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
             // C12: announce on every known device's presence channel
             if !devices.is_empty() {
@@ -1724,22 +1747,56 @@ async fn recv_cmd(
         });
     }
     // A listening recv accepts a code typed straight into it — the first
-    // thing real users try (observed live).
+    // thing real users try (observed live). C22: stdin runs RAW (cbreak) on a
+    // tty so an open y/N question resolves on a single keypress, no Enter;
+    // outside a question, bytes accumulate into lines (echoed manually since
+    // raw mode disables terminal echo).
+    let question_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tty_guard = if !daemon && std::io::stdin().is_terminal() { Some(TtyGuard::raw()) } else { None };
     if !daemon {
         let tx = tx.clone();
+        let q = question_open.clone();
         tokio::spawn(async move {
-            use tokio::io::AsyncBufReadExt;
-            let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
+            use tokio::io::AsyncReadExt;
+            let mut stdin = tokio::io::stdin();
+            let mut buf = [0u8; 1];
+            let mut line = String::new();
+            while stdin.read(&mut buf).await.map(|n| n == 1).unwrap_or(false) {
+                let c = buf[0] as char;
+                if q.load(std::sync::atomic::Ordering::Relaxed) && "yYnN".contains(c) && line.is_empty() {
+                    eprintln!("{c}"); // echo the answer (raw mode is no-echo)
+                    let _ = tx.send(Ev::StdinLine(c.to_lowercase().to_string()));
+                    continue;
+                }
+                match buf[0] {
+                    b'\n' | b'\r' => {
+                        eprintln!();
+                        let _ = tx.send(Ev::StdinLine(line.trim().to_string()));
+                        line.clear();
+                    }
+                    0x7f | 0x08 => {
+                        if line.pop().is_some() {
+                            eprint!("\x08 \x08");
+                        }
+                    }
+                    _ if !c.is_control() => {
+                        eprint!("{c}");
+                        line.push(c);
+                    }
+                    _ => {}
+                }
             }
         });
     }
     let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
+    // C22: offers awaiting consent — exactly ONE stdin owner (the reader
+    // task); answers arrive as StdinLine events, never via a competing
+    // blocking read racing for the user's "y".
+    let mut pending: std::collections::VecDeque<(String, Value)> = Default::default();
     let mut completed = 0usize;
 
     loop {
-        let Some(ev) = next_ev(&mut rx, &conn).await? else { continue };
+        let Some(ev) = next_ev(&mut rx, &conn, !pending.is_empty()).await? else { continue };
 
         match ev {
             Ev::PairMatched(v) => {
@@ -1913,23 +1970,33 @@ async fn recv_cmd(
                         }
                     }
 
-                    // C14: consent. -y accepts everything; a resume of a
-                    // partial we already said yes to auto-accepts; everything
-                    // else gets an explicit prompt naming the sender.
+                    // C14/C22: consent. -y accepts everything; a resume of a
+                    // partial we already said yes to auto-accepts; a verified
+                    // device auto-accepts; otherwise the question joins the
+                    // pending queue and the answer arrives via StdinLine — a
+                    // per-process token marks re-enqueued offers so a remote
+                    // peer can't forge "already consented".
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                     let link_trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let consented = v["__consent"].as_str() == Some(consent_token());
                     let ok = if daemon {
-                        link_trusted || (is_resume && offset > 0 && link_trusted)
+                        link_trusted
                     } else {
-                        yes
-                            || link_trusted // C12: HMAC-verified
-                            || (is_resume && offset > 0)
-                            || prompt_accept(&sender_name, &name, size, paired).await
+                        yes || consented || link_trusted || (is_resume && offset > 0)
                     };
-                    if daemon && !ok {
-                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  declined {name} from unverified peer {sender_name}")));
-                    }
                     if !ok {
+                        if !daemon && std::io::stdin().is_terminal() {
+                            pending.push_back((pid.clone(), v.clone()));
+                            question_open.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if pending.len() == 1 {
+                                ui::sticky(&offer_question(&sender_name, &name, size, paired));
+                            }
+                            continue; // decision arrives later via StdinLine
+                        }
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!(
+                            "  declined {name} from {sender_name} ({})",
+                            if daemon { "unverified peer" } else { "no tty — use -y to auto-accept" }
+                        )));
                         t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
                         continue;
                     }
@@ -2024,7 +2091,35 @@ async fn recv_cmd(
                 }
             }
             Ev::StdinLine(line) => {
-                if regex_lite_code(&line) {
+                let ans = line.to_lowercase();
+                if !pending.is_empty() {
+                    // C22: an open question owns the next stdin line.
+                    if ans == "y" || ans == "yes" {
+                        let (qpid, mut qv) = pending.pop_front().unwrap();
+                        ui::clear_sticky();
+                        qv["__consent"] = json!(consent_token());
+                        let _ = tx.send(Ev::Control(qpid, qv)); // re-enter the offer path, consented
+                    } else if ans == "n" || ans == "no" || ans.is_empty() {
+                        let (qpid, qv) = pending.pop_front().unwrap();
+                        ui::clear_sticky();
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  declined {}", qv["name"].as_str().unwrap_or("file"))));
+                        if let Some(t) = conn.transport_of(&qpid) {
+                            t.send_control(&json!({ "type": "file-decline", "id": qv["id"] })).await?;
+                        }
+                    }
+                    // show the next queued question (or re-show on gibberish)
+                    if let Some((qpid, qv)) = pending.front() {
+                        let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
+                        ui::sticky(&offer_question(
+                            &s,
+                            qv["name"].as_str().unwrap_or("file"),
+                            qv["size"].as_u64().unwrap_or(0),
+                            paired,
+                        ));
+                    } else {
+                        question_open.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else if regex_lite_code(&line) {
                     ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
                     paired = true;
                     sio.emit("pair-claim", json!({ "code": line.to_lowercase() })).await.ok();
@@ -2035,6 +2130,9 @@ async fn recv_cmd(
             Ev::Interrupted => {
                 flush_inflight(&mut by_sid).await;
                 ui::say(&format!("  {} interrupted — partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                if let Some(g) = &tty_guard {
+                    g.restore(); // process::exit skips Drop
+                }
                 let _ = sio.disconnect().await;
                 std::process::exit(130);
             }
@@ -2090,22 +2188,64 @@ async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     }
 }
 
-async fn prompt_accept(sender: &str, name: &str, size: u64, paired: bool) -> bool {
-    if !std::io::stdin().is_terminal() {
-        eprintln!("declining {name} (no tty for confirmation — use -y to auto-accept)");
-        return false;
+/// C22: cbreak-mode guard — single-keypress answers without losing line
+/// input. `stty` keeps us dependency-free; Drop restores the terminal (and
+/// the Interrupted path calls restore() explicitly since process::exit skips
+/// Drop).
+struct TtyGuard {
+    saved: Option<String>,
+}
+
+impl TtyGuard {
+    fn raw() -> TtyGuard {
+        let saved = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        if saved.is_some() {
+            let _ = std::process::Command::new("stty")
+                .args(["-icanon", "-echo", "min", "1", "time", "0"])
+                .stdin(std::process::Stdio::inherit())
+                .status();
+        }
+        TtyGuard { saved }
     }
-    let sender = if sender.is_empty() { "unknown peer".to_string() } else { sender.to_string() };
-    let name = name.to_string();
+    fn restore(&self) {
+        if let Some(s) = &self.saved {
+            let _ = std::process::Command::new("stty")
+                .arg(s)
+                .stdin(std::process::Stdio::inherit())
+                .status();
+        }
+    }
+}
+
+impl Drop for TtyGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+/// C22: per-process token marking a locally re-enqueued (consented) offer.
+/// A remote peer cannot know it, so it cannot forge consent in a control msg.
+fn consent_token() -> &'static str {
+    static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    T.get_or_init(fresh_secret)
+}
+
+fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
+    let sender = if sender.is_empty() { "unknown peer" } else { sender };
     let hint = if paired { " [paired]" } else { "" };
-    tokio::task::spawn_blocking(move || {
-        eprint!("{sender}{hint} offers {name} ({}) — accept? [y/N] ", human(size));
-        let mut line = String::new();
-        std::io::stdin().read_line(&mut line).ok();
-        matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
-    })
-    .await
-    .unwrap_or(false)
+    format!(
+        "  {}{} offers {} ({}) — accept? [y/N] ",
+        ui::paint(ui::Tone::Bold, sender),
+        hint,
+        name,
+        human(size)
+    )
 }
 
 // -------------------------------------------------------------------- tests --
