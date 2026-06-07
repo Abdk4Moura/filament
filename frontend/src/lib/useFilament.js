@@ -484,6 +484,20 @@ export function useFilament() {
       if (document.visibilityState === 'visible') {
         sigRef.current?.reconnect?.()
         for (const link of linksRef.current.values()) link.sendBack?.()
+        // #13 (measured live): two mobile tabs rarely negotiate while both
+        // awake — links that failed while WE were frozen stay failed forever.
+        // On refocus: reset retry budgets and rebuild every dead link.
+        attemptsRef.current.clear()
+        for (const [id, link] of [...linksRef.current.entries()]) {
+          const st = link.pc?.connectionState
+          if (st === 'failed' || st === 'closed' || st === 'disconnected') {
+            tel('refocus-revive', { peer: id.slice(-6), was: st })
+            const { name, peerUid } = { name: link.name, peerUid: link.peerUid }
+            link.close()
+            linksRef.current.delete(id)
+            makeLinkRef.current?.({ id, name, uid: peerUid })
+          }
+        }
       } else {
         for (const link of linksRef.current.values()) link.sendBrb?.(120)
       }
