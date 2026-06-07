@@ -1659,6 +1659,9 @@ async fn recv_cmd(
     let sio = net::connect_signaling(server, tx.clone()).await?;
 
     let mut paired = code.is_some();
+    // C24: at most one typed claim in flight — a second typed code while one
+    // is pending was silently dropped in live use; now it queues a message.
+    let mut claim_in_flight = false;
     let mut devices = devices_load(); // channel -> identity lookup for proofs
     match &code {
         Some(c) => {
@@ -1817,14 +1820,25 @@ async fn recv_cmd(
 
         match ev {
             Ev::PairMatched(v) => {
+                claim_in_flight = false;
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 ui::say(&format!("  {} code accepted — joining sender", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 sio.emit("join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await.ok();
             }
-            Ev::PairError(v) => bail!(
-                "code rejected: {} — one-time codes burn after a single use and expire after 10 minutes; ask the sender for a fresh one",
-                v["error"].as_str().unwrap_or("?")
-            ),
+            Ev::PairError(v) => {
+                let why = v["error"].as_str().unwrap_or("?").to_string();
+                if code.is_some() && conn.links.is_empty() && completed == 0 {
+                    // started WITH a code that failed: nothing else to do
+                    bail!("code rejected: {why} — one-time codes burn after a single use and expire after 10 minutes; ask the sender for a fresh one");
+                }
+                // a TYPED claim failing must not kill a listening session
+                paired = false;
+                claim_in_flight = false;
+                ui::say(&format!(
+                    "  {} code rejected: {why} — codes burn after one use and expire after 10 min; still listening",
+                    ui::paint(ui::Tone::Err, ui::glyph_err()),
+                ));
+            }
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
                 if let Some(peers) = v["peers"].as_array() {
@@ -2154,9 +2168,14 @@ async fn recv_cmd(
                         question_open.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else if regex_lite_code(&line) {
-                    ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
-                    paired = true;
-                    sio.emit("pair-claim", json!({ "code": line.to_lowercase() })).await.ok();
+                    if claim_in_flight {
+                        ui::say(&ui::paint(ui::Tone::Dim, "  (a claim is already in flight — wait for it to resolve)"));
+                    } else {
+                        ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
+                        paired = true;
+                        claim_in_flight = true;
+                        sio.emit("pair-claim", json!({ "code": line.to_lowercase() })).await.ok();
+                    }
                 } else if !line.is_empty() {
                     ui::say(&ui::paint(ui::Tone::Dim, "  (type a code like brave-otter-123 to claim it)"));
                 }

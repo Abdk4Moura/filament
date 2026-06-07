@@ -10,6 +10,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createSignaling } from './signaling.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
+import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the server's
 // one-time codes (backend/signaling.py — keep in sync). 4,096 combinations
@@ -122,6 +123,8 @@ export function useFilament() {
   // Update an EXISTING peer only — never re-adds (#3). A late callback from a
   // closed PeerLink must not resurrect a tile we already removed.
   const updatePeer = useCallback((id, patch) => {
+    if (patch.status) telPeer(id, patch.status)
+    if (patch.route) tel('peer-route', { peer: id.slice(-6), route: patch.route })
     setPeers((prev) => {
       const i = prev.findIndex((x) => x.id === id)
       if (i === -1) return prev
@@ -245,6 +248,7 @@ export function useFilament() {
 
       const sig = await createSignaling(cfg)
       sigRef.current = sig
+      installTel(tabUid())
       const myName = randomName()
       myNameRef.current = myName
 
@@ -302,6 +306,8 @@ export function useFilament() {
       // Reflect transport up/down in the UI (the rejoin itself is automatic),
       // and refresh ICE config on reconnect — TURN creds are time-limited (#9).
       sig.on('status', ({ connected: up }) => {
+        tel(up ? 'socket-up' : 'socket-down', {})
+        if (!up) telFlush()
         setConnected(up)
         if (up) fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
       })
@@ -385,8 +391,17 @@ export function useFilament() {
     const sig = sigRef.current
     if (!sig) return null
     const kw = typeof keyword === 'string' ? keyword : null // UI passes the click event
+    const t0 = Date.now()
+    tel('pair-create-click', {})
+    const watchdog = setTimeout(() => {
+      // no pair-code after 5s = the emit very likely died in a zombie socket
+      tel('pair-create-timeout', { afterMs: Date.now() - t0 })
+      telFlush()
+    }, 5000)
     return new Promise((resolve) => {
       sig.on('pair-code', function onCode({ code }) {
+        clearTimeout(watchdog)
+        tel('pair-create-ok', { rttMs: Date.now() - t0 })
         setRoomCode(code)
         setRoomScope((s) => {
           if (s !== 'code') prevScopeRef.current = s

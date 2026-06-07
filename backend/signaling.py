@@ -136,6 +136,11 @@ class _MemRegistry:
     def pair_claim(self, code):
         return getattr(self, "_pairs", {}).pop(code, None)
 
+    def peek_pair(self, code):
+        """Telemetry only: (exists, creator, creator_alive) without consuming."""
+        creator = getattr(self, "_pairs", {}).get(code)
+        return (creator is not None, creator, creator in self._m)
+
 
 class _RedisRegistry:
     """Shared membership in Redis so api replicas see one another's peers.
@@ -248,6 +253,11 @@ class _RedisRegistry:
     def pair_create(self, code, sid, ttl=600):
         return bool(self.r.set(f"filament:pair:{code}", sid, nx=True, ex=ttl))
 
+    def peek_pair(self, code):
+        """Telemetry only: (exists, creator, creator_alive) without consuming."""
+        creator = self.r.get(f"filament:pair:{code}")
+        return (creator is not None, creator, bool(creator and self.r.exists(self._lk(creator))))
+
     def pair_claim(self, code):
         creator = self.r.getdel(f"filament:pair:{code}")
         # Don't match against a creator whose connection is already dead.
@@ -292,12 +302,26 @@ def make_registry(redis_url):
     return _RedisRegistry(redis_url) if redis_url else _MemRegistry()
 
 
+def _tel(event, **kv):
+    """Debugger-grade telemetry (C24): one JSON line per lifecycle event,
+    prefixed TEL, to stdout -> docker logs. No file contents, no file names."""
+    import json as _json
+    import sys as _sys
+    import time as _t
+
+    try:
+        print("TEL " + _json.dumps({"ts": round(_t.time(), 3), "ev": event, **kv}, separators=(",", ":")), flush=True)
+    except Exception:
+        _sys.stderr.write("TEL-fail\n")
+
+
 def register(socketio, registry):
     local_sids = set()  # connections owned by THIS instance (for lease refresh)
 
     @socketio.on("connect")
     def on_connect():
         local_sids.add(request.sid)
+        _tel("connect", sid=request.sid)
 
     if hasattr(registry, "refresh"):
         def _lease_loop():
@@ -325,6 +349,7 @@ def register(socketio, registry):
 
         join_room(room)
         registry.add(sid, room, name, uid)
+        _tel("join", sid=sid, uid=uid, room=room, peers=len(registry.peers_in(room, exclude=sid)))
 
         # Tell the joiner who's already here (they initiate offers); tell the
         # room someone arrived. With the Redis message queue these reach peers
@@ -342,6 +367,8 @@ def register(socketio, registry):
         for _ in range(4):
             code = keyword or _mint_pair_code()
             if registry.pair_create(code, sid, ttl=PAIR_TTL):
+                _tel("pair-create", sid=sid, code=code,
+                     in_room=bool(registry.room_of(sid)), leased=registry.meta(sid) is not None)
                 emit("pair-code", {"code": code, "ttl": PAIR_TTL})
                 return
             if keyword:  # a chosen keyword that's in use is an error, not a retry
@@ -376,11 +403,18 @@ def register(socketio, registry):
             emit("pair-error", {"error": "slow-down"})
             return
         code = _norm_code((data or {}).get("code"))
+        existed, peek_creator, creator_alive = registry.peek_pair(code) if code else (False, None, False)
         creator = registry.pair_claim(code) if code else None
         room = registry.room_of(creator) if creator else None
         if not room:
+            # The smoking-gun cases, now distinguishable: code never existed /
+            # expired, vs creator known but its liveness lease lapsed (zombie
+            # phone tab), vs creator alive but roomless.
+            _tel("pair-claim-fail", sid=request.sid, code=code, existed=existed,
+                 creator=peek_creator, creator_alive=creator_alive)
             emit("pair-error", {"error": "invalid"})
             return
+        _tel("pair-claim-ok", sid=request.sid, code=code, creator=creator, room=room)
         # Code BURNED (atomic claim). Pairing is ADDITIVE: the claimer joins the
         # creator's CURRENT room — the creator never moves, keeps seeing nearby
         # devices, and can mint another code to admit another person.
@@ -426,6 +460,7 @@ def register(socketio, registry):
 
     @socketio.on("disconnect")
     def on_disconnect():
+        _tel("disconnect", sid=request.sid)
         _do_leave(request.sid)
 
     def _channel_goodbye(sid):

@@ -8,6 +8,7 @@
 Files themselves never touch this server: they go peer-to-peer over a WebRTC
 data channel. The server only helps two browsers find each other.
 """
+import json
 import hashlib
 import ipaddress
 import os
@@ -108,6 +109,27 @@ def api_room_code():
 @app.get("/api/health")
 def api_health():
     return jsonify({"ok": True})
+
+
+# ----------------------------------------------------------- Telemetry -------
+@app.post("/api/telemetry")
+def telemetry():
+    """C24: browser clients beacon lifecycle events here (sendBeacon survives
+    page-hide). One TEL line per event into the container logs. Size-capped;
+    no file names or contents are ever sent."""
+    from signaling import _tel
+
+    raw = request.get_data(cache=False, as_text=True)[:8192]
+    try:
+        events = json.loads(raw)
+        if not isinstance(events, list):
+            events = [events]
+        for e in events[:50]:
+            if isinstance(e, dict) and isinstance(e.get("ev"), str):
+                _tel("web:" + e.pop("ev")[:40], **{k: v for k, v in list(e.items())[:12]})
+    except (ValueError, TypeError):
+        pass
+    return {"ok": True}
 
 
 # --------------------------------------------------------- Static / SPA -------
