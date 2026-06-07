@@ -1662,6 +1662,9 @@ async fn recv_cmd(
     // C24: at most one typed claim in flight — a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
+    // C25: when the current question appeared (answers sooner than 300ms are
+    // buffered keystrokes, not decisions)
+    let mut question_shown = Instant::now();
     let mut devices = devices_load(); // channel -> identity lookup for proofs
     match &code {
         Some(c) => {
@@ -1811,7 +1814,12 @@ async fn recv_cmd(
                 ui::clear_sticky();
                 if let Some((qpid, qv)) = pending.front() {
                     let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
-                    ui::sticky(&offer_question(&s, qv["name"].as_str().unwrap_or("file"), qv["size"].as_u64().unwrap_or(0), paired));
+                    {
+                        let q = offer_question(&s, qv["name"].as_str().unwrap_or("file"), qv["size"].as_u64().unwrap_or(0), paired);
+                        ui::say(&q); // permanent: a new question fronted (C25)
+                        ui::sticky(&q);
+                        question_shown = Instant::now();
+                    }
                 } else {
                     question_open.store(false, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2020,7 +2028,13 @@ async fn recv_cmd(
                             pending.push_back((pid.clone(), v.clone()));
                             question_open.store(true, std::sync::atomic::Ordering::Relaxed);
                             if pending.len() == 1 {
-                                ui::sticky(&offer_question(&sender_name, &name, size, paired));
+                                // C25: the question is a PERMANENT line first
+                                // (nothing can be asked invisibly), with the
+                                // sticky as the live answer tail.
+                                let q = offer_question(&sender_name, &name, size, paired);
+                                ui::say(&q);
+                                ui::sticky(&q);
+                                question_shown = Instant::now();
                             }
                             continue; // decision arrives later via StdinLine
                         }
@@ -2141,13 +2155,23 @@ async fn recv_cmd(
             Ev::StdinLine(line) => {
                 let ans = line.to_lowercase();
                 if !pending.is_empty() {
-                    // C22: an open question owns the next stdin line.
+                    // C22/C25: an open question owns stdin — but ONLY explicit
+                    // answers count. An empty line (stray CR, idle Enter) used
+                    // to default-decline an offer the user never saw; and any
+                    // keypress within 300ms of the question appearing is a
+                    // buffered stroke, not a decision.
+                    if question_shown.elapsed() < Duration::from_millis(300) {
+                        continue;
+                    }
+                    let mut answered = false;
                     if ans == "y" || ans == "yes" {
+                        answered = true;
                         let (qpid, mut qv) = pending.pop_front().unwrap();
                         ui::clear_sticky();
                         qv["__consent"] = json!(consent_token());
                         let _ = tx.send(Ev::Control(qpid, qv)); // re-enter the offer path, consented
-                    } else if ans == "n" || ans == "no" || ans.is_empty() {
+                    } else if ans == "n" || ans == "no" {
+                        answered = true;
                         let (qpid, qv) = pending.pop_front().unwrap();
                         ui::clear_sticky();
                         ui::say(&ui::paint(ui::Tone::Dim, &format!("  declined {}", qv["name"].as_str().unwrap_or("file"))));
@@ -2158,12 +2182,12 @@ async fn recv_cmd(
                     // show the next queued question (or re-show on gibberish)
                     if let Some((qpid, qv)) = pending.front() {
                         let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
-                        ui::sticky(&offer_question(
-                            &s,
-                            qv["name"].as_str().unwrap_or("file"),
-                            qv["size"].as_u64().unwrap_or(0),
-                            paired,
-                        ));
+                        let q = offer_question(&s, qv["name"].as_str().unwrap_or("file"), qv["size"].as_u64().unwrap_or(0), paired);
+                        if answered {
+                            ui::say(&q); // a NEW question fronted — permanent line (C25)
+                            question_shown = Instant::now();
+                        }
+                        ui::sticky(&q);
                     } else {
                         question_open.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
