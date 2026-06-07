@@ -1528,11 +1528,14 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         .json()
         .await?;
     // semver-aware: never "update" to an older or equal release (betas of
-    // the next version outrank the previous release; -pre < its release).
-    fn key(v: &str) -> (u64, u64, u64, bool) {
-        let (core, pre) = v.split_once('-').map(|(c, _)| (c, true)).unwrap_or((v, false));
+    // the next version outrank the previous release; -pre < its release;
+    // beta.2 > beta.1 — the prerelease NUMBER counts, found live when
+    // `--beta` kept offering beta.1 to beta.2).
+    fn key(v: &str) -> (u64, u64, u64, bool, u64) {
+        let (core, pre) = v.split_once('-').map(|(c, p)| (c, Some(p))).unwrap_or((v, None));
         let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
-        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0), !pre)
+        let pre_num = pre.and_then(|p| p.rsplit('.').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+        (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0), pre.is_none(), pre_num)
     }
     // Pick the HIGHEST eligible version, not the first listed — the API's
     // order is not newest-tag-first (observed live: cli-v0.2.0 listed above
