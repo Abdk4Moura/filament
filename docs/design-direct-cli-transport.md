@@ -3,10 +3,15 @@
 Status: DESIGN. Realizes the long-stubbed `Transport` trait second impl
 (`net.rs`: "DataChannelTransport is implementation #1; a QUIC transport for
 CLI↔CLI bulk speed slots in later without touching the transfer logic").
-Motivated by a live failure: two CLIs, one of them do-vm (public IP, no
-firewall), failed to pair — forced through WebRTC/ICE, whose cross-NAT
-traversal never completed (creator watchdog'd 3×15 s and quit; claimer
-orphaned). They never needed ICE at all.
+Motivated by — but NOT causally pinned to — a live failure: two CLIs, one of
+them do-vm (public IP, no firewall), failed to pair, forced through
+WebRTC/ICE. The exact root cause was never reproduced cross-machine (test B
+below proves only do-vm's half can allocate on coturn; whether the *remote*
+box could is the unconfirmed unknown). The honest framing: **this transport
+sidesteps the whole NAT-traversal class regardless of that incident's root
+cause.** It stands on its own merits — 1-RTT, no relay tax (the
+state-machine diagram showed transfers paying it), and the plain fact that
+two full network stacks should not need browser NAT-traversal machinery.
 
 ## The thesis
 
@@ -58,27 +63,51 @@ proof). A raw TCP transport must provide the SAME: confidentiality,
 integrity, and peer authentication. Plaintext or unauthenticated TCP is a
 hard NO — it would be a catastrophic regression for a file-transfer tool.
 
-Design: a **Noise protocol handshake** (Noise_NNpsk0 or Noise_KKpsk2) over
-the raw TCP socket, keyed differently per pairing mode:
+### Threat model (the address channel is untrusted)
+The `transport-offer{addrs}` rides the **untrusted signaling server**. A
+malicious or compromised server can substitute addresses → you dial an
+attacker's box → the Noise handshake **fails** (the attacker has no PSK) →
+you fall back to WebRTC. So the server can **DoS** (point you at dead/wrong
+addresses, force a fallback) but **cannot MITM**. *All* security rests on
+the PSK handshake; the address channel needs no integrity protection. This
+is the load-bearing statement — everything else follows from it.
 
-- **Known devices** (`--to name`, paired): the pre-shared `pair secret`
-  (32 bytes, already mutually held) is the Noise PSK. This AUTHENTICATES
-  the peer cryptographically — the same guarantee C20's HMAC proof gives,
-  now binding the transport itself. A MITM without the secret cannot
-  complete the handshake. This is strictly STRONGER than the WebRTC path
-  (no TURN server in the trust path at all).
-- **One-time code** (`pair <code>`): the code alone is low-entropy (~22
-  bits) — not a safe PSK against an active MITM who can guess it. Phase 1:
-  for code pairing, KEEP WebRTC (its DTLS + the signaling server's
-  single-claim burn is the existing trust model); the direct transport
-  engages only AFTER a secret is established, or for `--to` known devices.
-  Phase 2 (later): a PAKE (C15) over the code makes code-based direct
-  transport safe; tracked separately.
+### The handshake
+A **Noise_NNpsk0** handshake (via the `snow` crate — do NOT hand-roll the
+state machine) over the raw TCP socket. NNpsk0 fits the constraints: no
+pre-existing static keys (rules out KKpsk2), mutual auth derived from the
+PSK, and the ephemeral `ee` gives forward secrecy even if the secret later
+leaks. Rely on Noise's own ephemerals for replay + FS — **no homemade nonce
+scheme** bolted on top (redundant at best, weakening at worst).
 
-So phase 1 scope: **direct transport for KNOWN DEVICES only** (`--to`,
-`up`, daemon) — exactly the case that failed live, exactly the case with a
-real PSK. The `nonce` in transport-offer is the Noise handshake nonce;
-replay is prevented by it + the PSK.
+### Key derivation — the PSK is NOT the raw secret
+The pair secret already keys TWO things: the C20 HMAC proof, and the public
+channel id `sha256("filament-pair:"+secret)`. Feeding the *same* raw secret
+into a third primitive is cross-context key reuse — the classic footgun.
+Derive an independent transport key:
+```
+psk = HKDF-SHA256(ikm=secret, info="filament-direct-transport-v1")[:32]
+```
+Now the transport key is cryptographically independent of the proof key and
+the (published) channel hash.
+
+### Scope + downgrade safety
+- **Phase 1: KNOWN DEVICES only** (`--to`, `up`, daemon) — the case with a
+  real high-entropy PSK. The `nonce` in transport-offer is dropped (Noise
+  owns replay).
+- **One-time code** (`pair <code>`): the code is low-entropy (~22 bits), not
+  a safe PSK against an active guesser. Code pairing KEEPS WebRTC until a
+  PAKE (C15) makes it safe — tracked separately.
+- **Downgrade safety:** the WebRTC fallback STILL requires the C20
+  fingerprint proof. Forcing a fallback (the server's DoS power) therefore
+  never drops authentication — both transports authenticate, neither is a
+  soft path.
+
+### New attack surface (raw listener)
+- bind the TCP listener ONLY for the connection window; close it after the
+  handshake resolves (success or fallback). No idle open port.
+- rate-limit handshake attempts per source (a scanner that finds the port
+  fails the PSK, but must not be able to grind).
 
 ## What it fixes / improves (all measurable)
 
@@ -103,9 +132,15 @@ replay is prevented by it + the PSK.
    control message, the simultaneous-open dialer with a 5s budget.
 4. wire into the known-device connect paths (`--to`, `up`): try direct first,
    fall back to the existing WebRTC establish on timeout.
-5. gates: a CLI↔CLI direct transfer gate (assert `route: direct-tcp`, hash
-   match) + a chaos gate that blocks the direct port and asserts WebRTC
-   fallback still completes.
+5. gates — THREE, and the negative one is the security claim:
+   - **positive**: two secret-holders connect direct (`route: direct-tcp`,
+     hash match).
+   - **NEGATIVE (the actual security test)**: a dialer with a WRONG/ABSENT
+     PSK must be REJECTED — handshake fails, zero bytes flow. An auth gate
+     that only tests authorized access verifies nothing; per the ledger
+     rule, VERIFIED here *means this test exists*.
+   - **chaos fallback**: block the direct port → WebRTC fallback completes
+     AND still performs the C20 proof (downgrade never drops auth).
 6. ledger + CONTRACT entries; `route` taxonomy grows a `direct-tcp` value.
 
 Phase 1 deliberately leaves browsers, code-pairing, and QUIC for later —
