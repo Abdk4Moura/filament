@@ -460,9 +460,14 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 >   real WebRTC ICE/DTLS. Timing-dependent BY NATURE; cannot be proven 100% by
 >   sampling on a contended host (prod containers + coturn + monitors + an
 >   80 MB transfer all share the box). Best-effort here; meant for a quiescent
->   CI runner. The G-i glare under connection churn — the data channel opens
->   (`route: local`) but bytes never complete — is a real product bug tracked
->   for a scoped fix, NOT a test knob to tune.
+>   CI runner. The eventlet fixture (matching prod, vs the threading+Werkzeug
+>   dev server) made gates 5/12/13/16 reliable; **gate 6 still flakes** — its
+>   tab has the longest exposure (two sequential sends + a 5 s gap) and hits a
+>   transport-churn event most often. The killer is the browser's socket
+>   churning mid-transfer (`✓ route: local` → `○ left` repeated), NOT the
+>   stale-answer glare (which self-recovers). Real fix: browser↔CLI resume
+>   across a browser reconnect — tracked as a product bug (G-i / task #28),
+>   NOT a test knob.
 >
 > **Determinism rule (2026-06-08).** A flaky gate has a hidden dependency on
 > timing or load; the fix is to remove the dependency, never to retry (a retry
