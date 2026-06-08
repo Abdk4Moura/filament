@@ -429,8 +429,14 @@ export class PeerLink {
           }
         }
         // They say they don't recognize us; the hook may hold a secret for
-        // them — let it re-prove (once per link, hook-gated).
-        if (msg.trusted === false) this.onPeerStateDiverged('trust')
+        // them — let it re-prove. Report ONCE per link: the re-prove is
+        // one-shot, and a genuinely asymmetric peer (no secret for us) would
+        // otherwise repeat trusted:false on every 10s ping forever (observed
+        // live). Aligning the signal with the action keeps the monitor honest.
+        if (msg.trusted === false && !this._trustReported) {
+          this._trustReported = true
+          this.onPeerStateDiverged('trust')
+        }
         break
       }
     }
