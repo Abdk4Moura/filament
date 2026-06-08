@@ -75,70 +75,100 @@ fig.savefig("/root/.claude/jobs/330c2366/tmp/diagram-transport-matrix.png", dpi=
 print("matrix done")
 
 # ============================================================ 2. STATE MACHINE
-fig, ax = newfig(15, 12, "Filament — the session state machine (every state a client can be in)")
-ax.text(50, 94.5, "green = terminal-good   ·   red = divergence (tel-watch.py)   ·   amber = resilience overlay (legal)",
+def vstep(ax, a, b, label="", color=MUT, tc=MUT):
+    """clean straight VERTICAL spine arrow (a above b)."""
+    (x1,y1,w1,h1)=a; (x2,y2,w2,h2)=b
+    ar = FancyArrowPatch((x1, y1-h1/2), (x2, y2+h2/2), arrowstyle="-|>",
+                         mutation_scale=14, color=color, lw=1.7, zorder=1)
+    ax.add_patch(ar)
+    if label:
+        ax.text((x1+x2)/2+3.2, (y1-h1/2+y2+h2/2)/2, label, ha="left", va="center",
+                color=tc, fontsize=9, family="DejaVu Sans", zorder=4)
+
+def stub(ax, a, b, label="", color=RED_E, tc=RED_T, left=False):
+    """short HORIZONTAL dashed divergence stub between y-aligned boxes."""
+    (x1,y1,w1,h1)=a; (x2,y2,w2,h2)=b
+    sx = x1 - w1/2 if left else x1 + w1/2
+    ex = x2 + w2/2 if left else x2 - w2/2
+    ar = FancyArrowPatch((sx, y1), (ex, y2), arrowstyle="-|>", mutation_scale=12,
+                         color=color, lw=1.4, ls="--", zorder=1)
+    ax.add_patch(ar)
+    if label:
+        ax.text((sx+ex)/2, y1+1.6, label, ha="center", va="center", color=tc,
+                fontsize=8, family="DejaVu Sans", zorder=4)
+
+fig, ax = newfig(15, 13, "Filament — the session state machine (every state a client can be in)")
+ax.text(50, 95.5, "vertical spine = the happy path   ·   red stubs = divergence (tel-watch.py)   ·   green = terminal-good",
         ha="center", color=MUT, fontsize=10)
 
-proc = box(ax, 50, 90, 16, 4.5, "process start", BLU_F, BLU_E, "white", 10, "oval")
-conn = box(ax, 50, 82, 18, 5, "CONNECTING", GRY_F, GRY_E, FG, 11)
-join = box(ax, 50, 73, 30, 6, "JOINED  (in a room)\n↺ sync heartbeat ≤35s", GRY_F, GRY_E, FG, 11)
+SP = 42  # spine x
+proc = box(ax, SP, 91, 15, 4, "process start", BLU_F, BLU_E, "white", 10, "oval")
+conn = box(ax, SP, 83, 19, 5, "CONNECTING", GRY_F, GRY_E, FG, 11)
+join = box(ax, SP, 73, 30, 6, "JOINED  (in a room)\n↺ sync heartbeat", GRY_F, GRY_E, FG, 11)
 
-wait = box(ax, 16, 62, 22, 6, "WAITING_CLAIM\n(code shown)", GRY_F, GRY_E, FG, 10)
-subs = box(ax, 41, 62, 20, 6, "SUBSCRIBED\n(channels raised)", GRY_F, GRY_E, FG, 10)
-lstn = box(ax, 64, 62, 20, 6, "LISTENING\n(recv / up)", GRY_F, GRY_E, FG, 10)
+wait = box(ax, 15, 61, 22, 6.5, "WAITING_CLAIM\ncode shown", GRY_F, GRY_E, FG, 9.5)
+subs = box(ax, SP, 61, 20, 6.5, "SUBSCRIBED\nchannels raised", GRY_F, GRY_E, FG, 9.5)
+lstn = box(ax, 65, 61, 20, 6.5, "LISTENING\nrecv / up", GRY_F, GRY_E, FG, 9.5)
 
-paired = box(ax, 41, 51, 26, 6, "PAIRED_ROOM\ntwo sids, one room · ≤30s", GRY_F, BLU_E, BLU_T, 10)
-tport  = box(ax, 41, 41, 22, 6, "◆ TRANSPORT?", BLU_F, BLU_E, BLU_T, 11)
-wrtc   = box(ax, 22, 31, 22, 6, "WEBRTC / ICE\nconnecting ≤25s", GRY_F, GRY_E, FG, 10)
-dire   = box(ax, 60, 31, 22, 6, "DIRECT TCP/QUIC\n1-RTT dial", GRY_F, GREEN_E, GREEN_T, 10)
+paired = box(ax, SP, 50, 30, 6, "PAIRED_ROOM   two sids, one room", GRY_F, BLU_E, BLU_T, 10)
+tport  = box(ax, SP, 41, 22, 5.5, "◆  TRANSPORT?", BLU_F, BLU_E, BLU_T, 11)
+wrtc   = box(ax, 26, 31, 24, 6.5, "WEBRTC / ICE\nSTUN + TURN, ≤25s", GRY_F, GRY_E, FG, 9.5)
+dire   = box(ax, 58, 31, 24, 6.5, "DIRECT  TCP/QUIC\nNoise PSK, 1-RTT", GRY_F, GREEN_E, GREEN_T, 9.5)
 
-ready = box(ax, 41, 21, 18, 5, "CONNECTED", GREEN_F, GREEN_E, GREEN_T, 11)
-xfer  = box(ax, 17, 12, 24, 6, "TRANSFER\noffered→…→complete", GRY_F, GRY_E, FG, 9.5)
-remem = box(ax, 44, 12, 24, 6, "MUTUAL_REMEMBER\nkeep-stored + proof-ok", GRY_F, GRY_E, FG, 9.5)
-away  = box(ax, 70, 12, 18, 6, "AWAY (brb)\nheld; clears", AMB_F, AMB_E, AMB_T, 9.5)
-good  = box(ax, 41, 3.5, 22, 5, "✓ clean disconnect", GREEN_F, GREEN_E, GREEN_T, 10, "oval")
+ready = box(ax, SP, 21, 19, 5.5, "CONNECTED", GREEN_F, GREEN_E, GREEN_T, 11)
+xfer  = box(ax, 15, 11, 24, 6.5, "TRANSFER\noffered → complete", GRY_F, GRY_E, FG, 9.5)
+remem = box(ax, SP, 11, 25, 6.5, "MUTUAL_REMEMBER\nkeep + proof", GRY_F, GRY_E, FG, 9.5)
+away  = box(ax, 67, 11, 17, 6.5, "AWAY (brb)\nheld; clears", AMB_F, AMB_E, AMB_T, 9.5)
+good  = box(ax, SP, 2.5, 24, 4.5, "✓ clean disconnect", GREEN_F, GREEN_E, GREEN_T, 10, "oval")
 
-# divergences (right rail)
-d1 = box(ax, 86, 82, 22, 6, "D1 connected,\nnever joined >12s", RED_F, RED_E, RED_T, 9)
-d6 = box(ax, 86, 73, 22, 6, "D6 sync silent\nwhile live >90s", RED_F, RED_E, RED_T, 9)
-d5 = box(ax, 86, 62, 22, 6, "D5 ceremony room\nsolo >10min", RED_F, RED_E, RED_T, 9)
-d2 = box(ax, 86, 51, 22, 6, "D2 claimed pair,\nno completion >30s", RED_F, RED_E, RED_T, 9)
-d4 = box(ax, 86, 41, 22, 6, "D4 'connecting' →\nneither ready/failed", RED_F, RED_E, RED_T, 9)
-d3 = box(ax, 86, 9, 22, 6, "D3 peer gone,\nyou orphaned >15s", RED_F, RED_E, RED_T, 9)
+# divergences — right rail, each ALIGNED to its source state's y (clean stubs)
+RX = 87
+d1 = box(ax, RX, 83, 20, 6, "D1  connected,\nnever joined", RED_F, RED_E, RED_T, 8.5)
+d6 = box(ax, RX, 73, 20, 6, "D6  sync silent\nwhile live", RED_F, RED_E, RED_T, 8.5)
+d5 = box(ax, RX, 61, 20, 6, "D5  ceremony room\nsolo >10min", RED_F, RED_E, RED_T, 8.5)
+d2 = box(ax, RX, 50, 20, 6, "D2  claimed pair,\nno completion", RED_F, RED_E, RED_T, 8.5)
+d4 = box(ax,  9, 31, 15, 7, "D4  'connecting'\nnever resolves", RED_F, RED_E, RED_T, 8.5)
+d3 = box(ax, RX, 7,  20, 6, "D3  peer gone,\nyou orphaned", RED_F, RED_E, RED_T, 8.5)
 
-arrow(ax, proc, conn)
-arrow(ax, conn, join, "join")
-arrow(ax, conn, d1, "≤12s", RED_E, RED_T, "--", rad=-0.1, lx=0.55)
-arrow(ax, join, wait, "pair-create", lx=0.5)
-arrow(ax, join, subs, "subscribe", lx=0.5)
-arrow(ax, join, lstn, "listen", lx=0.5)
-arrow(ax, join, d6, "gap", RED_E, RED_T, "--", rad=0.2, lx=0.6)
-arrow(ax, wait, paired, "claim-ok", lx=0.5)
-arrow(ax, wait, d5, "solo", RED_E, RED_T, "--", rad=-0.2, lx=0.6)
-arrow(ax, subs, paired, "known-peer", lx=0.5)
-arrow(ax, lstn, paired, "peer-joined", rad=0.15, lx=0.5)
-arrow(ax, paired, tport)
-arrow(ax, paired, d2, ">30s", RED_E, RED_T, "--", rad=-0.2, lx=0.55)
-arrow(ax, tport, wrtc, "browser\ninvolved", lx=0.5)
-arrow(ax, tport, dire, "cli↔cli\nreachable", GREEN_E, GREEN_T, lx=0.5)
+# spine (straight vertical)
+vstep(ax, proc, conn)
+vstep(ax, conn, join, "join")
+vstep(ax, join, subs)
+vstep(ax, paired, tport)
+vstep(ax, ready, remem)
+# fan-out from JOINED to the three entry modes, and back into PAIRED_ROOM
+for nd, lb in ((wait,"pair-create"), (lstn,"listen")):
+    arrow(ax, join, nd, lb, lx=0.5)
+for nd, lb in ((wait,"claim-ok"), (subs,"known-peer"), (lstn,"peer-joined")):
+    arrow(ax, nd, paired, lb, lx=0.5)
+# transport fork + rejoin
+arrow(ax, tport, wrtc, "browser", lx=0.5)
+arrow(ax, tport, dire, "cli↔cli", GREEN_E, GREEN_T, lx=0.5)
 arrow(ax, wrtc, ready, "ICE ok", lx=0.55)
-arrow(ax, wrtc, d4, "silent", RED_E, RED_T, "--", rad=0.25, lx=0.82)
 arrow(ax, dire, ready, "dialed", GREEN_E, GREEN_T, lx=0.55)
-arrow(ax, dire, wrtc, "fail→fallback", AMB_E, AMB_T, "--", rad=0.3, lx=0.5)
+arrow(ax, dire, wrtc, "fail →\nfallback", AMB_E, AMB_T, "--", rad=0.3, lx=0.5)
+# outcomes
 arrow(ax, ready, xfer)
-arrow(ax, ready, remem)
 arrow(ax, ready, away)
-arrow(ax, xfer, good, rad=0.1)
+arrow(ax, xfer, good, lx=0.5)
 arrow(ax, remem, good)
-arrow(ax, good, d3, "peer left", RED_E, RED_T, "--", rad=-0.15, lx=0.6)
+arrow(ax, away, good, lx=0.5)
+# divergence stubs (aligned, no diagonals)
+stub(ax, conn, d1, ">12s")
+stub(ax, join, d6, "gap>90s")
+stub(ax, lstn, d5, ">10min")
+stub(ax, paired, d2, ">30s")
+stub(ax, wrtc, d4, ">25s", left=True)
+stub(ax, good, d3, "peer left")
 
-# resilience legend (bottom-left)
-ax.text(2, 30, "resilience overlays (legal, not divergence):\n"
-        "• hidden/frozen → brb → peers hold the line\n"
-        "• fresh sid → session.invalidate() → re-sync (C30)\n"
-        "• lost emit → next sync tick repairs (gate L)\n"
-        "• missed peer-join/left → roster digest (C30 p2)\n"
-        "• one-sided transfer/trust → link state-ping (C30 p3)",
-        ha="left", va="top", color=AMB_T, fontsize=8.5, family="DejaVu Sans")
+# resilience panel — its own bordered box in the clear lower-right quadrant
+box(ax, 84, 30, 30, 26,
+    "RESILIENCE OVERLAYS\n(legal — these self-correct,\nnever a divergence)\n\n"
+    "hidden/frozen → brb,\n    peers hold the line\n"
+    "fresh sid → invalidate\n    → re-sync  (C30)\n"
+    "lost emit → next sync\n    tick repairs  (gate L)\n"
+    "missed peer-join/left\n    → roster digest  (p2)\n"
+    "1-sided transfer/trust\n    → link state-ping  (p3)",
+    "#10171f", AMB_E, AMB_T, 8.5)
 fig.savefig("/root/.claude/jobs/330c2366/tmp/diagram-state-machine.png", dpi=160, facecolor=BG, bbox_inches="tight")
 print("state machine done")
