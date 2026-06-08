@@ -114,6 +114,42 @@ mid-transfer (socket alive, lease alive), replacement with the SAME uid
 (`FILAMENT_UID` test hook) joins, sender logs "superseding old link", resume
 completes, hash matches. Gate 2 covers the different-uid replacement flavor.
 
+### C6b. Live signaling reconnect must not tear down a flowing link (#28) — **VERIFIED**
+The WebRTC data channel is INDEPENDENT of the signaling socket, so a peer's
+socket reconnect mid-transfer must not kill the live channel. #28 has two
+triggers on the CLI side, both now closed (the browser keep-connected half is
+a separate change, commit `a55e494`):
+
+- **Supersede trigger** (`maybe_adopt`, ~1161): the reconnect arrives as a new
+  sid carrying the same uid. If the existing link is still flowing
+  (`link_flowing` — `idle_ms()` below `FILAMENT_ADOPT_ACTIVE_MS`, default 3s),
+  the reconnect is cosmetic; KEEP the old link ("keeping active link") instead
+  of superseding. A frozen-alive peer (gate 11) stops stamping activity, reads
+  idle, and still supersedes. **Verified by:** gate 11b.
+
+- **peer-left trigger / DEFERRED DROP** (`on_peer_left` + `reap_deferred`): the
+  server fires `peer-left` for the OLD sid while the channel stays alive.
+  Dropping unconditionally killed the transfer; the naive "skip drop if
+  flowing" guard hung gate 2 (a hard-killed peer reads flowing for a beat
+  before DTLS notices, so swallowing its one-shot peer-left strands the
+  sender). Instead: on peer-left for a flowing link, stash the payload in
+  `deferred_left` and re-check each main-loop tick (`reap_deferred`, hooked
+  after every `sess.tick`). Once the link goes idle past the threshold OR its
+  channel is dead (`idle_ms()==u64::MAX`), re-inject the stored peer-left with
+  a `__fil_force_drop` marker so the normal handler drops it then (opening the
+  rejoin window). A live reconnect never goes idle → the transfer finishes on
+  it → the idle link is reaped harmlessly. `roster.remove` stays immediate;
+  only the LINK drop is deferred. `drop_link` clears `deferred_left` (invariant:
+  it only holds live links), so a supersede of a deferred sid leaves no stale
+  blocker. The adoption gate treats a deferred-active slot as claimable
+  (`active_deferred`), so a DIFFERENT-uid replacement (gate 2) still takes over
+  during the deferral window instead of being squatted out. **Verified by:**
+  gate 11c (A/B: `FILAMENT_TEST_INJECT_PEER_LEFT` synthesizes the peer-left for
+  the active sid mid-stream without touching the channel; `FILAMENT_TEST_NO_DEFER`
+  proves the baseline drops it and the transfer dies). Side effect: a receiver
+  now defers the sender's link on NORMAL completion too, reaping ~one threshold
+  later before its clean exit (bounded ~3-5s, exits 0; measured).
+
 ### C7. Resume trusted name+size — silent corruption — **VERIFIED**
 `file-offer` now carries `head`: sha256 of the first 256 KiB. The receiver's
 `.part.meta` sidecar stores `{size, head}`; resume requires size match AND
@@ -467,7 +503,11 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 >   churning mid-transfer (`✓ route: local` → `○ left` repeated), NOT the
 >   stale-answer glare (which self-recovers). Real fix: browser↔CLI resume
 >   across a browser reconnect — tracked as a product bug (G-i / task #28),
->   NOT a test knob.
+>   NOT a test knob. (The CLI-side #28 halves are now closed — see C6b: a
+>   receiver deferring the sender's link on a flowing peer-left is exactly this
+>   churn case, so the deferred drop *plausibly* softens gate 6. UNVERIFIED for
+>   the browser path — gate 6 is browser-interop / full-suite only and was not
+>   run here; its row and status are unchanged.)
 >
 > **Determinism rule (2026-06-08).** A flaky gate has a hidden dependency on
 > timing or load; the fix is to remove the dependency, never to retry (a retry
@@ -501,6 +541,8 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 | 10 TURN relay via coturn container, `route: relayed` | C2, C17 | green (needs docker) |
 | 12 browser with PROD config (65536 framing) → CLI | C1 | green |
 | 11 frozen receiver superseded by same-uid replacement, resume | C6, F8 | green |
+| 11b active same-uid link survives a live reconnect (kept, no supersede), hash match | C6b, #28 | verified standalone on 8091; integrator to confirm in-suite |
+| 11c flowing link survives a peer-left (deferred drop), transfer completes, no supersede — A/B (NO_DEFER baseline fails) | C6b, #28 | verified standalone on 8091 (3×, A/B); integrator to confirm in-suite |
 | 13 multi-link: CLI + two browsers, transfer with bystander, nobody wedges | C18 | green |
 | 14 daemon: pair `--remember`, verified identity, room-less `up` receive | C19, C20, C12 | green |
 | 15 paired recv holds the line on sender vanish, fails honestly after window | C21 | green |
