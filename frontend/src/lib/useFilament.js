@@ -463,6 +463,14 @@ export function useFilament() {
         myIdRef.current = id // set before makeLink so politeness can be computed (#1)
         for (const [pid, l] of [...linksRef.current]) {
           if (expectedSecretRef.current.has(pid)) continue // known device — room-independent
+          // G-i: a signaling reconnect (our OWN socket blipped — welcome
+          // re-fires) must NOT tear down a HEALTHY P2P link. The data channel
+          // is peer-to-peer and independent of the signaling socket; nuking it
+          // here interrupts an in-flight transfer for no reason (the gate-6
+          // browser-churn flake; and any user's WiFi blip mid-send). Keep a
+          // connected link; only rebuild dead ones. (The remote's sid is the
+          // map key and is unaffected by OUR reconnect, so no re-key needed.)
+          if (l.pc?.connectionState === 'connected') continue
           l.close()
           linksRef.current.delete(pid)
           removePeer(pid)
