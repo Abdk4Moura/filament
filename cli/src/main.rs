@@ -60,6 +60,21 @@ fn quiet_exit_window() -> Duration {
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Gate-18 Mode B: the single predicate that decides whether a stuck/lost link
+/// should be DROPPED (transfer is complete; nothing left to fetch) rather than
+/// reconnected. Pulled out as a pure function so the gate-2 / gate-11c fence
+/// (mid-transfer links must NEVER be dropped) is unit-testable without a live
+/// WebRTC peer. The recv loop computes `conn.recv_done` from exactly this each
+/// tick; `on_stuck` then reads the flag.
+///
+/// - `completed`: files fully placed on disk so far.
+/// - `keep_open`: the receiver was asked to stay resident (gate 13).
+/// - `by_sid_empty`: NO stream is in flight (an in-progress reconnect/resume
+///   keeps a by_sid entry, which must keep the link reconnecting — gate 2/11c).
+fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> bool {
+    completed > 0 && !keep_open && by_sid_empty
+}
+
 const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 
 const EXAMPLES: &str = "\
@@ -644,6 +659,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
+        recv_done: false,
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -781,6 +797,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
+        recv_done: false,
     };
     {
         let tx = tx.clone();
@@ -1090,6 +1107,22 @@ struct Conn {
     /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
     /// deferred sid can't leave a stale blocker.
     deferred_left: HashMap<String, Value>,
+    /// Gate-18 Mode B: set TRUE by the recv loop, each tick, exactly when the
+    /// transfer is COMPLETE and nothing is in flight (`completed>0 &&
+    /// by_sid.is_empty() && !keep_open`). When it holds, `on_stuck` DROPS a
+    /// stuck/lost link instead of re-establishing it: there is nothing left to
+    /// fetch, so reconnect attempts are pointless and a sender that departs
+    /// AFTER delivering every byte would otherwise FLAP the link forever
+    /// (establish → connect → die → Stuck → establish …), each cycle resetting
+    /// `attempts` (so MAX_ATTEMPTS never caps it) and re-arming `expected_secret`
+    /// (so `digest_says_alone` never holds) — `conn.links` never empties and the
+    /// quiet-exit never fires → RC=124 hang. Dropping the link empties
+    /// `conn.links` and lets the quiet-exit fire. Recomputed PER TICK (never
+    /// sticky) so a mid-transfer link (`by_sid` non-empty) always reconnects
+    /// normally — kill-resume (gate 2) and the #28 deferred-drop (gate 11c)
+    /// reconnect paths are untouched. Defaults false, so the send-side and
+    /// connecting-phase `on_stuck` callers are unaffected.
+    recv_done: bool,
 }
 
 impl Conn {
@@ -1301,6 +1334,26 @@ impl Conn {
         let Some(l) = self.links.get(pid) else { return Ok(false) };
         if l.generation != generation || l.peer.is_connected() {
             return Ok(false); // stale timer from a superseded attempt
+        }
+        // Gate-18 Mode B: the transfer is COMPLETE (recv_done; recomputed per
+        // tick by the recv loop, so this can only be true with by_sid empty and
+        // !keep_open) and this link just went stuck/lost. Reconnecting would
+        // fetch nothing and merely FLAP the link — resetting attempts and
+        // re-arming expected_secret each cycle — so conn.links never empties and
+        // the quiet-exit can't fire (RC=124 hang under contention). DROP it
+        // instead: links empties, quiet-exit fires. Fenced to complete-only, so
+        // a mid-transfer link (recv_done=false) reconnects normally (gate 2/11c).
+        // FILAMENT_TEST_DISABLE_MODEB_DROP reverts to the old reconnect-always
+        // behaviour so the gate proves A/B with ONE binary: baseline (toggle set)
+        // hangs to RC=124 under the churn hook; fix (toggle unset) exits cleanly.
+        if self.recv_done && std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_err() {
+            let was_active = self.is_active(pid);
+            eprintln!(
+                "{}",
+                ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after completion — nothing left to fetch)"))
+            );
+            self.drop_link(pid);
+            return Ok(was_active);
         }
         let attempts = l.attempts + 1;
         if attempts >= MAX_ATTEMPTS {
@@ -1951,6 +2004,7 @@ async fn send_cmd(
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
+        recv_done: false,
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -2529,6 +2583,7 @@ async fn recv_cmd(
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
+        recv_done: false,
     };
     {
         let tx = tx.clone();
@@ -2655,6 +2710,42 @@ async fn recv_cmd(
 
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
         sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
+
+        // Gate-18 Mode B: recompute the completion flag AFTER the sweep, every
+        // tick (never sticky). When true, a stuck/lost link is DROPPED in
+        // on_stuck instead of re-established — see Conn::recv_done. Refreshing it
+        // here, where `completed`/`by_sid` were just settled, makes the gate-2/
+        // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
+        // recv_done=false and reconnects unchanged.
+        conn.recv_done = recv_transfer_done(completed, keep_open, by_sid.is_empty());
+
+        // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
+        // FLAP that contention triggers in the wild (the sender's departure puts
+        // the receiver's link into the C4 reconnect loop). Once everything is on
+        // disk, force each surviving link to go stuck repeatedly — reset its
+        // attempts (mirroring the real flap's attempts-reset, so MAX_ATTEMPTS
+        // can never cap it) and re-inject Ev::Stuck. On the BASELINE (no fix)
+        // on_stuck re-establishes → link persists → conn.links never empties →
+        // hang to timeout (RC=124). WITH the fix on_stuck drops on recv_done →
+        // links empties → no link to churn next tick → quiet-exit fires. Driven
+        // at LOOP level (not inside on_stuck) so the A/B tests the fix, not
+        // itself.
+        if conn.recv_done && std::env::var("FILAMENT_TEST_CHURN_AFTER_COMPLETE").is_ok() {
+            let churn: Vec<(String, u32)> = conn
+                .links
+                .iter()
+                .map(|(pid, l)| (pid.clone(), l.generation))
+                .collect();
+            for (pid, generation) in churn {
+                if let Some(l) = conn.links.get_mut(&pid) {
+                    l.attempts = 0; // mirror the real flap: cap never accumulates
+                    // Tear the data channel down so on_stuck's is_connected()
+                    // guard sees a dead link and the Stuck isn't swallowed.
+                    l.peer.close().await;
+                }
+                let _ = conn.tx.send(Ev::Stuck(pid, generation));
+            }
+        }
 
         // #28 exit reconciliation: once everything is received and the only links
         // left are ones held open purely for their deferred-drop reap (their
@@ -3630,6 +3721,31 @@ mod tests {
         for a in ["1.2.3.4", "165.22.207.231", "2606:4700::1", "8.8.8.8", "not-an-ip", ""] {
             assert!(!net::is_private_addr(a), "{a} should be public/invalid");
         }
+    }
+
+    #[test]
+    fn recv_done_drops_only_when_complete() {
+        // Gate-18 Mode B: the drop-instead-of-reconnect decision must hold
+        // ONLY when the transfer is complete and idle. This is the exact fence
+        // that protects gate 2 (kill-resume) and gate 11c (deferred-drop): a
+        // mid-transfer link (by_sid non-empty) must always reconnect.
+        // complete + idle + not keep_open -> drop the dead link, let quiet-exit
+        assert!(recv_transfer_done(1, false, true));
+        assert!(recv_transfer_done(3, false, true));
+    }
+
+    #[test]
+    fn recv_done_false_mid_transfer_protects_resume() {
+        // by_sid NON-empty == a stream in flight (an in-progress reconnect or
+        // resume). Must NOT drop — gate 2 / gate 11c reconnect paths depend on
+        // this returning false so on_stuck re-establishes.
+        assert!(!recv_transfer_done(0, false, false)); // nothing done, mid-stream
+        assert!(!recv_transfer_done(1, false, false)); // file done but another in flight
+        // keep_open (gate 13): a resident receiver never self-drops its links.
+        assert!(!recv_transfer_done(1, true, true));
+        assert!(!recv_transfer_done(5, true, true));
+        // nothing completed yet (still connecting / first stream) -> reconnect.
+        assert!(!recv_transfer_done(0, false, true));
     }
 
     #[test]

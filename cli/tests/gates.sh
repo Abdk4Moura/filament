@@ -592,6 +592,70 @@ else
   bad "quiet-exit (G-k)"; echo "  RC=$RC walltime=$((T1 - T0))s"; tail -n 6 "$WORK/g18-recv.log"
 fi
 
+# -------------------------------------------------------------- gate 18b ----
+# Gate 18 Mode B (the contention flake #28 could not previously reproduce): a
+# transfer COMPLETES, the sender's peer-left is LOST (as in gate 18), but the
+# sender's departure also puts the receiver's now-pointless link into the C4
+# reconnect loop. The link FLAPS (establish → connect → die → Stuck → establish
+# …); each cycle RESETS attempts (so MAX_ATTEMPTS never caps it) and re-arms
+# expected_secret (so digest_says_alone never holds) → conn.links never empties
+# → the quiet-exit never fires → RC=124 hang to the timeout. Standalone it
+# passes (no contention to trigger the flap); only under suite load did the
+# departure-into-reconnect race fire — a heisenbug. This makes it DETERMINISTIC.
+#
+# FILAMENT_TEST_CHURN_AFTER_COMPLETE forces the post-completion flap from the
+# recv loop (close + re-inject Ev::Stuck with attempts reset, mirroring the wild
+# flap) ONCE the file is on disk. A/B with ONE binary via
+# FILAMENT_TEST_DISABLE_MODEB_DROP:
+#   A (baseline, drop disabled): on_stuck re-establishes → link persists → hang
+#     → RC=124. This is the bug, reproduced on demand.
+#   B (fix): on_stuck sees recv_done and DROPS the link (nothing left to fetch)
+#     → conn.links empties → no link left to churn → quiet-exit fires fast.
+# The fence is recv_done == (completed>0 && by_sid.is_empty() && !keep_open), so
+# a MID-transfer link (by_sid non-empty) is never dropped — gate 2 (kill-resume)
+# and gate 11c (deferred-drop) reconnect paths are untouched (unit-tested too).
+say "18b: recv exits on post-completion link churn — Mode B (RC=124 flake, #28)"
+W="g18b-$$-$RANDOM"; H_DIR="$WORK/g18b"; mkdir -p "$H_DIR"
+# A) baseline: Mode-B drop disabled → the post-completion flap hangs to timeout.
+DA="$H_DIR/a"; mkdir -p "$DA"
+WA="g18ba-$$-$RANDOM"
+"$BIN" send "$SMALL" --word "$WA" --server "$SERVER" >"$WORK/g18ba-send.log" 2>&1 &
+SPA=$!; pids+=($SPA); sleep 3
+( sleep 6; kill -9 $SPA 2>/dev/null ) &   # sender departs after delivering the file
+FILAMENT_TEST_DISABLE_MODEB_DROP=1 FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 \
+  FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
+  timeout 30 "$BIN" recv "$WA" -y --dir "$DA" --server "$SERVER" </dev/null >"$WORK/g18ba-recv.log" 2>&1
+RCA=$?
+kill -9 $SPA 2>/dev/null; wait $SPA 2>/dev/null
+# Baseline MUST hang (RC=124) yet still have the bytes on disk (it's the EXIT
+# that's broken, not the transfer) and show the flap, never a clean drop.
+base_ok=0
+{ [ $RCA -eq 124 ] && [ "$(hashof "$DA/small.bin" 2>/dev/null)" = "$H_SMALL" ] \
+  && grep -q "stuck while connecting — retrying" "$WORK/g18ba-recv.log" \
+  && ! grep -q "nothing left to fetch" "$WORK/g18ba-recv.log"; } && base_ok=1
+# B) fix: Mode-B drop on → on_stuck drops the dead link, quiet-exit fires fast.
+DB="$H_DIR/b"; mkdir -p "$DB"
+WB="g18bb-$$-$RANDOM"
+"$BIN" send "$SMALL" --word "$WB" --server "$SERVER" >"$WORK/g18bb-send.log" 2>&1 &
+SPB=$!; pids+=($SPB); sleep 3
+T0=$(date +%s)
+( sleep 6; kill -9 $SPB 2>/dev/null ) &
+FILAMENT_TEST_CHURN_AFTER_COMPLETE=1 FILAMENT_TEST_DROP_PEER_LEFT=1 FILAMENT_QUIET_EXIT_SECS=2 \
+  timeout 30 "$BIN" recv "$WB" -y --dir "$DB" --server "$SERVER" </dev/null >"$WORK/g18bb-recv.log" 2>&1
+RCB=$?
+T1=$(date +%s)
+kill -9 $SPB 2>/dev/null; wait $SPB 2>/dev/null
+if [ "$base_ok" = "1" ] && [ $RCB -eq 0 ] \
+   && [ "$(hashof "$DB/small.bin" 2>/dev/null)" = "$H_SMALL" ] \
+   && grep -q "nothing left to fetch" "$WORK/g18bb-recv.log" \
+   && grep -F "done (1 file" "$WORK/g18bb-recv.log" >/dev/null \
+   && [ $((T1 - T0)) -lt 15 ]; then
+  ok "Mode B: baseline hung (RC=$RCA), fix dropped dead link + exited in $((T1-T0))s (A/B proven)"
+else
+  bad "gate-18b Mode B"; echo "  base_ok=$base_ok RCA=$RCA RCB=$RCB fix_walltime=$((T1-T0))s"
+  tail -n 6 "$WORK/g18bb-recv.log" "$WORK/g18ba-recv.log"
+fi
+
 # --------------------------------------------------------------- gate 19 ----
 say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 # Seed 16's drop pattern is 'DD....': BOTH processes lose their first two
