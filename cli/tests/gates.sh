@@ -391,6 +391,58 @@ if [ $RCS -eq 0 ] && [ "$(hashof "$D1B/big.bin")" = "$H_BIG" ] \
   ok "active link preserved across same-uid reconnect (kept deliberately, no supersede)"
 else bad "flow-preserve (#28)"; tail -n 4 "$WORK/g11b-send.log" "$WORK/g11b-recv1.log"; fi
 
+# -------------------------------------------------------------- gate 11c ----
+# #28 second half (the socket-reconnect TRIGGER): when the server fires a
+# peer-left for the ACTIVE link's old sid while its data channel is still
+# alive (a signaling reconnect mid-transfer), the sender must NOT drop the
+# link — it DEFERS the drop and the transfer completes on the same live
+# channel. 11b covered the same-uid SUPERSEDE path (a new sid arrives); this
+# covers the peer-left path, which used to drop unconditionally and kill the
+# transfer. FILAMENT_TEST_INJECT_PEER_LEFT deterministically injects the
+# synthetic peer-left for the active sid at a byte offset WITHOUT touching the
+# data channel (a SIGSTOP/kill can't isolate the socket from the channel).
+# A/B BY CONSTRUCTION: the same hook with FILAMENT_TEST_NO_DEFER reverts to the
+# old unconditional drop and MUST fail to complete — so a regression that
+# silently stops deferring is caught, not papered over. Pin the idle threshold
+# default (3s) >> a healthy inter-frame gap so the live channel reads flowing.
+say "11c: active link survives a peer-left on a still-flowing channel (#28 trigger)"
+WC="g11c-$$-$RANDOM"; DC="$WORK/g11c"; mkdir -p "$DC"
+INJC=$((8 * 1024 * 1024))
+# Default idle threshold (3s) >> a healthy inter-frame gap, so the live channel
+# reads flowing when the synthetic peer-left lands and the defer engages. (Don't
+# pin it HIGH here: a high threshold keeps the sender's reaped-link alive ~30s
+# after `done.`, which holds the receiver's socket open past its own clean exit
+# and trips the recv timeout — measured 3/3 red. The reap never fires
+# mid-transfer at the 3s default anyway: the channel stays busy throughout.)
+# A) baseline: defer disabled — the injected peer-left drops the live link and
+#    the transfer cannot complete on it.
+WCA="g11ca-$$-$RANDOM"; DCA="$WORK/g11ca"; mkdir -p "$DCA"
+FILAMENT_TEST_INJECT_PEER_LEFT=$INJC FILAMENT_TEST_NO_DEFER=1 \
+  "$BIN" send "$BIG" --word "$WCA" --server "$SERVER" >"$WORK/g11ca-send.log" 2>&1 &
+SPA=$!; pids+=($SPA); sleep 3
+timeout 90 "$BIN" recv "$WCA" -y --dir "$DCA" --server "$SERVER" >"$WORK/g11ca-recv.log" 2>&1
+RCA=$?
+RCSA=99; for _ in $(seq 1 60); do kill -0 $SPA 2>/dev/null || { wait $SPA; RCSA=$?; break; }; sleep 1; done
+kill -9 $SPA 2>/dev/null
+HCA="x"; [ -f "$DCA/big.bin" ] && HCA=$(hashof "$DCA/big.bin")
+base_ok=0; { [ $RCA -ne 0 ] || [ $RCSA -ne 0 ] || [ "$HCA" != "$H_BIG" ]; } \
+  && grep -q "injecting synthetic peer-left" "$WORK/g11ca-send.log" && base_ok=1
+# B) fix: defer active — the link is kept, transfer completes on it, no supersede.
+FILAMENT_TEST_INJECT_PEER_LEFT=$INJC \
+  "$BIN" send "$BIG" --word "$WC" --server "$SERVER" >"$WORK/g11c-send.log" 2>&1 &
+SPB=$!; pids+=($SPB); sleep 3
+timeout 120 "$BIN" recv "$WC" -y --dir "$DC" --server "$SERVER" >"$WORK/g11c-recv.log" 2>&1
+RCB=$?
+RCSB=99; for _ in $(seq 1 150); do kill -0 $SPB 2>/dev/null || { wait $SPB; RCSB=$?; break; }; sleep 1; done
+kill -9 $SPB 2>/dev/null
+HCB="x"; [ -f "$DC/big.bin" ] && HCB=$(hashof "$DC/big.bin")
+if [ "$base_ok" = "1" ] && [ $RCB -eq 0 ] && [ $RCSB -eq 0 ] && [ "$HCB" = "$H_BIG" ] \
+   && grep -q "injecting synthetic peer-left" "$WORK/g11c-send.log" \
+   && grep -q "deferring drop" "$WORK/g11c-send.log" \
+   && ! grep -q "superseding old link" "$WORK/g11c-send.log"; then
+  ok "deferred drop: flowing link survives its peer-left, transfer completes (A/B proven)"
+else bad "deferred-drop (#28 trigger)"; tail -n 4 "$WORK/g11c-send.log" "$WORK/g11ca-send.log"; fi
+
 # --------------------------------------------------------------- gate 13 ----
 say "13: multi-link — CLI + two browsers, nobody wedges (C18)"
 if [ -z "${SKIP_BROWSER:-}" ] && [ -d "$HERE/node_modules/playwright" ]; then

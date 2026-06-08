@@ -643,6 +643,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         rejoin_window: REJOIN_WINDOW,
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
+        deferred_left: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -660,6 +661,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
             Err(_) => continue,
         };
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
+        conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
         match ev {
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
@@ -778,6 +780,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         rejoin_window: REJOIN_WINDOW,
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
+        deferred_left: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -841,6 +844,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             }
         }
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
+        conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
         let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => bail!("signaling closed"),
@@ -1073,6 +1077,19 @@ struct Conn {
     /// (peer sid, until) — the peer told us it's stepping away (C21).
     away: Option<(String, Instant)>,
     chunk_size: usize,
+    /// #28 (deferred drop): sids that got a peer-left while their data channel
+    /// was still FLOWING. The signaling socket left the room, but the WebRTC
+    /// link is independent and may be a cosmetic reconnect mid-transfer. We do
+    /// NOT drop immediately (that kills a live transfer) and do NOT drop never
+    /// (a hard-killed peer reads flowing for a beat and would strand the
+    /// sender). Instead we stash the original peer-left payload here and
+    /// re-check on every main-loop tick: once the link goes idle past the
+    /// flowing threshold (or its channel is dead), we re-inject the stored
+    /// peer-left so the normal handler runs verbatim — now dropping it. A live
+    /// reconnect never goes idle (the transfer completes on it), so its entry
+    /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
+    /// deferred sid can't leave a stale blocker.
+    deferred_left: HashMap<String, Value>,
 }
 
 impl Conn {
@@ -1184,7 +1201,31 @@ impl Conn {
             }
             self.establish(v.clone()).await?;
         }
-        if want_active && self.active.is_none() && self.targetable(&name, peer_uid.as_deref()) {
+        // #28: a deferred-active slot is claimable. When the active link got a
+        // peer-left but is still flowing, we keep `active` pointing at it (so a
+        // same-uid reconnect's supersede still sees it active, and the live
+        // transfer's offer/exit machinery is undisturbed). But a DIFFERENT-uid
+        // replacement (gate 2: hard-killed receiver, fresh recv) must still be
+        // able to take over — otherwise the deferred link squats the slot until
+        // the reap, and the replacement (whose ChannelReady already fired) never
+        // gets promoted or offered the file. Treating a deferred active as
+        // "claimable" promotes the replacement at peer-joined, before its
+        // ChannelReady, so the offer goes out on the same baseline path.
+        let active_deferred = self
+            .active
+            .as_ref()
+            .is_some_and(|a| self.deferred_left.contains_key(a));
+        if want_active && (self.active.is_none() || active_deferred) && self.targetable(&name, peer_uid.as_deref()) {
+            // Claiming the slot from a deferred link: discharge that link now
+            // (it left the room and is being replaced) so reap doesn't later
+            // re-inject a stale peer-left against the slot the new peer holds.
+            if active_deferred {
+                if let Some(old) = self.active.clone() {
+                    if old != peer_id {
+                        self.drop_link(&old);
+                    }
+                }
+            }
             self.active = Some(peer_id.clone());
             self.waiting_rejoin = None;
         }
@@ -1192,6 +1233,11 @@ impl Conn {
     }
 
     fn drop_link(&mut self, pid: &str) {
+        // #28: dropping a link also discharges any deferred peer-left for it —
+        // so a supersede (maybe_adopt) of a deferred same-uid sid can't leave a
+        // stale entry blocking adoption. Invariant: deferred_left only ever
+        // holds sids that are still live links.
+        self.deferred_left.remove(pid);
         if let Some(old) = self.links.remove(pid) {
             // Never await close in the event loop (F8): mark + spawn.
             let p = old.peer.clone();
@@ -1340,29 +1386,49 @@ impl Conn {
     /// A peer's socket died. Drop its link; if it was the active target, open
     /// the rejoin window (their client auto-rejoins; C6 supersede completes
     /// the recovery). Returns true if the ACTIVE peer left.
+    ///
+    /// #28 DEFERRED DROP: peer-left fires when a sid LEAVES THE ROOM, but the
+    /// WebRTC data channel is independent and may still be flowing — either a
+    /// cosmetic signaling reconnect mid-transfer (keep it!) or a hard-killed
+    /// peer whose channel reads flowing for a beat before DTLS notices (must
+    /// still drop, or the sender strands). We can't tell the two apart at this
+    /// instant, so we DEFER: stash the payload and re-check each tick
+    /// (`reap_deferred`). If it goes idle/dead it gets re-injected here with a
+    /// force marker and dropped then; if it keeps flowing the transfer
+    /// completes on the live channel and the idle link is reaped harmlessly.
+    /// The roster entry is removed immediately (the sid truly left); only the
+    /// LINK drop is deferred.
     fn on_peer_left(&mut self, v: &Value) -> bool {
         let Some(pid) = v["id"].as_str() else { return false };
-        // NOTE (#28): we deliberately do NOT skip the drop for a "still-flowing"
-        // link here. peer-left is one-shot, and a hard-killed peer's data
-        // channel reads as flowing for a beat (last write stamped just before
-        // the kill, DTLS death not yet detected) — swallowing its only peer-left
-        // would strand the sender on a dead link forever (gate 2 hang). The
-        // same-uid SUPERSEDE path (maybe_adopt) is where #28 is actually fixed:
-        // a live reconnect arrives as a new sid and the flowing old link is kept
-        // there; the browser keep-connected half (a55e494) mirrors it.
-        self.roster.remove(pid);
-        if !self.links.contains_key(pid) {
+        let pid = pid.to_string();
+        self.roster.remove(&pid);
+        if !self.links.contains_key(&pid) {
             return false;
         }
-        let was_active = self.is_active(pid);
-        self.drop_link(pid);
+        // Defer the drop while the data channel is still moving bytes — unless
+        // this is the force re-injection from reap_deferred (the link has since
+        // gone idle/dead and must drop now). FILAMENT_TEST_NO_DEFER reverts to
+        // the old unconditional-drop behaviour so an A/B repro can prove the
+        // deferral is what saves the live transfer (baseline must FAIL).
+        let forced = v["__fil_force_drop"].as_bool() == Some(true);
+        let defer_disabled = std::env::var("FILAMENT_TEST_NO_DEFER").is_ok();
+        if !forced && !defer_disabled && self.link_flowing(&pid) {
+            // Idempotent: first peer-left for this sid records the original
+            // payload; a duplicate is swallowed (no double-defer, no drop).
+            self.deferred_left.entry(pid.clone()).or_insert_with(|| v.clone());
+            let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "peer".into());
+            eprintln!("{name} signaling left — data channel still flowing, deferring drop");
+            return false;
+        }
+        let was_active = self.is_active(&pid);
+        self.drop_link(&pid);
         if was_active {
             // C21: informed waits — a peer that declared `brb` gets its
             // promised window (plus slack); an unannounced vanish gets the
             // short default. Their client auto-rejoins; C6 supersede or a
             // fresh adopt completes the recovery.
             self.rejoin_window = match &self.away {
-                Some((apid, until)) if apid == pid && *until > Instant::now() => {
+                Some((apid, until)) if *apid == pid && *until > Instant::now() => {
                     until.duration_since(Instant::now()) + Duration::from_secs(15)
                 }
                 _ => rejoin_unwarned(),
@@ -1370,6 +1436,44 @@ impl Conn {
             self.waiting_rejoin = Some(Instant::now());
         }
         was_active
+    }
+
+    /// #28: re-check every deferred peer-left. Called on every main-loop tick
+    /// (idempotent, cheap). A deferred sid is discharged when it is no longer
+    /// flowing — its data channel went idle past the threshold OR died
+    /// (idle_ms == u64::MAX). We then re-inject the ORIGINAL peer-left payload
+    /// (flagged force) so the normal Ev::PeerLeft handler runs verbatim — same
+    /// loop-side flush/messaging/rejoin behaviour as a non-deferred leave, with
+    /// the link now correctly dropped. A sid that vanished from `links` (e.g. a
+    /// supersede dropped it; drop_link already cleared its entry, but belt-and-
+    /// braces) is forgotten silently. A still-flowing sid is left to keep
+    /// flowing — the reconnect case, where the transfer completes on the live
+    /// channel and the all-done exit reaps it.
+    fn reap_deferred(&mut self) {
+        if self.deferred_left.is_empty() {
+            return;
+        }
+        let ready: Vec<(String, Value)> = self
+            .deferred_left
+            .iter()
+            .filter(|(sid, _)| !self.links.contains_key(*sid) || !self.link_flowing(sid))
+            .map(|(sid, v)| (sid.clone(), v.clone()))
+            .collect();
+        for (sid, mut payload) in ready {
+            self.deferred_left.remove(&sid);
+            if !self.links.contains_key(&sid) {
+                continue; // link already gone (superseded); nothing to drop
+            }
+            // Force the drop this time (the channel is now idle/dead).
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("__fil_force_drop".into(), Value::Bool(true));
+            }
+            let name = self.link(&sid).map(|l| l.name.clone()).unwrap_or_else(|| "peer".into());
+            eprintln!("{name} link went idle after deferred leave — dropping now");
+            // Re-inject so the loop's own peer-left branch handles partials,
+            // messaging and the rejoin window exactly as a fresh leave would.
+            let _ = self.tx.send(Ev::PeerLeft(payload));
+        }
     }
 
     /// C21: any traffic from a peer cancels its declared absence.
@@ -1837,6 +1941,7 @@ async fn send_cmd(
         rejoin_window: REJOIN_WINDOW,
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
+        deferred_left: HashMap::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -1877,6 +1982,8 @@ async fn send_cmd(
         };
         // C30: converge session state every iteration (incl. ticks).
         sess.tick(&sio).await;
+        // #28: discharge any deferred peer-left whose channel has gone idle/dead.
+        conn.reap_deferred();
         // C30 phase 3: tell every link our truth every ~10s (sender side has
         // no receive-partials; the ping mainly carries trusted/away and keeps
         // the peer's away-mark honest).
@@ -2139,8 +2246,11 @@ async fn send_cmd(
                     let out = outgoing.clone();
                     let chunk = conn.chunk_size.min(t.max_payload());
                     let tx2 = tx.clone();
+                    // #28 test hook: the active peer's sid, so the streamer can
+                    // synthesize a peer-left for it mid-flight (see stream_one).
+                    let active_sid = conn.active.clone();
                     tokio::spawn(async move {
-                        match stream_one(out, t, id.clone(), offset, chunk).await {
+                        match stream_one(out, t, id.clone(), offset, chunk, active_sid, tx2.clone()).await {
                             Ok(()) => {
                                 let _ = tx2.send(Ev::TransferDone(id));
                             }
@@ -2224,6 +2334,8 @@ async fn stream_one(
     id: String,
     offset: u64,
     chunk: usize,
+    active_sid: Option<String>,
+    tx: mpsc::UnboundedSender<Ev>,
 ) -> Result<()> {
     let (sid, name, size, path) = {
         let out = outgoing.lock().await;
@@ -2233,6 +2345,16 @@ async fn stream_one(
     if offset > 0 {
         eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
     }
+    // #28 deterministic test hook: once we cross this byte offset, synthesize a
+    // peer-left for the ACTIVE peer WITHOUT touching the data channel — exactly
+    // the "signaling reconnect mid-transfer, channel stays alive" case. The
+    // deferred-drop path must keep the link and let the transfer finish on it.
+    // Injecting the active sid is critical: a wrong id makes on_peer_left
+    // return early (link-not-found) and the test would falsely pass.
+    let inject_at: Option<u64> = std::env::var("FILAMENT_TEST_INJECT_PEER_LEFT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let mut injected = false;
     let mut f = std::fs::File::open(&path)?;
     f.seek(SeekFrom::Start(offset))?;
     let mut sent = offset;
@@ -2246,6 +2368,13 @@ async fn stream_one(
         t.send_frame(sid, &buf[..n]).await?;
         sent += n as u64;
         bar.tick(sent);
+        if let (false, Some(at), Some(asid)) = (injected, inject_at, active_sid.as_ref()) {
+            if sent >= at {
+                injected = true;
+                eprintln!("[test] injecting synthetic peer-left for active sid at {sent} bytes");
+                let _ = tx.send(Ev::PeerLeft(json!({ "id": asid })));
+            }
+        }
     }
     t.send_control(&json!({ "type": "file-end", "id": id, "sid": sid })).await?;
     t.flush().await?;
@@ -2390,6 +2519,7 @@ async fn recv_cmd(
         rejoin_window: REJOIN_WINDOW,
         away: None,
         chunk_size: net::MAX_DC_PAYLOAD,
+        deferred_left: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -2487,6 +2617,8 @@ async fn recv_cmd(
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
         sess.tick(&sio).await;
+        // #28: discharge any deferred peer-left whose channel has gone idle/dead.
+        conn.reap_deferred();
 
         // C30 phase 3: state pings — each open link hears our transfer/away
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
