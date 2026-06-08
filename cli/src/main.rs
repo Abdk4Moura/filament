@@ -1476,6 +1476,15 @@ impl Conn {
         }
     }
 
+    /// #28 exit reconciliation: true when every remaining link is one we're only
+    /// holding open for its deferred-drop reap (vacuously true with no links). A
+    /// link in `deferred_left` is a peer whose signaling already left; once all
+    /// transfers are complete it protects nothing, so it must not delay exit by
+    /// the full deferral window.
+    fn only_deferred_links(&self) -> bool {
+        self.links.keys().all(|k| self.deferred_left.contains_key(k))
+    }
+
     /// C21: any traffic from a peer cancels its declared absence.
     fn note_alive(&mut self, pid: &str) {
         if matches!(&self.away, Some((apid, _)) if apid == pid) {
@@ -2646,6 +2655,20 @@ async fn recv_cmd(
 
         // G-k completion sweep (top-of-loop): see sweep_completed_streams.
         sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
+
+        // #28 exit reconciliation: once everything is received and the only links
+        // left are ones held open purely for their deferred-drop reap (their
+        // sender's signaling left AFTER the transfer finished), there is nothing
+        // in flight to protect — exit promptly instead of paying the full
+        // FILAMENT_ADOPT_ACTIVE_MS deferral. Restores the pre-#28 prompt exit; an
+        // in-progress reconnect keeps `by_sid` non-empty and so is unaffected.
+        if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
+            && !conn.links.is_empty() && conn.only_deferred_links()
+        {
+            eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+            let _ = sio.disconnect().await;
+            return Ok(());
+        }
 
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding — if that holds quietly for the quiet-exit window (10s
