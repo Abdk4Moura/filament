@@ -14,6 +14,7 @@ Event contract (kept in sync with CONTRACT.md):
   server -> client   welcome {id,peers:[{id,name}]} · peer-joined {id,name}
                      peer-left {id} · signal {from,data}
 """
+import os
 import re
 import secrets as _secrets
 import time as _time
@@ -392,7 +393,11 @@ def register(socketio, registry):
     # sweep the space. 5 attempts/min per connection (and per client IP, so
     # reconnecting doesn't reset it) makes an exhaustive sweep of 3.7M codes
     # take years instead of the minutes the unthrottled 9,000-code space took.
-    CLAIM_LIMIT = 5
+    # FIL_CLAIM_LIMIT overrides it: the gate fixture sets it sky-high so the
+    # suite's many rapid claims never collide (the limit is a prod security
+    # control, irrelevant to a local single-tester fixture — pinning it makes
+    # the claim path DETERMINISTIC instead of timing-window-dependent).
+    CLAIM_LIMIT = int(os.environ.get("FIL_CLAIM_LIMIT", "5"))
     CLAIM_WINDOW = 60.0
     _claim_log = defaultdict(deque)  # key -> recent claim timestamps
 

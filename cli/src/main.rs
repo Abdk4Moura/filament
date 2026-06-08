@@ -795,6 +795,23 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     let mut prompted = false;
     let mut peer: Option<(String, String)> = None; // (pid, display name)
     let deadline = Instant::now() + Duration::from_secs(600); // code TTL
+    // The pairing peer left before the ceremony finished. Give a short grace
+    // for a transient reconnect, then FAIL FAST — don't orphan in the room
+    // for the full 10-min TTL (the D3/D5 divergence the monitor kept
+    // catching: creator's connect failed, it quit, claimer sat silent).
+    // Once the code is CLAIMED, the ceremony must finish in seconds. Bound it:
+    // if it hasn't completed within this budget, the peer disconnected or could
+    // never connect — fail fast instead of orphaning in the room for the full
+    // 600s TTL (the D3/D5 divergence the monitor kept catching). 60s is generous
+    // (covers a slow cross-NAT WebRTC with its 3×15s establishment retries);
+    // FILAMENT_PAIR_GRACE_SECS shortens it for gate 17b.
+    let ceremony_budget = Duration::from_secs(
+        std::env::var("FILAMENT_PAIR_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
+    );
+    let mut ceremony_deadline: Option<Instant> = None;
+    // Gate 17b hook: connect but never complete, so the ceremony budget fires
+    // deterministically (same-machine pairs otherwise finish in ~1s).
+    let stall = std::env::var("FILAMENT_TEST_PAIR_STALL").is_ok();
 
     loop {
         // Done when the petname is settled AND a secret is mutual: either we
@@ -815,6 +832,13 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         }
         if Instant::now() > deadline {
             bail!("timed out — the code was never used (codes expire after 10 minutes)");
+        }
+        // Fail fast: the code was claimed but the ceremony didn't finish in
+        // time — the peer disconnected or never connected.
+        if let Some(dl) = ceremony_deadline {
+            if Instant::now() > dl {
+                bail!("the other device disconnected or could not connect before pairing finished — make sure both run `filament pair` at the same time, then try again");
+            }
         }
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
@@ -844,9 +868,11 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             }
             Ev::PairUsed(_) => {
                 ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
+                ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
             }
             Ev::PairMatched(v) => {
                 let room = v["room"].as_str().unwrap_or_default().to_string();
+                ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
                 ui::say(&format!("  {} code accepted — connecting", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 sess.room = Some(room.clone()); // C30: desire moves with us
                 sess.touch();
@@ -883,6 +909,9 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 };
                 ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &display)));
                 peer = Some((pid.clone(), display.clone()));
+                if stall {
+                    continue; // gate 17b: connected, but deliberately never complete
+                }
                 if creator && !initiated {
                     t.send_control(&json!({ "type": "pair-keep", "secret": secret })).await?;
                     initiated = true;
@@ -926,6 +955,9 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                     petname = Some(n);
                 }
             }
+            Ev::Control(pid, v) if stall => {
+                let _ = (pid, v); // gate 17b: connected, but ignore all ceremony control
+            }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 Some("pair-keep") => {
                     let sec = v["secret"].as_str().unwrap_or_default().to_string();
@@ -961,11 +993,13 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             }
             Ev::PcState(pid, st) => conn.on_pc_state(&pid, &st).await,
             Ev::PeerLeft(v) => {
+                // A faster, friendlier signal than the ceremony budget when it
+                // arrives: the pairing peer left the room. (The budget is the
+                // hard backstop — server peer-left can lag behind a hard kill.)
                 let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
-                if conn.on_peer_left(&v) {
-                    let n = gone.unwrap_or_else(|| "they".into());
-                    ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} stepped away — holding the line (their client rejoins)")));
-                }
+                conn.on_peer_left(&v);
+                let n = gone.unwrap_or_else(|| "the other device".into());
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} disconnected — waiting briefly in case it reconnects…")));
             }
             Ev::Interrupted => bail!("interrupted"),
             _ => {}

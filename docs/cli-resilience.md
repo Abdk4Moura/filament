@@ -451,6 +451,36 @@ completion depends on a remote peer behaving. Gate 11 verifies.
 
 ## Part 4 — Standing test gates (`cli/tests/gates.sh`)
 
+> **Two tiers (2026-06-08).** The suite splits by *kind* of determinism:
+> - **CORE** (`SKIP_BROWSER=1 ./gates.sh --with-relay`) — every gate
+>   deterministic BY CONSTRUCTION (CLI-only, seeded loss, fixture-pinned).
+>   This is the commit/merge gate and must be **100%**; one green never proves
+>   it, but you can *reason* it cannot flake.
+> - **BROWSER-INTEROP** (gates 5, 6, 12, 13, 16) — real headless Chromium +
+>   real WebRTC ICE/DTLS. Timing-dependent BY NATURE; cannot be proven 100% by
+>   sampling on a contended host (prod containers + coturn + monitors + an
+>   80 MB transfer all share the box). Best-effort here; meant for a quiescent
+>   CI runner. The G-i glare under connection churn — the data channel opens
+>   (`route: local`) but bytes never complete — is a real product bug tracked
+>   for a scoped fix, NOT a test knob to tune.
+>
+> **Determinism rule (2026-06-08).** A flaky gate has a hidden dependency on
+> timing or load; the fix is to remove the dependency, never to retry (a retry
+> hides non-determinism, it doesn't eliminate it). Three load-induced flakes
+> were rooted out under deliberately-loaded "so-so" conditions:
+> - **claim rate-limit** ('slow-down'): the suite owns its fixture backend
+>   with `FIL_CLAIM_LIMIT` pinned sky-high — the 5/min limit is a prod
+>   security control, but in a test it makes rapid claims a timing lottery.
+> - **throughput floor** (8 MB/s): an absolute MB/s pass/fail *is*
+>   non-determinism (it encodes machine speed). Replaced by a correctness
+>   assertion (80 MB completes + hash) under a generous hang ceiling (240s);
+>   speed is logged, never asserted.
+> - **browser glare** (gate 6/12, the G-i flake): a CPU-starved headless
+>   Chromium dropped its socket → reconnected → triggered a stale-answer
+>   negotiation glare. `FIL_PING_TIMEOUT=120` on the fixture keeps a briefly-
+>   starved tab connected, removing the trigger. Real users aren't CPU-
+>   starved, so prod keeps the 20s default.
+
 | Gate | Covers | Status |
 |---|---|---|
 | 0 unit tests (politeness, meta, head-hash, paths, route addrs, sanitization) | #1, C2, C7 | green |

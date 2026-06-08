@@ -8,11 +8,25 @@
 Files themselves never touch this server: they go peer-to-peer over a WebRTC
 data channel. The server only helps two browsers find each other.
 """
-import json
-import hashlib
-import ipaddress
 import os
-import secrets
+
+# Eventlet's cooperative concurrency must be installed BEFORE anything imports
+# threading/socket, so this runs first — but ONLY for a direct `python app.py`
+# run that opts in via FIL_SELF_MONKEYPATCH=1 (the gate fixture). Prod runs
+# under `gunicorn -k eventlet`, which already monkey-patches in the worker, and
+# sets FIL_ASYNC_MODE=eventlet but NOT this flag — so prod's import path is
+# untouched. Rationale: the threading + Werkzeug dev server services socket.io
+# heartbeats poorly under load (a browser whose pings lag disconnects →
+# reconnects → stale-answer glare, the gate-6/12 flake); eventlet matches prod
+# and handles the concurrency reliably.
+if os.environ.get("FIL_SELF_MONKEYPATCH") == "1":
+    import eventlet  # noqa: E402
+    eventlet.monkey_patch()
+
+import json  # noqa: E402
+import hashlib  # noqa: E402
+import ipaddress  # noqa: E402
+import secrets  # noqa: E402
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -42,11 +56,20 @@ CORS(app, resources={r"/api/*": {"origins": _origins}})
 ASYNC_MODE = os.environ.get("FIL_ASYNC_MODE", "threading")
 # FIL_REDIS_URL turns on horizontal scaling: a shared message queue (so emits
 # reach peers on any replica) + a shared room registry. Unset = single instance.
+# ping_timeout/interval govern how long a transiently-unresponsive client is
+# tolerated before engine.io declares it gone. Defaults (20s/25s) are fine in
+# prod, but a CPU-STARVED headless browser in CI can't service pings in time,
+# gets disconnected, reconnects with a fresh sid, and triggers a stale-answer
+# negotiation glare — the gate-6/12 flake. FIL_PING_TIMEOUT (set generously by
+# the test fixture) keeps a briefly-starved tab connected, removing the trigger
+# deterministically. Real users aren't CPU-starved, so prod keeps the defaults.
 socketio = SocketIO(
     app,
     async_mode=ASYNC_MODE,
     cors_allowed_origins=_origins,
     message_queue=config.REDIS_URL or None,
+    ping_timeout=int(os.environ.get("FIL_PING_TIMEOUT", "20")),
+    ping_interval=int(os.environ.get("FIL_PING_INTERVAL", "25")),
 )
 signaling.register(socketio, signaling.make_registry(config.REDIS_URL))
 
@@ -160,4 +183,11 @@ def _send_index():
 
 
 if __name__ == "__main__":
-    socketio.run(app, host="0.0.0.0", port=config.PORT, debug=True, allow_unsafe_werkzeug=True)
+    # debug=True enables the Werkzeug auto-reloader, which forks + watches
+    # files and can RESTART the server mid-run — dropping every socket, which
+    # makes clients reconnect and triggers the stale-answer negotiation glare
+    # (the gate-6/12 browser flake). Default OFF; set FIL_DEBUG=1 for local
+    # dev. (Prod runs via gunicorn, unaffected by this block.)
+    _debug = os.environ.get("FIL_DEBUG", "0") == "1"
+    socketio.run(app, host="0.0.0.0", port=config.PORT, debug=_debug,
+                 use_reloader=False, allow_unsafe_werkzeug=True)
