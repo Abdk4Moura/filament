@@ -2512,6 +2512,9 @@ async fn recv_cmd(
             }
         }
 
+        // G-k completion sweep (top-of-loop): see sweep_completed_streams.
+        sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
+
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding — if that holds quietly for the quiet-exit window (10s
         // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
@@ -3013,6 +3016,14 @@ async fn recv_cmd(
                     t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
                 }
                 Some("file-end") => {
+                    // Test hook (gate 18 standalone repro): drop the file-end
+                    // control frame so a fully-received stream is stranded in
+                    // by_sid — mirrors a sender whose PC tears down before the
+                    // best-effort file-end is delivered. The G-k completion
+                    // sweep must then finalize it on size and quiet-exit.
+                    if std::env::var("FILAMENT_TEST_DROP_FILE_END").is_ok() {
+                        continue;
+                    }
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     if let Some(mut inc) = by_sid.remove(&(pid.clone(), sid)) {
                         inc.file.flush().await?;
@@ -3020,32 +3031,10 @@ async fn recv_cmd(
                             completed += 1;
                             continue;
                         }
-                        drop(inc.file);
                         let rename_to = if completed == 0 { output.clone() } else { None };
-                        let final_path = unique_path(&dir, rename_to.as_deref().unwrap_or(&inc.name));
-                        if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
-                            // C23: a duplicate stream's partial may already be
-                            // finalized — discard quietly instead of dying.
-                            ui::say(&ui::paint(ui::Tone::Dim, &format!("  (stream for {} already finalized — duplicate discarded: {e})", inc.name)));
-                            continue;
-                        }
-                        let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
-                        let ok = inc.received == inc.size;
-                        inc.bar.done(inc.received);
-                        let shown = final_path.display().to_string();
-                        ui::say(&format!(
-                            "    {} {}{}",
-                            ui::paint(ui::Tone::Dim, ui::glyph_arrow()),
-                            ui::link(&format!("file://{shown}"), &shown),
-                            if ok { String::new() } else { ui::paint(ui::Tone::Err, "  SIZE MISMATCH") },
-                        ));
-                        completed += 1;
-                        if daemon {
-                            use std::io::Write as _;
-                            let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(up_log()) {
-                                let _ = writeln!(f, "{}  {}  {}  from {}", chrono_now(), inc.name, human(inc.received), from);
-                            }
+                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                            completed += 1;
                         }
                     }
                 }
@@ -3150,13 +3139,21 @@ async fn recv_cmd(
             // after a successful transfer it's just closure (the quiet-exit
             // prints the same `done (N files).` the peer-left path would).
             Ev::Stuck(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open && completed == 0 {
-                    bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open {
+                    // G-k: the dropped link may have delivered every byte but
+                    // lost its file-end — finalize before deciding it's fatal.
+                    sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
+                    if completed == 0 {
+                        bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                    }
                 }
             }
             Ev::GraceExpired(pid, generation) => {
-                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open && completed == 0 {
-                    bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                if conn.on_stuck(&pid, generation, "lost").await? && paired && !keep_open {
+                    sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
+                    if completed == 0 {
+                        bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
+                    }
                 }
             }
             Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
@@ -3201,6 +3198,93 @@ async fn recv_cmd(
             _ => {}
         }
     }
+}
+
+/// Finalize a fully-received incoming file: flush, rename `.part` → final,
+/// clean up the meta sidecar, and (in daemon mode) append to the upload log.
+/// Returns true if the file was placed (so the caller bumps `completed`).
+/// Shared by the file-end control-frame path and the G-k completion sweep —
+/// the two must not drift. `daemon`/`from_name` drive only the daemon log.
+async fn finalize_incoming(
+    mut inc: IncomingFile,
+    dir: &Path,
+    rename_to: Option<&str>,
+    daemon: bool,
+    from_name: &str,
+) -> Result<bool> {
+    inc.file.flush().await?;
+    drop(inc.file);
+    let final_path = unique_path(dir, rename_to.unwrap_or(&inc.name));
+    if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
+        // C23: a duplicate stream's partial may already be finalized — discard
+        // quietly instead of dying.
+        ui::say(&ui::paint(ui::Tone::Dim, &format!("  (stream for {} already finalized — duplicate discarded: {e})", inc.name)));
+        return Ok(false);
+    }
+    let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
+    let ok = inc.received == inc.size;
+    inc.bar.done(inc.received);
+    let shown = final_path.display().to_string();
+    ui::say(&format!(
+        "    {} {}{}",
+        ui::paint(ui::Tone::Dim, ui::glyph_arrow()),
+        ui::link(&format!("file://{shown}"), &shown),
+        if ok { String::new() } else { ui::paint(ui::Tone::Err, "  SIZE MISMATCH") },
+    ));
+    if daemon {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(up_log()) {
+            let _ = writeln!(f, "{}  {}  {}  from {}", chrono_now(), inc.name, human(inc.received), from_name);
+        }
+    }
+    Ok(true)
+}
+
+/// G-k completion sweep: file-end delivery is best-effort. A stream can
+/// receive every expected byte yet have its file-end LOST when the sender's
+/// PeerConnection tears down first (observed under load). The bytes are whole
+/// (held in `inc.received`; `finalize_incoming` flushes the BufWriter before
+/// rename so the on-disk file is complete), but the stream is stranded in
+/// `by_sid` with no live link to ever deliver file-end — and that non-empty
+/// `by_sid` plus `completed == 0` blocks the quiet-exit while the dead link
+/// spins through the reconnect-retry loop to the 120s ceiling. Finalize any
+/// fully received stream whose link is gone. `received == size` is exactly the
+/// bar the file-end handler itself checks, so this can never claim a genuine
+/// partial (received < size stays parked for resume — gate 2) and never
+/// touches the offer-stage corruption guard (gate 3). Called both at top-of-
+/// loop and right after a link is dropped in the Stuck/GraceExpired handlers,
+/// so the bail on `completed == 0` sees the finalized file.
+async fn sweep_completed_streams(
+    by_sid: &mut HashMap<(String, u32), IncomingFile>,
+    conn: &Conn,
+    dir: &Path,
+    output: &Option<String>,
+    to_stdout: bool,
+    daemon: bool,
+    completed: &mut usize,
+) -> Result<()> {
+    let done_sids: Vec<(String, u32)> = by_sid
+        .iter()
+        .filter(|((pid, _), inc)| inc.received == inc.size && !conn.links.contains_key(pid))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in done_sids {
+        if let Some(mut inc) = by_sid.remove(&key) {
+            if to_stdout {
+                // Parity with the file-end handler: flush before counting it,
+                // since dropping a tokio BufWriter does not async-flush.
+                let _ = inc.file.flush().await;
+                *completed += 1;
+                continue;
+            }
+            let rename_to = if *completed == 0 { output.clone() } else { None };
+            ui::say(&ui::paint(ui::Tone::Dim, &format!("  ({} fully received — sender left before file-end; finalizing)", inc.name)));
+            if finalize_incoming(inc, dir, rename_to.as_deref(), daemon, "").await? {
+                *completed += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Park in-flight receives: flush buffers so the .part files are complete up
