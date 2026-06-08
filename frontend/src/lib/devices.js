@@ -36,6 +36,37 @@ export function devicesStore(name, secret) {
   return list
 }
 
+/// L1-a (spec §8): store a v2 device record with its agreed capability set.
+/// Grows the record with `v` and `caps` (deny-by-default; "transfer" is the L0
+/// baseline). The {name, secret} fields are unchanged so the reconnect path
+/// (devicesLoad / channelOf / proofFor) keeps working byte-for-byte.
+export function devicesStoreV2(name, secret, caps) {
+  const list = devicesLoad().filter((d) => d.secret !== secret)
+  list.push({ name, secret, v: 2, caps: caps || ['transfer'], addedAt: Date.now() })
+  try {
+    localStorage.setItem(KEY, JSON.stringify(list))
+  } catch (e) {
+    console.warn('filament: could not persist known device (private browsing?)', e)
+  }
+  return list
+}
+
+/// L1-a (spec §8): a device's granted capabilities. v1 records (no caps) read
+/// as ["transfer"] for back-compat. Returns null if the device isn't known.
+export function deviceCaps(name) {
+  const d = devicesLoad().find((x) => x.name === name)
+  if (!d) return null
+  return Array.isArray(d.caps) ? d.caps : ['transfer']
+}
+
+/// L1-a (spec §8 / gate 5): deny-by-default capability check. "transfer" is the
+/// always-allowed L0 baseline; future caps must be explicitly granted.
+export function deviceAllows(name, capability) {
+  if (capability === 'transfer') return true
+  const caps = deviceCaps(name)
+  return !!caps && caps.includes(capability)
+}
+
 export function devicesForget(name) {
   const list = devicesLoad().filter((d) => d.name !== name)
   try {

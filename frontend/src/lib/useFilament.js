@@ -12,7 +12,9 @@ import { createSession } from './session.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
-import { devicesLoad, devicesStore, devicesForget, channelOf, proofFor } from './devices.js'
+import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, channelOf, proofFor } from './devices.js'
+import { mintWords, mintNameplate } from './words.js'
+import { pakeReady, PakePairing, parseSpokenCode, PAIR_V2_CAPS } from './pairing.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the server's
 // one-time codes (backend/signaling.py — keep in sync). 4,096 combinations
@@ -199,6 +201,19 @@ export function useFilament() {
   // unreciprocated secret is exactly the one-sided dead weight C12 cured).
   const [pendingKeeps, setPendingKeeps] = useState([]) // [{peerId, name, secret}]
 
+  // ---- L1-a PAKE v2 pairing state -----------------------------------------
+  // The pending v2 pairing config (nameplate + locally-held password) set when
+  // we create/claim a code; consumed once we land in the paired room and a link
+  // comes up. The active PakePairing runs SPAKE2 over the `signal` relay.
+  const pakeReadyRef = useRef(false)
+  const pendingPakeRef = useRef(null) // { nameplate, password } awaiting a peer
+  const pakeRef = useRef(null) // active PakePairing for the current peer
+  const pakePeerRef = useRef(null) // peer sid we run the PAKE with
+  const [pairStatus, setPairStatus] = useState(null) // 'pairing' | 'paired' | 'refused' | error string
+  // Drive the active pairing one step (idempotent): send our element, then the
+  // confirm once K + fingerprints exist; finalize on success/abort.
+  const drivePakeRef = useRef(() => {})
+
   const acceptKeep = useCallback((peerId) => {
     setPendingKeeps((prev) => {
       const k = prev.find((x) => x.peerId === peerId)
@@ -261,6 +276,12 @@ export function useFilament() {
         // headed to this same device (matched by its stable uid).
         onChannelOpen: () => {
           attemptsRef.current.delete(id) // established — reset watchdog retries
+          // L1-a: a v2 pairing is in flight for this peer — now that SDP (and
+          // thus the DTLS fingerprints) is exchanged, run the SPAKE2 ceremony.
+          if (pendingPakeRef.current) {
+            ensurePakePairing(id)
+            drivePake()
+          }
           // C20: if this peer was introduced via a known-device channel, prove
           // we hold the secret — bound to THIS link's DTLS fingerprints. Both
           // sides do this (mutual acknowledgement), each verifies the other.
@@ -289,7 +310,18 @@ export function useFilament() {
         },
         // C12/C27: the peer asked to be remembered. That's a trust grant —
         // queue it for the HUMAN; the banner answers with pair-keep-ack.
+        // L1-a downgrade-refusal (spec §6.1): if WE are mid v2 pairing, a
+        // pair-keep means the peer is a legacy v1 client. Refuse — secure
+        // first-pairing requires v2 on both ends. We NEVER store a
+        // server-readable secret on the v2 path, so a server stripping v:2
+        // cannot force this downgrade.
         onPairKeep: (secret) => {
+          if (pendingPakeRef.current) {
+            tel('pake-refuse-v1-peer', { peer: id.slice(-6) })
+            setPairStatus('the other device uses an older version and cannot pair securely — update it. Nothing was stored.')
+            link.sendPairKeepAck(false)
+            return
+          }
           tel('pair-keep-offered', { peer: id.slice(-6) })
           setPendingKeeps((prev) => (prev.some((k) => k.peerId === id) ? prev : [...prev, { peerId: id, name, secret }]))
         },
@@ -514,6 +546,17 @@ export function useFilament() {
         }
       })
       sig.on('signal', ({ from, data }) => {
+        // L1-a: PAKE messages ride the opaque `signal` relay. If we have a
+        // pending v2 pairing, route pake-msg/pake-confirm into the PAKE machine
+        // (creating the PakePairing on first contact) — OUT of the WebRTC path.
+        if (data?.type === 'pake-msg' || data?.type === 'pake-confirm') {
+          ensurePakePairing(from)
+          if (pakeRef.current && pakePeerRef.current === from) {
+            pakeRef.current.onSignal(data)
+            drivePake()
+          }
+          return
+        }
         let link = linksRef.current.get(from)
         if (!link) {
           // Only an incoming offer may create a new link — ignore stray answers/
@@ -645,9 +688,75 @@ export function useFilament() {
   // pair-matched to BOTH parties and the code is burned forever.
   const rejoinRef = useRef(null)
 
-  const pairWithCode = useCallback((code) => {
+  // L1-a: finalize a completed PakePairing — store the device under K-derived
+  // secret with its agreed caps, or surface the refusal. Idempotent.
+  const finalizePake = useCallback(() => {
+    const p = pakeRef.current
+    if (!p) return
+    if (p.secret) {
+      const peerId = pakePeerRef.current
+      const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
+      setKnownDevices(devicesStoreV2(name, p.secret, p.caps))
+      subscribeKnown()
+      tel('pake-paired', { peer: String(peerId).slice(-6) })
+      setPairStatus('paired')
+      pakeRef.current = null
+      pendingPakeRef.current = null
+    } else if (p.aborted) {
+      tel('pake-refused', { why: p.aborted })
+      setPairStatus(`pairing refused: ${p.aborted}`)
+      pakeRef.current = null
+      pendingPakeRef.current = null
+    }
+  }, [subscribeKnown])
+
+  // L1-a: lazily create the PakePairing for `peerId` from the pending config
+  // (set by generateCode/pairWithCode). Binds the SPAKE2 session to THIS peer.
+  const ensurePakePairing = useCallback((peerId) => {
+    if (pakeRef.current && pakePeerRef.current === peerId) return pakeRef.current
+    const cfg = pendingPakeRef.current
+    if (!cfg || !pakeReadyRef.current) return null
+    pakePeerRef.current = peerId
+    pakeRef.current = new PakePairing({
+      nameplate: cfg.nameplate,
+      password: cfg.password,
+      caps: PAIR_V2_CAPS,
+      sendSignal: (payload) => sigRef.current?.signal(peerId, payload),
+      getFingerprints: () => linksRef.current.get(peerId)?.fingerprints() || null,
+    })
+    setPairStatus('pairing')
+    return pakeRef.current
+  }, [])
+
+  // L1-a: drive the active pairing one step (idempotent). Called when a link
+  // comes up, on each inbound PAKE signal, and from a short poll for the
+  // fingerprint-dependent confirm step.
+  const drivePake = useCallback(() => {
+    const p = pakeRef.current
+    if (!p) return
+    if (!p.aborted && !p.secret) {
+      p.sendOurMessage()
+      p.tryConfirm()
+    }
+    finalizePake()
+  }, [finalizePake])
+  drivePakeRef.current = drivePake
+
+  const pairWithCode = useCallback(async (code) => {
     const clean = String(code).trim()
-    if (clean) sigRef.current?.pairClaim(clean)
+    if (!clean) return
+    // L1-a (PAKE v2): parse the typed code CLIENT-SIDE; send ONLY the nameplate
+    // to the server. The password (words) feeds SPAKE2 and never leaves here.
+    await pakeReady()
+    pakeReadyRef.current = true
+    const { nameplate, password } = parseSpokenCode(clean)
+    if (!nameplate || !password) {
+      setPairStatus('that code does not look right — expected e.g. brave-otter-ruby-3141')
+      return
+    }
+    pendingPakeRef.current = { nameplate, password }
+    setPairStatus('pairing')
+    sigRef.current?.pairClaimV2(nameplate)
   }, [])
 
   // Mint a single-use speakable code (or register a chosen keyword). We STAY in
@@ -681,8 +790,22 @@ export function useFilament() {
         return null
       }
     }
+    // L1-a (PAKE v2): mint the WORDS locally; the server allocates ONLY the
+    // numeric nameplate. The full code is assembled+displayed from our OWN mint
+    // when pair-ok arrives (the server never echoes any words).
+    await pakeReady()
+    pakeReadyRef.current = true
     return new Promise((resolve) => {
       let retried = false
+      const mintAndCreate = () => {
+        const words = mintWords()
+        const nameplate = mintNameplate()
+        const full = `${words}-${nameplate}`
+        // Stash the password so the eventual peer can run SPAKE2 with us.
+        pendingPakeRef.current = { nameplate, password: words, full }
+        sig.pairCreateV2(nameplate)
+        return full
+      }
       const arm = () =>
         setTimeout(() => {
           if (!retried) {
@@ -691,7 +814,7 @@ export function useFilament() {
             sig.reconnect?.()
             waitUp(6000).then(() => {
               watchdog = arm()
-              sig.pairCreate(kw)
+              mintAndCreate()
             })
           } else {
             tel('pair-create-timeout', { afterMs: Date.now() - t0 })
@@ -700,17 +823,23 @@ export function useFilament() {
           }
         }, 5000)
       let watchdog = arm()
-      sig.on('pair-code', function onCode({ code }) {
+      // Collision: the server says our nameplate is taken — re-mint and retry.
+      sig.on('pair-error', function onTaken({ error }) {
+        if (error === 'taken') mintAndCreate()
+      })
+      sig.on('pair-ok', function onOk() {
         clearTimeout(watchdog)
-        tel('pair-create-ok', { rttMs: Date.now() - t0, retried })
-        setRoomCode(code)
+        const full = pendingPakeRef.current?.full
+        tel('pair-create-ok', { rttMs: Date.now() - t0, retried, v: 2 })
+        setRoomCode(full)
+        setPairStatus('pairing')
         setRoomScope((s) => {
           if (s !== 'code') prevScopeRef.current = s
           return 'code'
         })
-        resolve(code)
+        resolve(full)
       })
-      sig.pairCreate(kw)
+      mintAndCreate()
     })
   }, [])
 

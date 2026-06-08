@@ -40,6 +40,8 @@ clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
 flate2 = "1.1.9"
 qrcode = { version = "0.14.1", default-features = false }
+# L1-a: the shared SPAKE2 PAKE core (also compiles to wasm for the browser).
+filament-pake = { path = "../pake" }
 
 [profile.release]
 lto = true

@@ -367,6 +367,15 @@ def register(socketio, registry):
     # -- one-time pairing (#11): say the code aloud; it works exactly once. --
     PAIR_TTL = 600  # unclaimed codes evaporate after 10 minutes
 
+    # L1-a (PAKE v2): a v:2 client mints the WORDS locally and asks the server
+    # to allocate only the NAMEPLATE (the numeric routing suffix). The server
+    # NEVER sees or generates the words — the entire MITM-resistance claim rests
+    # on this (spec §2.0). A v2 nameplate is validated to be purely numeric so a
+    # client can never smuggle words into it; the server stores ONLY that
+    # nameplate and never echoes any code back (the creator displays its own
+    # locally-assembled `words-nameplate`).
+    _NAMEPLATE_RE = re.compile(r"^[0-9]{3,5}$")
+
     @socketio.on("pair-create")
     def on_pair_create(data=None):
         sid = request.sid
@@ -376,7 +385,33 @@ def register(socketio, registry):
         # failure observed live).
         if hasattr(registry, "refresh"):
             registry.refresh([sid])
-        keyword = _norm_code((data or {}).get("keyword"))
+        data = data or {}
+        # GATE 6 fixture hook (downgrade-refused): FIL_FORCE_V1 makes the server
+        # behave like a malicious/legacy relay that STRIPS the v:2 flag — it
+        # ignores `v` and falls into the v1 word-minting branch. A v2 client must
+        # REFUSE this (it gets a legacy `pair-code` instead of `pair-ok` and
+        # aborts with "update to pair securely"). Pinned like FIL_CLAIM_LIMIT so
+        # prod is untouched.
+        force_v1 = os.environ.get("FIL_FORCE_V1") == "1"
+        # --- v2 path: nameplate-only allocation, no words ever cross the wire.
+        if data.get("v") == 2 and not force_v1:
+            nameplate = _norm_code(data.get("nameplate"))
+            if not _NAMEPLATE_RE.match(nameplate):
+                # Defense-in-depth: reject anything that isn't a bare number so
+                # a buggy/malicious v2 client can't park words server-side.
+                emit("pair-error", {"error": "bad-nameplate"})
+                return
+            if registry.pair_create(nameplate, sid, ttl=PAIR_TTL):
+                # NO words echoed; the creator shows its OWN minted full code.
+                _tel("pair-create", sid=sid, nameplate=nameplate, v=2,
+                     in_room=bool(registry.room_of(sid)), leased=registry.meta(sid) is not None)
+                emit("pair-ok", {"nameplate": nameplate, "ttl": PAIR_TTL, "v": 2})
+                return
+            # Collision: the client re-mints a fresh nameplate and retries.
+            emit("pair-error", {"error": "taken"})
+            return
+        # --- v1 path (unchanged): server mints the whole adj-animal-NNN code.
+        keyword = _norm_code(data.get("keyword"))
         for _ in range(4):
             code = keyword or _mint_pair_code()
             if registry.pair_create(code, sid, ttl=PAIR_TTL):
@@ -419,7 +454,18 @@ def register(socketio, registry):
         if not _claim_allowed(request.sid):
             emit("pair-error", {"error": "slow-down"})
             return
-        code = _norm_code((data or {}).get("code"))
+        data = data or {}
+        # L1-a (PAKE v2): a v:2 claimer sends ONLY the nameplate — the password
+        # (words) NEVER reaches the server (relay-blind, gate 2). The full typed
+        # code is split CLIENT-SIDE; only the numeric nameplate is the rendezvous
+        # selector here. For v1 clients the whole `code` is still the selector.
+        if data.get("v") == 2:
+            code = _norm_code(data.get("nameplate"))
+            if not _NAMEPLATE_RE.match(code):
+                emit("pair-error", {"error": "invalid", "why": "bad-nameplate"})
+                return
+        else:
+            code = _norm_code(data.get("code"))
         existed, peek_creator, creator_alive = registry.peek_pair(code) if code else (False, None, False)
         creator = registry.pair_claim(code) if code else None
         room = registry.room_of(creator) if creator else None

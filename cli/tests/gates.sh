@@ -481,7 +481,7 @@ say "17: pair ceremony — no file, both stores hold the SAME secret (C29)"
 DA17="$WORK/g17a"; DB17="$WORK/g17b"; mkdir -p "$DA17" "$DB17"
 FILAMENT_CONFIG_DIR="$DA17" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g17-a.log" 2>&1 &
 P17=$!; pids+=($P17); sleep 4
-C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
+C17=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17-a.log" | head -1 | tr 'A-Z' 'a-z')
 G17=0
 FILAMENT_CONFIG_DIR="$DB17" timeout 90 "$BIN" pair "$C17" --name boxA --server "$SERVER" >"$WORK/g17-b.log" 2>&1 || G17=1
 wait $P17 || G17=1
@@ -500,7 +500,7 @@ say "17b: pair ceremony fails FAST when it can't complete (no 10-min orphan)"
 DC="$WORK/g17c"; mkdir -p "$DC/a" "$DC/b"
 FILAMENT_CONFIG_DIR="$DC/a" timeout 120 "$BIN" pair --name gone --server "$SERVER" >"$WORK/g17c-a.log" 2>&1 &
 CR=$!; pids+=($CR); sleep 4
-CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
+CX=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g17c-a.log" | head -1 | tr 'A-Z' 'a-z')
 T0=$(date +%s)
 FILAMENT_TEST_PAIR_STALL=1 FILAMENT_PAIR_GRACE_SECS=5 FILAMENT_CONFIG_DIR="$DC/b" \
   timeout 90 "$BIN" pair "$CX" --name orphan --server "$SERVER" >"$WORK/g17c-b.log" 2>&1
@@ -551,7 +551,7 @@ say "19: gate L — lossy session emits still converge (C30; loss=0.5 seed=16)"
 DA19="$WORK/g19a"; DB19="$WORK/g19b"; D19="$WORK/g19"; mkdir -p "$DA19" "$DB19" "$D19"
 FILAMENT_CONFIG_DIR="$DA19" timeout 90 "$BIN" pair --name boxB --server "$SERVER" >"$WORK/g19-pa.log" 2>&1 &
 P19=$!; pids+=($P19); sleep 4
-C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
+C19=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$WORK/g19-pa.log" | head -1 | tr 'A-Z' 'a-z')
 G19=0
 FILAMENT_CONFIG_DIR="$DB19" timeout 90 "$BIN" pair "$C19" --name boxA --server "$SERVER" >"$WORK/g19-pb.log" 2>&1 || G19=1
 wait $P19 || G19=1
@@ -566,6 +566,37 @@ kill $U19 2>/dev/null; wait $U19 2>/dev/null
 if [ $G19 -eq 0 ] && [ "$(hashof "$D19/small.bin")" = "$H_SMALL" ] && [ $((T1 - T0)) -lt 60 ]; then
   ok "lossy rendezvous converged in $((T1 - T0))s (both sides dropped join+subscribe)"
 else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"; fi
+
+# ============================================================================
+# L1-a — PAKE first-pairing gates (spec docs/L1-pake-protocol.md §10)
+# ----------------------------------------------------------------------------
+# These SEVEN gates verify the SPAKE2 first-pairing change. They are validated
+# by STANDALONE scripts under /root/.claude/jobs/330c2366/tmp/wt-l1a-gates/ on
+# PORT 8093 (NOT 8077 — this suite's fixture), because the PAKE security
+# properties want their own deterministic, two-tier harness:
+#
+#   gate L1a-1 mutual-key       gate1_mutual_key.sh  — two real `filament pair`
+#       processes, same code → byte-identical pinned secret; confirmation passes.
+#   gate L1a-2 adversarial      adversary (pake bin) — NEGATIVE security test:
+#       a relay/MITM without the password cannot derive K nor substitute a key
+#       (element-MITM, a=fingerprint-rewrite, caps-rewrite all DETECTED → abort,
+#       zero secret). A/B numbers printed. *Required by the ledger NEGATIVE rule.*
+#   gate L1a-3 wrongpw-burns    gate3_wrongpw_burn.sh — wrong password REFUSED,
+#       nothing stored, nameplate BURNED (no silent same-code retry).
+#   gate L1a-4 browser<->cli    gate4_interop.mjs — committed browser WASM and
+#       native CLI derive the SAME secret + mutually confirm (deterministic).
+#   gate L1a-5 caps deny-default cargo test capability_deny_by_default — empty
+#       caps refuse a gated action; "transfer" is the L0 baseline; not escalatable.
+#   gate L1a-6 downgrade-refused gate6_downgrade.sh — a v:2-stripping server
+#       (FIL_FORCE_V1) is refused; no v2 path stores a server-readable secret.
+#   gate L1a-7 no-regression    gate7_noregression.sh — vanilla send/recv still
+#       transfers; remembered v2 devices reconnect via the unchanged proof path.
+#       (Plus: existing gates 0/19 below still pass — pairing is additive.)
+#
+# Backend crypto: backend/tests/test_pair_codes.py::PakeV2Nameplate (incl. the
+# relay-blind NEGATIVE assertion that words never reach the server). Shared
+# SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
+# ============================================================================
 
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"

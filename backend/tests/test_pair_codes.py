@@ -142,5 +142,118 @@ class ClaimRateLimit(unittest.TestCase):
         )
 
 
+class PakeV2Nameplate(unittest.TestCase):
+    """L1-a: a v:2 client mints the WORDS locally; the server only allocates and
+    matches the numeric NAMEPLATE and NEVER sees the words (spec §2.0). This is
+    the structural foundation of the relay-blind / gate-2 security claim."""
+
+    def _server(self):
+        from flask import Flask
+        from flask_socketio import SocketIO
+
+        app = Flask(__name__)
+        sio = SocketIO(app, async_mode="threading")
+        # Pin the claim limit high so the test's rapid claims are deterministic.
+        import os
+        os.environ["FIL_CLAIM_LIMIT"] = "1000000"
+        signaling.register(sio, signaling._MemRegistry())
+        return app, sio
+
+    def test_v2_create_allocates_nameplate_no_words(self):
+        app, sio = self._server()
+        c = sio.test_client(app)
+        c.get_received()
+        # Creator must be in a room (real flow joins a solo room first).
+        c.emit("join", {"room": "solo-x", "name": "a", "uid": "ua"})
+        c.get_received()
+        c.emit("pair-create", {"nameplate": "4242", "v": 2})
+        evs = [e for e in c.get_received()]
+        names = {e["name"] for e in evs}
+        self.assertIn("pair-ok", names, f"v2 create must ack pair-ok, got {names}")
+        ok = next(e for e in evs if e["name"] == "pair-ok")["args"][0]
+        self.assertEqual(ok["nameplate"], "4242")
+        # CRITICAL: the ack carries NO words / no full code field.
+        self.assertNotIn("code", ok, "v2 ack must not echo any code/words")
+
+    def test_v2_create_rejects_words_in_nameplate(self):
+        app, sio = self._server()
+        c = sio.test_client(app)
+        c.get_received()
+        c.emit("join", {"room": "solo-y", "name": "a", "uid": "ua"})
+        c.get_received()
+        # A malicious/buggy v2 client tries to park words in the nameplate.
+        c.emit("pair-create", {"nameplate": "brave-otter-314", "v": 2})
+        errs = [e["args"][0]["error"] for e in c.get_received() if e["name"] == "pair-error"]
+        self.assertEqual(errs, ["bad-nameplate"], "non-numeric nameplate must be refused")
+
+    def test_v2_claim_relay_blind(self):
+        """The end-to-end relay-blind property (gate 2 foundation, ledger NEGATIVE
+        rule): across a full v2 create+claim the WORDS never reach the server —
+        not in any received event payload, not in the server's TEL telemetry.
+        Asserted, not argued."""
+        import io
+        import json as _json
+        from contextlib import redirect_stdout
+
+        app, sio = self._server()
+        # Capture everything the server logs (TEL lines) during the exchange.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            creator = sio.test_client(app)
+            creator.get_received()
+            creator.emit("join", {"room": "solo-z", "name": "creator", "uid": "uc"})
+            creator.get_received()
+            creator.emit("pair-create", {"nameplate": "5151", "v": 2})
+            creator_evs = creator.get_received()  # pair-ok
+
+            claimer = sio.test_client(app)
+            claimer.get_received()
+            claimer.emit("join", {"room": "claimer-solo", "name": "claimer", "uid": "uk"})
+            claimer.get_received()
+            # The user TYPED "brave-otter-ruby-5151"; the client split it and sent
+            # ONLY the nameplate. The words must never appear server-side.
+            claimer.emit("pair-claim", {"nameplate": "5151", "v": 2})
+            claimer_evs = claimer.get_received()
+            creator_evs2 = creator.get_received()  # pair-used now arrives
+
+        creator_evs = creator_evs + creator_evs2
+        cl_names = [e["name"] for e in claimer_evs]
+        self.assertIn("pair-matched", cl_names, f"claimer should be matched, got {cl_names}")
+        self.assertIn("pair-used", {e["name"] for e in creator_evs}, "creator told code was used")
+
+        # The corpus the server saw: its TEL log + every payload it sent back.
+        server_saw = buf.getvalue() + _json.dumps(creator_evs) + _json.dumps(claimer_evs)
+
+        # NEGATIVE ASSERTION: no wordlist token (the password) appears anywhere.
+        words = set(signaling._ADJ) | set(signaling._ANIMAL)
+        # The frontend's EXTRA list (colors) — mirror it here for completeness.
+        words |= {"azure", "cobalt", "coral", "crimson", "emerald", "hazel", "indigo",
+                  "ivory", "jade", "lilac", "olive", "rose", "ruby", "scarlet", "teal", "violet"}
+        leaked = sorted(w for w in words if w in server_saw)
+        self.assertEqual(leaked, [], f"PASSWORD LEAKED to the server: {leaked}")
+        # And no generic "word-word" pattern (a password shape) anywhere.
+        self.assertNotRegex(server_saw, r"[a-z]{3,8}-[a-z]{3,8}-[a-z]{3,8}",
+                            "a multi-word password shape leaked server-side")
+
+    def test_v2_burn_once(self):
+        app, sio = self._server()
+        creator = sio.test_client(app)
+        creator.get_received()
+        creator.emit("join", {"room": "rs", "name": "creator", "uid": "uc"})
+        creator.get_received()
+        creator.emit("pair-create", {"nameplate": "6262", "v": 2})
+        creator.get_received()
+        a = sio.test_client(app); a.get_received()
+        a.emit("join", {"room": "as", "name": "a", "uid": "ua"}); a.get_received()
+        a.emit("pair-claim", {"nameplate": "6262", "v": 2})
+        self.assertIn("pair-matched", {e["name"] for e in a.get_received()})
+        # Second claim of the same nameplate finds nothing — burned.
+        b = sio.test_client(app); b.get_received()
+        b.emit("join", {"room": "bs", "name": "b", "uid": "ub"}); b.get_received()
+        b.emit("pair-claim", {"nameplate": "6262", "v": 2})
+        errs = [e["args"][0]["error"] for e in b.get_received() if e["name"] == "pair-error"]
+        self.assertEqual(errs, ["invalid"], "a burned nameplate must not re-match")
+
+
 if __name__ == "__main__":
     unittest.main()
