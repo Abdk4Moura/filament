@@ -1095,6 +1095,25 @@ impl Conn {
         self.links.get(pid).and_then(|l| l.transport.clone())
     }
 
+    /// #28: is the link keyed by `pid` actively moving transfer bytes right now?
+    /// The data channel is independent of the signaling socket, so when a
+    /// same-uid reconnect arrives as a new sid, superseding must NOT tear down
+    /// an old link that's still flowing. A frozen-alive peer (gate 11's
+    /// SIGSTOP'd receiver) stops stamping activity, so it reads as not-flowing
+    /// and the supersede proceeds as before. Threshold is overridable for
+    /// deterministic gating (FILAMENT_ADOPT_ACTIVE_MS); the 3 s default sits
+    /// well above a healthy sub-100 ms inter-frame gap so a transient ICE blip
+    /// can't masquerade as idle and let a spurious supersede through.
+    fn link_flowing(&self, pid: &str) -> bool {
+        let threshold = std::env::var("FILAMENT_ADOPT_ACTIVE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(3000);
+        self.transport_of(pid)
+            .map(|t| t.idle_ms() < threshold)
+            .unwrap_or(false)
+    }
+
     /// May this peer become the TRANSFER TARGET? (Filters gate targeting,
     /// never answering — every peer still gets a polite link.)
     fn targetable(&self, name: &str, peer_uid: Option<&str>) -> bool {
@@ -1135,6 +1154,16 @@ impl Conn {
             .find(|(sid, l)| l.uid.is_some() && l.uid == peer_uid && **sid != peer_id)
             .map(|(sid, _)| sid.clone());
         if let Some(old_sid) = stale {
+            // #28: the same device reconnected its signaling socket (fresh sid).
+            // If its existing data channel is still flowing, the reconnect is
+            // cosmetic — superseding would tear down an active transfer. Keep the
+            // old link; once it goes idle a later roster/presence event supersedes.
+            if self.link_flowing(&old_sid) {
+                // Observable so a gate can assert the keep happened (true
+                // positive), not merely that no supersede line appeared.
+                eprintln!("{name} reconnected — keeping active link");
+                return Ok(self.is_active(&old_sid));
+            }
             eprintln!("{name} reconnected — superseding old link");
             let was_active = self.is_active(&old_sid);
             let secret = self.links.get(&old_sid).and_then(|l| l.expected_secret.clone());
@@ -1313,6 +1342,14 @@ impl Conn {
     /// the recovery). Returns true if the ACTIVE peer left.
     fn on_peer_left(&mut self, v: &Value) -> bool {
         let Some(pid) = v["id"].as_str() else { return false };
+        // NOTE (#28): we deliberately do NOT skip the drop for a "still-flowing"
+        // link here. peer-left is one-shot, and a hard-killed peer's data
+        // channel reads as flowing for a beat (last write stamped just before
+        // the kill, DTLS death not yet detected) — swallowing its only peer-left
+        // would strand the sender on a dead link forever (gate 2 hang). The
+        // same-uid SUPERSEDE path (maybe_adopt) is where #28 is actually fixed:
+        // a live reconnect arrives as a new sid and the flowing old link is kept
+        // there; the browser keep-connected half (a55e494) mirrors it.
         self.roster.remove(pid);
         if !self.links.contains_key(pid) {
             return false;

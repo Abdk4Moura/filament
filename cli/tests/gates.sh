@@ -324,7 +324,12 @@ fi
 # --------------------------------------------------------------- gate 11 ----
 say "11: same-uid rejoin supersede (C6) — frozen receiver replaced by same device"
 W="g11-$$-$RANDOM"; D="$WORK/g11"; mkdir -p "$D"
-"$BIN" send "$BIG" --word "$W" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
+# #28: the same-uid supersede now only fires for an IDLE link — an actively
+# flowing one is preserved (a live signaling reconnect must not tear down a
+# transfer). A frozen receiver goes idle, so it still supersedes; we pin the
+# idle threshold low and sleep past it after the freeze to keep that
+# deterministic regardless of how fast the replacement joins.
+FILAMENT_ADOPT_ACTIVE_MS=500 "$BIN" send "$BIG" --word "$W" --server "$SERVER" >"$WORK/g11-send.log" 2>&1 &
 SP=$!; pids+=($SP); sleep 3
 FILAMENT_UID="samedevice$$" "$BIN" recv "$W" -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv1.log" 2>&1 &
 R1=$!; pids+=($R1)
@@ -337,7 +342,7 @@ done
 # with the SAME uid joins, the sender must take the supersede path, not the
 # peer-left path.
 kill -STOP $R1 2>/dev/null
-sleep 1
+sleep 3   # > FILAMENT_ADOPT_ACTIVE_MS so the frozen link reads as idle (#28)
 FILAMENT_UID="samedevice$$" timeout 180 "$BIN" recv -y --dir "$D" --server "$SERVER" >"$WORK/g11-recv2.log" 2>&1
 RC2=$?
 # bounded wait: a hung sender must fail the gate, not the whole suite
@@ -350,6 +355,41 @@ if [ $RC2 -eq 0 ] && [ $RCS -eq 0 ] && [ "$(hashof "$D/big.bin")" = "$H_BIG" ] \
    && grep -q "resuming at" "$WORK/g11-recv2.log"; then
   ok "same-uid supersede: sender swapped links, transfer resumed, hash matches"
 else bad "uid supersede"; tail -n 4 "$WORK/g11-send.log" "$WORK/g11-recv2.log"; fi
+
+# -------------------------------------------------------------- gate 11b ----
+# The inverse of gate 11 (#28): when the same device reconnects its signaling
+# socket (same uid, new sid) WHILE the original link is actively transferring,
+# the sender must KEEP the flowing link — the data channel is independent of
+# the socket. Pre-fix, the unconditional C6 supersede tore down the live
+# transfer (issue #28). Same R2 wiring as gate 11, so if R2 ever failed to
+# reach the sender, gate 11 would fail first — keeping this 'no supersede'
+# assertion honest. Default idle threshold (3s) >> a healthy inter-frame gap.
+say "11b: active same-uid link survives a live reconnect (#28)"
+W2="g11b-$$-$RANDOM"; D1B="$WORK/g11b1"; D2B="$WORK/g11b2"; mkdir -p "$D1B" "$D2B"
+"$BIN" send "$BIG" --word "$W2" --server "$SERVER" >"$WORK/g11b-send.log" 2>&1 &
+SP=$!; pids+=($SP); sleep 3
+FILAMENT_UID="livedev$$" "$BIN" recv "$W2" -y --dir "$D1B" --server "$SERVER" >"$WORK/g11b-recv1.log" 2>&1 &
+R1=$!; pids+=($R1)
+for _ in $(seq 1 60); do
+  sz=$(stat -c %s "$D1B/big.bin.part" 2>/dev/null || echo 0)
+  [ "$sz" -gt $((8 * 1024 * 1024)) ] && break
+  sleep 0.5
+done
+# Same device rejoins (same uid, new sid) while R1 keeps flowing — must NOT
+# supersede. R1 is left running; R2 is a never-adopted bystander we reap.
+FILAMENT_UID="livedev$$" timeout 120 "$BIN" recv -y --dir "$D2B" --server "$SERVER" >"$WORK/g11b-recv2.log" 2>&1 &
+R2B=$!; pids+=($R2B)
+RCS=99
+for _ in $(seq 1 120); do kill -0 $SP 2>/dev/null || { wait $SP; RCS=$?; break; }; sleep 1; done
+kill -9 $R1 $R2B 2>/dev/null
+# True positive: assert the sender SAW the reconnect and DELIBERATELY kept the
+# link ("keeping active link") — not merely the absence of a supersede line,
+# which a never-arriving R2 would also produce.
+if [ $RCS -eq 0 ] && [ "$(hashof "$D1B/big.bin")" = "$H_BIG" ] \
+   && grep -q "keeping active link" "$WORK/g11b-send.log" \
+   && ! grep -q "superseding old link" "$WORK/g11b-send.log"; then
+  ok "active link preserved across same-uid reconnect (kept deliberately, no supersede)"
+else bad "flow-preserve (#28)"; tail -n 4 "$WORK/g11b-send.log" "$WORK/g11b-recv1.log"; fi
 
 # --------------------------------------------------------------- gate 13 ----
 say "13: multi-link — CLI + two browsers, nobody wedges (C18)"

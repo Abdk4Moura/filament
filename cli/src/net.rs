@@ -100,6 +100,12 @@ pub trait Transport: Send + Sync {
     /// Resolve once all queued bytes are flushed to the wire.
     async fn flush(&self) -> Result<()>;
     fn max_payload(&self) -> usize;
+    /// Milliseconds since this link last moved a byte. `u64::MAX` means "no
+    /// activity tracked / idle forever" — the safe default, so an untracked
+    /// transport never blocks a supersede. Backs the #28 data-flow guard.
+    fn idle_ms(&self) -> u64 {
+        u64::MAX
+    }
 }
 
 // The channel is DETACHED (SettingEngine::detach_data_channels): webrtc-rs's
@@ -109,10 +115,28 @@ pub trait Transport: Send + Sync {
 // `a=max-message-size` we advertise.
 const READ_BUF: usize = 1 << 20;
 
+/// Milliseconds since a process-wide monotonic epoch. Backs data-flow recency:
+/// it lets `maybe_adopt`/`on_peer_left` tell an actively-transferring link from
+/// a frozen-alive one (gate 11's SIGSTOP'd receiver vs #28's live reconnect).
+/// Monotonic on purpose — an NTP wall-clock step must not flip a recency check.
+fn now_ms() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
 pub struct DataChannelTransport {
     raw: Arc<RawDataChannel>,
     drained: Arc<Notify>,
     dead: Arc<std::sync::atomic::AtomicBool>, // set by the read loop on EOF/error
+    // Monotonic ms-stamp of the last byte that actually moved (send_frame write
+    // returned Ok, or the read loop delivered a frame). #28: a same-uid
+    // signaling reconnect must not supersede a link whose data channel — which
+    // is independent of the socket — is still flowing.
+    last_activity: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl DataChannelTransport {
@@ -157,6 +181,12 @@ impl Transport for DataChannelTransport {
         self.raw
             .write_data_channel(&Bytes::from(framed), false)
             .await?;
+        // Stamp at the unambiguous "bytes moved" point: the write returned Ok.
+        // A frozen receiver (gate 11) stalls send_frame in the backpressure park
+        // above, so this never fires and the link goes idle — exactly the signal
+        // that lets the supersede proceed for frozen-alive but not for flowing.
+        self.last_activity
+            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -173,6 +203,18 @@ impl Transport for DataChannelTransport {
 
     fn max_payload(&self) -> usize {
         MAX_DC_PAYLOAD
+    }
+
+    fn idle_ms(&self) -> u64 {
+        // A dead channel has been idle forever — never let a recent-but-now-dead
+        // stamp keep a link reading as "flowing". Without this, a same-uid
+        // supersede could be skipped for an old link that just died (its last
+        // stamp still fresh), keeping a dead link instead of swapping to the new
+        // sid. The `dead` flag is the unambiguous "channel gone" signal.
+        if self.is_dead() {
+            return u64::MAX;
+        }
+        now_ms().saturating_sub(self.last_activity.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -698,6 +740,9 @@ async fn wire_channel(
             };
             let drained = Arc::new(Notify::new());
             let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // Seed activity at open so a link mid-handshake (no bytes yet) is
+            // never falsely treated as idle/supersedable (#28 guard).
+            let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
 
             // C8a: one persistent buffered-amount-low subscription wakes all
             // parked senders.
@@ -719,6 +764,7 @@ async fn wire_channel(
                 let closed = closed.clone();
                 let dead = dead.clone();
                 let drained = drained.clone();
+                let last_activity = last_activity.clone();
                 let peer_id = peer_id.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; READ_BUF];
@@ -738,6 +784,12 @@ async fn wire_channel(
                             }
                             Ok((n, false)) => {
                                 if n >= 4 && !closed.load(std::sync::atomic::Ordering::Relaxed) {
+                                    // Inbound transfer bytes = link is flowing (#28
+                                    // guard). Only data frames count, not control —
+                                    // periodic acks/state pings must not keep an
+                                    // otherwise-idle link looking active.
+                                    last_activity
+                                        .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                                     let sid = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
                                     let _ = tx.send(Ev::Chunk(
                                         peer_id.clone(),
@@ -753,7 +805,7 @@ async fn wire_channel(
 
             if !closed.load(std::sync::atomic::Ordering::Relaxed) {
                 let transport: Arc<dyn Transport> =
-                    Arc::new(DataChannelTransport { raw, drained, dead });
+                    Arc::new(DataChannelTransport { raw, drained, dead, last_activity });
                 let _ = tx.send(Ev::ChannelReady(peer_id.clone(), transport));
             }
         })
