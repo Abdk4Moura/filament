@@ -1048,7 +1048,11 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         // 1) Once we know the peer's signaling sid, send our SPAKE2 element over
         //    the opaque `signal` relay (the server cannot read it).
         if let Some(pid) = pake_peer.clone() {
-            if !sent_pake_msg {
+            // gate 17b (FILAMENT_TEST_PAIR_STALL): never send our SPAKE2 element,
+            // so the exchange can't complete on either side and the ceremony's
+            // fail-fast `ceremony_deadline` fires — proving the no-10-min-orphan
+            // guard. Test-only: `stall` is set solely by that env var.
+            if !sent_pake_msg && !stall {
                 sio.emit("signal", json!({ "to": pid, "data": {
                     "type": "pake-msg", "v": 2, "msg": b64_encode(&pake_msg)
                 }})).await.ok();
