@@ -250,6 +250,12 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
     }}>{label}</button>
   )
 
+  // Auto-dash: the user types/pastes "grand hawk ruby 8045" or "GRAND-HAWK-RUBY-8045"
+  // and sees dashes either way. Uppercase, collapse any run of spaces/dashes to a
+  // single dash, and drop a leading dash (from a leading space). Safe because the
+  // submit path still canonicalizes via normCode (WASM) before SPAKE2.
+  const formatCode = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
+
   const submitCode = () => { const c = code.trim(); if (c) { onPairWithCode(c); setCode(''); setEntering(false) } }
 
   const wrap = {
@@ -299,7 +305,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
             THIS room) — so the affordance belongs here too, not just in auto. */}
         {entering ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
+            <input autoFocus value={code} onChange={(e) => setCode(formatCode(e.target.value))} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
               placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
                 background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
             {ghostBtn('pair', submitCode, true)}
@@ -325,7 +331,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
       </div>
       {entering ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
+          <input autoFocus value={code} onChange={(e) => setCode(formatCode(e.target.value))} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
             placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
               background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
           {ghostBtn('pair', submitCode, true)}
@@ -341,9 +347,37 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
   )
 }
 
+// L1-a (PAKE v2): mirrors the C27 keep banner, but the device NAME is editable
+// before remembering. Holds the draft name in its own state (a hook can't live
+// in the parent's .map), seeded from the peer's display name; the human can edit
+// or decline. Accept stores under the chosen name (local-only, no wire ack).
+function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, D, accent }) {
+  const [name, setName] = useState(k.name || 'device')
+  const accept = () => onAcceptPakeKeep?.(k.peerId, name)
+  return (
+    <div style={{
+      border: '1px solid ' + accent, background: T.panel, padding: '10px ' + D.tilePad + 'px',
+      marginBottom: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: 12, color: T.text, whiteSpace: 'nowrap' }}>Paired ✓ &nbsp;Remember</span>
+      <input value={name} onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') accept() }}
+        placeholder="device" style={{
+          font: 'inherit', fontSize: 12, padding: '6px 9px', flex: 1, minWidth: 120,
+          background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+      <span style={{ fontSize: 12, color: T.text, whiteSpace: 'nowrap' }}>as a device? You'd reconnect automatically, no codes.</span>
+      <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+        <button onClick={accept} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: accent, color: T.onAccent, border: '1px solid ' + accent }}>remember</button>
+        <button onClick={() => onDeclinePakeKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>not now</button>
+      </span>
+    </div>
+  )
+}
+
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
-    onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep, ui = {} } = props
+    onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
+    onAcceptPakeKeep, onDeclinePakeKeep, ui = {} } = props
   const mode = ui.theme === 'light' ? 'light' : 'dark'
   const accentSet = ACCENTS[ui.accent] || ACCENTS.green
   const accent = accentSet[mode === 'light' ? 'l' : 'd']
@@ -434,9 +468,16 @@ export default function Filament(props) {
     </div>
   ))
 
+  // L1-a: v2 PAKE pairings completed — K is agreed, now ask before remembering
+  // (with an editable name). Kept separate from v1 keepBanners on purpose.
+  const pakeKeepBanners = (state.pendingPakeKeep || []).map((k) => (
+    <PakeKeepBanner key={k.peerId} k={k} onAcceptPakeKeep={onAcceptPakeKeep} onDeclinePakeKeep={onDeclinePakeKeep} T={T} D={D} accent={accent} />
+  ))
+
   const discovery = (
     <>
       {keepBanners}
+      {pakeKeepBanners}
       <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
         onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
     </>

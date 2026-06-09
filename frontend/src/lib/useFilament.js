@@ -210,9 +210,38 @@ export function useFilament() {
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
   const [pairStatus, setPairStatus] = useState(null) // 'pairing' | 'paired' | 'refused' | error string
+  // L1-a consent (mirrors C27 pendingKeeps for v2): when a PAKE completes, K is
+  // agreed but remembering is a separate TRUST GRANT the human decides. Queue
+  // {peerId, name, secret, caps} here and prompt before any local store.
+  const [pendingPakeKeep, setPendingPakeKeep] = useState([]) // [{peerId, name, secret, caps}]
   // Drive the active pairing one step (idempotent): send our element, then the
   // confirm once K + fingerprints exist; finalize on success/abort.
   const drivePakeRef = useRef(() => {})
+
+  // L1-a: the human chose to remember this v2-paired device. v2 keeps are
+  // LOCAL-ONLY — both sides hold K independently, so there's no wire ack and no
+  // half to discard (unlike v1's sendPairKeepAck). Store under the chosen name.
+  const acceptPakeKeep = useCallback((peerId, chosenName) => {
+    setPendingPakeKeep((prev) => {
+      const k = prev.find((x) => x.peerId === peerId)
+      if (k) {
+        const name = (chosenName && String(chosenName).trim()) || k.name
+        setKnownDevices(devicesStoreV2(name, k.secret, k.caps))
+        tel('pake-paired-stored', { peer: String(peerId).slice(-6) })
+        subscribeKnown()
+      }
+      return prev.filter((x) => x.peerId !== peerId)
+    })
+  }, [subscribeKnown])
+
+  // L1-a: declined remembering. K stays agreed (fine — the device just isn't
+  // remembered); nothing to undo locally, just drop the prompt.
+  const declinePakeKeep = useCallback((peerId) => {
+    setPendingPakeKeep((prev) => {
+      if (prev.some((x) => x.peerId === peerId)) tel('pake-keep-declined', { peer: String(peerId).slice(-6) })
+      return prev.filter((x) => x.peerId !== peerId)
+    })
+  }, [])
 
   const acceptKeep = useCallback((peerId) => {
     setPendingKeeps((prev) => {
@@ -696,8 +725,11 @@ export function useFilament() {
     if (p.secret) {
       const peerId = pakePeerRef.current
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
-      setKnownDevices(devicesStoreV2(name, p.secret, p.caps))
-      subscribeKnown()
+      // K is agreed — pairing crypto succeeded. But remembering is a separate
+      // trust grant (C27): queue a consent prompt instead of storing silently.
+      // Capture secret/caps/name NOW, before we null pakeRef below. Dedup by
+      // peerId so the per-tick drivePake doesn't enqueue twice.
+      setPendingPakeKeep((prev) => (prev.some((k) => k.peerId === peerId) ? prev : [...prev, { peerId, name, secret: p.secret, caps: p.caps }]))
       tel('pake-paired', { peer: String(peerId).slice(-6) })
       setPairStatus('paired')
       pakeRef.current = null
@@ -957,5 +989,8 @@ export function useFilament() {
     pendingKeeps, // C27: [{peerId, name}] — peers asking to be remembered
     acceptKeep, // C27: store the secret + ack; auto-connect from now on
     declineKeep, // C27: refuse; the sender discards its half too
+    pendingPakeKeep, // L1-a: [{peerId, name, secret, caps}] — v2 pairings awaiting remember-consent
+    acceptPakeKeep, // L1-a: store the v2 device under the chosen name (local-only)
+    declinePakeKeep, // L1-a: don't remember (K stays agreed)
   }
 }
