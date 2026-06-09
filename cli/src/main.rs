@@ -2769,7 +2769,25 @@ async fn recv_cmd(
         // no room-independent (channel) link remains — lingering dead links
         // can't block the exit when the server knows nobody's there.
         let digest_says_alone = digest_alone && conn.links.values().all(|l| l.expected_secret.is_none());
-        if completed > 0 && !keep_open && by_sid.is_empty() && (conn.links.is_empty() || digest_says_alone) && pending.is_empty() {
+        // #28 Mode B: a dead link that keeps FLAPPING — on_stuck reconnect, or a
+        // roster/session reconcile re-adopting the gone sender and re-arming
+        // `expected_secret` so `digest_says_alone` never holds — must NOT block
+        // this fallback once everything is received; `conn.links` may never
+        // empty under churn (the RC=124 hang). Surgical: discriminate on link
+        // HEALTH, not existence — a churning/reconnecting/dead link (never
+        // `Ready`) does not block exit, but a healthy `Ready` link (e.g. a
+        // bystander between two human-paced sends, gate 6) STILL does. So this is
+        // a no-op for healthy peers, not a behaviour change — only a peer we've
+        // lost contact with stops blocking. FILAMENT_TEST_DISABLE_MODEB_DROP
+        // restores the old links-gated behaviour so gate 18b proves the A/B
+        // (baseline hangs, fix exits) with one binary.
+        let no_healthy_link = conn.links.values().all(|l| !matches!(l.presence, Presence::Ready));
+        let links_clear = if std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_err() {
+            no_healthy_link
+        } else {
+            conn.links.is_empty() || digest_says_alone
+        };
+        if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty() && links_clear {
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
                 Some(since) if since.elapsed() > quiet_window => {
