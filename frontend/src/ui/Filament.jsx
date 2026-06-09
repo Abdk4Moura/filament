@@ -4,7 +4,7 @@
    optional `ui` prop carries display options (theme/accent/density/columns/font);
    omit it for sensible defaults (dark / green / airy). */
 
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
@@ -236,6 +236,67 @@ function LanChip({ localHelper, T }) {
   )
 }
 
+// Cursor-safe auto-dash code field. The prior regression reformatted the whole
+// string on every keystroke and let React reset the caret to the END — so any
+// mid-string edit jumped to the tail. Here we (1) count the ALPHANUMERIC chars
+// before the caret in the raw input, (2) format, (3) re-find that same Nth
+// alphanumeric in the formatted string, and (4) restore the caret there in a
+// layout effect (before paint). Counting alphanumerics — not raw offset — makes
+// collapse/strip/paste/backspace all caret-stable regardless of length change.
+function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, placeholder, accent, T }) {
+  const ref = useRef(null)
+  const caretRef = useRef(null)
+
+  // Restore the caret AFTER React commits the new (formatted) value but BEFORE
+  // the browser paints, so the user never sees it flicker to the end.
+  // useLayoutEffect (not useEffect) is load-bearing here: it runs before paint,
+  // so on a mid-string edit the caret never visibly snaps to the end and back.
+  useLayoutEffect(() => {
+    if (caretRef.current != null && ref.current) {
+      const pos = caretRef.current
+      caretRef.current = null
+      try { ref.current.setSelectionRange(pos, pos) } catch (e) {}
+    }
+  })
+
+  const handleChange = (e) => {
+    const el = e.target
+    const raw = el.value
+    const sel = el.selectionStart ?? raw.length
+    // How many real (alphanumeric) chars sit before the caret in the raw text?
+    const before = (raw.slice(0, sel).match(/[A-Za-z0-9]/g) || []).length
+    const formatted = format(raw)
+    // Walk the formatted string to just past the `before`-th alphanumeric.
+    let seen = 0
+    let pos = formatted.length
+    if (before === 0) {
+      pos = 0
+    } else {
+      for (let i = 0; i < formatted.length; i++) {
+        if (/[A-Za-z0-9]/.test(formatted[i])) {
+          seen++
+          if (seen === before) { pos = i + 1; break }
+        }
+      }
+    }
+    // If the char just before the raw caret was a separator (the user just typed
+    // a space/dash to end a word), step PAST the dash it became, so the next
+    // word starts after the dash — not before it (which would shove the dash to
+    // the tail). Conditional on the separator: a normal mid-word edit must NOT
+    // skip, or the caret would jump over a real dash.
+    if (sel > 0 && /[\s-]/.test(raw[sel - 1]) && formatted[pos] === '-') pos++
+    caretRef.current = pos
+    onChange(formatted)
+  }
+
+  return (
+    <input ref={ref} autoFocus={autoFocus} value={value} onChange={handleChange}
+      onKeyDown={(e) => { if (e.key === 'Enter') onSubmit(); if (e.key === 'Escape') onCancel() }}
+      placeholder={placeholder} style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
+        background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+  )
+}
+
 function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, T, D, accent }) {
   const scope = state.roomScope || 'link'
   const [copied, fireCopy] = useCopied()
@@ -249,6 +310,12 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
       border: '1px solid ' + (primary ? accent : T.line),
     }}>{label}</button>
   )
+
+  // Auto-dash: the user types/pastes "grand hawk ruby 8045" or "GRANDHAWKRUBY8045"
+  // and sees dashes either way. Uppercase, collapse any run of spaces/dashes to a
+  // single dash, and drop a leading dash. Safe because the submit path still
+  // canonicalizes via normCode (WASM) before SPAKE2.
+  const formatCode = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
 
   const submitCode = () => { const c = code.trim(); if (c) { onPairWithCode(c); setCode(''); setEntering(false) } }
 
@@ -299,9 +366,9 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
             THIS room) — so the affordance belongs here too, not just in auto. */}
         {entering ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
-              placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
-                background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+            <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
+              onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
+              placeholder="ENTER CODE" accent={accent} T={T} />
             {ghostBtn('pair', submitCode, true)}
             {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
           </div>
@@ -325,9 +392,9 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
       </div>
       {entering ? (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
-            placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
-              background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+          <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
+            onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
+            placeholder="ENTER CODE" accent={accent} T={T} />
           {ghostBtn('pair', submitCode, true)}
           {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
         </div>
@@ -341,9 +408,37 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
   )
 }
 
+// L1-a (PAKE v2): mirrors the C27 keep banner, but the device NAME is editable
+// before remembering. Holds the draft name in its own state (a hook can't live
+// in the parent's .map), seeded from the peer's display name; the human can edit
+// or decline. Accept stores under the chosen name (local-only, no wire ack).
+function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, D, accent }) {
+  const [name, setName] = useState(k.name || 'device')
+  const accept = () => onAcceptPakeKeep?.(k.peerId, name)
+  return (
+    <div style={{
+      border: '1px solid ' + accent, background: T.panel, padding: '10px ' + D.tilePad + 'px',
+      marginBottom: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
+    }}>
+      <span style={{ fontSize: 12, color: T.text, whiteSpace: 'nowrap' }}>Paired ✓ &nbsp;Remember</span>
+      <input value={name} onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') accept() }}
+        placeholder="device" style={{
+          font: 'inherit', fontSize: 12, padding: '6px 9px', flex: 1, minWidth: 120,
+          background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+      <span style={{ fontSize: 12, color: T.text, whiteSpace: 'nowrap' }}>as a device? You'd reconnect automatically, no codes.</span>
+      <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+        <button onClick={accept} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: accent, color: T.onAccent, border: '1px solid ' + accent }}>remember</button>
+        <button onClick={() => onDeclinePakeKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>not now</button>
+      </span>
+    </div>
+  )
+}
+
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
-    onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep, ui = {} } = props
+    onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
+    onAcceptPakeKeep, onDeclinePakeKeep, ui = {} } = props
   const mode = ui.theme === 'light' ? 'light' : 'dark'
   const accentSet = ACCENTS[ui.accent] || ACCENTS.green
   const accent = accentSet[mode === 'light' ? 'l' : 'd']
@@ -434,9 +529,16 @@ export default function Filament(props) {
     </div>
   ))
 
+  // L1-a: v2 PAKE pairings completed — K is agreed, now ask before remembering
+  // (with an editable name). Kept separate from v1 keepBanners on purpose.
+  const pakeKeepBanners = (state.pendingPakeKeep || []).map((k) => (
+    <PakeKeepBanner key={k.peerId} k={k} onAcceptPakeKeep={onAcceptPakeKeep} onDeclinePakeKeep={onDeclinePakeKeep} T={T} D={D} accent={accent} />
+  ))
+
   const discovery = (
     <>
       {keepBanners}
+      {pakeKeepBanners}
       <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
         onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
     </>

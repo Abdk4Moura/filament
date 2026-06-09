@@ -8,8 +8,12 @@ venv/
 
 # Node / Vite
 node_modules/
+cli/tests/node_modules
 frontend/dist/
 backend/dist/
+
+# Test build artifacts
+frontend/tests/.pakekeep-bundle.js
 
 # Build / coverage
 build
