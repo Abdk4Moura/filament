@@ -421,12 +421,43 @@ impl Transport for DirectTransport {
     }
 
     async fn flush(&self) -> Result<()> {
-        // QUIC's write_all already commits to the send buffer; nothing extra to
-        // drain at the app layer (stream FIN on close handles the tail).
+        // Per-file flush (called after every `file-end`). QUIC is ordered and
+        // reliable, so file N's buffered tail is delivered before file N+1's
+        // bytes with no app-layer action — and we MUST NOT `finish()` here or a
+        // multi-file send dies after the first file. The real delivery barrier
+        // is in `drain_finish()`, run once at teardown.
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(anyhow!("direct connection closed while flushing"));
         }
         Ok(())
+    }
+
+    async fn drain_finish(&self) -> Result<()> {
+        // THE cross-machine fix. `write_all` only commits bytes to quinn's send
+        // buffer; dropping the connection (process exit after `send`) sends
+        // CONNECTION_CLOSE immediately and discards anything not yet acked — on a
+        // real WAN that truncates the last file's tail (loopback hid it: the
+        // buffer drains before close). quinn's documented barrier: `finish()` the
+        // stream (this runs ONLY at final teardown, so ending the send half is
+        // correct), then await `stopped()`, which resolves `Ok(None)` once the
+        // peer has acknowledged receipt of every byte incl. the FIN.
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(()); // connection already gone — nothing left to drain
+        }
+        let stopped = {
+            let mut s = self.send.lock().await;
+            let _ = s.finish(); // harmless if already finished/stopped
+            s.stopped()
+        };
+        // A live-but-slow transfer keeps acks flowing, so this waits exactly as
+        // long as delivery needs; a dead peer makes quinn error `stopped()`. The
+        // outer wall is only a backstop against a silently half-dead peer so we
+        // never hang forever (Ctrl-C also escapes).
+        match tokio::time::timeout(std::time::Duration::from_secs(180), stopped).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(anyhow!("direct drain: peer dropped before full ack: {e}")),
+            Err(_) => Err(anyhow!("direct drain: timed out after 180s awaiting peer ack")),
+        }
     }
 
     fn max_payload(&self) -> usize {

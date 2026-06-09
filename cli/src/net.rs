@@ -108,6 +108,17 @@ pub trait Transport: Send + Sync {
     async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()>;
     /// Resolve once all queued bytes are flushed to the wire.
     async fn flush(&self) -> Result<()>;
+    /// FINAL-teardown drain: block until the peer has acknowledged *all* written
+    /// bytes, then end the send direction. Distinct from `flush()`, which is
+    /// called per-file (after each `file-end`) and must NOT end the stream.
+    /// Default delegates to `flush()` — correct for the DataChannel transport,
+    /// whose `flush()` already polls `buffered_amount` to zero before exit. The
+    /// direct-QUIC transport overrides this: dropping a quinn connection discards
+    /// un-acked send-buffer bytes, so a no-op here truncates the tail of the last
+    /// file on any link slower than loopback (the cross-machine bug).
+    async fn drain_finish(&self) -> Result<()> {
+        self.flush().await
+    }
     fn max_payload(&self) -> usize;
     /// Milliseconds since this link last moved a byte. `u64::MAX` means "no
     /// activity tracked / idle forever" — the safe default, so an untracked

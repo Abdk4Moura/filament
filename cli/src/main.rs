@@ -2910,7 +2910,14 @@ async fn send_cmd(
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
                 if let Some(t) = conn.transport() {
-                    t.flush().await.ok();
+                    // Block until the peer has acked every byte before we exit —
+                    // a torn-down QUIC connection drops un-acked send-buffer bytes
+                    // and truncates the last file (no-op on DataChannel, which
+                    // already drained in flush()). Surface a drain failure rather
+                    // than silently reporting "done" on a partial transfer.
+                    if let Err(e) = t.drain_finish().await {
+                        eprintln!("warning: transfer may be incomplete — {e}");
+                    }
                 }
                 for o in out.iter().filter(|o| o.temp) {
                     let _ = std::fs::remove_file(&o.path);
