@@ -1,0 +1,38 @@
+# Filament PAKE core — the ONE SPAKE2 implementation shared by the CLI
+# (native rlib) and the browser (wasm32 via wasm-bindgen). Promoted from the
+# L1-0 spike (spike/pake-core) into production: OsRng (not the spike's seeded
+# RNG), wasm-bindgen objects (not the spike's C-ABI Mutex handle table).
+#
+# Crate decision (L1-a): spake2 = "=0.4.0", RustCrypto/PAKEs, pinned exact.
+# NEVER 0.5.0-pre. TODO(audit): seek an independent audit before any 1.0 —
+# this crate is unaudited (RustCrypto provenance, used by magic-wormhole).
+[package]
+name = "filament-pake"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "Shared SPAKE2 PAKE core for Filament first-pairing (CLI + browser)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PAKE crypto lives ENTIRELY in this crate so the CLI (sha2 0.11, hand-rolled
+# HMAC) and the browser derive byte-identical K / MAC / secret. This crate owns
+# its own sha2 0.10 / hkdf / hmac so there is no cross-version drift.
+spake2 = "=0.4.0"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+hex = "0.4"
+rand_core = "0.6"
+getrandom = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# OsRng -> crypto.getRandomValues in the browser.
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+
+[features]
+default = []

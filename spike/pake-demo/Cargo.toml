@@ -1,0 +1,18 @@
+# SPIKE — throwaway. De-risks L1-0 SPAKE2 approach.
+# Isolated from cli/ so the production crate's Cargo.lock is untouched.
+[package]
+name = "pake-demo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+spake2 = "=0.4.0"            # stable RustCrypto release (NOT 0.5.0-pre)
+sha2 = "0.10"               # for the HKDF/MAC key-confirmation demo
+hkdf = "0.12"
+hmac = "0.12"
+hex = "0.4"
+
+[[bin]]
+name = "pake-demo"
+path = "src/main.rs"

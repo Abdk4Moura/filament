@@ -51,6 +51,9 @@ pub enum Ev {
     PeerLeft(Value),
     Signal(Value),
     PairCode(Value),
+    /// L1-a: v2 nameplate-allocation ack (server allocated our nameplate; it
+    /// echoes NO words — the creator displays its own locally-minted code).
+    PairOk(Value),
     PairMatched(Value),
     #[allow(dead_code)] // payload is {code}; senders only need the wake-up
     PairUsed(Value),
@@ -317,6 +320,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         .on("peer-left", fwd(Ev::PeerLeft, tx.clone()))
         .on("signal", fwd(Ev::Signal, tx.clone()))
         .on("pair-code", fwd(Ev::PairCode, tx.clone()))
+        .on("pair-ok", fwd(Ev::PairOk, tx.clone()))
         .on("pair-matched", fwd(Ev::PairMatched, tx.clone()))
         .on("pair-used", fwd(Ev::PairUsed, tx.clone()))
         .on("pair-error", fwd(Ev::PairError, tx.clone()))

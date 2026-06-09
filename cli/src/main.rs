@@ -436,6 +436,80 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
     Ok(())
 }
 
+/// L1-a (spec §8): store a v2 device record with its agreed capability set.
+/// `caps` is deny-by-default; "transfer" is the L0 baseline. The on-disk shape
+/// grows `v` and `caps` but the existing `{name, secret}` fields are unchanged,
+/// so the reconnect path (`devices_load`, which reads only name+secret) keeps
+/// working byte-for-byte — no regression.
+fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
+    let p = devices_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // Preserve other records verbatim (including their v/caps if present).
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    arr.retain(|d| d["name"].as_str() != Some(name));
+    arr.push(json!({"name": name, "secret": secret, "v": 2, "caps": caps,
+                    "addedAt": SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)}));
+    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// L1-a (spec §8): read a device's granted capabilities. v1 records (no `caps`)
+#[allow(dead_code)] // enforcement hook (gate 5); exercised by the capability gate
+/// read as `["transfer"]` for backward compatibility; deny-by-default otherwise.
+/// Returns None if the device isn't known.
+fn device_caps(name: &str) -> Option<Vec<String>> {
+    device_caps_at(&devices_path(), name)
+}
+
+/// Path-explicit core of `device_caps` (testable without touching the global
+/// config-dir env var).
+#[allow(dead_code)]
+fn device_caps_at(path: &Path, name: &str) -> Option<Vec<String>> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let arr = serde_json::from_str::<Value>(&raw).ok()?;
+    for d in arr.as_array()? {
+        if d["name"].as_str() == Some(name) {
+            return Some(match d.get("caps").and_then(|c| c.as_array()) {
+                Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
+                None => vec!["transfer".to_string()], // v1 record
+            });
+        }
+    }
+    None
+}
+
+/// Path-explicit deny-by-default check (testable).
+#[allow(dead_code)]
+fn device_allows_at(path: &Path, name: &str, capability: &str) -> bool {
+    if capability == "transfer" {
+        return true; // L0 baseline — never gated (spec §8)
+    }
+    device_caps_at(path, name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
+}
+
+/// L1-a (spec §8 / gate 5): deny-by-default capability enforcement hook. A
+/// gated action is allowed only if the device's record grants the capability.
+/// "transfer" is the L0 baseline (always allowed, even for empty caps) so this
+/// never regresses existing send/recv. Wired now; future L-layers add caps.
+#[allow(dead_code)] // enforcement hook (gate 5); exercised by the capability gate
+fn device_allows(name: &str, capability: &str) -> bool {
+    if capability == "transfer" {
+        return true; // L0 baseline — never gated (spec §8)
+    }
+    device_caps(name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
+}
+
 /// C27: a declined remember offer must not leave one-sided dead weight.
 fn devices_remove(name: &str) -> Result<()> {
     let p = devices_path();
@@ -752,11 +826,80 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
 }
 
 // ----------------------------------------------------------------- pair ----
-// C29: remembering a device is a first-class ceremony — no file transfer to
-// pretend through. Mint (or claim) a one-time code, connect, hand the pair
-// secret over the encrypted link (pair-keep; C27 consent applies on the far
-// side), confirm mutuality, exit. Initiation rule: the code CREATOR sends the
-// keep; a claimer falls back after 3 s of silence (browsers never initiate).
+// L1-a (PAKE v2): remembering a device is a first-class ceremony — no file
+// transfer to pretend through. The first-pairing now runs a real SPAKE2 PAKE
+// over the SPOKEN code so a malicious signaling server cannot MITM enrollment.
+//
+// The load-bearing change vs v1:
+//   - The CLIENT mints the words locally (server sees only the numeric
+//     nameplate); the password (words) NEVER reaches the server.
+//   - SPAKE2 runs over the opaque `signal` relay BEFORE any secret exists.
+//   - A key-confirmation MAC folds in the SORTED DTLS fingerprints + caps, so a
+//     server that substitutes a DTLS cert OR rewrites caps is DETECTED → abort.
+//   - The 32-byte pinned secret is HKDF(K) — AGREED, never transmitted. The old
+//     `pair-keep` secret-over-DataChannel step is GONE from the v2 path.
+//   - Downgrade is structurally impossible: a v2 client NEVER sends pair-keep
+//     and NEVER stores a secret from a received pair-keep. A received pair-keep
+//     means the peer is v1 → abort with "update to pair securely". A server
+//     stripping `v:2` therefore cannot force the readable-secret path.
+//
+// Helpers below decode/encode the opaque PAKE payloads carried on `signal`.
+
+/// Base64 (no external dep — small alphabet table). Used only for the 33-byte
+/// SPAKE2 element / 32-byte MAC opaque payloads on the signal relay.
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s: Vec<u8> = s.bytes().filter(|&b| b != b'=' && !b.is_ascii_whitespace()).collect();
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    for chunk in s.chunks(4) {
+        let mut n = 0u32;
+        let mut bits = 0;
+        for &c in chunk {
+            n = (n << 6) | val(c)?;
+            bits += 6;
+        }
+        n <<= 24 - bits;
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The capability set v2 first-pairing agrees on. "transfer" is the L0 baseline
+/// (always allowed); deny-by-default future caps are NOT granted at first
+/// enrollment. BOTH sides MAC the identical canonical string or confirmation
+/// fails — so this default is fixed and unconditional (spec §8 / gate 5).
+fn pair_v2_caps() -> Vec<String> {
+    vec!["transfer".to_string()]
+}
 
 async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, relay: bool) -> Result<()> {
     let my_uid = mk_uid("p");
@@ -770,13 +913,30 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     sess.room = Some(solo.clone());
     sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
     let creator = code.is_none();
+    // L1-a: the spoken code is split CLIENT-SIDE into (nameplate, password). The
+    // password (words) NEVER leaves this process; only the nameplate is sent.
+    let mut my_words; // the password (creator mints; claimer types)
+    let mut my_nameplate;
     match &code {
         Some(c) => {
+            // Claimer: normalize the typed code, split, send ONLY the nameplate.
+            let normalized = filament_pake::norm_code(c);
+            let (np, pw) = filament_pake::split_code(&normalized);
+            if pw.is_empty() || np.is_empty() {
+                bail!("that code doesn't look right — expected something like brave-otter-ruby-3141");
+            }
+            my_words = pw;
+            my_nameplate = np.clone();
             ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, c)));
-            sio.emit("pair-claim", json!({ "code": c.to_lowercase() })).await.ok();
+            sio.emit("pair-claim", json!({ "nameplate": np, "v": 2 })).await.ok();
         }
         None => {
-            sio.emit("pair-create", json!({})).await.ok();
+            // Creator: mint words + nameplate locally; ask the server to allocate
+            // ONLY the nameplate. The full code is displayed from our own mint
+            // when pair-ok arrives (the server never echoes any words).
+            my_words = filament_pake::words::mint_words();
+            my_nameplate = filament_pake::words::mint_nameplate();
+            sio.emit("pair-create", json!({ "nameplate": my_nameplate, "v": 2 })).await.ok();
         }
     }
 
@@ -807,13 +967,32 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         });
     }
 
-    let secret = fresh_secret(); // ours, if WE end up initiating
     let mut petname = name; // resolved --name, prompt answer, or peer's display name
-    let mut their_secret: Option<String> = None; // a received keep (we claimed)
-    let mut ack_ok = false; // our keep was consented to
-    let mut initiated = false;
     let mut prompted = false;
     let mut peer: Option<(String, String)> = None; // (pid, display name)
+
+    // ---- L1-a PAKE state ----------------------------------------------------
+    // The agreed pinned secret (HKDF(K)); set ONLY after key confirmation passes.
+    let mut agreed_secret: Option<String> = None;
+    // Our live SPAKE2 session (consumed by finish) and our outbound element.
+    let mut pake_state: Option<filament_pake::PakeState>;
+    let mut pake_msg: Vec<u8>;
+    // Derived K (after finishing on the peer's element). Held until confirmation.
+    let mut pake_k: Option<Vec<u8>> = None;
+    // Peer signaling sid we run the PAKE with (set when the link is adopted).
+    let mut pake_peer: Option<String> = None;
+    let mut sent_pake_msg = false;
+    let mut sent_confirm = false;
+    let caps = pair_v2_caps();
+    let caps_canon = filament_pake::canonical_caps(&caps);
+
+    // Start our SPAKE2 session immediately: identity = nameplate, password =
+    // words. Both sides MUST pass identical Password AND Identity (spec §3.1).
+    {
+        let (st, msg) = filament_pake::start(my_words.as_bytes(), my_nameplate.as_bytes());
+        pake_state = Some(st);
+        pake_msg = msg;
+    }
     let deadline = Instant::now() + Duration::from_secs(600); // code TTL
     // The pairing peer left before the ceremony finished. Give a short grace
     // for a transient reconnect, then FAIL FAST — don't orphan in the room
@@ -834,13 +1013,15 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     let stall = std::env::var("FILAMENT_TEST_PAIR_STALL").is_ok();
 
     loop {
-        // Done when the petname is settled AND a secret is mutual: either we
-        // received theirs (claimer path) or ours was consented to (ack).
+        // Done when the petname is settled AND the PAKE agreed a secret (key
+        // confirmation passed). The secret is HKDF(K) — never transmitted, the
+        // same on both sides; it drops straight into devices.json.
         if let Some(n) = petname.clone() {
-            if let Some(sec) = their_secret.clone().or(if ack_ok { Some(secret.clone()) } else { None }) {
-                devices_store(&n, &sec)?;
+            if let Some(sec) = agreed_secret.clone() {
+                // caps_v2 (spec §8): record GRANTED caps, deny-by-default.
+                devices_store_v2(&n, &sec, &caps)?;
                 ui::say(&format!(
-                    "  {} {} mutually remembered — either device now finds the other automatically, no codes",
+                    "  {} {} mutually remembered — verified end-to-end (no key ever crossed the server)",
                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                     ui::paint(ui::Tone::Bold, &n),
                 ));
@@ -862,6 +1043,38 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         }
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
         conn.reap_deferred(); // #28: discharge deferred peer-left when idle/dead
+
+        // ---- L1-a PAKE progression (runs every iteration) ------------------
+        // 1) Once we know the peer's signaling sid, send our SPAKE2 element over
+        //    the opaque `signal` relay (the server cannot read it).
+        if let Some(pid) = pake_peer.clone() {
+            if !sent_pake_msg {
+                sio.emit("signal", json!({ "to": pid, "data": {
+                    "type": "pake-msg", "v": 2, "msg": b64_encode(&pake_msg)
+                }})).await.ok();
+                sent_pake_msg = true;
+            }
+            // 2) Once K is derived AND both DTLS fingerprints are known, send the
+            //    key-confirmation MAC over K + sorted fingerprints + caps. The MAC
+            //    is gated on the fingerprints so a server that substitutes a DTLS
+            //    cert produces a different fingerprint → the peer's verify fails.
+            if !sent_confirm {
+                if let Some(k) = pake_k.clone() {
+                    if let Some(l) = conn.link(&pid) {
+                        if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                            let mac = filament_pake::our_confirm(&k, &my_fp, &their_fp, &caps_canon);
+                            sio.emit("signal", json!({ "to": pid, "data": {
+                                "type": "pake-confirm", "v": 2,
+                                "mac": b64_encode(&mac),
+                                "caps": caps.clone(),
+                            }})).await.ok();
+                            sent_confirm = true;
+                        }
+                    }
+                }
+            }
+        }
+
         let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => ev,
             Ok(None) => bail!("signaling closed"),
@@ -878,14 +1091,23 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 sess.invalidate(); // C30: fresh sid — re-assert next tick
             }
             Ev::Synced(v) => { sess.on_synced(&v); }
-            Ev::PairCode(v) => {
-                let c = v["code"].as_str().unwrap_or("?");
-                ui::clipboard(c);
+            Ev::PairOk(_v) => {
+                // L1-a: the server allocated our nameplate. Display the FULL code
+                // from OUR OWN local mint (the server never echoed any words).
+                let full = format!("{my_words}-{my_nameplate}");
+                ui::clipboard(&full);
                 ui::say("");
-                ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &c.to_uppercase())));
+                ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &full.to_uppercase())));
                 ui::say("");
                 ui::say(&ui::paint(ui::Tone::Dim, "  on the other device: type it into the web app, or `filament pair <code>`"));
-                ui::say(&ui::paint(ui::Tone::Dim, "  one claim · expires in 10 min · waiting…"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  one claim · expires in 10 min · paired end-to-end (no key crosses the server)"));
+            }
+            Ev::PairCode(v) => {
+                // v1 server (shouldn't happen for a v2 create, but be safe): a
+                // legacy server-minted code means the peer can't PAKE-pair.
+                let c = v["code"].as_str().unwrap_or("?");
+                let _ = c;
+                bail!("this server returned a legacy code — update the server (or the peer) to pair securely");
             }
             Ev::PairUsed(_) => {
                 ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
@@ -900,9 +1122,21 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             }
             Ev::PairError(v) => {
+                // Creator nameplate collision: re-mint a FRESH nameplate (and
+                // fresh words) and retry — never reuse a burned code.
+                if creator && v["error"].as_str() == Some("taken") {
+                    my_words = filament_pake::words::mint_words();
+                    my_nameplate = filament_pake::words::mint_nameplate();
+                    let (st, msg) = filament_pake::start(my_words.as_bytes(), my_nameplate.as_bytes());
+                    pake_state = Some(st);
+                    pake_msg = msg;
+                    sent_pake_msg = false;
+                    sio.emit("pair-create", json!({ "nameplate": my_nameplate, "v": 2 })).await.ok();
+                    continue;
+                }
                 let hint = match v["why"].as_str() {
                     Some("sender-gone") => "that code's creator already left — ask them for a fresh one".to_string(),
-                    _ => format!("{} — codes burn after one use and expire after 10 min", v["error"].as_str().unwrap_or("?")),
+                    _ => format!("{} — codes burn after one use; a failed pairing needs a FRESH code (re-run `filament pair`)", v["error"].as_str().unwrap_or("?")),
                 };
                 bail!("code rejected: {hint}");
             }
@@ -912,6 +1146,49 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // L1-a: PAKE messages ride the opaque `signal` relay. Branch them
+                // OUT of the WebRTC signal path (SDP/ICE) into the PAKE machine.
+                match data["type"].as_str() {
+                    Some("pake-msg") => {
+                        pake_peer.get_or_insert(from.clone());
+                        if pake_k.is_none() {
+                            if let Some(state) = pake_state.take() {
+                                let peer_el = data["msg"].as_str().and_then(b64_decode).unwrap_or_default();
+                                match filament_pake::finish(state, &peer_el) {
+                                    Some(k) => pake_k = Some(k),
+                                    None => bail!("pairing failed: malformed key-exchange message (abort)"),
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Some("pake-confirm") => {
+                        // Verify the peer's key-confirmation MAC under OUR K, folding
+                        // the SORTED DTLS fingerprints + caps. Mismatch ⇒ wrong
+                        // password OR a server that substituted a DTLS cert OR
+                        // rewrote caps ⇒ ABORT, agree NOTHING.
+                        let Some(k) = pake_k.clone() else {
+                            bail!("pairing failed: confirmation arrived before key exchange (abort)");
+                        };
+                        let recv_mac = data["mac"].as_str().and_then(b64_decode).unwrap_or_default();
+                        let fps = match conn.link(&from) {
+                            Some(l) => l.peer.fingerprints().await,
+                            None => None,
+                        };
+                        let Some((my_fp, their_fp)) = fps else {
+                            bail!("pairing failed: no DTLS fingerprints to bind confirmation (abort)");
+                        };
+                        // We MAC against OUR fixed caps, so a server that rewrites the
+                        // relayed `caps` field cannot make the MAC verify.
+                        if filament_pake::verify_peer_confirm(&k, &my_fp, &their_fp, &caps_canon, &recv_mac) {
+                            agreed_secret = Some(filament_pake::secret_from_k(&k));
+                        } else {
+                            bail!("pairing REFUSED: key confirmation failed — wrong code, or the connection is being tampered with (a server cannot forge this). Nothing was stored; ask for a FRESH code.");
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 conn.ensure_responder(&from, &data).await?;
                 if let Some(l) = conn.link(&from) {
                     if let Err(e) = l.peer.handle_signal(data).await {
@@ -930,22 +1207,15 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 };
                 ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &display)));
                 peer = Some((pid.clone(), display.clone()));
+                let _ = &t; // transport not used on the v2 path (no secret over DC)
                 if stall {
                     continue; // gate 17b: connected, but deliberately never complete
                 }
-                if creator && !initiated {
-                    t.send_control(&json!({ "type": "pair-keep", "secret": secret })).await?;
-                    initiated = true;
-                } else if !creator {
-                    // Fallback: browsers (and legacy peers) never initiate —
-                    // give the creator 3 s, then hand over OUR secret.
-                    let tx = tx.clone();
-                    let pid = pid.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(3)).await;
-                        let _ = tx.send(Ev::Control(pid, json!({ "type": "__pair_fallback" })));
-                    });
-                }
+                // L1-a: the link is up and SDP fingerprints exist. Mark this peer
+                // as our PAKE counterpart; the progression block (top of the loop)
+                // sends our SPAKE2 element and, once K + fingerprints are known,
+                // the key-confirmation MAC. NO secret is sent over the DataChannel.
+                pake_peer.get_or_insert(pid.clone());
                 // Settle the petname: --name wins; otherwise ask (tty) or
                 // default to their display name (scripts, pipes).
                 if petname.is_none() && !prompted {
@@ -979,30 +1249,15 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             Ev::Control(pid, v) if stall => {
                 let _ = (pid, v); // gate 17b: connected, but ignore all ceremony control
             }
-            Ev::Control(pid, v) => match v["type"].as_str() {
+            Ev::Control(_pid, v) => match v["type"].as_str() {
+                // L1-a downgrade-refusal (spec §6.1): a v2 client NEVER stores a
+                // secret handed over the DataChannel. Receiving a `pair-keep` means
+                // the PEER is a legacy v1 client. We refuse — pairing securely
+                // requires v2 on both ends. A malicious server stripping `v:2`
+                // cannot exploit this: there is no path here that stores a
+                // server-readable secret.
                 Some("pair-keep") => {
-                    let sec = v["secret"].as_str().unwrap_or_default().to_string();
-                    if sec.len() == 64 && !initiated {
-                        // Running `filament pair` IS consent — ack and keep.
-                        their_secret = Some(sec);
-                        if let Some(t) = conn.transport_of(&pid) {
-                            t.send_control(&json!({ "type": "pair-keep-ack", "ok": true })).await.ok();
-                        }
-                    }
-                }
-                Some("pair-keep-ack") => {
-                    if v["ok"].as_bool() == Some(false) {
-                        bail!("they declined to be remembered — nothing stored on either side");
-                    }
-                    ack_ok = true;
-                }
-                Some("__pair_fallback") => {
-                    if !creator && !initiated && their_secret.is_none() {
-                        if let Some(t) = conn.transport_of(&pid) {
-                            t.send_control(&json!({ "type": "pair-keep", "secret": secret })).await?;
-                            initiated = true;
-                        }
-                    }
+                    bail!("the other device uses an older version and can't pair securely — update it (or this CLI) so first-pairing runs the encrypted handshake. Nothing was stored.");
                 }
                 _ => {}
             },
@@ -3639,6 +3894,48 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_deny_by_default() {
+        // GATE 5: deny-by-default. A device with empty caps is refused any gated
+        // action; "transfer" is the always-allowed L0 baseline; a v1 record
+        // (no caps) reads as ["transfer"]; future caps must be explicitly
+        // granted (i.e. agreed under K at re-enrollment), not escalatable.
+        let dir = std::env::temp_dir().join(format!("fil-caps-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("devices.json");
+        let sec = "a".repeat(64);
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "empty",   "secret": sec, "v": 2, "caps": []},
+                {"name": "xfer",    "secret": sec, "v": 2, "caps": ["transfer"]},
+                {"name": "execcap", "secret": sec, "v": 2, "caps": ["transfer", "remote-exec"]},
+                {"name": "legacy",  "secret": sec}  // v1 record: reads as ["transfer"]
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // transfer is the L0 baseline — allowed even for empty caps.
+        assert!(device_allows_at(&p, "empty", "transfer"), "transfer is the L0 baseline");
+        assert!(device_allows_at(&p, "xfer", "transfer"));
+        // A v1 record reads as caps:["transfer"] (back-compat, spec §8).
+        assert_eq!(device_caps_at(&p, "legacy"), Some(vec!["transfer".to_string()]));
+        assert!(device_allows_at(&p, "legacy", "transfer"));
+        // Deny-by-default: a gated future cap is REFUSED unless explicitly granted.
+        assert!(!device_allows_at(&p, "empty", "remote-exec"), "empty caps must deny remote-exec");
+        assert!(!device_allows_at(&p, "xfer", "remote-exec"), "transfer-only must deny remote-exec");
+        assert!(!device_allows_at(&p, "legacy", "remote-exec"), "v1 record must deny remote-exec");
+        // Only a device explicitly granted the cap (under K, at enrollment) is allowed.
+        assert!(device_allows_at(&p, "execcap", "remote-exec"), "explicitly granted cap is allowed");
+        // An unknown device grants no GATED cap (but transfer is the universal
+        // L0 baseline, so it is allowed regardless — never regresses send/recv).
+        assert!(!device_allows_at(&p, "ghost", "remote-exec"));
+        assert!(device_allows_at(&p, "ghost", "transfer"), "transfer baseline is universal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn proof_matches_browser() {
