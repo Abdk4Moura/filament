@@ -15,6 +15,7 @@
 // Failure-mode ledger: ../docs/cli-resilience.md — every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
+mod l2;
 mod net;
 mod session;
 mod ui;
@@ -205,6 +206,34 @@ enum Cmd {
     /// Print the man page (roff) to stdout
     #[command(hide = true)]
     Man,
+    /// Tunnel: wire stdio to one TCP stream on a known peer's localhost (the
+    /// ssh ProxyCommand primitive). Off by default; FILAMENT_L2=1 enables the
+    /// acceptor side in `up`/`recv`.
+    Netcat {
+        /// Known device (petname) to tunnel through
+        peer: String,
+        /// Remote port on the peer's localhost
+        rport: u16,
+    },
+    /// Tunnel: local TCP listener; each connection becomes one stream to the
+    /// peer's localhost:<rport>.
+    Forward {
+        /// Local port to listen on (127.0.0.1)
+        lport: u16,
+        /// Known device (petname) to tunnel through
+        peer: String,
+        /// Remote port on the peer's localhost
+        rport: u16,
+    },
+    /// Tunnel: run your real `ssh` over the data channel via ProxyCommand
+    /// (reuses your keys, known_hosts, and ~/.ssh/config).
+    Ssh {
+        /// Known device (petname) to ssh into
+        peer: String,
+        /// Extra args passed through to ssh (user@host, commands, -p, ...)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Petname management (C12): names are LOCAL aliases for pair secrets — the
@@ -250,7 +279,7 @@ fn install_id() -> String {
     id
 }
 
-fn mk_uid(prefix: &str) -> String {
+pub(crate) fn mk_uid(prefix: &str) -> String {
     // Test hook (gate 11): a pinned uid lets the harness exercise the
     // same-device-rejoined supersede path (C6). The cli-s-/cli-r- role prefix
     // must survive the override or same-role skip (C13) breaks.
@@ -302,7 +331,7 @@ fn config_set(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn display_name() -> String {
+pub(crate) fn display_name() -> String {
     if let Ok(n) = std::env::var("FILAMENT_NAME") {
         return n;
     }
@@ -404,7 +433,7 @@ fn devices_path() -> PathBuf {
     PathBuf::from(home).join(".config/filament/devices.json")
 }
 
-fn devices_load() -> Vec<(String, String)> {
+pub(crate) fn devices_load() -> Vec<(String, String)> {
     let Ok(raw) = std::fs::read_to_string(devices_path()) else { return Vec::new() };
     serde_json::from_str::<Value>(&raw)
         .ok()
@@ -523,7 +552,7 @@ fn devices_remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn channel_of(secret: &str) -> String {
+pub(crate) fn channel_of(secret: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"filament-pair:");
     h.update(secret.as_bytes());
@@ -556,7 +585,7 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
 /// certificate fingerprints are mixed in sorted order — a channel MITM'd by
 /// anyone (including the signaling server) has different fingerprints, so
 /// the proof fails and auto-accept refuses.
-fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str, fp1: &str, fp2: &str) -> String {
+pub(crate) fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str, fp1: &str, fp2: &str) -> String {
     let (lo, hi) = if a_uid < b_uid { (a_uid, b_uid) } else { (b_uid, a_uid) };
     let (f_lo, f_hi) = if fp1 < fp2 { (fp1, fp2) } else { (fp2, fp1) };
     hmac_sha256(
@@ -565,7 +594,7 @@ fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str, fp1: &str
     )
 }
 
-fn fresh_secret() -> String {
+pub(crate) fn fresh_secret() -> String {
     let mut buf = [0u8; 32];
     // std-only CSPRNG is unavailable; derive from getrandom via std::fs on unix
     if std::fs::File::open("/dev/urandom")
@@ -1910,7 +1939,7 @@ async fn main() -> Result<()> {
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
-        const CMDS: [&str; 12] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce"];
+        const CMDS: [&str; 15] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh"];
         let code_re = regex_lite_code(first);
         if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
             if std::path::Path::new(first).exists() {
@@ -2008,6 +2037,9 @@ async fn main() -> Result<()> {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(())
         }
+        Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, cli.relay).await,
+        Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
+        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay),
     }
 }
 
@@ -2926,6 +2958,12 @@ async fn recv_cmd(
     let mut digest_alone = false;
     // C30 phase 3: link mini-sync — state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
+    // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
+    // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in; the cap gate
+    // is still a placeholder pending L1-a). Keyed by peer sid so multiple links
+    // stay isolated.
+    let l2_enabled = std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
+    let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
 
     loop {
         let ev = match tokio::time::timeout(
@@ -3260,6 +3298,32 @@ async fn recv_cmd(
             }
             Ev::Control(pid, v) => match v["type"].as_str() {
                 _ if !conn.links.contains_key(&pid) => {}
+                // L2 (ssh/TCP tunnel) acceptor. Opt-in (FILAMENT_L2=1). The
+                // capability gate is the proof-verified `trusted` flag on this
+                // link (placeholder for L1-a caps); localhost-only is enforced in
+                // accept_control. A non-trusted or non-loopback open is refused.
+                Some("l2-open") | Some("l2-close") if l2_enabled => {
+                    let Some(t) = conn.transport_of(&pid) else { continue };
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let mux = l2_muxes
+                        .entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    match mux.accept_control(&v, trusted).await {
+                        l2::OpenVerdict::Accept { sid, host, port, rx } => {
+                            tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx));
+                        }
+                        l2::OpenVerdict::Deny { sid, err } => {
+                            // Log refused dials (threat model: port-scan / SSRF
+                            // visibility). The gate observes this line.
+                            eprintln!("l2: refused stream {sid:#x}: {err}");
+                            let _ = t
+                                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
+                                .await;
+                        }
+                        l2::OpenVerdict::Ignore => {}
+                    }
+                }
                 Some("brb") => {
                     // C21: the peer announces a benign absence (mobile file
                     // picker suspends the tab). Hold the line that long.
@@ -3564,7 +3628,14 @@ async fn recv_cmd(
                 _ => {}
             },
             Ev::Chunk(pid, sid, data) => {
-                if let Some(inc) = by_sid.get_mut(&(pid, sid)) {
+                // L2 streams live in the HIGH half of the sid space — route them
+                // to the tunnel mux, never the file-transfer table (the pure
+                // high-bit prefix check keeps file send/recv byte-identical).
+                if l2_enabled && l2::is_l2_sid(sid) {
+                    if let Some(mux) = l2_muxes.get(&pid) {
+                        mux.on_frame(sid, data).await;
+                    }
+                } else if let Some(inc) = by_sid.get_mut(&(pid, sid)) {
                     inc.file.write_all(&data).await?;
                     inc.received += data.len() as u64;
                     inc.bar.tick(inc.received);
@@ -3679,7 +3750,16 @@ async fn recv_cmd(
                     }
                 }
             }
-            Ev::PcState(pid, s) => conn.on_pc_state(&pid, &s).await,
+            Ev::PcState(pid, s) => {
+                // L2: a dead/closed link must abort every tunnel stream it
+                // carried so no pump hangs on a peer that's gone (design §3.5).
+                if l2_enabled && (s == "failed" || s == "closed" || s == "disconnected") {
+                    if let Some(mux) = l2_muxes.remove(&pid) {
+                        mux.shutdown_all().await;
+                    }
+                }
+                conn.on_pc_state(&pid, &s).await;
+            }
             Ev::PeerLeft(v) => {
                 // Test hook (gate 18): peer-left delivery is best-effort in the
                 // real world; this simulates the loss deterministically so the

@@ -714,6 +714,21 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
 # ============================================================================
 
+# --------------------------------------------------------- L2 tunnel gates ---
+# ssh / TCP over the data channel (docs/L2-tunnel-design.md). These run their
+# OWN fixture backend on port 8097 (NOT this suite's 8077) and are OPT-IN:
+# they are NOT part of the deterministic-core commit gate (single-stream scope;
+# real sshd; longer-running). Run them standalone with `tests/l2-gates.sh`, or
+# inline here with `L2_GATES=1 ./gates.sh`.
+if [ "${L2_GATES:-0}" = "1" ]; then
+  say "L2: ssh/TCP tunnel (port 8097 — delegates to l2-gates.sh)"
+  if bash "$HERE/l2-gates.sh"; then
+    ok "L2 tunnel gates (ssh round-trip, forward, half-close, cap/SSRF deny, teardown)"
+  else
+    bad "L2 tunnel gates"
+  fi
+fi
+
 # ---------------------------------------------------------------- summary ---
 printf '\n\033[1m%d passed, %d failed%s\033[0m\n' "$PASS" "$FAIL" "${FAILED_GATES:+ —$FAILED_GATES}"
 echo "artifacts: $WORK"
