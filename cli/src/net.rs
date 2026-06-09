@@ -67,6 +67,12 @@ pub enum Ev {
     /// (peer sid, ...) — every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
+    /// rung-1 direct path (FILAMENT_DIRECT): an AUTHENTICATED QUIC transport for
+    /// (peer sid) won the simultaneous-open race and passed the pair-secret MAC.
+    /// Handled like ChannelReady but the link is pre-trusted (the MAC already
+    /// proved the secret — stronger than the post-DC pair-proof), so the
+    /// DTLS-bound pair-proof dance is skipped.
+    DirectReady(String, Arc<dyn Transport>),
     Control(String, Value),
     Chunk(String, u32, Bytes),
     PcState(String, String),

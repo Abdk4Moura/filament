@@ -15,6 +15,7 @@
 // Failure-mode ledger: ../docs/cli-resilience.md — every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
+mod direct;
 mod l2;
 mod net;
 mod session;
@@ -763,6 +764,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -806,7 +808,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
                 if let Some(l) = conn.link(&from) {
-                    if let Err(e) = l.peer.handle_signal(data).await {
+                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
                         eprintln!("signal failed to apply: {e} (recovering)");
                     }
                 }
@@ -820,7 +822,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 let (dev_name, sec) = if is_b { (&b_name, &b_sec) } else { (&a_name, &a_sec) };
                 let other_name = if is_b { &a_name } else { &b_name };
                 if let Some(l) = conn.link(&pid) {
-                    if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                    if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                         // prove ourselves, then vouch
                         t.send_control(&json!({
                             "type": "pair-proof",
@@ -987,6 +989,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -1094,7 +1097,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             if !sent_confirm {
                 if let Some(k) = pake_k.clone() {
                     if let Some(l) = conn.link(&pid) {
-                        if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                        if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                             let mac = filament_pake::our_confirm(&k, &my_fp, &their_fp, &caps_canon);
                             sio.emit("signal", json!({ "to": pid, "data": {
                                 "type": "pake-confirm", "v": 2,
@@ -1205,7 +1208,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                         };
                         let recv_mac = data["mac"].as_str().and_then(b64_decode).unwrap_or_default();
                         let fps = match conn.link(&from) {
-                            Some(l) => l.peer.fingerprints().await,
+                            Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
                             None => None,
                         };
                         let Some((my_fp, their_fp)) = fps else {
@@ -1224,7 +1227,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 }
                 conn.ensure_responder(&from, &data).await?;
                 if let Some(l) = conn.link(&from) {
-                    if let Err(e) = l.peer.handle_signal(data).await {
+                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
                         eprintln!("signal failed to apply: {e} (recovering)");
                     }
                 }
@@ -1323,7 +1326,11 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
 // rejoin window when the peer's socket dies entirely.
 
 struct Link {
-    peer: Arc<Peer>,
+    /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
+    /// negotiation — it rides authenticated QUIC), so every WebRTC-only call
+    /// site (`handle_signal`, `fingerprints`, `restart_ice`, the watchdog's
+    /// `is_connected`) is reachable only when this is `Some`.
+    peer: Option<Arc<Peer>>,
     info: Value, // {id,name,uid} as last seen — enough to re-establish
     name: String,
     uid: Option<String>,
@@ -1336,6 +1343,10 @@ struct Link {
     expected_secret: Option<(String, String)>,
     /// C26: what the status roster shows for this peer
     presence: Presence,
+    /// rung-1 (FILAMENT_DIRECT): this link's transport is an authenticated direct
+    /// QUIC connection — its pair-secret MAC already proved identity, so the
+    /// post-channel DTLS pair-proof is skipped and the link is born trusted.
+    direct: bool,
 }
 
 /// C26: per-peer presence for the static status roster.
@@ -1411,6 +1422,25 @@ struct Conn {
     /// reconnect paths are untouched. Defaults false, so the send-side and
     /// connecting-phase `on_stuck` callers are unaffected.
     recv_done: bool,
+    /// rung-1 (FILAMENT_DIRECT): in-flight direct-QUIC attempts, keyed by peer
+    /// sid. While an attempt is pending we do NOT establish WebRTC for that peer
+    /// (sequential, per the design review — avoids two transports racing to
+    /// ChannelReady). On deadline expiry with no DirectReady the entry is
+    /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
+    direct_pending: HashMap<String, DirectPending>,
+}
+
+/// rung-1: state for one in-flight direct-QUIC attempt.
+struct DirectPending {
+    /// (name, secret) for the known device — gates the attempt and keys the MAC.
+    secret: (String, String),
+    /// budget deadline; on expiry with no DirectReady we fall back to WebRTC.
+    deadline: Instant,
+    /// set once the peer's transport-offer arrived and we spawned the racer, so
+    /// a duplicate offer doesn't spawn a second race.
+    racing: bool,
+    /// kept alive so the bound UDP port stays ours until the race consumes it.
+    endpoint: Option<quinn::Endpoint>,
 }
 
 impl Conn {
@@ -1560,10 +1590,13 @@ impl Conn {
         // holds sids that are still live links.
         self.deferred_left.remove(pid);
         if let Some(old) = self.links.remove(pid) {
-            // Never await close in the event loop (F8): mark + spawn.
-            let p = old.peer.clone();
-            p.mark_closed();
-            tokio::spawn(async move { p.close().await });
+            // Never await close in the event loop (F8): mark + spawn. A direct
+            // link has no WebRTC peer; dropping the Link drops its QUIC transport
+            // (the keepalive task observes conn.closed() and tears down).
+            if let Some(p) = old.peer.clone() {
+                p.mark_closed();
+                tokio::spawn(async move { p.close().await });
+            }
         }
         if self.is_active(pid) {
             self.active = None;
@@ -1572,6 +1605,13 @@ impl Conn {
 
     async fn establish(&mut self, info: Value) -> Result<()> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
+        // rung-1: a direct-QUIC attempt owns this peer until its budget expires.
+        // Suppress the WebRTC offer so the path stays SEQUENTIAL (no two
+        // transports racing to ChannelReady). `expired_direct` removes the
+        // pending before calling us for the fallback, so this never blocks it.
+        if self.direct_pending.contains_key(&peer_id) {
+            return Ok(());
+        }
         self.drop_link(&peer_id); // re-establish replaces any same-sid link
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
         let name = info["name"].as_str().unwrap_or("peer").to_string();
@@ -1595,7 +1635,7 @@ impl Conn {
         self.links.insert(
             peer_id,
             Link {
-                peer,
+                peer: Some(peer),
                 info,
                 name,
                 uid: peer_uid,
@@ -1605,9 +1645,163 @@ impl Conn {
                 trusted: false,
                 expected_secret: None,
                 presence: Presence::Connecting,
+                direct: false,
             },
         );
         Ok(())
+    }
+
+    // --- rung-1 direct-QUIC path (FILAMENT_DIRECT) ---------------------------
+    //
+    // Sequential by design: when both peers are CLIs and a pair secret is known,
+    // try a direct authenticated QUIC connection FIRST and only fall back to the
+    // WebRTC `establish` above if no authenticated connection lands within the
+    // budget. The whole thing is gated on `direct::direct_enabled()`, so with the
+    // flag OFF none of this runs and the WebRTC path is byte-for-byte unchanged.
+
+    /// Begin a direct attempt against `pid`: bind a quinn endpoint, advertise our
+    /// candidates via a relayed `transport-offer`, and stash the pending state.
+    /// No Link is created yet — it is born (with `peer: None`, pre-trusted) only
+    /// when an authenticated connection wins (Ev::DirectReady). Idempotent per
+    /// peer (a second call while pending is a no-op). The peer's own
+    /// transport-offer (Ev::TransportOffer) drives the race.
+    async fn start_direct(&mut self, pid: &str, name: &str, secret: &str) {
+        if !direct::direct_enabled() {
+            return;
+        }
+        if self.direct_pending.contains_key(pid) || self.links.contains_key(pid) {
+            return; // already trying, or already linked (WebRTC or direct)
+        }
+        let (ep, port) = match direct::bind_endpoint() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("filament: direct disabled (endpoint bind failed: {e})");
+                return;
+            }
+        };
+        let cands = direct::gather_candidates(&self.server, port).await;
+        // transport-offer rides the OPAQUE signaling relay (same channel as ICE
+        // signals); the server cannot read or forge it without failing the MAC.
+        let _ = self
+            .sio
+            .emit(
+                "signal",
+                json!({ "to": pid, "data": { "type": "transport-offer", "v": 1, "addrs": cands } }),
+            )
+            .await;
+        eprintln!("filament: DIRECT-OFFER sent to {name} ({pid}) — {} candidate(s)", port);
+        self.direct_pending.insert(
+            pid.to_string(),
+            DirectPending {
+                secret: (name.to_string(), secret.to_string()),
+                deadline: Instant::now() + direct::DIRECT_BUDGET,
+                racing: false,
+                endpoint: Some(ep),
+            },
+        );
+    }
+
+    /// The peer advertised its candidates. If we have a matching pending attempt
+    /// and haven't started the race yet, consume the endpoint and spawn the
+    /// simultaneous-open + auth race; the winner posts Ev::DirectReady.
+    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>) {
+        let Some(p) = self.direct_pending.get_mut(pid) else { return };
+        if p.racing {
+            return;
+        }
+        let Some(ep) = p.endpoint.take() else { return };
+        p.racing = true;
+        let secret = p.secret.1.clone();
+        let tx = self.tx.clone();
+        let pid_s = pid.to_string();
+        tokio::spawn(async move {
+            if let Some(t) =
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone()).await
+            {
+                let _ = tx.send(Ev::DirectReady(pid_s, t));
+            }
+            // On None the per-tick reaper handles the WebRTC fallback at deadline.
+        });
+    }
+
+    /// Create the Link for a direct connection that won the race. `peer: None`
+    /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
+    /// proved identity — at least as strong as the DTLS pair-proof it replaces).
+    fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>) {
+        let pend = self.direct_pending.remove(pid);
+        let (name, secret) = match pend {
+            Some(p) => p.secret,
+            None => ("peer".to_string(), String::new()),
+        };
+        let info = self
+            .roster
+            .get(pid)
+            .cloned()
+            .unwrap_or_else(|| json!({ "id": pid, "name": name }));
+        let uid = info["uid"].as_str().map(|s| s.to_string());
+        let expected_secret = if secret.is_empty() {
+            None
+        } else {
+            Some((name.clone(), secret))
+        };
+        self.next_gen += 1;
+        let generation = self.next_gen;
+        self.links.insert(
+            pid.to_string(),
+            Link {
+                peer: None,
+                info,
+                name,
+                uid,
+                transport: Some(t),
+                generation,
+                attempts: 0,
+                trusted: true,
+                expected_secret,
+                presence: Presence::Ready,
+                direct: true,
+            },
+        );
+    }
+
+    /// Per-tick: a direct attempt whose budget expired without an authenticated
+    /// connection falls back to the WebRTC `establish` (unchanged). Returns the
+    /// list of (pid, info) to establish — caller awaits establish outside the
+    /// borrow. Also drops any pending whose Link already exists.
+    fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
+        let now = Instant::now();
+        let mut fell_back = Vec::new();
+        let expired: Vec<String> = self
+            .direct_pending
+            .iter()
+            .filter(|(pid, p)| now >= p.deadline && !self.links.contains_key(*pid))
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in expired {
+            if let Some(p) = self.direct_pending.remove(&pid) {
+                let info = self
+                    .roster
+                    .get(&pid)
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
+                eprintln!(
+                    "filament: DIRECT-FALLBACK for {} — no authenticated QUIC in budget, using WebRTC",
+                    p.secret.0
+                );
+                fell_back.push((pid, info, p.secret));
+            }
+        }
+        // Drop pendings whose link landed by another route (cleanup).
+        let linked: Vec<String> = self
+            .direct_pending
+            .keys()
+            .filter(|pid| self.links.contains_key(*pid))
+            .cloned()
+            .collect();
+        for pid in linked {
+            self.direct_pending.remove(&pid);
+        }
+        fell_back
     }
 
     /// C3/C4: watchdog or grace expiry — retry that LINK with fresh config,
@@ -1620,7 +1814,12 @@ impl Conn {
             return Ok(false);
         }
         let Some(l) = self.links.get(pid) else { return Ok(false) };
-        if l.generation != generation || l.peer.is_connected() {
+        // rung-1: a direct link has no WebRTC watchdog (no Peer::connect timer),
+        // so on_stuck can't fire for it; defensively no-op if it ever does.
+        if l.direct {
+            return Ok(false);
+        }
+        if l.generation != generation || l.peer.as_ref().map(|p| p.is_connected()).unwrap_or(true) {
             return Ok(false); // stale timer from a superseded attempt
         }
         // Gate-18 Mode B: the transfer is COMPLETE (recv_done; recomputed per
@@ -1706,8 +1905,10 @@ impl Conn {
                     announce = Some(("◌", ui::Tone::Warn, "reconnecting…"));
                     Duration::from_secs(6)
                 };
-                if !l.peer.polite && !away {
-                    l.peer.restart_ice().await;
+                if let Some(p) = &l.peer {
+                    if !p.polite && !away {
+                        p.restart_ice().await;
+                    }
                 }
                 let tx = self.tx.clone();
                 let pid = pid.to_string();
@@ -2296,6 +2497,7 @@ async fn send_cmd(
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -2338,6 +2540,17 @@ async fn send_cmd(
         sess.tick(&sio).await;
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // rung-1: a direct attempt that timed out without an authenticated QUIC
+        // connection falls back to the WebRTC establish (unchanged path).
+        for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.establish(info).await?;
+            if let Some(l) = conn.link_mut(&pid) {
+                l.expected_secret = Some((n, sec));
+            }
+            if conn.to_filter.is_none() && conn.active.is_none() {
+                conn.active = Some(pid.clone());
+            }
+        }
         // C30 phase 3: tell every link our truth every ~10s (sender side has
         // no receive-partials; the ping mainly carries trusted/away and keeps
         // the peer's away-mark honest).
@@ -2404,6 +2617,12 @@ async fn send_cmd(
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
                         eprintln!("known device '{n}' is online — connecting");
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        // rung-1: both ends are CLIs (known device) — try direct
+                        // QUIC FIRST. start_direct records the pending so the
+                        // maybe_adopt->establish below skips the WebRTC offer
+                        // until the budget expires (then it falls back).
+                        let (n, sec) = (n.clone(), sec.clone());
+                        conn.start_direct(&pid, &n, &sec).await;
                         conn.maybe_adopt(&v, true).await?;
                         if let Some(l) = conn.link_mut(&pid) {
                             l.expected_secret = Some((n.clone(), sec.clone()));
@@ -2414,16 +2633,34 @@ async fn send_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // rung-1: a relayed transport-offer carries the peer's direct
+                // candidates — kick off the simultaneous-open + auth race.
+                if data["type"].as_str() == Some("transport-offer") {
+                    let cands: Vec<String> = data["addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    conn.on_transport_offer(&from, cands);
+                    continue;
+                }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
                 if let Some(l) = conn.link(&from) {
                     // Never fatal (F6): the watchdog/grace machinery owns
                     // failed negotiations.
-                    if let Err(e) = l.peer.handle_signal(data).await {
+                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
                         eprintln!("signal failed to apply: {e} (recovering)");
                     }
                 }
+            }
+            // rung-1: the authenticated direct-QUIC connection won the race.
+            // Create the (pre-trusted) Link, then funnel into the SAME ready
+            // handler the WebRTC path uses (announce + offers) by re-emitting
+            // ChannelReady — the transfer logic rides the trait unchanged.
+            Ev::DirectReady(pid, t) => {
+                conn.adopt_direct(&pid, t.clone());
+                let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
@@ -2438,24 +2675,32 @@ async fn send_cmd(
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(l) = conn.link(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
-                    let p = l.peer.clone();
-                    tokio::spawn(async move {
-                        // ICE may renominate; retry briefly (mirrors the
-                        // browser's _detectRoute attempts) so fast transfers
-                        // still get a route line before the process exits.
-                        for _ in 0..6 {
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                            if let Some(r) = p.route().await {
-                                ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
-                                break;
+                    let is_direct = l.direct;
+                    if let Some(p) = l.peer.clone() {
+                        tokio::spawn(async move {
+                            // ICE may renominate; retry briefly (mirrors the
+                            // browser's _detectRoute attempts) so fast transfers
+                            // still get a route line before the process exits.
+                            for _ in 0..6 {
+                                tokio::time::sleep(Duration::from_millis(400)).await;
+                                if let Some(r) = p.route().await {
+                                    ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    break;
+                                }
                             }
-                        }
-                    });
+                        });
+                    } else if is_direct {
+                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, "route: direct-quic")));
+                    }
                     // C12: prove identity to a known device (their daemon
                     // auto-accepts only after verifying); or hand over a new
-                    // pair secret when the user asked to --remember.
-                    if let Some((_n, sec)) = &l.expected_secret {
-                        if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                    // pair secret when the user asked to --remember. A DIRECT
+                    // link already proved the secret via the QUIC keying-material
+                    // MAC (>= the DTLS pair-proof), so it skips this dance.
+                    if is_direct {
+                        // pre-authenticated; nothing to prove over the channel.
+                    } else if let Some((_n, sec)) = &l.expected_secret {
+                        if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                             t.send_control(&json!({
                                 "type": "pair-proof",
                                 "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
@@ -2546,10 +2791,7 @@ async fn send_cmd(
                     if v["trusted"].as_bool() == Some(false) && !reproved.contains(&pid) {
                         let proof = match conn.link(&pid) {
                             Some(l) => match &l.expected_secret {
-                                Some((_n, sec)) => l
-                                    .peer
-                                    .fingerprints()
-                                    .await
+                                Some((_n, sec)) => (match &l.peer { Some(p) => p.fingerprints().await, None => None })
                                     .map(|(my_fp, their_fp)| proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp)),
                                 None => None,
                             },
@@ -2875,6 +3117,7 @@ async fn recv_cmd(
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -2980,6 +3223,13 @@ async fn recv_cmd(
         sess.tick(&sio).await;
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).
+        for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.maybe_adopt(&info, true).await?;
+            if let Some(l) = conn.link_mut(&pid) {
+                l.expected_secret = Some((n, sec));
+            }
+        }
 
         // C30 phase 3: state pings — each open link hears our transfer/away
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
@@ -3038,7 +3288,9 @@ async fn recv_cmd(
                     l.attempts = 0; // mirror the real flap: cap never accumulates
                     // Tear the data channel down so on_stuck's is_connected()
                     // guard sees a dead link and the Stuck isn't swallowed.
-                    l.peer.close().await;
+                    if let Some(p) = &l.peer {
+                        p.close().await;
+                    }
                 }
                 let _ = conn.tx.send(Ev::Stuck(pid, generation));
             }
@@ -3223,6 +3475,9 @@ async fn recv_cmd(
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
                     eprintln!("known device '{n}' appeared — connecting");
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    // rung-1: known device = both CLIs; try direct QUIC first.
+                    let (n, sec) = (n.clone(), sec.clone());
+                    conn.start_direct(&pid, &n, &sec).await;
                     conn.maybe_adopt(&v, true).await?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
@@ -3240,35 +3495,55 @@ async fn recv_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // rung-1: a relayed transport-offer carries the peer's direct
+                // candidates — start the simultaneous-open + auth race.
+                if data["type"].as_str() == Some("transport-offer") {
+                    let cands: Vec<String> = data["addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    conn.on_transport_offer(&from, cands);
+                    continue;
+                }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
                 if let Some(l) = conn.link(&from) {
                     // Never fatal (F6): the watchdog/grace machinery owns
                     // failed negotiations.
-                    if let Err(e) = l.peer.handle_signal(data).await {
+                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
                         eprintln!("signal failed to apply: {e} (recovering)");
                     }
                 }
+            }
+            // rung-1: authenticated direct-QUIC won the race — adopt as a
+            // pre-trusted Link, then funnel into the normal ChannelReady handler.
+            Ev::DirectReady(pid, t) => {
+                conn.adopt_direct(&pid, t.clone());
+                let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
-                    let p = l.peer.clone();
-                    tokio::spawn(async move {
-                        // ICE may renominate; retry briefly (mirrors the
-                        // browser's _detectRoute attempts) so fast transfers
-                        // still get a route line before the process exits.
-                        for _ in 0..6 {
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                            if let Some(r) = p.route().await {
-                                ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
-                                break;
+                    let is_direct = l.direct;
+                    if let Some(p) = l.peer.clone() {
+                        tokio::spawn(async move {
+                            // ICE may renominate; retry briefly (mirrors the
+                            // browser's _detectRoute attempts) so fast transfers
+                            // still get a route line before the process exits.
+                            for _ in 0..6 {
+                                tokio::time::sleep(Duration::from_millis(400)).await;
+                                if let Some(r) = p.route().await {
+                                    ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    break;
+                                }
                             }
-                        }
-                    });
+                        });
+                    } else if is_direct {
+                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, "route: direct-quic")));
+                    }
                 }
                 // C29: an in-session pairing — exactly one side hands over a
                 // secret; consent (pair-keep-ack / our store) completes it.
@@ -3421,7 +3696,7 @@ async fn recv_cmd(
                     let mac = v["mac"].as_str().unwrap_or_default();
                     let peer_uid = conn.link(&pid).and_then(|l| l.uid.clone()).unwrap_or_default();
                     let fps = match conn.link(&pid) {
-                        Some(l) => l.peer.fingerprints().await,
+                        Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
                         None => None,
                     };
                     let Some((my_fp, their_fp)) = fps else {

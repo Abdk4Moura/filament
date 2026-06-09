@@ -81,6 +81,17 @@ def api_config():
     return jsonify(config.public_config())
 
 
+@app.get("/api/whoami")
+def api_whoami():
+    """Echo the caller's public IP (CF-Connecting-IP behind Cloudflare).
+
+    Used by the direct CLI<->CLI transport (FILAMENT_DIRECT) to learn its own
+    public address — a one-line STUN-free substitute for advertising a public
+    candidate. No room, no auth: it reveals only the IP the caller already has.
+    """
+    return jsonify({"ip": _client_ip()})
+
+
 # Human-friendly code alphabet: no 0/O/1/I/L to avoid mistyping.
 _CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 

@@ -42,6 +42,11 @@ flate2 = "1.1.9"
 qrcode = { version = "0.14.1", default-features = false }
 # L1-a: the shared SPAKE2 PAKE core (also compiles to wasm for the browser).
 filament-pake = { path = "../pake" }
+# rung-1 direct CLI<->CLI transport (FILAMENT_DIRECT=1). ring crypto to match
+# the rest of the rustls tree; we hand quinn an explicit ring-based config so
+# no process-default crypto provider is required.
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
 
 [profile.release]
 lto = true
