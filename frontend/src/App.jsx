@@ -51,8 +51,6 @@ export default function App() {
       onUseAutoRoom={qs.useAutoRoom}
       onAcceptKeep={qs.acceptKeep}
       onDeclineKeep={qs.declineKeep}
-      onAcceptPakeKeep={qs.acceptPakeKeep}
-      onDeclinePakeKeep={qs.declinePakeKeep}
     />
   )
 }
