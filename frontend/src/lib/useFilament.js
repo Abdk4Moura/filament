@@ -584,8 +584,23 @@ export function useFilament() {
         setRoomCode(null)
         setRoomScope((s) => (s === 'code' ? prevScopeRef.current || 'auto' : s))
       })
-      sig.on('pair-error', ({ error }) => {
-        console.warn('pairing failed:', error)
+      sig.on('pair-error', ({ error, why }) => {
+        console.warn('pairing failed:', error, why || '')
+        // Only translate CLAIM failures (we typed a code) into user-facing
+        // status. A create-side collision ('taken') is handled by generateCode's
+        // own retry and must not flash an error here.
+        if (error === 'invalid') {
+          if (why === 'bad-nameplate') {
+            setPairStatus('that code is not valid — check it and re-enter it (a full code looks like brave-otter-ruby-3141)')
+          } else if (why === 'sender-gone') {
+            setPairStatus('the other device left before you paired — ask them to create a fresh code, then try again')
+          } else {
+            // 'unknown': never existed / expired / already used.
+            setPairStatus('that code did not work — it may be mistyped, expired, or already used. Ask for a fresh code and try again.')
+          }
+        } else if (error === 'slow-down') {
+          setPairStatus('too many attempts — wait a moment and try again')
+        }
         setRoomCode(null)
         setRoomScope((s) => (s === 'code' ? prevScopeRef.current || 'auto' : s))
       })
@@ -750,11 +765,26 @@ export function useFilament() {
     if (!clean) return
     // L1-a (PAKE v2): parse the typed code CLIENT-SIDE; send ONLY the nameplate
     // to the server. The password (words) feeds SPAKE2 and never leaves here.
+    setPairStatus(null) // clear any stale failure from a previous attempt
     await pakeReady()
     pakeReadyRef.current = true
-    const { nameplate, password } = parseSpokenCode(clean)
-    if (!nameplate || !password) {
-      setPairStatus('that code does not look right — expected e.g. brave-otter-ruby-3141')
+    const { nameplate, password, normalized } = parseSpokenCode(clean)
+    // A valid PAKE code is `words…-NNNN`: a numeric trailing nameplate (3-5
+    // digits, matching the server's _NAMEPLATE_RE) AND at least one word of
+    // password before it. Catch the common mistakes CLIENT-SIDE with a clear,
+    // case-specific message instead of bouncing off the server as a bare
+    // "invalid" — distinguishing "no nameplate at all" from "looks like an old
+    // legacy code" from "missing the words half".
+    const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
+    if (!password || !normalized.includes('-')) {
+      // No dash / nothing before the number — not a full spoken code.
+      setPairStatus('that does not look like a full code — type the whole thing, e.g. brave-otter-ruby-3141')
+      return
+    }
+    if (!numericNameplate) {
+      // Trailing group is not the numeric nameplate (e.g. a 3-word legacy code
+      // with no number, or a partial/typo'd code).
+      setPairStatus('that code is missing its number — a full code ends in a 4-digit number, e.g. brave-otter-ruby-3141')
       return
     }
     pendingPakeRef.current = { nameplate, password }
@@ -912,21 +942,33 @@ export function useFilament() {
   // automatically when present and stays silent (available:false) when not.
   useEffect(() => {
     let alive = true
+    let t = null
     const HELPER = 'http://127.0.0.1:53317/peers'
+    // The helper is OPTIONAL and absent on a normal user's machine. A single
+    // refused fetch floods the console (net::ERR_CONNECTION_REFUSED) — so we
+    // probe ONCE, and only start the steady 3s poll if that first probe SUCCEEDS
+    // (helper present). On failure we go silent: no interval, no retries, no
+    // console spam. Worst case the helper started after page-load and isn't
+    // picked up until reload — an acceptable trade for a quiet console.
     const poll = async () => {
       try {
         const res = await fetch(HELPER, { signal: AbortSignal.timeout(800) })
         const data = await res.json()
-        if (alive) setLocalHelper({ available: true, peers: data.peers || [] })
+        if (!alive) return
+        setLocalHelper({ available: true, peers: data.peers || [] })
+        return true
       } catch {
         if (alive) setLocalHelper({ available: false, peers: [] })
+        return false
       }
     }
-    poll()
-    const t = setInterval(poll, 3000)
+    // First (and possibly only) probe. Light up the steady poll iff it's there.
+    poll().then((present) => {
+      if (alive && present && !t) t = setInterval(poll, 3000)
+    })
     return () => {
       alive = false
-      clearInterval(t)
+      if (t) clearInterval(t)
     }
   }, [])
 
@@ -952,6 +994,7 @@ export function useFilament() {
     declineTransfer,
     saveTransfer,
     clearTransfer,
+    pairStatus, // null | 'pairing' | 'paired' | a user-facing error/refusal string
     pairWithCode, // join a code room to pair across networks
     generateCode, // mint a fresh code and switch to it; returns the code
     useAutoRoom, // go back to the 'people near you' auto room

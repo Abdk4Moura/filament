@@ -272,7 +272,21 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
     }}>{label}</button>
   )
 
-  const submitCode = () => { const c = code.trim(); if (c) { onPairWithCode(c); setCode(''); setEntering(false) } }
+  // Keep the input open after submitting a code so the user sees the result
+  // (success/failure) and can correct a mistyped code in place — closing the
+  // box on submit is why pairing failures used to vanish silently.
+  const submitCode = () => { const c = code.trim(); if (c) onPairWithCode(c) }
+
+  // Surface pairing feedback (set by the hook). 'pairing'/'paired' are neutral;
+  // anything else is a user-facing error/refusal shown in the accent-warning hue.
+  const ps = state.pairStatus
+  const pairMsg = ps && ps !== 'paired'
+    ? (
+      <div style={{ fontSize: 11, lineHeight: 1.4, color: ps === 'pairing' ? T.dim : '#e0564f' }}>
+        {ps === 'pairing' ? 'pairing…' : ps}
+      </div>
+    )
+    : null
 
   const wrap = {
     border: '1px solid ' + T.line, background: T.panel, padding: '12px ' + D.tilePad + 'px',
@@ -320,12 +334,15 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         {/* Codes work from ANY room — minting is additive (the claimer joins
             THIS room) — so the affordance belongs here too, not just in auto. */}
         {entering ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
-              placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
-                background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
-            {ghostBtn('pair', submitCode, true)}
-            {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
+                placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
+                  background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+              {ghostBtn('pair', submitCode, true)}
+              {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+            </div>
+            {pairMsg}
           </div>
         ) : (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -346,12 +363,15 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         <div style={{ marginLeft: 'auto' }}><LanChip localHelper={state.localHelper} T={T} /></div>
       </div>
       {entering ? (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
-            placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
-              background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
-          {ghostBtn('pair', submitCode, true)}
-          {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <input autoFocus value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') submitCode(); if (e.key === 'Escape') { setEntering(false); setCode('') } }}
+              placeholder="ENTER CODE" style={{ font: 'inherit', fontSize: 12, letterSpacing: '.1em', textTransform: 'uppercase', padding: '7px 10px', flex: 1, minWidth: 130,
+                background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none' }} />
+            {ghostBtn('pair', submitCode, true)}
+            {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+          </div>
+          {pairMsg}
         </div>
       ) : (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
