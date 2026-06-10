@@ -65,24 +65,32 @@ def main():
       </section>""")
 
     html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Filament CLI — UX flow gallery</title>
 <style>
   :root {{ color-scheme: dark; }}
-  body {{ background:#0d1117; color:#c9d1d9; font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; margin:0; padding:32px; }}
+  * {{ box-sizing: border-box; }}
+  body {{ background:#0d1117; color:#c9d1d9; font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; margin:0; padding:24px; }}
   h1 {{ font-size:24px; margin:0 0 4px; }}
   .sub {{ color:#8b949e; margin:0 0 8px; }}
   .summary {{ margin:12px 0 28px; font-size:14px; }}
   .summary b {{ font-size:18px; }}
-  .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(440px,1fr)); gap:20px; }}
-  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:16px; }}
-  .hd {{ display:flex; justify-content:space-between; align-items:center; }}
+  .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(min(440px,100%),1fr)); gap:20px; }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:16px; min-width:0; }}
+  .hd {{ display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }}
   .flow {{ font:12px monospace; color:#58a6ff; letter-spacing:.04em; }}
   .badge {{ color:#fff; font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; }}
   h2 {{ font-size:16px; margin:8px 0 4px; }}
   .cap {{ color:#8b949e; font-size:13px; margin:0 0 10px; }}
-  .detail {{ color:#6e7681; font-size:12px; margin:8px 0 0; font-family:monospace; }}
-  img {{ width:100%; border-radius:6px; border:1px solid #30363d; background:#000; }}
+  .detail {{ color:#6e7681; font-size:12px; margin:8px 0 0; font-family:monospace; overflow-wrap:anywhere; }}
+  img {{ width:100%; height:auto; border-radius:6px; border:1px solid #30363d; background:#000; }}
   .nogif {{ height:140px; display:flex; align-items:center; justify-content:center; color:#555; border:1px dashed #30363d; border-radius:6px; }}
+  @media (max-width: 600px) {{
+    body {{ padding:14px; }}
+    h1 {{ font-size:20px; }}
+    .grid {{ gap:14px; }}
+    .card {{ padding:12px; }}
+  }}
 </style></head><body>
   <h1>Filament CLI — UX flow gallery</h1>
   <p class="sub">Human-watchable recordings of each CLI UX flow (cli↔cli and cli↔web), driven against a local backend.</p>
