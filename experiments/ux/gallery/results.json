@@ -4,7 +4,7 @@
     "title": "Pair two devices",
     "caption": "A mints a PAKE code, B claims it; both derive the same channel \u2014 no key crosses the server.",
     "verdict": "PASS",
-    "detail": "paired; matching channel 34d5315dda60",
+    "detail": "paired; matching channel b96e3d0218c6",
     "gif": "01.gif"
   },
   "02": {

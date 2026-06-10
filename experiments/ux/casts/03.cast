@@ -1,5 +1,7 @@
-{"version":2,"width":80,"height":24,"timestamp":1781121412,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '03'","env":{"SHELL":"/bin/bash"}}
-[0.016544, "o", "\r\n\u001b[1;36m=== UX: send a file with a one-time code; the other side claims it and receives ===\u001b[0m\r\n"]
-[0.045331, "o", "\u001b[1;33m[A]$\u001b[0m filament send report.pdf --word ux-26250-demo\r\n"]
-[0.216736, "o", "\u001b[1;33m[A]\u001b[0m code is ux-26250-demo — read it to the other device\r\n\u001b[1;35m[B]$\u001b[0m filament recv ux-26250-demo -y\r\n"]
-[21.996837, "x", "143"]
+{"version":2,"width":80,"height":24,"timestamp":1781122704,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '03'","env":{"SHELL":"/bin/bash"}}
+[0.031969, "o", "\r\n\u001b[1;36m=== UX: send a file with a one-time code; the other side claims it and receives ===\u001b[0m\r\n"]
+[0.093181, "o", "\u001b[1;33m[A]$\u001b[0m filament send report.pdf --word ux-24660-demo\r\n"]
+[0.464017, "o", "\u001b[1;33m[A]\u001b[0m code is ux-24660-demo — read it to the other device"]
+[0.46679, "o", "\r\n"]
+[0.466901, "o", "\u001b[1;35m[B]$\u001b[0m filament recv ux-24660-demo -y\r\n"]
+[21.9933, "x", "143"]

@@ -1,8 +1,8 @@
-{"version":2,"width":80,"height":24,"timestamp":1781121387,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '04'","env":{"SHELL":"/bin/bash"}}
-[0.013774, "o", "\r\n\u001b[1;36m=== UX: send --to a KNOWN device: no code, identity proof-verified, auto-accepted ===\u001b[0m\r\n"]
-[0.043319, "o", "\u001b[2m  phone and laptop already know each other (paired earlier)\u001b[0m\r\n\u001b[1;35m[B]$\u001b[0m filament up   (laptop, always-on receiver)\r\n"]
-[0.623416, "o", "\u001b[1;33m[A]$\u001b[0m filament send slides.key --to laptop\r\n"]
-[2.693329, "o", "\u001b[1;35m[B]\u001b[0m identity verified: 'phone' (auto-accepting)\r\n"]
-[2.707934, "o", "\u001b[1;35m[B]\u001b[0m delivered as: payload.bin\r\n\u001b[2m  (receiver 'up' saves under the source basename, not the sender's --name)\u001b[0m\r\n"]
-[2.710372, "o", "\r\n\u001b[1;32m  ✔ PASS\u001b[0m  no code; verified 'laptop'; delivered + hash match\r\nRESULT 04 PASS no code; verified 'laptop'; delivered + hash match\r\n"]
-[2.711086, "x", "0"]
+{"version":2,"width":80,"height":24,"timestamp":1781122689,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '04'","env":{"SHELL":"/bin/bash"}}
+[0.026664, "o", "\r\n\u001b[1;36m=== UX: send --to a KNOWN device: no code, identity proof-verified, auto-accepted ===\u001b[0m\r\n"]
+[0.069362, "o", "\u001b[2m  phone and laptop already know each other (paired earlier)\u001b[0m\r\n\u001b[1;35m[B]$\u001b[0m filament up   (laptop, always-on receiver)\r\n"]
+[0.675409, "o", "\u001b[1;33m[A]$\u001b[0m filament send slides.key --to laptop\r\n"]
+[2.687441, "o", "\u001b[1;35m[B]\u001b[0m identity verified: 'phone' (auto-accepting)\r\n"]
+[2.710645, "o", "\u001b[1;35m[B]\u001b[0m delivered as: payload.bin\r\n\u001b[2m  (receiver 'up' saves under the source basename, not the sender's --name)\u001b[0m\r\n"]
+[2.712835, "o", "\r\n\u001b[1;32m  ✔ PASS\u001b[0m  no code; verified 'laptop'; delivered + hash match\r\nRESULT 04 PASS no code; verified 'laptop'; delivered + hash match\r\n"]
+[2.716977, "x", "0"]
