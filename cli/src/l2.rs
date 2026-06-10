@@ -531,6 +531,13 @@ async fn bring_up_to_known(
                 if Some(pid.as_str()) == my_id.as_deref() {
                     continue;
                 }
+                // #9: never dial our OWN install (the up subscribes this pair
+                // channel too). Pair secrets are symmetric, so a self-connect
+                // can pass the pair-proof and tunnel into the WRONG host's
+                // sshd — the local daemon answering as the remote device.
+                if crate::is_self_uid(&my_uid, v["uid"].as_str()) {
+                    continue;
+                }
                 // Queue every distinct sid; the loop top rotates through them.
                 if peer.as_ref().is_some_and(|p| p.id == pid)
                     || queue.iter().any(|(q, _)| *q == pid)

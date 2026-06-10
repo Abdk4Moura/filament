@@ -314,7 +314,7 @@ pub(crate) fn mk_uid(prefix: &str) -> String {
 }
 
 /// Same install (our own daemon / another process of this device)?
-fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
+pub(crate) fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
     if std::env::var("FILAMENT_UID").is_ok() {
         return false; // test hook pins uids; don't second-guess it
     }
@@ -4026,9 +4026,17 @@ async fn recv_cmd(
                         eprintln!("pair-proof received before fingerprints known — ignoring");
                         continue;
                     };
-                    let hit = devices
-                        .iter()
-                        .find(|(_, s)| proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp) == mac);
+                    // #9: pair secrets are symmetric — our own install holds
+                    // every secret we do, so a same-host process could prove
+                    // "pop2" and tunnel callers into the WRONG machine. Refuse.
+                    let hit = if is_self_uid(&conn.my_uid, Some(peer_uid.as_str())) {
+                        eprintln!("pair-proof from our own install — refusing (self-connect)");
+                        None
+                    } else {
+                        devices
+                            .iter()
+                            .find(|(_, s)| proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp) == mac)
+                    };
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
