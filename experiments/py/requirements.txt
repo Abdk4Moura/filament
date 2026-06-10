@@ -5,3 +5,8 @@ websocket-client>=1.9    # REQUIRED: enables the websocket transport. Without it
                          # "One or more namespaces failed to connect" (the seed
                          # probe.py bug) — only polling is available otherwise.
 spake2>=0.9              # SPAKE2 pairing (Ed25519), mirrors pake/src/lib.rs
+requests>=2.32          # python-socketio's HTTP/polling dependency. The library
+                        # connects via websocket by default (the Rust CLI's
+                        # transport, and the only one the eventlet fixture delivers
+                        # server-emits on promptly), but requests is needed for the
+                        # initial Engine.IO HTTP handshake.
