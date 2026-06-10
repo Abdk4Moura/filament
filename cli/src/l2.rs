@@ -425,6 +425,15 @@ async fn bring_up_to_known(
     let mut peer: Option<Arc<Peer>> = None;
     let mut peer_uid: Option<String> = None;
     let mut generation: u32 = 0;
+    // Item 3: the L2 initiator races a DIRECT-QUIC dial against WebRTC. On
+    // KnownPeer we bind a quinn endpoint + advertise our candidates (mirrors
+    // `start_direct` in main.rs); when the peer's transport-offer arrives we
+    // consume this endpoint into the race. UNCONDITIONAL here: `bring_up_to_known`
+    // only ever serves L2 (netcat/ssh/forward), which always wants direct — and
+    // `filament ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
+    // on `direct_enabled()` would kill the direct dial on the live path. main.rs
+    // gates because it ALSO serves file transfer; this function never does.
+    let mut endpoint: Option<quinn::Endpoint> = None;
 
     eprintln!("filament: waiting for known device '{peer_name}'...");
 
@@ -447,6 +456,7 @@ async fn bring_up_to_known(
                 peer_uid = v["uid"].as_str().map(|s| s.to_string());
                 let mine = my_id.clone().unwrap_or_default();
                 let polite = net::polite_role(&my_uid, peer_uid.as_deref(), &mine, &pid);
+                let pid_for_offer = pid.clone();
                 generation += 1;
                 let p = Peer::connect(
                     pid, polite, cfg.ice_servers.clone(), relay,
@@ -454,13 +464,81 @@ async fn bring_up_to_known(
                 )
                 .await?;
                 peer = Some(p);
+
+                // Item 3: also start a DIRECT-QUIC attempt racing the WebRTC dial
+                // above. Bind our endpoint, gather candidates, and advertise them
+                // via a relayed `transport-offer` (mirrors `start_direct`). The
+                // peer's own offer drives the race (handled in Ev::Signal below).
+                // Keep the endpoint in scope; it's consumed when the race starts.
+                if endpoint.is_none() {
+                    match crate::direct::bind_endpoint() {
+                        Ok((ep, port)) => {
+                            let cands = crate::direct::gather_candidates(server, port).await;
+                            let offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
+                            sio.emit("signal", json!({ "to": pid_for_offer, "data": offer }))
+                                .await
+                                .ok();
+                            eprintln!("filament: DIRECT-OFFER sent to '{peer_name}' — port {port}");
+                            endpoint = Some(ep);
+                        }
+                        Err(e) => {
+                            eprintln!("filament: direct disabled (endpoint bind failed: {e}) — WebRTC only");
+                        }
+                    }
+                }
             }
             Ev::Signal(v) => {
+                let data = v["data"].clone();
+                // Item 3: a relayed `transport-offer` carries the peer's direct
+                // candidates. Do NOT hand it to the WebRTC `Peer`; instead consume
+                // our endpoint and spawn the simultaneous-open + auth race
+                // (`race_connect_labeled`, the same primitive `start_direct`
+                // drives). The winner posts Ev::DirectReady into THIS loop's tx,
+                // so the DirectTransport's reader funnels Chunk/Control/PcState to
+                // the rx the caller hands to `pump_initiator`.
+                if data["type"].as_str() == Some("transport-offer") {
+                    if let Some(ep) = endpoint.take() {
+                        let peer_cands: Vec<String> = data["addrs"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let secret = secret.clone();
+                        let pid = v["from"].as_str().unwrap_or_default().to_string();
+                        let tx = tx.clone();
+                        tokio::spawn(async move {
+                            if let Some(t) = crate::direct::race_connect_labeled(
+                                ep, peer_cands, &secret, pid.clone(), tx.clone(), "direct-quic",
+                            )
+                            .await
+                            {
+                                let _ = tx.send(Ev::DirectReady(pid, t, "direct-quic"));
+                            }
+                            // On None the WebRTC path (Ev::ChannelReady) continues.
+                        });
+                    }
+                    continue;
+                }
                 if let Some(p) = &peer {
-                    if let Err(e) = p.handle_signal(v["data"].clone()).await {
+                    if let Err(e) = p.handle_signal(data).await {
                         eprintln!("filament: signal: {e}");
                     }
                 }
+            }
+            Ev::DirectReady(_pid, t, route) => {
+                // Item 3: the DIRECT-QUIC race won before WebRTC. The acceptor's
+                // `adopt_direct` (main.rs) is born `trusted: true` + identity-bound
+                // `verified_name` — its pair-secret MAC already proved who we are —
+                // so the cap gate is satisfied WITHOUT a pair-proof. We deliberately
+                // do NOT replicate the ChannelReady proof here: that MAC is built
+                // from the WebRTC DTLS fingerprints, which a direct QUIC link does
+                // not have, and the acceptor's direct link (`peer: None`) has none
+                // to verify against. (design-l2-direct-ladder.md §NOTE: pre-trust
+                // OR pair-proof — we confirmed pre-trust holds for the L2 acceptor.)
+                eprintln!("filament: tunnel up to '{peer_name}' (route: {route})");
+                // The WebRTC `peer` is now superfluous; the guard owns it (its
+                // teardown/forget semantics are unchanged — no extra teardown).
+                let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
+                return Ok((t, rx, guard));
             }
             Ev::ChannelReady(_pid, t) => {
                 // Prove identity so the peer's up/recv marks this link trusted —
