@@ -127,6 +127,10 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
   // C12: a remembered device — here because of the PAIRING, not the room.
   // Dashed accent border + chip distinguish it; the hint line says why.
   const known = !!peer.known
+  // Prefer OUR local petname for a remembered/verified device over the name the
+  // peer announces (e.g. show "my-laptop", not the broadcast "root@do-vm").
+  // Strangers/unknown peers keep their announced name.
+  const displayName = peer.known || peer.verified || peer.name
   return (
     <div
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
@@ -166,7 +170,7 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
       {ready && known && peer.shell && onOpenShell && (
         <button
           onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
-          title={`open a terminal on ${peer.name}`}
+          title={`open a terminal on ${displayName}`}
           style={{
             position: 'absolute', left: D.tilePad, bottom: D.tilePad, zIndex: 2,
             display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: 'inherit', fontSize: 10.5,
@@ -176,7 +180,7 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
         ><span style={{ fontWeight: 700 }}>›_</span> shell</button>
       )}
       <div>
-        <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{peer.name}</div>
+        <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
         <div style={{ fontSize: 10.5, display: 'flex', justifyContent: 'space-between', color: T.dim }}>
           <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status]}</span>
           <span>{peer.lastSeen}</span>
