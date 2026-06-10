@@ -572,30 +572,109 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     }
 }
 
-/// `filament ssh <peer> [args...]`: run the user's REAL ssh with our `netcat` as
-/// the ProxyCommand, so keys / known_hosts / ~/.ssh/config all work unchanged.
-/// The ProxyCommand is built from the current executable and carries --server /
-/// --relay so the fresh netcat process hits the same backend and peer.
-pub fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
+/// Seamless-shell bootstrap (initiator): over the already-authenticated filament
+/// channel, hand the acceptor our managed pubkey and fetch its host keys, so a
+/// user with ZERO ssh setup gets a no-prompt shell. The exchange is pure control
+/// JSON over the transport `bring_up_to_known` returns (no mux needed).
+///
+/// Returns `Ok(hostkeys)` on grant (the acceptor installed our key); the caller
+/// pins the host keys and spawns ssh. Returns `Err` if the acceptor DENIES (the
+/// device lacks the `shell` cap) or times out — in which case the caller MUST NOT
+/// fall through to a key-less ssh attempt (that would be a muddy auth failure
+/// instead of a clear "zero shell" denial).
+async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<String>> {
+    // Managed keypair lives under the filament config dir — NEVER ~/.ssh.
+    let pubkey = crate::sshkeys::ensure_managed_key()?;
+
+    let (t, mut rx) = bring_up_to_known(server, peer, relay).await?;
+    t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey })).await?;
+
+    // Await the verdict (bounded — a daemon without FILAMENT_L2 / without the cap
+    // must not hang us forever).
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "shell bootstrap timed out — is '{peer}' running `filament up` with shell access granted?"
+            ));
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Some(Ev::Control(_pid, v))) => match v["type"].as_str() {
+                Some("shell-bootstrap-ack") => {
+                    let hostkeys: Vec<String> = v["hostkeys"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    return Ok(hostkeys);
+                }
+                Some("shell-bootstrap-deny") => {
+                    let why = v["reason"].as_str().unwrap_or("shell capability not granted");
+                    return Err(anyhow!(
+                        "shell refused by '{peer}': {why}. Run `filament grant <this-device> shell` on '{peer}'."
+                    ));
+                }
+                _ => continue,
+            },
+            Ok(Some(_)) => continue, // other events on this link — ignore
+            Ok(None) => return Err(anyhow!("channel closed before shell bootstrap completed")),
+            Err(_) => continue, // timeout sliver — loop re-checks the deadline
+        }
+    }
+}
+
+/// `filament ssh <peer> [args...]`: seamless shell over the trusted channel.
+///
+/// With zero pre-existing ssh setup: bootstrap our managed key + the peer's host
+/// key over the authenticated filament channel, pin them, then run ssh pointed
+/// EXCLUSIVELY at filament-managed material (-o IdentityFile / IdentitiesOnly /
+/// UserKnownHostsFile) with a `filament netcat` ProxyCommand. No prompts, no
+/// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
+/// peer lacks the `shell` cap we abort HERE, before invoking ssh.
+pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
+    // The destination token ssh uses; we control it, so the host-key pin is keyed
+    // to exactly this. `<login>@filament-<peer>` keeps it stable + recognizable.
+    let login = std::env::var("FILAMENT_SSH_USER")
+        .ok()
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into());
+    // ssh matches known_hosts by HOST token only (never user@host), so the pin
+    // MUST be keyed on the bare host or it is silently inert.
+    let host = format!("filament-{peer}");
+    let dest_token = format!("{login}@{host}");
+
+    // 1) Bootstrap auth material over the trusted channel (deny-by-default gate).
+    let hostkeys = shell_bootstrap(server, peer, relay).await?;
+    crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
+
+    // 2) Build the ProxyCommand: a fresh `filament netcat` link to peer:22 (or a
+    // test port via FILAMENT_SSH_PORT, mirroring FILAMENT_L2_DIALHOST).
+    let rport: u16 = std::env::var("FILAMENT_SSH_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(22);
     let exe = std::env::current_exe()?;
     let exe = exe.to_string_lossy();
     let mut proxy = format!("{exe} --server {server}");
     if relay {
         proxy.push_str(" --relay");
     }
-    // ssh substitutes %h (the hostname arg) — but we want the FILAMENT peer name,
-    // not whatever host token ssh ends up using, so embed `peer` literally.
-    proxy.push_str(&format!(" netcat {peer} 22"));
+    proxy.push_str(&format!(" netcat {peer} {rport}"));
 
+    // 3) ssh pointed ONLY at filament-managed key + known_hosts; no prompts.
+    let key = crate::sshkeys::managed_key_path();
+    let kh = crate::sshkeys::known_hosts_path();
     let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-o").arg(format!("ProxyCommand={proxy}"));
+    cmd.arg("-o").arg(format!("ProxyCommand={proxy}"))
+        .arg("-o").arg(format!("IdentityFile={}", key.display()))
+        .arg("-o").arg("IdentitiesOnly=yes")
+        .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
+        .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o").arg("StrictHostKeyChecking=accept-new");
     for a in extra {
         cmd.arg(a);
     }
-    // ssh needs a destination; if the caller didn't pass one, use the peer name
-    // (a harmless placeholder host — ProxyCommand carries the real routing).
+    // ssh needs a destination; if the caller passed a non-flag token, honor it
+    // (their explicit user@host), else use our pinned dest token.
     if !extra.iter().any(|a| !a.starts_with('-')) {
-        cmd.arg(peer);
+        cmd.arg(&dest_token);
     }
     let status = cmd.status()?;
     std::process::exit(status.code().unwrap_or(1));

@@ -20,6 +20,7 @@ mod holepunch;
 mod l2;
 mod net;
 mod session;
+mod sshkeys;
 mod ui;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -235,6 +236,23 @@ enum Cmd {
         /// Extra args passed through to ssh (user@host, commands, -p, ...)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Grant a known device a capability (deny-by-default). `shell` permits
+    /// seamless `filament ssh` into THIS machine — a separate consent from
+    /// file transfer; pairing alone never yields a shell.
+    Grant {
+        /// Known device (petname)
+        device: String,
+        /// Capability to grant (e.g. `shell`)
+        capability: String,
+    },
+    /// Revoke a capability from a known device. Revoking `shell` also strips the
+    /// device's filament-managed block from this machine's authorized_keys.
+    Revoke {
+        /// Known device (petname)
+        device: String,
+        /// Capability to revoke (e.g. `shell`)
+        capability: String,
     },
 }
 
@@ -539,6 +557,53 @@ fn device_allows(name: &str, capability: &str) -> bool {
         return true; // L0 baseline — never gated (spec §8)
     }
     device_caps(name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
+}
+
+/// Grant or revoke a capability on an EXISTING known device, preserving its
+/// secret and any other caps. Promotes a v1 record (no `caps`) to v2 with the
+/// back-compat baseline `["transfer"]` first, so granting `shell` never silently
+/// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
+/// Returns Err if the device is unknown (you can't grant a stranger a shell).
+fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p)
+        .map_err(|_| anyhow::anyhow!("no known device named '{name}' — pair first"))?;
+    let mut arr: Vec<Value> = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut found = false;
+    for d in arr.iter_mut() {
+        if d["name"].as_str() != Some(name) {
+            continue;
+        }
+        found = true;
+        // Current caps: v1 (absent) reads as the transfer baseline.
+        let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
+            Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
+            None => vec!["transfer".to_string()],
+        };
+        caps.retain(|c| c != capability);
+        if grant {
+            caps.push(capability.to_string());
+        }
+        if let Some(obj) = d.as_object_mut() {
+            obj.insert("v".into(), json!(2));
+            obj.insert("caps".into(), json!(caps));
+        }
+    }
+    if !found {
+        return Err(anyhow::anyhow!(
+            "no known device named '{name}' — run `filament devices` to see who you've paired"
+        ));
+    }
+    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// C27: a declined remember offer must not leave one-sided dead weight.
@@ -1342,6 +1407,12 @@ struct Link {
     trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     expected_secret: Option<(String, String)>,
+    /// The devices.json PETNAME this link proved as (the cap-store key). Set on a
+    /// verified `pair-proof` (WebRTC) or at birth for a direct link (already
+    /// identity-bound). `None` until proven. Capability lookups (e.g. the `shell`
+    /// gate) MUST key on this, NOT on `name` (a presence display string that may
+    /// not match a stored record).
+    verified_name: Option<String>,
     /// C26: what the status roster shows for this peer
     presence: Presence,
     /// rung-1 (FILAMENT_DIRECT): this link's transport is an authenticated direct
@@ -1656,6 +1727,7 @@ impl Conn {
                 attempts: 0,
                 trusted: false,
                 expected_secret: None,
+                verified_name: None,
                 presence: Presence::Connecting,
                 direct: false,
                 direct_route: "direct-quic", // unused for WebRTC links (peer.is_some())
@@ -1854,6 +1926,9 @@ impl Conn {
                 generation,
                 attempts: 0,
                 trusted: true,
+                // A direct link is born identity-bound (its pair-secret MAC
+                // already proved who it is), so the petname is known up front.
+                verified_name: expected_secret.as_ref().map(|(n, _)| n.clone()),
                 expected_secret,
                 presence: Presence::Ready,
                 direct: true,
@@ -2238,7 +2313,7 @@ async fn main() -> Result<()> {
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
-        const CMDS: [&str; 15] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh"];
+        const CMDS: [&str; 17] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh", "grant", "revoke"];
         let code_re = regex_lite_code(first);
         if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
             if std::path::Path::new(first).exists() {
@@ -2338,7 +2413,29 @@ async fn main() -> Result<()> {
         }
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, cli.relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
-        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay),
+        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay).await,
+        Cmd::Grant { device, capability } => {
+            device_set_cap(&device, &capability, true)?;
+            println!(
+                "granted '{capability}' to '{device}'. {}",
+                if capability == "shell" {
+                    "they can now `filament ssh` into this machine (their key is installed on first connect)."
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        Cmd::Revoke { device, capability } => {
+            device_set_cap(&device, &capability, false)?;
+            if capability == "shell" {
+                sshkeys::remove_authorized_key(&device)?;
+                println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
+            } else {
+                println!("revoked '{capability}' from '{device}'.");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -3710,6 +3807,71 @@ async fn recv_cmd(
                         l2::OpenVerdict::Ignore => {}
                     }
                 }
+                // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
+                // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
+                // when the link is proof-verified (`trusted`) AND the proven
+                // device holds the NEW `shell` capability — distinct from
+                // `transfer`, so pairing for file transfer never yields a shell.
+                // The write happens only here (over the authenticated channel)
+                // into a clearly-marked, removable authorized_keys block.
+                Some("shell-bootstrap") if l2_enabled => {
+                    let Some(t) = conn.transport_of(&pid) else { continue };
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    // Cap lookup keys on the PROVEN petname, not the presence name.
+                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    let granted = trusted
+                        && dev.as_deref().map(|n| device_allows(n, "shell")).unwrap_or(false);
+                    if !granted {
+                        let who = dev.as_deref().unwrap_or("<unverified>");
+                        eprintln!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)");
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": "shell capability not granted"
+                            }))
+                            .await;
+                        continue;
+                    }
+                    let device = dev.unwrap();
+                    let pubkey = v["pubkey"].as_str().unwrap_or_default().to_string();
+                    // Basic shape check: an ed25519/rsa/ecdsa pubkey line. Never
+                    // install junk.
+                    let looks_ok = pubkey.starts_with("ssh-") || pubkey.starts_with("ecdsa-");
+                    if pubkey.is_empty() || !looks_ok {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": "malformed pubkey"
+                            }))
+                            .await;
+                        continue;
+                    }
+                    match sshkeys::install_authorized_key(&device, &pubkey) {
+                        Ok(()) => {
+                            let hostkeys = sshkeys::host_pubkeys();
+                            let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                            eprintln!(
+                                "l2: shell granted to '{device}' — installed managed key (filament-managed block)"
+                            );
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "shell-bootstrap-ack",
+                                    "hostkeys": hostkeys,
+                                    "user": login
+                                }))
+                                .await;
+                        }
+                        Err(e) => {
+                            eprintln!("l2: shell bootstrap install failed for '{device}': {e}");
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "shell-bootstrap-deny",
+                                    "reason": "install failed"
+                                }))
+                                .await;
+                        }
+                    }
+                }
                 Some("brb") => {
                     // C21: the peer announces a benign absence (mobile file
                     // picker suspends the tab). Hold the line that long.
@@ -3820,6 +3982,10 @@ async fn recv_cmd(
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
+                            // Record the proven devices.json petname — the cap
+                            // store key (the `shell` bootstrap gate looks up caps
+                            // under exactly this, not the presence display name).
+                            l.verified_name = Some(n.clone());
                         }
                         eprintln!("identity verified: '{n}' (auto-accepting)");
                         true
