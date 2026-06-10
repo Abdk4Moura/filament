@@ -668,13 +668,24 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         .arg("-o").arg(format!("UserKnownHostsFile={}", kh.display()))
         .arg("-o").arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o").arg("StrictHostKeyChecking=accept-new");
-    for a in extra {
-        cmd.arg(a);
+    // Split passthrough args into ssh OPTIONS (leading `-…` flags) and the remote
+    // COMMAND (everything from the first non-flag token on). The destination is
+    // ALWAYS our managed token — in the seamless model `<peer>` IS the host — so
+    // the destination must be inserted BETWEEN the options and the command, or
+    // ssh would mistake the command (e.g. `hostname`) for the host.
+    let mut split = extra.len();
+    for (i, a) in extra.iter().enumerate() {
+        if !a.starts_with('-') {
+            split = i;
+            break;
+        }
     }
-    // ssh needs a destination; if the caller passed a non-flag token, honor it
-    // (their explicit user@host), else use our pinned dest token.
-    if !extra.iter().any(|a| !a.starts_with('-')) {
-        cmd.arg(&dest_token);
+    for a in &extra[..split] {
+        cmd.arg(a); // leading ssh flags (e.g. -p, -L, -v)
+    }
+    cmd.arg(&dest_token); // the destination is the filament peer
+    for a in &extra[split..] {
+        cmd.arg(a); // remote command + its args
     }
     let status = cmd.status()?;
     std::process::exit(status.code().unwrap_or(1));
