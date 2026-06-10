@@ -150,9 +150,9 @@ enum Cmd {
         /// Only connect to a peer whose display name contains this (C13)
         #[arg(long)]
         to: Option<String>,
-        /// File name when sending stdin ('-')
-        #[arg(long, default_value = "stdin.bin")]
-        name: String,
+        /// Override the offered file name (for stdin '-', or a single file)
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Receive files from a peer (browser or CLI)
     Recv {
@@ -2799,13 +2799,20 @@ async fn send_cmd(
     word: Option<String>,
     room: Option<String>,
     to: Option<String>,
-    stdin_name: String,
+    name: Option<String>,
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
     if paths.is_empty() {
         bail!("nothing to send — pass files, directories, or '-' for stdin");
     }
+    // --name overrides the offered name, but only makes sense for a SINGLE
+    // payload (stdin, or one regular file). With multiple paths or a directory
+    // there is no single name to override, so warn that it's ignored.
+    if name.is_some() && paths.len() > 1 {
+        eprintln!("{}", ui::paint(ui::Tone::Warn, "--name is ignored when sending multiple paths"));
+    }
+    let single = paths.len() == 1;
     let my_uid = mk_uid("s");
     let mut outgoing: Vec<Outgoing> = Vec::new();
     for (i, p) in paths.iter().enumerate() {
@@ -2817,11 +2824,15 @@ async fn send_cmd(
             let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
             drop(f);
             let head = head_hash(&spool);
-            outgoing.push(Outgoing { id, sid, name: stdin_name.clone(), size: n, head, path: spool, temp: true, accepted_once: false, done: false });
+            let offered = name.clone().filter(|_| single).unwrap_or_else(|| "stdin.bin".into());
+            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, path: spool, temp: true, accepted_once: false, done: false });
         } else {
             let path = PathBuf::from(p);
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
             if meta.is_dir() {
+                if name.is_some() && single {
+                    eprintln!("{}", ui::paint(ui::Tone::Warn, "--name is ignored for a directory (it's tarred under the directory name)"));
+                }
                 let dirname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dir".into());
                 let spool = std::env::temp_dir().join(format!("filament-tar-{}-{}.tar", std::process::id(), i));
                 eprintln!("packing {p} -> {dirname}.tar ...");
@@ -2835,9 +2846,13 @@ async fn send_cmd(
                 let head = head_hash(&spool);
                 outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, path: spool, temp: true, accepted_once: false, done: false });
             } else {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+                // A single regular file with --name uses the override; otherwise
+                // the basename. With multiple files --name was already warned off.
+                let offered = name.clone().filter(|_| single).unwrap_or_else(|| {
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone())
+                });
                 let head = head_hash(&path);
-                outgoing.push(Outgoing { id, sid, name, size: meta.len(), head, path, temp: false, accepted_once: false, done: false });
+                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, path, temp: false, accepted_once: false, done: false });
             }
         }
     }
