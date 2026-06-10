@@ -3708,6 +3708,24 @@ async fn recv_cmd(
             return Ok(());
         }
 
+        // Bug 2: the transfer is COMPLETE and the sender's link is fully GONE
+        // (dropped via peer-left, or via the grace/Mode-B path when peer-left
+        // was lost). With no live link and nothing left to fetch there is
+        // nothing to wait for — exit at once instead of holding out the full
+        // rejoin window (peer-left case) or the quiet-exit window (lost-peer-left
+        // case). Fenced exactly like the exits above: by_sid empty + no pending
+        // questions, so a mid-transfer reconnect (which keeps `by_sid`
+        // non-empty) is untouched, and --keep-open still lingers by design.
+        if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
+            && conn.links.is_empty()
+        {
+            conn.waiting_rejoin = None;
+            ui::clear_sticky();
+            eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+            let _ = sio.disconnect().await;
+            return Ok(());
+        }
+
         // G-k fallback: everything done, nobody attached, no questions
         // outstanding — if that holds quietly for the quiet-exit window (10s
         // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
