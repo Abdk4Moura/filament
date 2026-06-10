@@ -472,10 +472,21 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut all = devices_load();
-    all.retain(|(n, _)| n != name);
-    all.push((name.to_string(), secret.to_string()));
-    let arr: Vec<Value> = all.iter().map(|(n, s)| json!({"name": n, "secret": s})).collect();
+    // Operate on the raw JSON so OTHER records keep their v2 fields (caps,
+    // addedAt) verbatim. Going through the (name, secret) tuples of
+    // devices_load() silently rewrote every other device as bare
+    // {name, secret}, wiping their `shell` grants on any store (pairing,
+    // introduce, rename) — a quiet privilege-loss bug.
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    match arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+        // Re-storing an existing name: only the secret rotates; keep its caps.
+        Some(existing) => existing["secret"] = json!(secret),
+        None => arr.push(json!({"name": name, "secret": secret})),
+    }
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
     #[cfg(unix)]
     {
@@ -612,10 +623,21 @@ fn devices_remove(name: &str) -> Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut all = devices_load();
-    all.retain(|(n, _)| n != name);
-    let arr: Vec<Value> = all.iter().map(|(n, s)| json!({"name": n, "secret": s})).collect();
+    // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
+    // addedAt). The old tuple round-trip rewrote every survivor as bare
+    // {name, secret}, silently wiping their `shell` grants on any forget.
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    arr.retain(|d| d["name"].as_str() != Some(name));
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -2447,16 +2469,31 @@ async fn main() -> Result<()> {
                     println!("(their side still holds its half; it will hear \"never met you\" on the next proof)");
                 }
                 Some(DevicesAction::Rename { old, new }) => {
-                    let all = devices_load();
-                    let Some((_, sec)) = all.iter().find(|(n, _)| n == &old) else {
+                    // Rename in place on the raw record so caps/v2 fields ride
+                    // along (remove+store dropped the renamed device's caps).
+                    let p = devices_path();
+                    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default();
+                    if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
                         bail!("no device named '{old}' — see `filament devices`");
-                    };
-                    if all.iter().any(|(n, _)| n == &new) {
+                    }
+                    if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
                         bail!("'{new}' already exists — forget it first or pick another name");
                     }
-                    let sec = sec.clone();
-                    devices_remove(&old)?;
-                    devices_store(&new, &sec)?;
+                    for d in arr.iter_mut() {
+                        if d["name"].as_str() == Some(old.as_str()) {
+                            d["name"] = json!(new);
+                        }
+                    }
+                    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                    }
                     println!("renamed '{old}' -> '{new}' (local alias only — the secret, and the other side, are unchanged)");
                 }
             }
@@ -4628,6 +4665,45 @@ mod tests {
         assert!(!device_allows_at(&p, "ghost", "remote-exec"));
         assert!(device_allows_at(&p, "ghost", "transfer"), "transfer baseline is universal");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forget_and_store_preserve_other_devices_caps() {
+        // Regression: forgetting/pairing a device must NOT wipe the `shell`
+        // (or any v2) caps of the OTHER devices. The old (name, secret) tuple
+        // round-trip rewrote every survivor as bare {name, secret}, silently
+        // dropping their grants — a remembered device lost its shell on the
+        // next `forget`/`pair`.
+        let dir = std::env::temp_dir().join(format!("fil-store-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Serialize: these tests mutate the process-global FILAMENT_CONFIG_DIR.
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let p = dir.join("devices.json");
+        let sec = "b".repeat(64);
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "shellbox", "secret": sec, "v": 2, "caps": ["transfer", "shell"]},
+                {"name": "dupe",     "secret": sec, "v": 2, "caps": ["transfer"]},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forgetting 'dupe' must leave 'shellbox' with its shell cap intact.
+        devices_remove("dupe").unwrap();
+        assert!(device_allows_at(&p, "shellbox", "shell"), "forget wiped a survivor's shell cap");
+        assert!(device_caps_at(&p, "dupe").is_none(), "dupe should be gone");
+
+        // Storing a NEW pairing must also preserve 'shellbox'’s caps.
+        devices_store("newpeer", &sec).unwrap();
+        assert!(device_allows_at(&p, "shellbox", "shell"), "store wiped a survivor's shell cap");
+        // And re-storing an existing name keeps its caps (only the secret rotates).
+        devices_store("shellbox", &"c".repeat(64)).unwrap();
+        assert!(device_allows_at(&p, "shellbox", "shell"), "re-store dropped the device's own caps");
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
