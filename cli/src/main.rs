@@ -183,6 +183,16 @@ enum Cmd {
         /// Drop directory (default: `filament config dir`, else ~/Filament)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Accept seamless `filament ssh` from ANY paired (proof-verified) device
+        /// — no per-device `grant` needed. Enables the tunnel acceptor too, so you
+        /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
+        /// required). Prints a security banner.
+        #[arg(long)]
+        shell: bool,
+        /// Like --shell but ONLY for these devices (comma-separated petnames);
+        /// every other device still needs an explicit `grant <dev> shell`.
+        #[arg(long, value_name = "DEVICES")]
+        shell_only: Option<String>,
     },
     /// Show whether the daemon runs and what it received recently
     Status,
@@ -739,16 +749,65 @@ fn daemon_alive() -> Option<u32> {
     cmd.contains("filament").then_some(pid)
 }
 
-async fn up_cmd(server: &str, install: bool, dir: Option<PathBuf>, relay: bool) -> Result<()> {
+/// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
+/// may `filament ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
+/// always enforced separately — this is purely the capability side.
+#[derive(Clone, Debug)]
+enum ShellPolicy {
+    /// Default: only devices explicitly `grant`ed the `shell` cap.
+    Granted,
+    /// `up --shell`: any paired device.
+    All,
+    /// `up --shell-only a,b`: only these petnames auto-shell; others need a grant.
+    Only(std::collections::HashSet<String>),
+}
+
+impl ShellPolicy {
+    fn auto_allows(&self, name: &str) -> bool {
+        match self {
+            ShellPolicy::Granted => false,
+            ShellPolicy::All => true,
+            ShellPolicy::Only(set) => set.contains(name),
+        }
+    }
+    /// Active policy implies the L2 tunnel acceptor is on (you can't ssh without it).
+    fn enables_l2(&self) -> bool {
+        !matches!(self, ShellPolicy::Granted)
+    }
+}
+
+async fn up_cmd(
+    server: &str,
+    install: bool,
+    dir: Option<PathBuf>,
+    relay: bool,
+    shell: bool,
+    shell_only: Option<String>,
+) -> Result<()> {
+    let shell_policy = match &shell_only {
+        Some(csv) => ShellPolicy::Only(
+            csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        ),
+        None if shell => ShellPolicy::All,
+        None => ShellPolicy::Granted,
+    };
     if install {
         let exe = std::env::current_exe()?;
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
         std::fs::create_dir_all(&unit_dir)?;
         let unit = unit_dir.join("filament.service");
+        // Carry the shell policy into the unit so a service install keeps the
+        // same seamless-ssh posture the user asked for on the command line.
+        let mut up_args = String::from(" up");
+        if let Some(csv) = &shell_only {
+            up_args.push_str(&format!(" --shell-only {csv}"));
+        } else if shell {
+            up_args.push_str(" --shell");
+        }
         std::fs::write(&unit, format!(
-            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={} up\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-            exe.display()
+            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={}{}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            exe.display(), up_args
         ))?;
         ui::say(&format!("  {} wrote {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), unit.display()));
         let enabled = std::process::Command::new("systemctl")
@@ -770,7 +829,23 @@ async fn up_cmd(server: &str, install: bool, dir: Option<PathBuf>, relay: bool) 
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(pidfile(), std::process::id().to_string())?;
-    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None).await;
+    match &shell_policy {
+        ShellPolicy::All => ui::say(&format!(
+            "  {} seamless shell ON — ANY paired device can `filament ssh` into this machine",
+            ui::paint(ui::Tone::Warn, "!"),
+        )),
+        ShellPolicy::Only(set) => {
+            let mut names: Vec<&String> = set.iter().collect();
+            names.sort();
+            let list = names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            ui::say(&format!(
+                "  {} seamless shell ON for: {list} — they can `filament ssh` into this machine",
+                ui::paint(ui::Tone::Warn, "!"),
+            ));
+        }
+        ShellPolicy::Granted => {}
+    }
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy).await;
     let _ = std::fs::remove_file(pidfile());
     res
 }
@@ -2424,7 +2499,7 @@ async fn main() -> Result<()> {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output, ShellPolicy::Granted).await
         }
         Cmd::Config { key, value } => {
             match (key, value) {
@@ -2443,7 +2518,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, dir } => up_cmd(&server, install, dir, cli.relay).await,
+        Cmd::Up { install, dir, shell, shell_only } => up_cmd(&server, install, dir, cli.relay, shell, shell_only).await,
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
@@ -3306,6 +3381,7 @@ async fn recv_cmd(
     remember: Option<String>,
     daemon: bool,
     output: Option<String>,
+    shell_policy: ShellPolicy,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -3500,10 +3576,12 @@ async fn recv_cmd(
     // C30 phase 3: link mini-sync — state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
-    // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in; the cap gate
-    // is still a placeholder pending L1-a). Keyed by peer sid so multiple links
-    // stay isolated.
-    let l2_enabled = std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
+    // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in) OR an active
+    // `up --shell` policy turns it on (you can't ssh in without the acceptor).
+    // The cap gate (shell-bootstrap) is enforced separately. Keyed by peer sid
+    // so multiple links stay isolated.
+    let l2_enabled = shell_policy.enables_l2()
+        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
 
     loop {
@@ -3906,8 +3984,14 @@ async fn recv_cmd(
                     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
                     // Cap lookup keys on the PROVEN petname, not the presence name.
                     let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    // Granted if the device was explicitly `grant`ed shell OR an
+                    // active `up --shell[-only]` policy auto-allows it. Trust
+                    // (pair-proof) is still required either way.
                     let granted = trusted
-                        && dev.as_deref().map(|n| device_allows(n, "shell")).unwrap_or(false);
+                        && dev
+                            .as_deref()
+                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .unwrap_or(false);
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         eprintln!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)");
@@ -4666,6 +4750,23 @@ mod tests {
         assert!(device_allows_at(&p, "ghost", "transfer"), "transfer baseline is universal");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shell_policy_gates_auto_shell() {
+        // `up` default: NOTHING auto-shells — a device needs an explicit grant.
+        let g = ShellPolicy::Granted;
+        assert!(!g.auto_allows("popos"));
+        assert!(!g.enables_l2(), "default must not silently enable the L2 acceptor");
+        // `up --shell`: every paired device auto-shells, and L2 is on.
+        let a = ShellPolicy::All;
+        assert!(a.auto_allows("popos") && a.auto_allows("anything"));
+        assert!(a.enables_l2());
+        // `up --shell-only popos,laptop`: only the listed petnames; others don't.
+        let o = ShellPolicy::Only(["popos".to_string(), "laptop".to_string()].into_iter().collect());
+        assert!(o.auto_allows("popos") && o.auto_allows("laptop"));
+        assert!(!o.auto_allows("stranger"), "shell-only must not auto-shell unlisted devices");
+        assert!(o.enables_l2());
     }
 
     #[test]
