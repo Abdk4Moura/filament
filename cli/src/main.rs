@@ -79,6 +79,25 @@ fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> 
     completed > 0 && !keep_open && by_sid_empty
 }
 
+/// Bug 5: after repeated stuck-while-connecting on establishment, the user has
+/// no clue WHY. The dominant single-host cause is a browser publishing mDNS
+/// (`*.local`) ICE candidates the CLI can't resolve when both ends share one
+/// machine — the candidate pair never nominates and the link wedges silently.
+/// Print this hint at most once per command. `shown` is the caller's one-shot
+/// latch so the hint never repeats and never fires on a normal first blip.
+fn maybe_hint_local_wedge(shown: &mut bool) {
+    if *shown {
+        return;
+    }
+    *shown = true;
+    ui::say(&ui::paint(
+        ui::Tone::Dim,
+        "  still can't connect — if both ends are on the SAME machine, a browser's \
+         mDNS (.local) ICE candidates can block this; try a different network path, \
+         or disable mDNS ICE in the browser (chrome://flags → \"Anonymize local IPs\").",
+    ));
+}
+
 const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 
 const EXAMPLES: &str = "\
@@ -2905,8 +2924,38 @@ async fn send_cmd(
     let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
     let started = Instant::now();
     let claim_deadline = Duration::from_secs(600);
+    // Bug 6: bound ESTABLISHMENT. netcat/ssh cap how long they hunt for a peer;
+    // `send` had no such bound, so an ICE wedge (no candidate pair ever
+    // nominates) hung unbounded with the spinner spinning. Cap the time to the
+    // FIRST live data channel (ChannelReady); once a channel is up, a long
+    // legitimate transfer is never interrupted by this. Overridable / disablable
+    // (0 = off) via FILAMENT_SEND_TIMEOUT.
+    let establish_deadline = std::env::var("FILAMENT_SEND_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60));
+    let mut established = false;
+    // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
+    let mut stuck_while_connecting = 0u32;
+    let mut wedge_hint_shown = false;
 
     loop {
+        // Bug 6: no data channel has come up within the establishment window —
+        // an ICE wedge or a peer that claimed the code but never connected. Fail
+        // honestly instead of spinning forever. A non-zero deadline only; a live
+        // channel (established) disarms it so big transfers are never cut off.
+        if !established
+            && !establish_deadline.is_zero()
+            && started.elapsed() >= establish_deadline
+        {
+            ui::clear_sticky();
+            bail!(
+                "no peer connected within {}s — is a receiver running / the page open? \
+                 (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
+                establish_deadline.as_secs()
+            );
+        }
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.waiting_rejoin.is_none() {
             // C30: read in ≤2s slices — a blocking full-deadline read starves
@@ -3057,6 +3106,9 @@ async fn send_cmd(
                 if !conn.is_active(&pid) {
                     continue;
                 }
+                // Bug 6: a live channel to the active peer disarms the
+                // establishment timeout — the rest of the transfer is unbounded.
+                established = true;
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(l) = conn.link(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
@@ -3265,6 +3317,14 @@ async fn send_cmd(
                 std::process::exit(130);
             }
             Ev::Stuck(pid, generation) => {
+                // Bug 5: if we keep getting stuck BEFORE a channel ever came up,
+                // surface the single-host mDNS hint once.
+                if !established {
+                    stuck_while_connecting += 1;
+                    if stuck_while_connecting >= 2 {
+                        maybe_hint_local_wedge(&mut wedge_hint_shown);
+                    }
+                }
                 if conn.on_stuck(&pid, generation, "stuck while connecting").await? {
                     bail!("lost the receiving peer after {} attempts", MAX_ATTEMPTS);
                 }
@@ -3605,6 +3665,10 @@ async fn recv_cmd(
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
     // web-shell: per-sid resize senders so a `pty-resize` reaches its PTY task.
     let mut pty_resizers: HashMap<u32, tokio::sync::mpsc::UnboundedSender<(u16, u16)>> = HashMap::new();
+    // Bug 5: surface the single-host mDNS wedge hint once after repeated stuck.
+    let mut stuck_while_connecting = 0u32;
+    let mut wedge_hint_shown = false;
+    let mut ever_received = false;
 
     loop {
         let ev = match tokio::time::timeout(
@@ -3663,6 +3727,9 @@ async fn recv_cmd(
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
         conn.recv_done = recv_transfer_done(completed, keep_open, by_sid.is_empty());
+        if completed > 0 || !by_sid.is_empty() {
+            ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
+        }
 
         // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
         // FLAP that contention triggers in the wild (the sender's departure puts
@@ -4561,6 +4628,14 @@ async fn recv_cmd(
             // after a successful transfer it's just closure (the quiet-exit
             // prints the same `done (N files).` the peer-left path would).
             Ev::Stuck(pid, generation) => {
+                // Bug 5: repeated stuck before ANY byte arrived → hint at the
+                // single-host mDNS wedge once.
+                if !ever_received {
+                    stuck_while_connecting += 1;
+                    if stuck_while_connecting >= 2 {
+                        maybe_hint_local_wedge(&mut wedge_hint_shown);
+                    }
+                }
                 if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open {
                     // G-k: the dropped link may have delivered every byte but
                     // lost its file-end — finalize before deciding it's fatal.
