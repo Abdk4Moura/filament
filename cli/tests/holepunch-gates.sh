@@ -51,6 +51,13 @@ reap() {
   [ -n "$TURN_CT" ] && kill "$TURN_CT" 2>/dev/null || true
   [ -n "$R1" ] && kill "$R1" 2>/dev/null || true
   [ -n "$R2" ] && kill "$R2" 2>/dev/null || true
+  # Belt-and-suspenders: kill every helper THIS run spawned, so a hard SIGKILL of
+  # the parent never leaves reflectors/backends holding the lab netns + ports for
+  # the next run. Scoped by the run-unique TURN_SECRET + this WORK dir.
+  pkill -f "static-auth-secret=$TURN_SECRET" 2>/dev/null || true
+  pkill -f "natprobe.py server $STUN_IP $PROBE_PORT" 2>/dev/null || true
+  pkill -f "natprobe.py server $REFL2 $PROBE_PORT" 2>/dev/null || true
+  pkill -f "$WORK" 2>/dev/null || true
   lab_cleanup
   [ -n "${KEEP_WORK:-}" ] && echo "logs kept in $WORK" || rm -rf "$WORK"
 }
@@ -101,11 +108,30 @@ start_turn() {
 probe_mapping() {
   local cli_ns="$1"
   nse "$WAN_NS" ip addr add "$REFL2/32" dev lo 2>/dev/null || true
-  nse "$WAN_NS" "$PY" "$LAB/natprobe.py" server "$STUN_IP" "$PROBE_PORT" & R1=$!
-  nse "$WAN_NS" "$PY" "$LAB/natprobe.py" server "$REFL2" "$PROBE_PORT" & R2=$!
-  sleep 0.5
-  local out; out=$(nse "$cli_ns" "$PY" "$LAB/natprobe.py" client "$STUN_IP" "$REFL2" "$PROBE_PORT")
-  kill "$R1" "$R2" 2>/dev/null || true; R1=""; R2=""
+  # Make sure NO stale reflector still holds the probe port (a leftover bind ->
+  # "Address already in use" -> the new server dies -> the client times out ->
+  # empty verdict). Reap any prior natprobe server and wait for the port to free.
+  pkill -f "natprobe.py server .* $PROBE_PORT" 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    nse "$WAN_NS" ss -ulnp 2>/dev/null | grep -q ":$PROBE_PORT " || break
+    sleep 0.3
+  done
+  # CRITICAL: this function is called as `map=$(probe_mapping ...)`, so it runs
+  # inside a command substitution. A backgrounded child INHERITS the $(...) stdout
+  # pipe and keeps it open until it exits — so the substitution would block
+  # forever waiting on the long-lived reflector servers. Redirect their fds to
+  # /dev/null so they don't hold the capture pipe; only the client's stdout is
+  # captured.
+  nse "$WAN_NS" "$PY" "$LAB/natprobe.py" server "$STUN_IP" "$PROBE_PORT" >/dev/null 2>&1 & R1=$!
+  nse "$WAN_NS" "$PY" "$LAB/natprobe.py" server "$REFL2" "$PROBE_PORT" >/dev/null 2>&1 & R2=$!
+  sleep 0.7
+  local out; out=$(timeout 15 ip netns exec "$cli_ns" "$PY" "$LAB/natprobe.py" client "$STUN_IP" "$REFL2" "$PROBE_PORT" 2>/dev/null)
+  kill "$R1" "$R2" 2>/dev/null || true
+  # Reap the python reflectors directly (kill of the `ip netns exec` wrapper can
+  # leave the python child); scoped to the probe port so nothing else is touched.
+  pkill -f "natprobe.py server $STUN_IP $PROBE_PORT" 2>/dev/null || true
+  pkill -f "natprobe.py server $REFL2 $PROBE_PORT" 2>/dev/null || true
+  R1=""; R2=""
   echo "$out" | grep -oE "MAPPING=[A-Za-z-]+" | head -1 | cut -d= -f2
 }
 
