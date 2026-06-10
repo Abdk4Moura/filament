@@ -302,7 +302,8 @@ enum DevicesAction {
     Rename { old: String, new: String },
 }
 
-/// Looks like a speakable code: word-word-digits.
+/// Looks like a legacy speakable TRANSFER code: word-word-digits (3 segments).
+/// This is what `send --code` mints and `recv` claims.
 fn regex_lite_code(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == 3
@@ -312,6 +313,19 @@ fn regex_lite_code(s: &str) -> bool {
         && !parts[1].is_empty()
         && parts[2].len() >= 2
         && parts[2].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Bug 4: looks like a PAKE PAIRING code: adj-animal-extra-NNNN (4 segments,
+/// three lowercase words then a numeric nameplate). This is what `pair` mints
+/// and the browser's "pair with code" consumes — NOT interchangeable with the
+/// 3-segment transfer code above. Used only to give a helpful error/route, not
+/// to authenticate (the PAKE does that).
+fn looks_like_pake_code(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 4
+        && parts[..3].iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
+        && parts[3].len() >= 2
+        && parts[3].chars().all(|c| c.is_ascii_digit())
 }
 
 // --------------------------------------------------------------- utilities --
@@ -1137,6 +1151,18 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.room = Some(solo.clone());
     sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
+    // Bug 4: a 3-segment legacy TRANSFER code (word-word-digits) typed into
+    // `pair`, which expects a 4-segment PAKE pairing code — redirect clearly
+    // before the PAKE handshake stalls forever against a peer that isn't pairing.
+    if let Some(c) = &code {
+        if regex_lite_code(c) && !looks_like_pake_code(c) {
+            bail!(
+                "'{c}' looks like a one-time TRANSFER code (from `filament send --code`), not a pairing code.\n  \
+                 To receive that transfer: run `filament {c}` (or `filament recv {c}`)\n  \
+                 A pairing code looks like `brave-otter-ruby-3141` (one more word)."
+            );
+        }
+    }
     let creator = code.is_none();
     // L1-a: the spoken code is split CLIENT-SIDE into (nameplate, password). The
     // password (words) NEVER leaves this process; only the nameplate is sent.
@@ -2515,6 +2541,10 @@ async fn main() -> Result<()> {
                 argv.push("--code".into());
             } else if code_re {
                 argv.insert(1, "recv".into());
+            } else if looks_like_pake_code(first) {
+                // Bug 4: a 4-segment PAKE pairing code (from `filament pair`) —
+                // claim it via the pairing ceremony, not recv.
+                argv.insert(1, "pair".into());
             }
         }
     }
@@ -3479,6 +3509,18 @@ async fn recv_cmd(
     shell_policy: ShellPolicy,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
+    // Bug 4: a 4-segment PAKE pairing code (adj-animal-extra-NNNN) was typed
+    // into `recv`, which only claims 3-segment transfer codes — fail with a
+    // clear redirect instead of a silent never-connect.
+    if let Some(c) = &code {
+        if looks_like_pake_code(c) && !regex_lite_code(c) {
+            bail!(
+                "'{c}' looks like a PAIRING code (from `filament pair`), not a transfer code.\n  \
+                 To pair a device: run `filament pair {c}`\n  \
+                 A transfer code looks like `brave-otter-37` (one fewer word)."
+            );
+        }
+    }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
@@ -5130,5 +5172,50 @@ mod tests {
         let evil2 = "/absolute/path.bin";
         let name2 = Path::new(evil2).file_name().map(|n| n.to_string_lossy().into_owned());
         assert_eq!(name2.as_deref(), Some("path.bin"));
+    }
+
+    // Bug 1: `send --name X` is honored for a SINGLE regular file (offer name =
+    // override), the basename otherwise, and "stdin.bin" for bare stdin. This
+    // mirrors the send_cmd offer-name decision as a pure check.
+    #[test]
+    fn send_name_override_for_single_file() {
+        let offered = |name: Option<&str>, single: bool, basename: &str| -> String {
+            name.map(String::from)
+                .filter(|_| single)
+                .unwrap_or_else(|| basename.to_string())
+        };
+        // single file + --name → the override wins
+        assert_eq!(offered(Some("renamed.bin"), true, "original.txt"), "renamed.bin");
+        // single file, no --name → basename
+        assert_eq!(offered(None, true, "original.txt"), "original.txt");
+        // multiple paths (single=false) + --name → ignored, basename used
+        assert_eq!(offered(Some("renamed.bin"), false, "original.txt"), "original.txt");
+        // stdin default
+        let stdin = |name: Option<&str>, single: bool| {
+            name.map(String::from).filter(|_| single).unwrap_or_else(|| "stdin.bin".into())
+        };
+        assert_eq!(stdin(Some("logs.tar"), true), "logs.tar");
+        assert_eq!(stdin(None, true), "stdin.bin");
+    }
+
+    // Bug 4: the legacy 3-segment transfer code and the 4-segment PAKE pairing
+    // code are distinguishable, and never both match the same string.
+    #[test]
+    fn transfer_and_pairing_codes_are_distinguishable() {
+        // legacy transfer code: word-word-digits
+        assert!(regex_lite_code("brave-otter-37"));
+        assert!(!looks_like_pake_code("brave-otter-37"));
+        // PAKE pairing code: adj-animal-extra-NNNN
+        assert!(looks_like_pake_code("brave-otter-ruby-3141"));
+        assert!(!regex_lite_code("brave-otter-ruby-3141"));
+        // neither classifier ever claims the same string
+        for s in ["brave-otter-37", "brave-otter-ruby-3141", "calm-lynx-9", "swift-fox-teal-1000"] {
+            assert!(!(regex_lite_code(s) && looks_like_pake_code(s)), "{s} ambiguous");
+        }
+        // junk matches neither
+        assert!(!regex_lite_code("hello"));
+        assert!(!looks_like_pake_code("hello"));
+        assert!(!looks_like_pake_code("a-b-c-d")); // last seg not numeric
+        assert!(!looks_like_pake_code("Brave-otter-ruby-3141")); // uppercase
     }
 }
