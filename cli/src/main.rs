@@ -2547,7 +2547,10 @@ async fn main() -> Result<()> {
                         println!("no known devices yet — run `filament pair` to add one");
                     }
                     for (n, s) in all {
-                        println!("{n}  (channel {})", &channel_of(&s)[..12]);
+                        // Show the granted capability set so `grant shell` is
+                        // visible here (v1 records read as [transfer]).
+                        let caps = device_caps(&n).unwrap_or_else(|| vec!["transfer".to_string()]);
+                        println!("{n}  (channel {})  [{}]", &channel_of(&s)[..12], caps.join(", "));
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
