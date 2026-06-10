@@ -159,10 +159,11 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
           <StatusDot color={sc} glow={ready} />
         </div>
       </div>
-      {/* web-shell: a paired, connected device can offer a terminal. The button
-          only appears for remembered + ready peers; the actual shell is still
-          gated server-side (the CLI must run `up --shell` / grant shell). */}
-      {ready && known && onOpenShell && (
+      {/* web-shell: the button appears only for a remembered + connected device
+          that ADVERTISED a shell (peer.shell, from the CLI's `caps` message — set
+          when it runs `up --shell` / FILAMENT_L2). The pty-open is still gated
+          server-side, so this is purely about hiding the button for the 90%. */}
+      {ready && known && peer.shell && onOpenShell && (
         <button
           onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
           title={`open a terminal on ${peer.name}`}

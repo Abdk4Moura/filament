@@ -66,7 +66,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -84,6 +84,8 @@ export class PeerLink {
     this.onPtyData = onPtyData || (() => {}) // raw PTY bytes (Uint8Array) from the peer
     this.onPtyClose = onPtyClose || (() => {}) // shell exited / stream closed
     this.onPtyReady = onPtyReady || (() => {}) // pty-open-ack arrived
+    this.onCaps = onCaps || (() => {}) // peer announced capabilities (e.g. shell)
+    this.peerShell = false // does the peer offer a web-shell? (set by a 'caps' msg)
     this._ptySid = null
     this.route = null // 'local' | 'direct' | 'relayed'
 
@@ -382,6 +384,10 @@ export class PeerLink {
 
   _onControl(msg) {
     switch (msg.type) {
+      case 'caps':
+        this.peerShell = !!msg.shell
+        this.onCaps({ shell: this.peerShell })
+        return
       case 'pty-open-ack':
         this.onPtyReady()
         return

@@ -3914,6 +3914,11 @@ async fn recv_cmd(
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
+                // web-shell discovery: tell the peer whether this receiver offers a
+                // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
+                // shows its per-device shell button ONLY when this is true; the
+                // actual pty-open is still gated server-side by the cap/policy.
+                let _ = t.send_control(&json!({ "type": "caps", "shell": l2_enabled })).await;
                 if let Some(l) = conn.link_mut(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t.clone());

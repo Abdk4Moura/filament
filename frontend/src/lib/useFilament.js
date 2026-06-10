@@ -272,6 +272,9 @@ export function useFilament() {
         onStatus: (status) => updatePeer(id, { status }),
         onTransfer: (t) => upsertTransfer(t),
         onRoute: (route) => updatePeer(id, { route }),
+        // web-shell: the peer announced whether it offers a terminal — surfaces
+        // the per-device shell button only for shell-enabled devices.
+        onCaps: (caps) => updatePeer(id, { shell: !!caps.shell }),
         // Resume: once the channel is open, re-offer any paused sends that were
         // headed to this same device (matched by its stable uid).
         onChannelOpen: () => {
