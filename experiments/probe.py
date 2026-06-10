@@ -75,7 +75,7 @@ class Probe:
 
     def connect(self):
         log("connecting", self.server)
-        self.sio.connect(self.server, transports=["websocket"], wait_timeout=10)
+        self.sio.connect(self.server, wait_timeout=12)
 
     def join(self, room, uid):
         self.sio.emit("join", {"room": room, "uid": uid, "name": self.name})
