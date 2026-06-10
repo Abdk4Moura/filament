@@ -52,7 +52,7 @@ reap() {
   [ -n "$R1" ] && kill "$R1" 2>/dev/null || true
   [ -n "$R2" ] && kill "$R2" 2>/dev/null || true
   lab_cleanup
-  rm -rf "$WORK"
+  [ -n "${KEEP_WORK:-}" ] && echo "logs kept in $WORK" || rm -rf "$WORK"
 }
 trap reap EXIT INT TERM
 
@@ -109,28 +109,33 @@ probe_mapping() {
   echo "$out" | grep -oE "MAPPING=[A-Za-z-]+" | head -1 | cut -d= -f2
 }
 
-# ---- pair A<->B as known devices (over WebRTC, flag off), capture the secret -
-# We reuse the shipped --remember handshake. Returns via globals SECRET + WORD.
+# ---- pair A<->B as known devices (over WebRTC, flag off) --------------------
+# Mirrors transport-gates.sh: A remembers boxB, B remembers boxA. The pair
+# secret + rendezvous identity land in each side's devices.json. Returns config
+# dirs via globals PAIR_CFGA / PAIR_CFGB.
 pair_devices() {
   local server="http://$RDV_IP:$BACKEND_PORT"
   local cfgA="$WORK/cfgA" cfgB="$WORK/cfgB"
-  mkdir -p "$cfgA" "$cfgB"
+  rm -rf "$cfgA" "$cfgB"; mkdir -p "$cfgA" "$cfgB"
   local pf="$WORK/pairsmall.bin"; head -c 4096 /dev/urandom >"$pf"
   local W="hp-pair-$RANDOM"
-  # Sender remembers; receiver remembers. The pair secret is written to config.
   nse "${LAB_PREFIX}-cliA" env FILAMENT_CONFIG_DIR="$cfgA" \
-      "$BIN" send "$pf" --word "$W" --remember --server "$server" \
+      "$BIN" send "$pf" --word "$W" --remember boxB --server "$server" \
       >"$WORK/pair-send.log" 2>&1 &
   local sp=$!
-  sleep 2
+  sleep 3
   nse "${LAB_PREFIX}-cliB" env FILAMENT_CONFIG_DIR="$cfgB" \
-      timeout 60 "$BIN" recv "$W" -y --remember --dir "$WORK/pairout" --server "$server" \
+      timeout 60 "$BIN" recv "$W" -y --remember boxA --dir "$WORK/pairout" --server "$server" \
       >"$WORK/pair-recv.log" 2>&1 || true
   kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
   PAIR_CFGA="$cfgA"; PAIR_CFGB="$cfgB"
+  [ -s "$cfgA/devices.json" ] && [ -s "$cfgB/devices.json" ]
 }
 
-# ---- one transfer trial, return "route|hashok" -----------------------------
+# ---- one known-device transfer trial, return "route|hashok" ----------------
+# Mirrors transport-gates.sh GATE 1: B runs `up` (known-device daemon), A does
+# `send --to boxB`. The known-device rendezvous triggers start_direct -> the
+# rung-1 -> rung-2 -> WebRTC ladder.
 # run_known_transfer <extra_env> <tag>
 run_known_transfer() {
   local extra_env="$1" tag="$2"
@@ -139,23 +144,30 @@ run_known_transfer() {
   mkdir -p "$outdir"
   head -c "$PAYLOAD_BYTES" /dev/urandom > "$payload"
   local want_hash; want_hash=$(hashof "$payload")
-  # Known-device auto-reconnect: sender + receiver use the SAME config dirs that
-  # hold the pairing, and a shared word so they rendezvous.
-  local W="hp-xfer-$tag-$RANDOM"
-  nse "${LAB_PREFIX}-cliA" env $extra_env FILAMENT_CONFIG_DIR="$PAIR_CFGA" \
-      "$BIN" send "$payload" --word "$W" --server "$server" \
-      >"$WORK/send-$tag.log" 2>&1 &
-  local sp=$!
-  sleep 2
+  # B: known-device daemon, listening.
   nse "${LAB_PREFIX}-cliB" env $extra_env FILAMENT_CONFIG_DIR="$PAIR_CFGB" \
-      timeout "$CONNECT_TIMEOUT" "$BIN" recv "$W" -y --dir "$outdir" --server "$server" \
-      >"$WORK/recv-$tag.log" 2>&1 || true
-  kill "$sp" 2>/dev/null || true; wait "$sp" 2>/dev/null || true
+      timeout "$CONNECT_TIMEOUT" "$BIN" up --dir "$outdir" --server "$server" \
+      >"$WORK/recv-$tag.log" 2>&1 &
+  local up=$!
+  sleep 3
+  # A: send to the known device boxB.
+  nse "${LAB_PREFIX}-cliA" env $extra_env FILAMENT_CONFIG_DIR="$PAIR_CFGA" \
+      timeout "$CONNECT_TIMEOUT" "$BIN" send "$payload" --to boxB --server "$server" \
+      >"$WORK/send-$tag.log" 2>&1 || true
+  sleep 1
+  kill "$up" 2>/dev/null || true; wait "$up" 2>/dev/null || true
 
   local got; got=$(find "$outdir" -type f ! -name '*.part' ! -name '*.meta' | head -1)
+  # Prefer the AUTHORITATIVE connect marker (DIRECT-CONNECT ok (route: X)) over
+  # the UI line, then fall back to the UI route line for the WebRTC/relay case.
   local route
-  route=$(grep -hoE "route: (local|direct-quic|holepunched|relayed|direct)" \
-            "$WORK/send-$tag.log" "$WORK/recv-$tag.log" 2>/dev/null | head -1 | awk '{print $2}')
+  route=$(grep -hoE "DIRECT-CONNECT ok \(route: (direct-quic|holepunched)\)" \
+            "$WORK/send-$tag.log" "$WORK/recv-$tag.log" 2>/dev/null \
+            | grep -oE "(direct-quic|holepunched)" | head -1)
+  if [ -z "$route" ]; then
+    route=$(grep -hoE "route: (local|direct-quic|holepunched|relayed|direct)" \
+              "$WORK/send-$tag.log" "$WORK/recv-$tag.log" 2>/dev/null | head -1 | awk '{print $2}')
+  fi
   [ -z "$route" ] && route="-"
   local hashok=no
   if [ -n "$got" ] && [ "$(hashof "$got")" = "$want_hash" ]; then hashok=yes; fi
@@ -176,7 +188,10 @@ build_pair() {
     && nse "${LAB_PREFIX}-cliB" curl -fsS "http://$RDV_IP:$BACKEND_PORT/api/health" >/dev/null 2>&1
 }
 
+GATES="${GATES:-cone sym}"
+
 # ============================================================ GATE 1: CONE ====
+if [[ " $GATES " == *" cone "* ]]; then
 say "GATE 1 — cone NAT pair (port-restricted) -> hole-punch SUCCEEDS"
 lab_cleanup
 if build_pair port-restricted port-restricted; then
@@ -188,7 +203,7 @@ if build_pair port-restricted port-restricted; then
   else
     bad "topology NOT cone (A=$mapA B=$mapB) — cannot honestly assert punch"
   fi
-  pair_devices
+  if pair_devices; then ok "paired (A knows boxB, B knows boxA)"; else bad "pairing failed"; fi
   res=$(run_known_transfer "FILAMENT_DIRECT=1 FILAMENT_HOLEPUNCH=1" "cone")
   IFS='|' read -r route hashok <<<"$res"
   echo "  result: route=$route hashok=$hashok"
@@ -201,8 +216,10 @@ else
   bad "cone topology setup failed"
 fi
 lab_cleanup
+fi  # GATE 1
 
 # ========================================================= GATE 2: SYMMETRIC ==
+if [[ " $GATES " == *" sym "* ]]; then
 say "GATE 2 — symmetric NAT pair -> hole-punch FAILS, steps down to relay"
 lab_cleanup
 if build_pair symmetric symmetric; then
@@ -214,7 +231,7 @@ if build_pair symmetric symmetric; then
   else
     bad "topology NOT symmetric (A=$mapA B=$mapB) — cannot honestly assert step-down"
   fi
-  pair_devices
+  if pair_devices; then ok "paired (A knows boxB, B knows boxA)"; else bad "pairing failed"; fi
   res=$(run_known_transfer "FILAMENT_DIRECT=1 FILAMENT_HOLEPUNCH=1" "sym")
   IFS='|' read -r route hashok <<<"$res"
   echo "  result: route=$route hashok=$hashok"
@@ -227,6 +244,7 @@ else
   bad "symmetric topology setup failed"
 fi
 lab_cleanup
+fi  # GATE 2
 
 # ---- summary ---------------------------------------------------------------
 say "SUMMARY"

@@ -34,7 +34,7 @@ pub fn holepunch_enabled() -> bool {
 /// Total budget for the punch handshake before giving up (and stepping down to
 /// WebRTC). Symmetric NAT defeats the punch — this is how long we wait before
 /// declaring that and falling through.
-const PUNCH_BUDGET: Duration = Duration::from_secs(3);
+pub const PUNCH_BUDGET: Duration = Duration::from_secs(3);
 /// Punch retransmit cadence. The OUTBOUND send opens our NAT mapping/filter; we
 /// retransmit so a packet lands after the peer's mapping forms (the zero-RTT
 /// race) and to survive loss.

@@ -180,13 +180,27 @@ fn cand_str(ip: IpAddr, port: u16) -> String {
     SocketAddr::new(ip, port).to_string()
 }
 
+/// Test-only: suppress rung-1's public (`whoami`) candidate. `/api/whoami`
+/// returns IP only, NO port — so rung-1 advertises `public_ip:local_port`, which
+/// is correct ONLY when the NAT preserves the source port (Linux MASQUERADE in
+/// the lab happens to). On the very common NAT that does NOT preserve the port,
+/// that guessed candidate is wrong and rung-1's public path fails — which is
+/// exactly the class rung-2's STUN-learned srflx (real external port) exists to
+/// catch. This knob models that NAT class so the cone gate can exercise rung-2 in
+/// isolation. NOT a product knob — only the hole-punch gate sets it.
+fn suppress_public() -> bool {
+    std::env::var("FILAMENT_DIRECT_NO_PUBLIC").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Gather all advertisable candidates for our bound endpoint port.
 pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
     let mut cands: Vec<String> = local_ips().into_iter().map(|ip| cand_str(ip, port)).collect();
-    if let Some(pip) = public_ip(server).await {
-        let s = cand_str(pip, port);
-        if !cands.contains(&s) {
-            cands.push(s);
+    if !suppress_public() {
+        if let Some(pip) = public_ip(server).await {
+            let s = cand_str(pip, port);
+            if !cands.contains(&s) {
+                cands.push(s);
+            }
         }
     }
     cands

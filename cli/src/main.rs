@@ -1723,11 +1723,23 @@ impl Conn {
             port,
             my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
         );
+        // The WebRTC fallback reaper (`expired_direct`) fires at this deadline.
+        // rung-1's race always burns the full DIRECT_BUDGET when it can't win
+        // (its acceptor future never self-completes), so with hole-punch enabled
+        // the deadline MUST cover the WHOLE ladder — rung-1 budget + punch budget
+        // + QUIC handshake slack — or the reaper would race WebRTC against an
+        // in-flight punch and the route would be a coin flip. Flag-gated, so
+        // rung-1-only timing is byte-identical.
+        let deadline = if holepunch::holepunch_enabled() {
+            Instant::now() + direct::DIRECT_BUDGET + holepunch::PUNCH_BUDGET + Duration::from_secs(3)
+        } else {
+            Instant::now() + direct::DIRECT_BUDGET
+        };
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
                 secret: (name.to_string(), secret.to_string()),
-                deadline: Instant::now() + direct::DIRECT_BUDGET,
+                deadline,
                 racing: false,
                 endpoint: Some(ep),
                 punch_sock,
