@@ -121,7 +121,9 @@ UDP port per run). So the cross-machine "late-join presence miss" the Rust suffe
 is **not** in the signaling subscribe path; it lives downstream in the
 WebRTC/QUIC offer-race timing (`cli/src/l2.rs:437-505` — `direct_racing` ignores
 re-sends; a late initiator that misses the *first* offer then drops the rest).
-The fault knobs below let you reproduce exactly that class of failure on demand.
+This experiment **localizes the failure away from signaling** rather than
+reproducing the downstream race itself (that needs the stubbed transport); the
+fault knobs below *simulate* that class of offer-miss on demand.
 
 **4. Fault injection is deterministic** (e.g. `fault withhold`)
 
@@ -141,8 +143,8 @@ deterministic reproduction of the "offer never sent" half of the race.
 | Signaling client (connect/join/subscribe/sync/signal/pair-*) | **real**, verified vs fixture |
 | `channel_of`, `proof_for`, `norm_code`, `split_code` | **real**, wire-faithful (channel_of cross-checked vs binary) |
 | transport-offer build/parse + exchange | **real**, round-tripped with the binary |
-| SPAKE2 pairing ceremony + confirm-MAC | **real library**, unit-tested **python↔python only** — *not* Rust-wire-verified, because the Rust confirm-MAC folds in WebRTC DTLS fingerprints (`main.rs:1163`) that only exist with a live WebRTC peer |
-| `pair-proof` MAC | **real** (satisfies the acceptor's gate); rides the data channel in the real flow, so emitted but not transport-delivered here |
+| SPAKE2 pairing ceremony + confirm-MAC | faithful to the Rust **construction** (Ed25519 symmetric, identity-bound nameplate, HKDF→pinned secret, §4 confirm-MAC), unit-tested **python↔python only**. Two caveats on Rust interop: (a) the confirm-MAC folds in WebRTC DTLS fingerprints (`main.rs:1163`) that only exist with a live WebRTC peer, and (b) the python `spake2` and Rust `spake2` crates may frame the symmetric element differently — so even with a transport, Python↔Rust SPAKE2 is **not assumed wire-compatible** (unverified) |
+| `pair-proof` MAC (`proof_for`) | **real**, cross-checked **byte-for-byte vs the Rust pinned vector** (`main.rs:4595 proof_matches_browser` → `f98c3b6b…`), so it provably satisfies the acceptor's gate; rides the data channel in the real flow, so emitted but not transport-delivered here |
 | direct QUIC data transport (aioquic) | **stubbed / out of scope** — control plane only |
 
 ## Tests

@@ -29,6 +29,18 @@ def test_canonical_caps_order_independent():
     assert c.canonical_caps(["transfer", "transfer"]) == "transfer"
 
 
+def test_proof_for_matches_rust_pinned_vector():
+    # The SAME external vector main.rs:4595 `proof_matches_browser` pins, computed
+    # with `printf 'filament-proof2:u1|u1|u2|FPA|FPB' | openssl dgst -sha256
+    # -hmac s3cret`. If Python drifts, it stops recognizing Rust/browser devices.
+    want = "f98c3b6b7a70ebdf4b200680e83383881bdb1a11476283507359c55ef03a8474"
+    assert c.proof_for("s3cret", "u1", "u2", "u1", "FPB", "FPA") == want  # unsorted
+    assert c.proof_for("s3cret", "u1", "u1", "u2", "FPA", "FPB") == want
+    # channel_of cross-vector from the same Rust test.
+    assert c.channel_of("topsecret") == \
+        "1e32e46e93691c29d9c0305545a10c86a00ae9f3c43d4eea3c7423c1528f9b5d"
+
+
 def test_proof_for_normalizes_uid_and_fp_order():
     # proof_for sorts (a_uid,b_uid) and (fp1,fp2) — swapping inputs is identical.
     s = "abc123" * 10
