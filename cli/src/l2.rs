@@ -353,17 +353,54 @@ fn host_is_loopback(host: &str) -> bool {
 
 // ------------------------------------------------------------ INITIATOR side --
 
+/// Holds the signaling client + WebRTC peer that back a brought-up link so the
+/// CALLER decides their fate. A long-lived consumer (netcat/forward) calls
+/// `forget()` to keep the link alive for the process lifetime (byte-identical to
+/// the old `std::mem::forget`). A short-lived consumer (the shell bootstrap)
+/// calls `close().await` to TEAR THE LINK DOWN before opening a second link to
+/// the same device — otherwise the acceptor sees two same-device peers at once
+/// and its C6 supersede/adopt logic churns (one link gets dropped mid-use).
+pub struct LinkGuard {
+    sio: Option<rust_socketio::asynchronous::Client>,
+    peer: Option<Arc<Peer>>,
+}
+
+impl LinkGuard {
+    /// Keep the link alive forever (leaks sio+peer, as the long-lived tunnels
+    /// want). Consumes the guard.
+    fn forget(mut self) {
+        if let Some(sio) = self.sio.take() {
+            std::mem::forget(sio);
+        }
+        if let Some(p) = self.peer.take() {
+            std::mem::forget(p);
+        }
+    }
+
+    /// Cleanly close the link: drop the WebRTC peer connection and disconnect
+    /// signaling, so the acceptor reaps this peer promptly. Consumes the guard.
+    async fn close(mut self) {
+        if let Some(p) = self.peer.take() {
+            p.close().await;
+        }
+        if let Some(sio) = self.sio.take() {
+            let _ = sio.disconnect().await;
+        }
+    }
+}
+
 /// Minimal identity-mode link bring-up to a *known* device, mirroring the
 /// production send/recv path but stripped to exactly what L2 needs: join a solo
 /// room, subscribe to the device's presence channel, dial it when it appears,
 /// and prove our identity (pair-proof) so its `up`/`recv` marks us trusted —
 /// which is what unlocks the acceptor's capability gate. Returns the ready
-/// Transport plus the event receiver so the caller can pump the mux.
+/// Transport, the event receiver, and a `LinkGuard` the caller must either
+/// `forget()` (keep alive) or `close().await` (tear down).
 async fn bring_up_to_known(
     server: &str,
     peer_name: &str,
     relay: bool,
-) -> Result<(Arc<dyn Transport>, mpsc::UnboundedReceiver<Ev>)> {
+) -> Result<(Arc<dyn Transport>, mpsc::UnboundedReceiver<Ev>, LinkGuard)> {
     let secret = crate::devices_load()
         .into_iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(peer_name))
@@ -437,13 +474,12 @@ async fn bring_up_to_known(
                         t.send_control(&json!({ "type": "pair-proof", "mac": mac })).await?;
                     }
                 }
-                // Keep sio + peer alive for the link's lifetime.
-                std::mem::forget(sio);
-                if let Some(p) = peer.take() {
-                    std::mem::forget(p);
-                }
+                // Hand sio + peer to the caller via a guard: a long-lived tunnel
+                // `forget()`s it (keep alive); the bootstrap `close().await`s it
+                // (tear down before the second link).
                 eprintln!("filament: tunnel up to '{peer_name}'");
-                return Ok((t, rx));
+                let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
+                return Ok((t, rx, guard));
             }
             Ev::PcState(_, s) if s == "failed" || s == "closed" => {
                 return Err(anyhow!("connection {s} before the tunnel came up"));
@@ -503,7 +539,8 @@ async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<
 /// `filament netcat <peer> <rport>`: wire this process's stdio to one L2 stream.
 /// This is the ssh ProxyCommand primitive.
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
-    let (t, rx) = bring_up_to_known(server, peer, relay).await?;
+    let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    guard.forget(); // long-lived tunnel — keep the link alive for the process
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
@@ -554,7 +591,8 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 /// `filament forward <lport> <peer> <rport>`: local TCP listener; every accepted
 /// connection opens a fresh L2 stream to `peer:127.0.0.1:rport`.
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
-    let (t, rx) = bring_up_to_known(server, peer, relay).await?;
+    let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    guard.forget(); // long-lived listener — keep the link alive for the process
     let mux = Mux::new(t);
     tokio::spawn(pump_initiator(rx, mux.clone()));
 
@@ -586,16 +624,18 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<St
     // Managed keypair lives under the filament config dir — NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
-    let (t, mut rx) = bring_up_to_known(server, peer, relay).await?;
+    let (t, mut rx, guard) = bring_up_to_known(server, peer, relay).await?;
     t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey })).await?;
 
     // Await the verdict (bounded — a daemon without FILAMENT_L2 / without the cap
-    // must not hang us forever).
+    // must not hang us forever). Capture it, then ALWAYS tear this link down
+    // BEFORE returning, so the ssh data link (netcat ProxyCommand) is the only
+    // boxA peer the acceptor sees — no concurrent same-device supersede churn.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    loop {
+    let verdict: Result<Vec<String>> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(anyhow!(
+            break Err(anyhow!(
                 "shell bootstrap timed out — is '{peer}' running `filament up` with shell access granted?"
             ));
         }
@@ -606,21 +646,26 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<St
                         .as_array()
                         .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    return Ok(hostkeys);
+                    break Ok(hostkeys);
                 }
                 Some("shell-bootstrap-deny") => {
                     let why = v["reason"].as_str().unwrap_or("shell capability not granted");
-                    return Err(anyhow!(
+                    break Err(anyhow!(
                         "shell refused by '{peer}': {why}. Run `filament grant <this-device> shell` on '{peer}'."
                     ));
                 }
                 _ => continue,
             },
             Ok(Some(_)) => continue, // other events on this link — ignore
-            Ok(None) => return Err(anyhow!("channel closed before shell bootstrap completed")),
+            Ok(None) => break Err(anyhow!("channel closed before shell bootstrap completed")),
             Err(_) => continue, // timeout sliver — loop re-checks the deadline
         }
-    }
+    };
+
+    // Tear down the bootstrap link before the caller opens the ssh data link.
+    drop(t);
+    guard.close().await;
+    verdict
 }
 
 /// `filament ssh <peer> [args...]`: seamless shell over the trusted channel.
