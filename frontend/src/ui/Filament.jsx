@@ -5,6 +5,8 @@
    omit it for sensible defaults (dark / green / airy). */
 
 import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react'
+import { createPortal } from 'react-dom'
+import WebTerminal from './WebTerminal.jsx'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
@@ -114,7 +116,7 @@ function RouteBadge({ route, T }) {
   )
 }
 
-function PeerTile({ peer, onSendFiles, T, D, accent }) {
+function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
   const ready = peer.status === 'ready'
   const [over, setOver] = useState(false)
   const [hov, setHov] = useState(false)
@@ -125,6 +127,10 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
   // C12: a remembered device — here because of the PAIRING, not the room.
   // Dashed accent border + chip distinguish it; the hint line says why.
   const known = !!peer.known
+  // Prefer OUR local petname for a remembered/verified device over the name the
+  // peer announces (e.g. show "my-laptop", not the broadcast "root@do-vm").
+  // Strangers/unknown peers keep their announced name.
+  const displayName = peer.known || peer.verified || peer.name
   return (
     <div
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
@@ -157,8 +163,24 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
           <StatusDot color={sc} glow={ready} />
         </div>
       </div>
+      {/* web-shell: the button appears only for a remembered + connected device
+          that ADVERTISED a shell (peer.shell, from the CLI's `caps` message — set
+          when it runs `up --shell` / FILAMENT_L2). The pty-open is still gated
+          server-side, so this is purely about hiding the button for the 90%. */}
+      {ready && known && peer.shell && onOpenShell && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
+          title={`open a terminal on ${displayName}`}
+          style={{
+            position: 'absolute', left: D.tilePad, bottom: D.tilePad, zIndex: 2,
+            display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: 'inherit', fontSize: 10.5,
+            padding: '4px 8px', cursor: 'pointer', letterSpacing: '.02em',
+            border: '1px solid ' + accent + '66', color: accent, background: accent + '14',
+          }}
+        ><span style={{ fontWeight: 700 }}>›_</span> shell</button>
+      )}
       <div>
-        <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{peer.name}</div>
+        <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
         <div style={{ fontSize: 10.5, display: 'flex', justifyContent: 'space-between', color: T.dim }}>
           <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status]}</span>
           <span>{peer.lastSeen}</span>
@@ -317,7 +339,21 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
   // canonicalizes via normCode (WASM) before SPAKE2.
   const formatCode = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
 
-  const submitCode = () => { const c = code.trim(); if (c) { onPairWithCode(c); setCode(''); setEntering(false) } }
+  // Keep the input open after submitting a code so the user sees the result
+  // (success/failure) and can correct a mistyped code in place — closing the
+  // box on submit is why pairing failures used to vanish silently.
+  const submitCode = () => { const c = code.trim(); if (c) onPairWithCode(c) }
+
+  // Surface pairing feedback (set by the hook). 'pairing'/'paired' are neutral;
+  // anything else is a user-facing error/refusal shown in the accent-warning hue.
+  const ps = state.pairStatus
+  const pairMsg = ps && ps !== 'paired'
+    ? (
+      <div style={{ fontSize: 11, lineHeight: 1.4, color: ps === 'pairing' ? T.dim : '#e0564f' }}>
+        {ps === 'pairing' ? 'pairing…' : ps}
+      </div>
+    )
+    : null
 
   const wrap = {
     border: '1px solid ' + T.line, background: T.panel, padding: '12px ' + D.tilePad + 'px',
@@ -365,12 +401,15 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         {/* Codes work from ANY room — minting is additive (the claimer joins
             THIS room) — so the affordance belongs here too, not just in auto. */}
         {entering ? (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
-              onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
-              placeholder="ENTER CODE" accent={accent} T={T} />
-            {ghostBtn('pair', submitCode, true)}
-            {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
+                onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
+                placeholder="ENTER CODE" accent={accent} T={T} />
+              {ghostBtn('pair', submitCode, true)}
+              {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+            </div>
+            {pairMsg}
           </div>
         ) : (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -391,12 +430,15 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         <div style={{ marginLeft: 'auto' }}><LanChip localHelper={state.localHelper} T={T} /></div>
       </div>
       {entering ? (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
-            onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
-            placeholder="ENTER CODE" accent={accent} T={T} />
-          {ghostBtn('pair', submitCode, true)}
-          {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
+              onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
+              placeholder="ENTER CODE" accent={accent} T={T} />
+            {ghostBtn('pair', submitCode, true)}
+            {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+          </div>
+          {pairMsg}
         </div>
       ) : (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
@@ -456,6 +498,8 @@ export default function Filament(props) {
   const rootRef = useRef(null)
   const [narrow, setNarrow] = useState(!!ui.forceMobile)
   const [tab, setTab] = useState('peers')
+  const [shellPeer, setShellPeer] = useState(null) // web-shell: the peer whose terminal is open
+  const shellLink = shellPeer && state.getLink ? state.getLink(shellPeer.id) : null
   useEffect(() => {
     if (ui.forceMobile) {
       setNarrow(true)
@@ -499,7 +543,7 @@ export default function Filament(props) {
   const peerGrid = (gridCols) =>
     hasPeers ? (
       <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: D.gap }}>
-        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} T={T} D={D} accent={accent} />)}
+        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenShell={setShellPeer} T={T} D={D} accent={accent} />)}
       </div>
     ) : (
       emptyPeers
@@ -551,6 +595,28 @@ export default function Filament(props) {
     backgroundSize: '34px 34px',
   }
 
+  // web-shell: the terminal renders as a full-window overlay (portal to body) so
+  // it works in both the desktop and mobile layouts from one place. Disclosure
+  // stays intact — it only exists once a shell button is clicked.
+  const terminalOverlay = shellPeer
+    ? createPortal(
+        <div style={{ position: 'fixed', inset: 0, zIndex: 4000, background: T.bg }}>
+          {shellLink
+            ? <WebTerminal link={shellLink} peerName={shellPeer.name} route={shellPeer.route}
+                T={T} accent={accent} font={font} onClose={() => setShellPeer(null)} />
+            : (
+              <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: T.dim, fontFamily: font }}>
+                <div style={{ textAlign: 'center' }}>
+                  <div>not connected to {shellPeer.name}</div>
+                  <button onClick={() => setShellPeer(null)} style={{ marginTop: 12, padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>close</button>
+                </div>
+              </div>
+            )}
+        </div>,
+        document.body,
+      )
+    : null
+
   // ── Mobile layout ──────────────────────────────────────────────
   if (narrow) {
     const tabBtn = (k, n) => (
@@ -563,6 +629,7 @@ export default function Filament(props) {
     )
     return (
       <div ref={rootRef} style={rootStyle}>
+        {terminalOverlay}
         {/* stacked top bar */}
         <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -612,6 +679,7 @@ export default function Filament(props) {
   // ── Desktop layout ─────────────────────────────────────────────
   return (
     <div ref={rootRef} style={rootStyle}>
+      {terminalOverlay}
       {/* top bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
         borderBottom: '1px solid ' + T.line, background: T.bg }}>

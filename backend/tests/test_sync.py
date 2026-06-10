@@ -58,7 +58,7 @@ class SyncAckShape(unittest.TestCase):
         _app, _sio, c = _make()
         ack = _ack(c, {"v": 1, "room": "r1", "name": "alice", "uid": "u1", "channels": [C1]})
         self.assertEqual(ack, {"v": 1, "ok": True, "room": "r1", "channels": 1,
-                               "lease": True, "peers": []})
+                               "lease": True, "peers": [], "channel_peers": []})
 
     def test_missing_room_rejected(self):
         _app, _sio, c = _make()
@@ -244,9 +244,27 @@ class RegistryLevelConvergence(unittest.TestCase):
 
     def test_subscribe_returns_existing_members(self):
         reg = signaling._MemRegistry()
+        reg.refresh(["sid-a"])  # liveness lease (#10): only leased sids count
         reg.subscribe("sid-a", [C1])
         out = reg.subscribe("sid-b", [C1])
         self.assertEqual(out[C1], ["sid-a"], "second subscriber sees the first")
+
+    def test_subscribe_filters_unleased_members(self):
+        """#10: a channel member whose liveness lease lapsed (or never existed)
+        must not be advertised to a new subscriber — and is lazily evicted."""
+        reg = signaling._MemRegistry()
+        reg.subscribe("sid-dead", [C1])  # present but never leased
+        out = reg.subscribe("sid-b", [C1])
+        self.assertEqual(out[C1], [], "dead member must not be advertised")
+        self.assertNotIn("sid-dead", reg._chan[C1], "dead member lazily evicted")
+
+    def test_peers_in_filters_unleased_members(self):
+        """#10: room roster (welcome / sync digest) only lists leased sids."""
+        reg = signaling._MemRegistry()
+        reg.add("sid-a", "r1", "alice", "ua")  # add() takes the lease
+        reg.add("sid-dead", "r1", "bob", "ub")
+        reg._live.pop("sid-dead")  # lease lapses (e.g. socket died silently)
+        self.assertEqual([p["id"] for p in reg.peers_in("r1")], ["sid-a"])
 
 
 if __name__ == "__main__":

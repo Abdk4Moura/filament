@@ -1,0 +1,4 @@
+# scratch: logs, payloads, raw webm, timings, render screenshots
+.work/
+# npm deps + cached chromium (re-installed via `npm i` + `npx playwright install`)
+node_modules/

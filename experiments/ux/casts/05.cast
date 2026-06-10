@@ -1,0 +1,11 @@
+{"version":2,"width":80,"height":24,"timestamp":1781122689,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '05'","env":{"SHELL":"/bin/bash"}}
+[0.032274, "o", "\r\n\u001b[1;36m=== UX: always-on receiver: up + a paired send into it; status; down ===\u001b[0m\r\n"]
+[0.103544, "o", "\u001b[1;35m[B]$\u001b[0m filament up   (laptop)\r\n"]
+[0.725154, "o", "\u001b[1;33m[A]$\u001b[0m filament send backup.tar --to laptop"]
+[0.725925, "o", "\r\n"]
+[2.788806, "o", "\u001b[1;35m[B]$\u001b[0m filament status\r\n"]
+[2.810521, "o", "  ✓ up (pid 3799468)\r\n  1 known device\r\n  recent receives:\r\n    2026-06-10 20:18  payload.bin  1.4 MB  from root@do-vm\r\n"]
+[3.320812, "o", "\u001b[1;35m[B]$\u001b[0m filament down\r\n"]
+[3.344074, "o", "  ✓ stopped (pid 3799468)\r\n"]
+[3.902371, "o", "\r\n\u001b[1;32m  ✔ PASS\u001b[0m  up received; status reported; down stopped it\r\nRESULT 05 PASS up received; status reported; down stopped it\r\n"]
+[3.90308, "x", "0"]

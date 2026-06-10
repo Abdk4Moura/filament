@@ -1,0 +1,114 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filament CLI — UX flow gallery</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { background:#0d1117; color:#c9d1d9; font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; margin:0; padding:24px; }
+  h1 { font-size:24px; margin:0 0 4px; }
+  .sub { color:#8b949e; margin:0 0 8px; }
+  .summary { margin:12px 0 28px; font-size:14px; }
+  .summary b { font-size:18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(min(440px,100%),1fr)); gap:20px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:16px; min-width:0; }
+  .hd { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  .flow { font:12px monospace; color:#58a6ff; letter-spacing:.04em; }
+  .badge { color:#fff; font-size:11px; font-weight:700; padding:2px 8px; border-radius:10px; }
+  h2 { font-size:16px; margin:8px 0 4px; }
+  .cap { color:#8b949e; font-size:13px; margin:0 0 10px; }
+  .detail { color:#6e7681; font-size:12px; margin:8px 0 0; font-family:monospace; overflow-wrap:anywhere; }
+  img { width:100%; height:auto; border-radius:6px; border:1px solid #30363d; background:#000; }
+  .nogif { height:140px; display:flex; align-items:center; justify-content:center; color:#555; border:1px dashed #30363d; border-radius:6px; }
+  @media (max-width: 600px) {
+    body { padding:14px; }
+    h1 { font-size:20px; }
+    .grid { gap:14px; }
+    .card { padding:12px; }
+  }
+</style></head><body>
+  <h1>Filament CLI — UX flow gallery</h1>
+  <p class="sub">Human-watchable recordings of each CLI UX flow (cli↔cli and cli↔web), driven against a local backend.</p>
+  <p class="summary"><b style="color:#1f9d55">10 PASS</b> &nbsp; <b style="color:#c0392b">0 FAIL</b> &nbsp; <b style="color:#888">0 BLOCKED</b> &nbsp; / 10 scenarios</p>
+  <p style="margin:-12px 0 22px"><a href="reels.html" style="color:#7CF6C8;text-decoration:none">▶ watch the feature reels</a> <span style="color:#6e7681">— GPU-transcoded on a Tesla T4</span></p>
+  <div class="grid">
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>01 · Pair two devices</h2>
+        <p class="cap">A mints a PAKE code, B claims it; both derive the same channel — no key crosses the server.</p>
+        <img loading="lazy" src="01.gif" alt="Pair two devices">
+        <p class="detail">paired; matching channel b96e3d0218c6</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>02 · Devices: list / rename / forget</h2>
+        <p class="cap">And the regression guard: forgetting one device must NOT wipe another device's granted shell cap.</p>
+        <img loading="lazy" src="02.gif" alt="Devices: list / rename / forget">
+        <p class="detail">rename+forget worked; laptop's shell cap SURVIVED the unrelated forget</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>03 · Send with a one-time code</h2>
+        <p class="cap">Sender mints a speakable code; the receiver claims it and the bytes land, sha256-verified end-to-end.</p>
+        <img loading="lazy" src="03.gif" alt="Send with a one-time code">
+        <p class="detail">received payload.bin; sha256 matches end-to-end</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>04 · Send --to a known device</h2>
+        <p class="cap">No code: a remembered device, identity proof-verified and auto-accepted; bytes sha256-verified.</p>
+        <img loading="lazy" src="04.gif" alt="Send --to a known device">
+        <p class="detail">no code; verified 'laptop'; delivered + hash match</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>05 · Always-on receiver: up / status / down</h2>
+        <p class="cap">Bring up a trusted-only drop target, send into it, check status, stop it; bytes sha256-verified.</p>
+        <img loading="lazy" src="05.gif" alt="Always-on receiver: up / status / down">
+        <p class="detail">up received; status reported; down stopped it</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>06 · Grant shell + ssh over the tunnel</h2>
+        <p class="cap">Deny-by-default consent; then `filament ssh peer -- echo OK` runs over the data channel.</p>
+        <img loading="lazy" src="06.gif" alt="Grant shell + ssh over the tunnel">
+        <p class="detail">shell granted; ssh ran a remote command over the tunnel</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>07 · Introduce two devices</h2>
+        <p class="cap">A hub that knows both vouches them to each other with a fresh mutual secret.</p>
+        <img loading="lazy" src="07.gif" alt="Introduce two devices">
+        <p class="detail">introduce delivered a fresh mutual secret; alice<->bob now know each other</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔web</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>08 · CLI sends → the web app receives</h2>
+        <p class="cap">The browser (local frontend) accepts the offered file and reaches the download affordance.</p>
+        <img loading="lazy" src="08.gif" alt="CLI sends → the web app receives">
+        <p class="detail">CLI offered invoice.pdf; browser accepted and reached the download (save) affordance</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔web</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>09 · The web app sends → CLI recv</h2>
+        <p class="cap">Browser picks a file and sends it; the CLI receiver writes it, sha256-verified (authoritative no-recorder verify pass). The GIF is a best-effort visual; single-host browser→CLI WebRTC can't complete while the webm recorder runs — see README.</p>
+        <img loading="lazy" src="09.gif" alt="The web app sends → CLI recv">
+        <p class="detail">VERIFY pass (no recorder): sha256 MATCHES. GIF is a best-effort visual; single-host browser→CLI WebRTC can't complete while the webm recorder runs (recording-contention, not a product break).</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔web</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>10 · Pair the web app with the CLI</h2>
+        <p class="cap">CLI mints a PAKE code; the browser claims it and stores the device (key never crosses the server).</p>
+        <img loading="lazy" src="10.gif" alt="Pair the web app with the CLI">
+        <p class="detail">browser claimed the CLI's PAKE code; both sides stored the mutual device</p>
+      </section></div>
+</body></html>

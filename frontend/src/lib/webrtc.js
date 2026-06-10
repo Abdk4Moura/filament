@@ -66,7 +66,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -80,6 +80,13 @@ export class PeerLink {
     this.onPairProof = onPairProof || (() => {}) // C20: peer claims to be a known device
     this.onPairProofAck = onPairProofAck || (() => {}) // C27: peer judged our proof
     this.onPeerStateDiverged = onPeerStateDiverged || (() => {}) // C30 ph3: one-sided belief detected
+    // web-shell: the Terminal component reassigns these directly on the link.
+    this.onPtyData = onPtyData || (() => {}) // raw PTY bytes (Uint8Array) from the peer
+    this.onPtyClose = onPtyClose || (() => {}) // shell exited / stream closed
+    this.onPtyReady = onPtyReady || (() => {}) // pty-open-ack arrived
+    this.onCaps = onCaps || (() => {}) // peer announced capabilities (e.g. shell)
+    this.peerShell = false // does the peer offer a web-shell? (set by a 'caps' msg)
+    this._ptySid = null
     this.route = null // 'local' | 'direct' | 'relayed'
 
     // Resume support: a stable per-tab identity for the remote peer, plus
@@ -297,6 +304,13 @@ export class PeerLink {
     // Binary chunk: first 4 bytes are the stream id, the rest is payload (#4).
     if (data.byteLength < 4) return
     const sid = new DataView(data).getUint32(0)
+    // web-shell: PTY bytes for the open terminal stream (empty frame = closed).
+    if (sid === this._ptySid) {
+      const payload = data.slice(4)
+      if (payload.byteLength === 0) { this.onPtyClose(); this._ptySid = null }
+      else this.onPtyData(new Uint8Array(payload))
+      return
+    }
     const id = this._incomingBySid.get(sid)
     const entry = id && this.stores.partials.get(id)
     if (!entry) return
@@ -343,8 +357,43 @@ export class PeerLink {
     return mine && theirs ? { mine, theirs } : null
   }
 
+  // ---- web-shell (PTY over the data channel) -------------------------------
+  // The browser allocates a HIGH-HALF sid (top bit set) so the CLI acceptor's
+  // is_l2_sid router delivers our input frames to the PTY mux (the low range is
+  // file transfer). Output rides the same sid; _onMessage routes it to onPtyData.
+  openPty(cols, rows) {
+    this._ptySid = (0x80000000 | (this._nextSid++)) >>> 0
+    this._control({ type: 'pty-open', sid: this._ptySid, cols, rows })
+    return this._ptySid
+  }
+  sendPtyInput(u8) {
+    if (this._ptySid == null || this.channel?.readyState !== 'open') return
+    const framed = new Uint8Array(4 + u8.byteLength)
+    new DataView(framed.buffer).setUint32(0, this._ptySid)
+    framed.set(u8, 4)
+    this.channel.send(framed)
+  }
+  resizePty(cols, rows) {
+    if (this._ptySid != null) this._control({ type: 'pty-resize', sid: this._ptySid, cols, rows })
+  }
+  closePty() {
+    if (this._ptySid == null) return
+    this._control({ type: 'l2-close', sid: this._ptySid })
+    this._ptySid = null
+  }
+
   _onControl(msg) {
     switch (msg.type) {
+      case 'caps':
+        this.peerShell = !!msg.shell
+        this.onCaps({ shell: this.peerShell })
+        return
+      case 'pty-open-ack':
+        this.onPtyReady()
+        return
+      case 'l2-close':
+        if (msg.sid === this._ptySid) { this.onPtyClose(); this._ptySid = null }
+        return
       case CTRL.BRB:
         this._awayUntil = Date.now() + Math.min(msg.ttl || 120, 300) * 1000
         this.onStatus('away') // surfaced on the peer tile (C21 UX)

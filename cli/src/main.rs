@@ -15,9 +15,12 @@
 // Failure-mode ledger: ../docs/cli-resilience.md — every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
+mod direct;
+mod holepunch;
 mod l2;
 mod net;
 mod session;
+mod sshkeys;
 mod ui;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -76,6 +79,25 @@ fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> 
     completed > 0 && !keep_open && by_sid_empty
 }
 
+/// Bug 5: after repeated stuck-while-connecting on establishment, the user has
+/// no clue WHY. The dominant single-host cause is a browser publishing mDNS
+/// (`*.local`) ICE candidates the CLI can't resolve when both ends share one
+/// machine — the candidate pair never nominates and the link wedges silently.
+/// Print this hint at most once per command. `shown` is the caller's one-shot
+/// latch so the hint never repeats and never fires on a normal first blip.
+fn maybe_hint_local_wedge(shown: &mut bool) {
+    if *shown {
+        return;
+    }
+    *shown = true;
+    ui::say(&ui::paint(
+        ui::Tone::Dim,
+        "  still can't connect — if both ends are on the SAME machine, a browser's \
+         mDNS (.local) ICE candidates can block this; try a different network path, \
+         or disable mDNS ICE in the browser (chrome://flags → \"Anonymize local IPs\").",
+    ));
+}
+
 const VERSION: &str = env!("FILAMENT_BUILD_INFO"); // stamped by build.rs
 
 const EXAMPLES: &str = "\
@@ -128,9 +150,9 @@ enum Cmd {
         /// Only connect to a peer whose display name contains this (C13)
         #[arg(long)]
         to: Option<String>,
-        /// File name when sending stdin ('-')
-        #[arg(long, default_value = "stdin.bin")]
-        name: String,
+        /// Override the offered file name (for stdin '-', or a single file)
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Receive files from a peer (browser or CLI)
     Recv {
@@ -180,6 +202,22 @@ enum Cmd {
         /// Drop directory (default: `filament config dir`, else ~/Filament)
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Accept seamless `filament ssh` from ANY paired (proof-verified) device
+        /// — no per-device `grant` needed. Enables the tunnel acceptor too, so you
+        /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
+        /// required). Prints a security banner.
+        #[arg(long)]
+        shell: bool,
+        /// Like --shell but ONLY for these devices (comma-separated petnames);
+        /// every other device still needs an explicit `grant <dev> shell`.
+        #[arg(long, value_name = "DEVICES")]
+        shell_only: Option<String>,
+        /// Drop the web-shell / ssh PTY to this non-root account (via
+        /// `runuser -l <user>`). STRONGLY recommended when `up` runs as root:
+        /// without it, a granted device gets a shell as the up-process user
+        /// (often root). Requires `up` to run as root (runuser is setuid).
+        #[arg(long, value_name = "USER")]
+        shell_user: Option<String>,
     },
     /// Show whether the daemon runs and what it received recently
     Status,
@@ -215,6 +253,13 @@ enum Cmd {
         /// Remote port on the peer's localhost
         rport: u16,
     },
+    /// Open a PTY shell on a known device and bridge it to this terminal (the CLI
+    /// sibling of the browser web-shell). The peer must run `up --shell` (or grant
+    /// shell). Off by default; FILAMENT_L2=1 / --shell enables the acceptor.
+    Pty {
+        /// Known device (petname) to open a shell on
+        peer: String,
+    },
     /// Tunnel: local TCP listener; each connection becomes one stream to the
     /// peer's localhost:<rport>.
     Forward {
@@ -234,6 +279,23 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Grant a known device a capability (deny-by-default). `shell` permits
+    /// seamless `filament ssh` into THIS machine — a separate consent from
+    /// file transfer; pairing alone never yields a shell.
+    Grant {
+        /// Known device (petname)
+        device: String,
+        /// Capability to grant (e.g. `shell`)
+        capability: String,
+    },
+    /// Revoke a capability from a known device. Revoking `shell` also strips the
+    /// device's filament-managed block from this machine's authorized_keys.
+    Revoke {
+        /// Known device (petname)
+        device: String,
+        /// Capability to revoke (e.g. `shell`)
+        capability: String,
+    },
 }
 
 /// Petname management (C12): names are LOCAL aliases for pair secrets — the
@@ -246,7 +308,8 @@ enum DevicesAction {
     Rename { old: String, new: String },
 }
 
-/// Looks like a speakable code: word-word-digits.
+/// Looks like a legacy speakable TRANSFER code: word-word-digits (3 segments).
+/// This is what `send --code` mints and `recv` claims.
 fn regex_lite_code(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == 3
@@ -256,6 +319,19 @@ fn regex_lite_code(s: &str) -> bool {
         && !parts[1].is_empty()
         && parts[2].len() >= 2
         && parts[2].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Bug 4: looks like a PAKE PAIRING code: adj-animal-extra-NNNN (4 segments,
+/// three lowercase words then a numeric nameplate). This is what `pair` mints
+/// and the browser's "pair with code" consumes — NOT interchangeable with the
+/// 3-segment transfer code above. Used only to give a helpful error/route, not
+/// to authenticate (the PAKE does that).
+fn looks_like_pake_code(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('-').collect();
+    parts.len() == 4
+        && parts[..3].iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
+        && parts[3].len() >= 2
+        && parts[3].chars().all(|c| c.is_ascii_digit())
 }
 
 // --------------------------------------------------------------- utilities --
@@ -294,7 +370,7 @@ pub(crate) fn mk_uid(prefix: &str) -> String {
 }
 
 /// Same install (our own daemon / another process of this device)?
-fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
+pub(crate) fn is_self_uid(my_uid: &str, peer_uid: Option<&str>) -> bool {
     if std::env::var("FILAMENT_UID").is_ok() {
         return false; // test hook pins uids; don't second-guess it
     }
@@ -452,10 +528,21 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut all = devices_load();
-    all.retain(|(n, _)| n != name);
-    all.push((name.to_string(), secret.to_string()));
-    let arr: Vec<Value> = all.iter().map(|(n, s)| json!({"name": n, "secret": s})).collect();
+    // Operate on the raw JSON so OTHER records keep their v2 fields (caps,
+    // addedAt) verbatim. Going through the (name, secret) tuples of
+    // devices_load() silently rewrote every other device as bare
+    // {name, secret}, wiping their `shell` grants on any store (pairing,
+    // introduce, rename) — a quiet privilege-loss bug.
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    match arr.iter_mut().find(|d| d["name"].as_str() == Some(name)) {
+        // Re-storing an existing name: only the secret rotates; keep its caps.
+        Some(existing) => existing["secret"] = json!(secret),
+        None => arr.push(json!({"name": name, "secret": secret})),
+    }
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
     #[cfg(unix)]
     {
@@ -539,16 +626,74 @@ fn device_allows(name: &str, capability: &str) -> bool {
     device_caps(name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
 }
 
+/// Grant or revoke a capability on an EXISTING known device, preserving its
+/// secret and any other caps. Promotes a v1 record (no `caps`) to v2 with the
+/// back-compat baseline `["transfer"]` first, so granting `shell` never silently
+/// drops `transfer`. Deny-by-default consent for `filament grant`/`revoke`.
+/// Returns Err if the device is unknown (you can't grant a stranger a shell).
+fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
+    let p = devices_path();
+    let raw = std::fs::read_to_string(&p)
+        .map_err(|_| anyhow::anyhow!("no known device named '{name}' — pair first"))?;
+    let mut arr: Vec<Value> = serde_json::from_str::<Value>(&raw)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut found = false;
+    for d in arr.iter_mut() {
+        if d["name"].as_str() != Some(name) {
+            continue;
+        }
+        found = true;
+        // Current caps: v1 (absent) reads as the transfer baseline.
+        let mut caps: Vec<String> = match d.get("caps").and_then(|c| c.as_array()) {
+            Some(list) => list.iter().filter_map(|c| c.as_str().map(String::from)).collect(),
+            None => vec!["transfer".to_string()],
+        };
+        caps.retain(|c| c != capability);
+        if grant {
+            caps.push(capability.to_string());
+        }
+        if let Some(obj) = d.as_object_mut() {
+            obj.insert("v".into(), json!(2));
+            obj.insert("caps".into(), json!(caps));
+        }
+    }
+    if !found {
+        return Err(anyhow::anyhow!(
+            "no known device named '{name}' — run `filament devices` to see who you've paired"
+        ));
+    }
+    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 /// C27: a declined remember offer must not leave one-sided dead weight.
 fn devices_remove(name: &str) -> Result<()> {
     let p = devices_path();
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut all = devices_load();
-    all.retain(|(n, _)| n != name);
-    let arr: Vec<Value> = all.iter().map(|(n, s)| json!({"name": n, "secret": s})).collect();
+    // Raw-array filter so the REMAINING devices keep their v2 fields (caps,
+    // addedAt). The old tuple round-trip rewrote every survivor as bare
+    // {name, secret}, silently wiping their `shell` grants on any forget.
+    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    arr.retain(|d| d["name"].as_str() != Some(name));
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 
@@ -650,16 +795,93 @@ fn daemon_alive() -> Option<u32> {
     cmd.contains("filament").then_some(pid)
 }
 
-async fn up_cmd(server: &str, install: bool, dir: Option<PathBuf>, relay: bool) -> Result<()> {
+/// The argv for a web-shell PTY.
+///
+/// M-1 (privilege-drop): when `--shell-user <name>` is set, drop the PTY to that
+/// account via `runuser -l <user>` (a clean setuid+login-shell wrapper available
+/// on every systemd distro). `runuser` does no PAM password prompt, so it only
+/// works when `up` itself runs as root — which is exactly the case the flag is
+/// meant to de-fang (a root daemon should hand out a NON-root shell). Without the
+/// flag the PTY runs as the up-process user (often root on a server); this is an
+/// ACCEPTED RISK documented in docs/security/web-shell-review.md (M-1) and in the
+/// `up --shell` help. Operators are urged to pass `--shell-user`.
+fn shell_argv(shell_user: Option<&str>) -> Vec<String> {
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        if std::path::Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+    });
+    match shell_user {
+        // `runuser -l <user>` opens a fresh login shell as <user>; we don't force
+        // a specific shell so the target account's own login shell is honored.
+        Some(user) => vec!["runuser".into(), "-l".into(), user.into()],
+        None => vec![shell, "-l".into()],
+    }
+}
+
+/// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
+/// may `filament ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
+/// always enforced separately — this is purely the capability side.
+#[derive(Clone, Debug)]
+enum ShellPolicy {
+    /// Default: only devices explicitly `grant`ed the `shell` cap.
+    Granted,
+    /// `up --shell`: any paired device. M-2: this INTENTIONALLY grants every
+    /// proof-verified paired device — including ones introduced later via
+    /// pair-intro. Use `Only`/`--shell-only` to scope it.
+    All,
+    /// `up --shell-only a,b`: only these petnames auto-shell; others need a grant.
+    Only(std::collections::HashSet<String>),
+}
+
+impl ShellPolicy {
+    fn auto_allows(&self, name: &str) -> bool {
+        match self {
+            ShellPolicy::Granted => false,
+            ShellPolicy::All => true,
+            ShellPolicy::Only(set) => set.contains(name),
+        }
+    }
+    /// Active policy implies the L2 tunnel acceptor is on (you can't ssh without it).
+    fn enables_l2(&self) -> bool {
+        !matches!(self, ShellPolicy::Granted)
+    }
+}
+
+async fn up_cmd(
+    server: &str,
+    install: bool,
+    dir: Option<PathBuf>,
+    relay: bool,
+    shell: bool,
+    shell_only: Option<String>,
+    shell_user: Option<String>,
+) -> Result<()> {
+    let shell_policy = match &shell_only {
+        Some(csv) => ShellPolicy::Only(
+            csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        ),
+        None if shell => ShellPolicy::All,
+        None => ShellPolicy::Granted,
+    };
     if install {
         let exe = std::env::current_exe()?;
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let unit_dir = PathBuf::from(&home).join(".config/systemd/user");
         std::fs::create_dir_all(&unit_dir)?;
         let unit = unit_dir.join("filament.service");
+        // Carry the shell policy into the unit so a service install keeps the
+        // same seamless-ssh posture the user asked for on the command line.
+        let mut up_args = String::from(" up");
+        if let Some(csv) = &shell_only {
+            up_args.push_str(&format!(" --shell-only {csv}"));
+        } else if shell {
+            up_args.push_str(" --shell");
+        }
+        if let Some(u) = &shell_user {
+            up_args.push_str(&format!(" --shell-user {u}"));
+        }
         std::fs::write(&unit, format!(
-            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={} up\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-            exe.display()
+            "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={}{}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+            exe.display(), up_args
         ))?;
         ui::say(&format!("  {} wrote {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), unit.display()));
         let enabled = std::process::Command::new("systemctl")
@@ -681,7 +903,35 @@ async fn up_cmd(server: &str, install: bool, dir: Option<PathBuf>, relay: bool) 
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
     std::fs::write(pidfile(), std::process::id().to_string())?;
-    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None).await;
+    match &shell_policy {
+        // M-2: --shell intentionally grants ALL proof-verified paired devices
+        // (current AND any introduced later via pair-intro). This is a broad,
+        // deliberate over-grant; --shell-only is the scoped, safer alternative.
+        ShellPolicy::All => ui::say(&format!(
+            "  {} seamless shell ON — ANY paired device (now or paired later) can `filament ssh` into this machine",
+            ui::paint(ui::Tone::Warn, "!"),
+        )),
+        ShellPolicy::Only(set) => {
+            let mut names: Vec<&String> = set.iter().collect();
+            names.sort();
+            let list = names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+            ui::say(&format!(
+                "  {} seamless shell ON for: {list} — they can `filament ssh` into this machine",
+                ui::paint(ui::Tone::Warn, "!"),
+            ));
+        }
+        ShellPolicy::Granted => {}
+    }
+    // M-1: warn loudly when a shell policy is active but the PTY is NOT dropped to
+    // a non-root account. The granted device would get a shell as the up-process
+    // user (often root on a server). `--shell-user <name>` de-fangs this.
+    if shell_policy.enables_l2() && shell_user.is_none() {
+        ui::say(&format!(
+            "  {} shell PTYs run as THIS user (root if the daemon is root) — pass `--shell-user <name>` to drop to a non-root account",
+            ui::paint(ui::Tone::Warn, "!"),
+        ));
+    }
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
     let _ = std::fs::remove_file(pidfile());
     res
 }
@@ -763,6 +1013,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -805,11 +1056,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    if let Err(e) = l.peer.handle_signal(data).await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
@@ -820,7 +1067,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 let (dev_name, sec) = if is_b { (&b_name, &b_sec) } else { (&a_name, &a_sec) };
                 let other_name = if is_b { &a_name } else { &b_name };
                 if let Some(l) = conn.link(&pid) {
-                    if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                    if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                         // prove ourselves, then vouch
                         t.send_control(&json!({
                             "type": "pair-proof",
@@ -941,6 +1188,18 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.room = Some(solo.clone());
     sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
+    // Bug 4: a 3-segment legacy TRANSFER code (word-word-digits) typed into
+    // `pair`, which expects a 4-segment PAKE pairing code — redirect clearly
+    // before the PAKE handshake stalls forever against a peer that isn't pairing.
+    if let Some(c) = &code {
+        if regex_lite_code(c) && !looks_like_pake_code(c) {
+            bail!(
+                "'{c}' looks like a one-time TRANSFER code (from `filament send --code`), not a pairing code.\n  \
+                 To receive that transfer: run `filament {c}` (or `filament recv {c}`)\n  \
+                 A pairing code looks like `brave-otter-ruby-3141` (one more word)."
+            );
+        }
+    }
     let creator = code.is_none();
     // L1-a: the spoken code is split CLIENT-SIDE into (nameplate, password). The
     // password (words) NEVER leaves this process; only the nameplate is sent.
@@ -987,6 +1246,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -1094,7 +1354,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             if !sent_confirm {
                 if let Some(k) = pake_k.clone() {
                     if let Some(l) = conn.link(&pid) {
-                        if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                        if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                             let mac = filament_pake::our_confirm(&k, &my_fp, &their_fp, &caps_canon);
                             sio.emit("signal", json!({ "to": pid, "data": {
                                 "type": "pake-confirm", "v": 2,
@@ -1205,7 +1465,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                         };
                         let recv_mac = data["mac"].as_str().and_then(b64_decode).unwrap_or_default();
                         let fps = match conn.link(&from) {
-                            Some(l) => l.peer.fingerprints().await,
+                            Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
                             None => None,
                         };
                         let Some((my_fp, their_fp)) = fps else {
@@ -1223,11 +1483,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                     _ => {}
                 }
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    if let Err(e) = l.peer.handle_signal(data).await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {
                 let display = match conn.link_mut(&pid) {
@@ -1323,7 +1579,11 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
 // rejoin window when the peer's socket dies entirely.
 
 struct Link {
-    peer: Arc<Peer>,
+    /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
+    /// negotiation — it rides authenticated QUIC), so every WebRTC-only call
+    /// site (`handle_signal`, `fingerprints`, `restart_ice`, the watchdog's
+    /// `is_connected`) is reachable only when this is `Some`.
+    peer: Option<Arc<Peer>>,
     info: Value, // {id,name,uid} as last seen — enough to re-establish
     name: String,
     uid: Option<String>,
@@ -1334,8 +1594,21 @@ struct Link {
     trusted: bool,
     /// (name, secret) hypothesis to prove/verify on this link
     expected_secret: Option<(String, String)>,
+    /// The devices.json PETNAME this link proved as (the cap-store key). Set on a
+    /// verified `pair-proof` (WebRTC) or at birth for a direct link (already
+    /// identity-bound). `None` until proven. Capability lookups (e.g. the `shell`
+    /// gate) MUST key on this, NOT on `name` (a presence display string that may
+    /// not match a stored record).
+    verified_name: Option<String>,
     /// C26: what the status roster shows for this peer
     presence: Presence,
+    /// rung-1 (FILAMENT_DIRECT): this link's transport is an authenticated direct
+    /// QUIC connection — its pair-secret MAC already proved identity, so the
+    /// post-channel DTLS pair-proof is skipped and the link is born trusted.
+    direct: bool,
+    /// Route label for a direct link (no WebRTC `route()` to query): `direct-quic`
+    /// for rung-1, `holepunched` for rung-2. Ignored for WebRTC links.
+    direct_route: &'static str,
 }
 
 /// C26: per-peer presence for the static status roster.
@@ -1411,6 +1684,33 @@ struct Conn {
     /// reconnect paths are untouched. Defaults false, so the send-side and
     /// connecting-phase `on_stuck` callers are unaffected.
     recv_done: bool,
+    /// rung-1 (FILAMENT_DIRECT): in-flight direct-QUIC attempts, keyed by peer
+    /// sid. While an attempt is pending we do NOT establish WebRTC for that peer
+    /// (sequential, per the design review — avoids two transports racing to
+    /// ChannelReady). On deadline expiry with no DirectReady the entry is
+    /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
+    direct_pending: HashMap<String, DirectPending>,
+}
+
+/// rung-1: state for one in-flight direct-QUIC attempt.
+struct DirectPending {
+    /// (name, secret) for the known device — gates the attempt and keys the MAC.
+    secret: (String, String),
+    /// budget deadline; on expiry with no DirectReady we fall back to WebRTC.
+    deadline: Instant,
+    /// set once the peer's transport-offer arrived and we spawned the racer, so
+    /// a duplicate offer doesn't spawn a second race.
+    racing: bool,
+    /// kept alive so the bound UDP port stays ours until the race consumes it.
+    endpoint: Option<quinn::Endpoint>,
+    /// rung-2 (FILAMENT_HOLEPUNCH): a SECOND raw UDP socket, already STUN'd, kept
+    /// raw (not connected) so its NAT mapping is the one we punch + run QUIC on.
+    /// Consumed by the chained ladder in `on_transport_offer` only if rung-1
+    /// fails. None when hole-punch is off or STUN discovery failed.
+    punch_sock: Option<std::net::UdpSocket>,
+    /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
+    #[allow(dead_code)]
+    my_srflx: Option<std::net::SocketAddr>,
 }
 
 impl Conn {
@@ -1560,10 +1860,13 @@ impl Conn {
         // holds sids that are still live links.
         self.deferred_left.remove(pid);
         if let Some(old) = self.links.remove(pid) {
-            // Never await close in the event loop (F8): mark + spawn.
-            let p = old.peer.clone();
-            p.mark_closed();
-            tokio::spawn(async move { p.close().await });
+            // Never await close in the event loop (F8): mark + spawn. A direct
+            // link has no WebRTC peer; dropping the Link drops its QUIC transport
+            // (the keepalive task observes conn.closed() and tears down).
+            if let Some(p) = old.peer.clone() {
+                p.mark_closed();
+                tokio::spawn(async move { p.close().await });
+            }
         }
         if self.is_active(pid) {
             self.active = None;
@@ -1571,7 +1874,23 @@ impl Conn {
     }
 
     async fn establish(&mut self, info: Value) -> Result<()> {
+        self.establish_as(info, None).await
+    }
+
+    /// `force_polite: Some(true)` builds a pure responder link (no local offer)
+    /// regardless of uid comparison — required when the link exists to ANSWER
+    /// an incoming offer (ensure_responder / glare rebuild). The uid-based role
+    /// can come out impolite there (especially on the bare `{id}` roster-miss
+    /// fallback, which compares sids), making the "responder" offer too: glare.
+    async fn establish_as(&mut self, info: Value, force_polite: Option<bool>) -> Result<()> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
+        // rung-1: a direct-QUIC attempt owns this peer until its budget expires.
+        // Suppress the WebRTC offer so the path stays SEQUENTIAL (no two
+        // transports racing to ChannelReady). `expired_direct` removes the
+        // pending before calling us for the fallback, so this never blocks it.
+        if self.direct_pending.contains_key(&peer_id) {
+            return Ok(());
+        }
         self.drop_link(&peer_id); // re-establish replaces any same-sid link
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
         let name = info["name"].as_str().unwrap_or("peer").to_string();
@@ -1579,7 +1898,9 @@ impl Conn {
         // every attempt, not just the first.
         let cfg = net::fetch_config(&self.server).await?;
         self.chunk_size = cfg.chunk_size;
-        let polite = net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id);
+        let polite = force_polite.unwrap_or_else(|| {
+            net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id)
+        });
         self.next_gen += 1;
         let generation = self.next_gen;
         let peer = Peer::connect(
@@ -1595,7 +1916,7 @@ impl Conn {
         self.links.insert(
             peer_id,
             Link {
-                peer,
+                peer: Some(peer),
                 info,
                 name,
                 uid: peer_uid,
@@ -1604,10 +1925,272 @@ impl Conn {
                 attempts: 0,
                 trusted: false,
                 expected_secret: None,
+                verified_name: None,
                 presence: Presence::Connecting,
+                direct: false,
+                direct_route: "direct-quic", // unused for WebRTC links (peer.is_some())
             },
         );
         Ok(())
+    }
+
+    // --- rung-1 direct-QUIC path (FILAMENT_DIRECT) ---------------------------
+    //
+    // Sequential by design: when both peers are CLIs and a pair secret is known,
+    // try a direct authenticated QUIC connection FIRST and only fall back to the
+    // WebRTC `establish` above if no authenticated connection lands within the
+    // budget. The whole thing is gated on `direct::direct_enabled()`, so with the
+    // flag OFF none of this runs and the WebRTC path is byte-for-byte unchanged.
+
+    /// Begin a direct attempt against `pid`: bind a quinn endpoint, advertise our
+    /// candidates via a relayed `transport-offer`, and stash the pending state.
+    /// No Link is created yet — it is born (with `peer: None`, pre-trusted) only
+    /// when an authenticated connection wins (Ev::DirectReady). Idempotent per
+    /// peer (a second call while pending is a no-op). The peer's own
+    /// transport-offer (Ev::TransportOffer) drives the race.
+    async fn start_direct(&mut self, pid: &str, name: &str, secret: &str) {
+        if !direct::direct_enabled() {
+            return;
+        }
+        if self.direct_pending.contains_key(pid) || self.links.contains_key(pid) {
+            return; // already trying, or already linked (WebRTC or direct)
+        }
+        let (ep, port) = match direct::bind_endpoint() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("filament: direct disabled (endpoint bind failed: {e})");
+                return;
+            }
+        };
+        let cands = direct::gather_candidates(&self.server, port).await;
+
+        // rung-2 (FILAMENT_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
+        // can advertise a server-reflexive candidate. This socket is kept RAW
+        // (not handed to quinn) — its NAT mapping is the one we'll punch + run
+        // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
+        // no srflx is advertised and rung-2 simply won't fire for this peer.
+        let (punch_sock, my_srflx) = if holepunch::holepunch_enabled() {
+            match self.gather_srflx().await {
+                Some((sock, srflx)) => (Some(sock), Some(srflx)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        // transport-offer rides the OPAQUE signaling relay (same channel as ICE
+        // signals); the server cannot read or forge it without failing the MAC.
+        let mut offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
+        if let Some(s) = my_srflx {
+            offer["srflx"] = json!(s.to_string());
+        }
+        let _ = self
+            .sio
+            .emit("signal", json!({ "to": pid, "data": offer.clone() }))
+            .await;
+        eprintln!(
+            "filament: DIRECT-OFFER sent to {name} ({pid}) — port {} srflx {}",
+            port,
+            my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
+        );
+        // Re-send the offer periodically. The L2 initiator (netcat/ssh) subscribes
+        // to the channel AFTER us, so on a late join it can miss BOTH our single
+        // fire-once offer AND its own KnownPeer for us (presence delivery is racy)
+        // — the cross-machine stall. Re-emitting lets it catch a later offer and
+        // dial our (reachable) candidates; the initiator only races the FIRST
+        // offer it gets, so the extra emits are harmless once linked.
+        {
+            let sio = self.sio.clone();
+            let pid_c = pid.to_string();
+            tokio::spawn(async move {
+                for _ in 0..6 {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    let _ = sio
+                        .emit("signal", json!({ "to": pid_c, "data": offer.clone() }))
+                        .await;
+                }
+            });
+        }
+        // The WebRTC fallback reaper (`expired_direct`) fires at this deadline.
+        // rung-1's race always burns the full DIRECT_BUDGET when it can't win
+        // (its acceptor future never self-completes), so with hole-punch enabled
+        // the deadline MUST cover the WHOLE ladder — rung-1 budget + punch budget
+        // + QUIC handshake slack — or the reaper would race WebRTC against an
+        // in-flight punch and the route would be a coin flip. Flag-gated, so
+        // rung-1-only timing is byte-identical.
+        let deadline = if holepunch::holepunch_enabled() {
+            Instant::now() + direct::DIRECT_BUDGET + holepunch::PUNCH_BUDGET + Duration::from_secs(3)
+        } else {
+            Instant::now() + direct::DIRECT_BUDGET
+        };
+        self.direct_pending.insert(
+            pid.to_string(),
+            DirectPending {
+                secret: (name.to_string(), secret.to_string()),
+                deadline,
+                racing: false,
+                endpoint: Some(ep),
+                punch_sock,
+                my_srflx,
+            },
+        );
+    }
+
+    /// rung-2: bind a raw punch socket and discover its srflx via STUN against
+    /// the ICE config's STUN server. Returns (raw socket, srflx) or None.
+    async fn gather_srflx(&self) -> Option<(std::net::UdpSocket, std::net::SocketAddr)> {
+        let cfg = net::fetch_config(&self.server).await.ok()?;
+        let stun_urls: Vec<String> = cfg
+            .ice_servers
+            .iter()
+            .flat_map(|s| s.urls.iter().cloned())
+            .collect();
+        let stun_addr = holepunch::stun_server_addr(&stun_urls)?;
+        let sock = holepunch::bind_punch_socket().ok()?;
+        // STUN is blocking UDP I/O — run it off the reactor.
+        tokio::task::spawn_blocking(move || {
+            holepunch::stun_srflx(&sock, stun_addr).map(|srflx| (sock, srflx))
+        })
+        .await
+        .ok()?
+        .ok()
+    }
+
+    /// The peer advertised its candidates. If we have a matching pending attempt
+    /// and haven't started the race yet, consume the endpoint and spawn the
+    /// simultaneous-open + auth race; the winner posts Ev::DirectReady.
+    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
+        let Some(p) = self.direct_pending.get_mut(pid) else { return };
+        if p.racing {
+            return;
+        }
+        let Some(ep) = p.endpoint.take() else { return };
+        p.racing = true;
+        let secret = p.secret.1.clone();
+        // rung-2: hand the punch socket + peer's srflx to the chained ladder.
+        let punch_sock = p.punch_sock.take();
+        let peer_srflx_addr = peer_srflx
+            .as_deref()
+            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
+        let tx = self.tx.clone();
+        let pid_s = pid.to_string();
+        tokio::spawn(async move {
+            // rung-1: direct-dial QUIC over host candidates (UNCHANGED).
+            if let Some(t) =
+                direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone()).await
+            {
+                let _ = tx.send(Ev::DirectReady(pid_s, t, "direct-quic"));
+                return;
+            }
+            // rung-2: UDP hole-punch, then rung-1's QUIC race over the punched
+            // socket. Only fires with the flag on, a punch socket bound, and a
+            // peer srflx to punch toward. On failure (e.g. symmetric NAT) we fall
+            // through to the WebRTC step-down via the per-tick reaper.
+            if holepunch::holepunch_enabled() {
+                if let (Some(sock), Some(peer_srflx)) = (punch_sock, peer_srflx_addr) {
+                    eprintln!(
+                        "filament: rung-1 failed — attempting hole-punch to {peer_srflx}"
+                    );
+                    if let Some(t) = holepunch::connect(
+                        sock,
+                        peer_srflx,
+                        &secret,
+                        pid_s.clone(),
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(Ev::DirectReady(pid_s, t, "holepunched"));
+                        return;
+                    }
+                }
+            }
+            // On None the per-tick reaper handles the WebRTC fallback at deadline.
+        });
+    }
+
+    /// Create the Link for a direct connection that won the race. `peer: None`
+    /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
+    /// proved identity — at least as strong as the DTLS pair-proof it replaces).
+    fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        let pend = self.direct_pending.remove(pid);
+        let (name, secret) = match pend {
+            Some(p) => p.secret,
+            None => ("peer".to_string(), String::new()),
+        };
+        let info = self
+            .roster
+            .get(pid)
+            .cloned()
+            .unwrap_or_else(|| json!({ "id": pid, "name": name }));
+        let uid = info["uid"].as_str().map(|s| s.to_string());
+        let expected_secret = if secret.is_empty() {
+            None
+        } else {
+            Some((name.clone(), secret))
+        };
+        self.next_gen += 1;
+        let generation = self.next_gen;
+        self.links.insert(
+            pid.to_string(),
+            Link {
+                peer: None,
+                info,
+                name,
+                uid,
+                transport: Some(t),
+                generation,
+                attempts: 0,
+                trusted: true,
+                // A direct link is born identity-bound (its pair-secret MAC
+                // already proved who it is), so the petname is known up front.
+                verified_name: expected_secret.as_ref().map(|(n, _)| n.clone()),
+                expected_secret,
+                presence: Presence::Ready,
+                direct: true,
+                direct_route: route,
+            },
+        );
+    }
+
+    /// Per-tick: a direct attempt whose budget expired without an authenticated
+    /// connection falls back to the WebRTC `establish` (unchanged). Returns the
+    /// list of (pid, info) to establish — caller awaits establish outside the
+    /// borrow. Also drops any pending whose Link already exists.
+    fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
+        let now = Instant::now();
+        let mut fell_back = Vec::new();
+        let expired: Vec<String> = self
+            .direct_pending
+            .iter()
+            .filter(|(pid, p)| now >= p.deadline && !self.links.contains_key(*pid))
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in expired {
+            if let Some(p) = self.direct_pending.remove(&pid) {
+                let info = self
+                    .roster
+                    .get(&pid)
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
+                eprintln!(
+                    "filament: DIRECT-FALLBACK for {} — no authenticated QUIC in budget, using WebRTC",
+                    p.secret.0
+                );
+                fell_back.push((pid, info, p.secret));
+            }
+        }
+        // Drop pendings whose link landed by another route (cleanup).
+        let linked: Vec<String> = self
+            .direct_pending
+            .keys()
+            .filter(|pid| self.links.contains_key(*pid))
+            .cloned()
+            .collect();
+        for pid in linked {
+            self.direct_pending.remove(&pid);
+        }
+        fell_back
     }
 
     /// C3/C4: watchdog or grace expiry — retry that LINK with fresh config,
@@ -1620,7 +2203,12 @@ impl Conn {
             return Ok(false);
         }
         let Some(l) = self.links.get(pid) else { return Ok(false) };
-        if l.generation != generation || l.peer.is_connected() {
+        // rung-1: a direct link has no WebRTC watchdog (no Peer::connect timer),
+        // so on_stuck can't fire for it; defensively no-op if it ever does.
+        if l.direct {
+            return Ok(false);
+        }
+        if l.generation != generation || l.peer.as_ref().map(|p| p.is_connected()).unwrap_or(true) {
             return Ok(false); // stale timer from a superseded attempt
         }
         // Gate-18 Mode B: the transfer is COMPLETE (recv_done; recomputed per
@@ -1706,8 +2294,10 @@ impl Conn {
                     announce = Some(("◌", ui::Tone::Warn, "reconnecting…"));
                     Duration::from_secs(6)
                 };
-                if !l.peer.polite && !away {
-                    l.peer.restart_ice().await;
+                if let Some(p) = &l.peer {
+                    if !p.polite && !away {
+                        p.restart_ice().await;
+                    }
                 }
                 let tx = self.tx.clone();
                 let pid = pid.to_string();
@@ -1873,6 +2463,33 @@ impl Conn {
 
     /// #7 for the CLI: an offer from a roster peer we haven't linked yet
     /// creates a polite responder link. Stray signals from unknowns drop.
+    /// Apply a relayed signal to `from`'s link. Never fatal (F6): the
+    /// watchdog/grace machinery owns failed negotiations. On polite-side
+    /// glare (webrtc-rs can't roll back out of have-local-offer) the link is
+    /// rebuilt as a pure responder and the colliding offer re-applied.
+    async fn apply_signal(&mut self, from: &str, data: Value) {
+        let peer = match self.link(from).and_then(|l| l.peer.clone()) {
+            Some(p) => p,
+            None => return,
+        };
+        match peer.handle_signal(data).await {
+            Ok(net::SignalOutcome::Handled) => {}
+            Ok(net::SignalOutcome::Glare(offer)) => {
+                self.drop_link(from);
+                if let Err(e) = self.ensure_responder(from, &offer).await {
+                    eprintln!("signal: glare rebuild failed: {e} (recovering)");
+                    return;
+                }
+                if let Some(p) = self.link(from).and_then(|l| l.peer.clone()) {
+                    if let Err(e) = p.handle_signal(offer).await {
+                        eprintln!("signal failed to apply: {e} (recovering)");
+                    }
+                }
+            }
+            Err(e) => eprintln!("signal failed to apply: {e} (recovering)"),
+        }
+    }
+
     async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
         if self.links.contains_key(from) {
             return Ok(());
@@ -1880,10 +2497,24 @@ impl Conn {
         if data["type"].as_str() == Some("description")
             && data["description"]["type"].as_str() == Some("offer")
         {
-            if let Some(info) = self.roster.get(from).cloned() {
-                if self.links.len() < MAX_LINKS {
-                    self.establish(info).await?;
-                }
+            // Answer a WebRTC offer from a channel-peer EVEN IF we never got its
+            // known-peer. The existing-member known-peer notification is
+            // unreliable on prod (proven via the signaling harness: the NEW
+            // joiner is reliably notified, but the EXISTING member often is NOT)
+            // — which left the acceptor ignoring a valid initiator's offer and
+            // looking like "stuck connecting". One-sided discovery is now enough:
+            // whoever discovers drives, the other answers. SAFE: trust still
+            // gates entirely on the pair-proof MAC (an attacker without the
+            // secret fails it and is never trusted) — we only answer the offer
+            // and let the proof decide. A later known-peer refreshes name/uid.
+            let info = self
+                .roster
+                .get(from)
+                .cloned()
+                .unwrap_or_else(|| json!({ "id": from }));
+            if self.links.len() < MAX_LINKS {
+                // Forced responder: this link exists to answer THEIR offer.
+                self.establish_as(info, Some(true)).await?;
             }
         }
         Ok(())
@@ -1939,7 +2570,7 @@ async fn main() -> Result<()> {
     // `filament <something-like-a-code>` claims it. Subcommands still win.
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
-        const CMDS: [&str; 15] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh"];
+        const CMDS: [&str; 17] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh", "grant", "revoke"];
         let code_re = regex_lite_code(first);
         if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
             if std::path::Path::new(first).exists() {
@@ -1947,6 +2578,10 @@ async fn main() -> Result<()> {
                 argv.push("--code".into());
             } else if code_re {
                 argv.insert(1, "recv".into());
+            } else if looks_like_pake_code(first) {
+                // Bug 4: a 4-segment PAKE pairing code (from `filament pair`) —
+                // claim it via the pairing ceremony, not recv.
+                argv.insert(1, "pair".into());
             }
         }
     }
@@ -1966,7 +2601,7 @@ async fn main() -> Result<()> {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output, ShellPolicy::Granted, None).await
         }
         Cmd::Config { key, value } => {
             match (key, value) {
@@ -1985,7 +2620,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, dir } => up_cmd(&server, install, dir, cli.relay).await,
+        Cmd::Up { install, dir, shell, shell_only, shell_user } => up_cmd(&server, install, dir, cli.relay, shell, shell_only, shell_user).await,
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
@@ -1998,7 +2633,10 @@ async fn main() -> Result<()> {
                         println!("no known devices yet — run `filament pair` to add one");
                     }
                     for (n, s) in all {
-                        println!("{n}  (channel {})", &channel_of(&s)[..12]);
+                        // Show the granted capability set so `grant shell` is
+                        // visible here (v1 records read as [transfer]).
+                        let caps = device_caps(&n).unwrap_or_else(|| vec!["transfer".to_string()]);
+                        println!("{n}  (channel {})  [{}]", &channel_of(&s)[..12], caps.join(", "));
                     }
                 }
                 Some(DevicesAction::Forget { name }) => {
@@ -2011,16 +2649,31 @@ async fn main() -> Result<()> {
                     println!("(their side still holds its half; it will hear \"never met you\" on the next proof)");
                 }
                 Some(DevicesAction::Rename { old, new }) => {
-                    let all = devices_load();
-                    let Some((_, sec)) = all.iter().find(|(n, _)| n == &old) else {
+                    // Rename in place on the raw record so caps/v2 fields ride
+                    // along (remove+store dropped the renamed device's caps).
+                    let p = devices_path();
+                    let mut arr: Vec<Value> = std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                        .and_then(|v| v.as_array().cloned())
+                        .unwrap_or_default();
+                    if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
                         bail!("no device named '{old}' — see `filament devices`");
-                    };
-                    if all.iter().any(|(n, _)| n == &new) {
+                    }
+                    if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
                         bail!("'{new}' already exists — forget it first or pick another name");
                     }
-                    let sec = sec.clone();
-                    devices_remove(&old)?;
-                    devices_store(&new, &sec)?;
+                    for d in arr.iter_mut() {
+                        if d["name"].as_str() == Some(old.as_str()) {
+                            d["name"] = json!(new);
+                        }
+                    }
+                    std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                    }
                     println!("renamed '{old}' -> '{new}' (local alias only — the secret, and the other side, are unchanged)");
                 }
             }
@@ -2038,8 +2691,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, cli.relay).await,
+        Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, cli.relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
-        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay),
+        Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay).await,
+        Cmd::Grant { device, capability } => {
+            device_set_cap(&device, &capability, true)?;
+            println!(
+                "granted '{capability}' to '{device}'. {}",
+                if capability == "shell" {
+                    "they can now `filament ssh` into this machine (their key is installed on first connect)."
+                } else {
+                    ""
+                }
+            );
+            Ok(())
+        }
+        Cmd::Revoke { device, capability } => {
+            device_set_cap(&device, &capability, false)?;
+            if capability == "shell" {
+                sshkeys::remove_authorized_key(&device)?;
+                println!("revoked 'shell' from '{device}' and removed its filament-managed authorized_keys block.");
+            } else {
+                println!("revoked '{capability}' from '{device}'.");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2190,13 +2866,20 @@ async fn send_cmd(
     word: Option<String>,
     room: Option<String>,
     to: Option<String>,
-    stdin_name: String,
+    name: Option<String>,
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
     if paths.is_empty() {
         bail!("nothing to send — pass files, directories, or '-' for stdin");
     }
+    // --name overrides the offered name, but only makes sense for a SINGLE
+    // payload (stdin, or one regular file). With multiple paths or a directory
+    // there is no single name to override, so warn that it's ignored.
+    if name.is_some() && paths.len() > 1 {
+        eprintln!("{}", ui::paint(ui::Tone::Warn, "--name is ignored when sending multiple paths"));
+    }
+    let single = paths.len() == 1;
     let my_uid = mk_uid("s");
     let mut outgoing: Vec<Outgoing> = Vec::new();
     for (i, p) in paths.iter().enumerate() {
@@ -2208,11 +2891,15 @@ async fn send_cmd(
             let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
             drop(f);
             let head = head_hash(&spool);
-            outgoing.push(Outgoing { id, sid, name: stdin_name.clone(), size: n, head, path: spool, temp: true, accepted_once: false, done: false });
+            let offered = name.clone().filter(|_| single).unwrap_or_else(|| "stdin.bin".into());
+            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, path: spool, temp: true, accepted_once: false, done: false });
         } else {
             let path = PathBuf::from(p);
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
             if meta.is_dir() {
+                if name.is_some() && single {
+                    eprintln!("{}", ui::paint(ui::Tone::Warn, "--name is ignored for a directory (it's tarred under the directory name)"));
+                }
                 let dirname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dir".into());
                 let spool = std::env::temp_dir().join(format!("filament-tar-{}-{}.tar", std::process::id(), i));
                 eprintln!("packing {p} -> {dirname}.tar ...");
@@ -2226,9 +2913,13 @@ async fn send_cmd(
                 let head = head_hash(&spool);
                 outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, path: spool, temp: true, accepted_once: false, done: false });
             } else {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+                // A single regular file with --name uses the override; otherwise
+                // the basename. With multiple files --name was already warned off.
+                let offered = name.clone().filter(|_| single).unwrap_or_else(|| {
+                    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone())
+                });
                 let head = head_hash(&path);
-                outgoing.push(Outgoing { id, sid, name, size: meta.len(), head, path, temp: false, accepted_once: false, done: false });
+                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, path, temp: false, accepted_once: false, done: false });
             }
         }
     }
@@ -2296,6 +2987,7 @@ async fn send_cmd(
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -2314,8 +3006,38 @@ async fn send_cmd(
     let outgoing = Arc::new(tokio::sync::Mutex::new(outgoing));
     let started = Instant::now();
     let claim_deadline = Duration::from_secs(600);
+    // Bug 6: bound ESTABLISHMENT. netcat/ssh cap how long they hunt for a peer;
+    // `send` had no such bound, so an ICE wedge (no candidate pair ever
+    // nominates) hung unbounded with the spinner spinning. Cap the time to the
+    // FIRST live data channel (ChannelReady); once a channel is up, a long
+    // legitimate transfer is never interrupted by this. Overridable / disablable
+    // (0 = off) via FILAMENT_SEND_TIMEOUT.
+    let establish_deadline = std::env::var("FILAMENT_SEND_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60));
+    let mut established = false;
+    // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
+    let mut stuck_while_connecting = 0u32;
+    let mut wedge_hint_shown = false;
 
     loop {
+        // Bug 6: no data channel has come up within the establishment window —
+        // an ICE wedge or a peer that claimed the code but never connected. Fail
+        // honestly instead of spinning forever. A non-zero deadline only; a live
+        // channel (established) disarms it so big transfers are never cut off.
+        if !established
+            && !establish_deadline.is_zero()
+            && started.elapsed() >= establish_deadline
+        {
+            ui::clear_sticky();
+            bail!(
+                "no peer connected within {}s — is a receiver running / the page open? \
+                 (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
+                establish_deadline.as_secs()
+            );
+        }
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.waiting_rejoin.is_none() {
             // C30: read in ≤2s slices — a blocking full-deadline read starves
@@ -2338,6 +3060,17 @@ async fn send_cmd(
         sess.tick(&sio).await;
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // rung-1: a direct attempt that timed out without an authenticated QUIC
+        // connection falls back to the WebRTC establish (unchanged path).
+        for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.establish(info).await?;
+            if let Some(l) = conn.link_mut(&pid) {
+                l.expected_secret = Some((n, sec));
+            }
+            if conn.to_filter.is_none() && conn.active.is_none() {
+                conn.active = Some(pid.clone());
+            }
+        }
         // C30 phase 3: tell every link our truth every ~10s (sender side has
         // no receive-partials; the ping mainly carries trusted/away and keeps
         // the peer's away-mark honest).
@@ -2404,6 +3137,12 @@ async fn send_cmd(
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
                         eprintln!("known device '{n}' is online — connecting");
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
+                        // rung-1: both ends are CLIs (known device) — try direct
+                        // QUIC FIRST. start_direct records the pending so the
+                        // maybe_adopt->establish below skips the WebRTC offer
+                        // until the budget expires (then it falls back).
+                        let (n, sec) = (n.clone(), sec.clone());
+                        conn.start_direct(&pid, &n, &sec).await;
                         conn.maybe_adopt(&v, true).await?;
                         if let Some(l) = conn.link_mut(&pid) {
                             l.expected_secret = Some((n.clone(), sec.clone()));
@@ -2414,16 +3153,30 @@ async fn send_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // rung-1: a relayed transport-offer carries the peer's direct
+                // candidates — kick off the simultaneous-open + auth race.
+                if data["type"].as_str() == Some("transport-offer") {
+                    let cands: Vec<String> = data["addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    // rung-2: optional server-reflexive candidate for hole-punch.
+                    let srflx = data["srflx"].as_str().map(String::from);
+                    conn.on_transport_offer(&from, cands, srflx);
+                    continue;
+                }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    // Never fatal (F6): the watchdog/grace machinery owns
-                    // failed negotiations.
-                    if let Err(e) = l.peer.handle_signal(data).await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
+            }
+            // rung-1: the authenticated direct-QUIC connection won the race.
+            // Create the (pre-trusted) Link, then funnel into the SAME ready
+            // handler the WebRTC path uses (announce + offers) by re-emitting
+            // ChannelReady — the transfer logic rides the trait unchanged.
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
@@ -2435,27 +3188,39 @@ async fn send_cmd(
                 if !conn.is_active(&pid) {
                     continue;
                 }
+                // Bug 6: a live channel to the active peer disarms the
+                // establishment timeout — the rest of the transfer is unbounded.
+                established = true;
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(l) = conn.link(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
-                    let p = l.peer.clone();
-                    tokio::spawn(async move {
-                        // ICE may renominate; retry briefly (mirrors the
-                        // browser's _detectRoute attempts) so fast transfers
-                        // still get a route line before the process exits.
-                        for _ in 0..6 {
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                            if let Some(r) = p.route().await {
-                                ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
-                                break;
+                    let is_direct = l.direct;
+                    let direct_route = l.direct_route;
+                    if let Some(p) = l.peer.clone() {
+                        tokio::spawn(async move {
+                            // ICE may renominate; retry briefly (mirrors the
+                            // browser's _detectRoute attempts) so fast transfers
+                            // still get a route line before the process exits.
+                            for _ in 0..6 {
+                                tokio::time::sleep(Duration::from_millis(400)).await;
+                                if let Some(r) = p.route().await {
+                                    ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    break;
+                                }
                             }
-                        }
-                    });
+                        });
+                    } else if is_direct {
+                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
+                    }
                     // C12: prove identity to a known device (their daemon
                     // auto-accepts only after verifying); or hand over a new
-                    // pair secret when the user asked to --remember.
-                    if let Some((_n, sec)) = &l.expected_secret {
-                        if let Some((my_fp, their_fp)) = l.peer.fingerprints().await {
+                    // pair secret when the user asked to --remember. A DIRECT
+                    // link already proved the secret via the QUIC keying-material
+                    // MAC (>= the DTLS pair-proof), so it skips this dance.
+                    if is_direct {
+                        // pre-authenticated; nothing to prove over the channel.
+                    } else if let Some((_n, sec)) = &l.expected_secret {
+                        if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
                             t.send_control(&json!({
                                 "type": "pair-proof",
                                 "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
@@ -2546,10 +3311,7 @@ async fn send_cmd(
                     if v["trusted"].as_bool() == Some(false) && !reproved.contains(&pid) {
                         let proof = match conn.link(&pid) {
                             Some(l) => match &l.expected_secret {
-                                Some((_n, sec)) => l
-                                    .peer
-                                    .fingerprints()
-                                    .await
+                                Some((_n, sec)) => (match &l.peer { Some(p) => p.fingerprints().await, None => None })
                                     .map(|(my_fp, their_fp)| proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp)),
                                 None => None,
                             },
@@ -2637,6 +3399,14 @@ async fn send_cmd(
                 std::process::exit(130);
             }
             Ev::Stuck(pid, generation) => {
+                // Bug 5: if we keep getting stuck BEFORE a channel ever came up,
+                // surface the single-host mDNS hint once.
+                if !established {
+                    stuck_while_connecting += 1;
+                    if stuck_while_connecting >= 2 {
+                        maybe_hint_local_wedge(&mut wedge_hint_shown);
+                    }
+                }
                 if conn.on_stuck(&pid, generation, "stuck while connecting").await? {
                     bail!("lost the receiving peer after {} attempts", MAX_ATTEMPTS);
                 }
@@ -2668,7 +3438,14 @@ async fn send_cmd(
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
                 if let Some(t) = conn.transport() {
-                    t.flush().await.ok();
+                    // Block until the peer has acked every byte before we exit —
+                    // a torn-down QUIC connection drops un-acked send-buffer bytes
+                    // and truncates the last file (no-op on DataChannel, which
+                    // already drained in flush()). Surface a drain failure rather
+                    // than silently reporting "done" on a partial transfer.
+                    if let Err(e) = t.drain_finish().await {
+                        eprintln!("warning: transfer may be incomplete — {e}");
+                    }
                 }
                 for o in out.iter().filter(|o| o.temp) {
                     let _ = std::fs::remove_file(&o.path);
@@ -2766,8 +3543,24 @@ async fn recv_cmd(
     remember: Option<String>,
     daemon: bool,
     output: Option<String>,
+    shell_policy: ShellPolicy,
+    // M-1: optional non-root account the web-shell/ssh PTY is dropped to. `None`
+    // means the PTY runs as the up-process user (documented root risk).
+    shell_user: Option<String>,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
+    // Bug 4: a 4-segment PAKE pairing code (adj-animal-extra-NNNN) was typed
+    // into `recv`, which only claims 3-segment transfer codes — fail with a
+    // clear redirect instead of a silent never-connect.
+    if let Some(c) = &code {
+        if looks_like_pake_code(c) && !regex_lite_code(c) {
+            bail!(
+                "'{c}' looks like a PAIRING code (from `filament pair`), not a transfer code.\n  \
+                 To pair a device: run `filament pair {c}`\n  \
+                 A transfer code looks like `brave-otter-37` (one fewer word)."
+            );
+        }
+    }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
@@ -2875,6 +3668,7 @@ async fn recv_cmd(
         chunk_size: net::MAX_DC_PAYLOAD,
         deferred_left: HashMap::new(),
         recv_done: false,
+    direct_pending: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -2959,11 +3753,19 @@ async fn recv_cmd(
     // C30 phase 3: link mini-sync — state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
-    // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in; the cap gate
-    // is still a placeholder pending L1-a). Keyed by peer sid so multiple links
-    // stay isolated.
-    let l2_enabled = std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
+    // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in) OR an active
+    // `up --shell` policy turns it on (you can't ssh in without the acceptor).
+    // The cap gate (shell-bootstrap) is enforced separately. Keyed by peer sid
+    // so multiple links stay isolated.
+    let l2_enabled = shell_policy.enables_l2()
+        || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
+    // web-shell: per-sid resize senders are now owned by each Mux (l2.rs) so they
+    // are freed on every teardown path (H-1: closes the prior pty_resizers leak).
+    // Bug 5: surface the single-host mDNS wedge hint once after repeated stuck.
+    let mut stuck_while_connecting = 0u32;
+    let mut wedge_hint_shown = false;
+    let mut ever_received = false;
 
     loop {
         let ev = match tokio::time::timeout(
@@ -2980,6 +3782,13 @@ async fn recv_cmd(
         sess.tick(&sio).await;
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
+        // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).
+        for (pid, info, (n, sec)) in conn.expired_direct() {
+            conn.maybe_adopt(&info, true).await?;
+            if let Some(l) = conn.link_mut(&pid) {
+                l.expected_secret = Some((n, sec));
+            }
+        }
 
         // C30 phase 3: state pings — each open link hears our transfer/away
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
@@ -3015,6 +3824,9 @@ async fn recv_cmd(
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
         conn.recv_done = recv_transfer_done(completed, keep_open, by_sid.is_empty());
+        if completed > 0 || !by_sid.is_empty() {
+            ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
+        }
 
         // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
         // FLAP that contention triggers in the wild (the sender's departure puts
@@ -3038,7 +3850,9 @@ async fn recv_cmd(
                     l.attempts = 0; // mirror the real flap: cap never accumulates
                     // Tear the data channel down so on_stuck's is_connected()
                     // guard sees a dead link and the Stuck isn't swallowed.
-                    l.peer.close().await;
+                    if let Some(p) = &l.peer {
+                        p.close().await;
+                    }
                 }
                 let _ = conn.tx.send(Ev::Stuck(pid, generation));
             }
@@ -3053,6 +3867,24 @@ async fn recv_cmd(
         if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
             && !conn.links.is_empty() && conn.only_deferred_links()
         {
+            eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+            let _ = sio.disconnect().await;
+            return Ok(());
+        }
+
+        // Bug 2: the transfer is COMPLETE and the sender's link is fully GONE
+        // (dropped via peer-left, or via the grace/Mode-B path when peer-left
+        // was lost). With no live link and nothing left to fetch there is
+        // nothing to wait for — exit at once instead of holding out the full
+        // rejoin window (peer-left case) or the quiet-exit window (lost-peer-left
+        // case). Fenced exactly like the exits above: by_sid empty + no pending
+        // questions, so a mid-transfer reconnect (which keeps `by_sid`
+        // non-empty) is untouched, and --keep-open still lingers by design.
+        if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
+            && conn.links.is_empty()
+        {
+            conn.waiting_rejoin = None;
+            ui::clear_sticky();
             eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
             let _ = sio.disconnect().await;
             return Ok(());
@@ -3223,6 +4055,9 @@ async fn recv_cmd(
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
                     eprintln!("known device '{n}' appeared — connecting");
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
+                    // rung-1: known device = both CLIs; try direct QUIC first.
+                    let (n, sec) = (n.clone(), sec.clone());
+                    conn.start_direct(&pid, &n, &sec).await;
                     conn.maybe_adopt(&v, true).await?;
                     if let Some(l) = conn.link_mut(&pid) {
                         l.expected_secret = Some((n.clone(), sec.clone()));
@@ -3240,35 +4075,57 @@ async fn recv_cmd(
             Ev::Signal(v) => {
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
+                // rung-1: a relayed transport-offer carries the peer's direct
+                // candidates — start the simultaneous-open + auth race.
+                if data["type"].as_str() == Some("transport-offer") {
+                    let cands: Vec<String> = data["addrs"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    // rung-2: optional server-reflexive candidate for hole-punch.
+                    let srflx = data["srflx"].as_str().map(String::from);
+                    conn.on_transport_offer(&from, cands, srflx);
+                    continue;
+                }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    // Never fatal (F6): the watchdog/grace machinery owns
-                    // failed negotiations.
-                    if let Err(e) = l.peer.handle_signal(data).await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
+            }
+            // rung-1: authenticated direct-QUIC won the race — adopt as a
+            // pre-trusted Link, then funnel into the normal ChannelReady handler.
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
+                let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
+                // web-shell discovery: tell the peer whether this receiver offers a
+                // terminal (l2_enabled = `up --shell` / FILAMENT_L2). The browser
+                // shows its per-device shell button ONLY when this is true; the
+                // actual pty-open is still gated server-side by the cap/policy.
+                let _ = t.send_control(&json!({ "type": "caps", "shell": l2_enabled })).await;
                 if let Some(l) = conn.link_mut(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
-                    let p = l.peer.clone();
-                    tokio::spawn(async move {
-                        // ICE may renominate; retry briefly (mirrors the
-                        // browser's _detectRoute attempts) so fast transfers
-                        // still get a route line before the process exits.
-                        for _ in 0..6 {
-                            tokio::time::sleep(Duration::from_millis(400)).await;
-                            if let Some(r) = p.route().await {
-                                ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
-                                break;
+                    let is_direct = l.direct;
+                    let direct_route = l.direct_route;
+                    if let Some(p) = l.peer.clone() {
+                        tokio::spawn(async move {
+                            // ICE may renominate; retry briefly (mirrors the
+                            // browser's _detectRoute attempts) so fast transfers
+                            // still get a route line before the process exits.
+                            for _ in 0..6 {
+                                tokio::time::sleep(Duration::from_millis(400)).await;
+                                if let Some(r) = p.route().await {
+                                    ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    break;
+                                }
                             }
-                        }
-                    });
+                        });
+                    } else if is_direct {
+                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
+                    }
                 }
                 // C29: an in-session pairing — exactly one side hands over a
                 // secret; consent (pair-keep-ack / our store) completes it.
@@ -3322,6 +4179,147 @@ async fn recv_cmd(
                                 .await;
                         }
                         l2::OpenVerdict::Ignore => {}
+                    }
+                    // A PTY stream closing frees its resize channel — handled by
+                    // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
+                    // the mux now, so it can't leak past the stream).
+                }
+                // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
+                // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
+                // when the link is proof-verified (`trusted`) AND the proven
+                // device holds the NEW `shell` capability — distinct from
+                // `transfer`, so pairing for file transfer never yields a shell.
+                // The write happens only here (over the authenticated channel)
+                // into a clearly-marked, removable authorized_keys block.
+                Some("shell-bootstrap") if l2_enabled => {
+                    let Some(t) = conn.transport_of(&pid) else { continue };
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    // Cap lookup keys on the PROVEN petname, not the presence name.
+                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    // Granted if the device was explicitly `grant`ed shell OR an
+                    // active `up --shell[-only]` policy auto-allows it. Trust
+                    // (pair-proof) is still required either way.
+                    let granted = trusted
+                        && dev
+                            .as_deref()
+                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .unwrap_or(false);
+                    if !granted {
+                        let who = dev.as_deref().unwrap_or("<unverified>");
+                        eprintln!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)");
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-deny",
+                                "reason": "shell capability not granted"
+                            }))
+                            .await;
+                        continue;
+                    }
+                    let device = dev.unwrap();
+                    let pubkey = v["pubkey"].as_str().unwrap_or_default().to_string();
+                    // M-3 (authorized_keys injection): a single, well-formed key
+                    // line ONLY. validate_pubkey rejects interior newlines / CR /
+                    // control chars and multi-line payloads, so a trusted+shell
+                    // peer can't inject extra authorized_keys lines. Enforced here
+                    // AND again inside install_authorized_key (defense in depth).
+                    let pubkey = match sshkeys::validate_pubkey(&pubkey) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("l2: shell bootstrap refused: malformed pubkey from '{device}': {e}");
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "shell-bootstrap-deny",
+                                    "reason": "malformed pubkey"
+                                }))
+                                .await;
+                            continue;
+                        }
+                    };
+                    match sshkeys::install_authorized_key(&device, &pubkey) {
+                        Ok(()) => {
+                            let hostkeys = sshkeys::host_pubkeys();
+                            let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                            eprintln!(
+                                "l2: shell granted to '{device}' — installed managed key (filament-managed block)"
+                            );
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "shell-bootstrap-ack",
+                                    "hostkeys": hostkeys,
+                                    "user": login
+                                }))
+                                .await;
+                        }
+                        Err(e) => {
+                            eprintln!("l2: shell bootstrap install failed for '{device}': {e}");
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "shell-bootstrap-deny",
+                                    "reason": "install failed"
+                                }))
+                                .await;
+                        }
+                    }
+                }
+                // web-shell (browser terminal): spawn a login shell in a PTY and
+                // bridge it to a sid stream. Same deny-by-default gate as
+                // shell-bootstrap — a PTY is a superset of ssh-key access, so it
+                // reuses the `shell` cap / --shell policy and requires `trusted`.
+                Some("pty-open") if l2_enabled => {
+                    let Some(t) = conn.transport_of(&pid) else { continue };
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    if !l2::is_l2_sid(sid) {
+                        continue;
+                    }
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    let granted = trusted
+                        && dev
+                            .as_deref()
+                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .unwrap_or(false);
+                    if !granted {
+                        let who = dev.as_deref().unwrap_or("<unverified>");
+                        eprintln!("l2: pty refused: {who} (no shell cap / untrusted)");
+                        let _ = t
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
+                            .await;
+                        continue;
+                    }
+                    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                    let mux = l2_muxes
+                        .entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    // H-1 (DoS): refuse over the per-link stream cap or the global
+                    // PTY cap BEFORE spawning a shell. A flaky/hostile paired
+                    // device can otherwise flood `pty-open` and exhaust threads.
+                    if mux.at_stream_cap().await {
+                        eprintln!("l2: pty refused: too many streams on this link");
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
+                        continue;
+                    }
+                    let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
+                        eprintln!("l2: pty refused: too many PTYs (global cap {})", l2::MAX_PTYS_GLOBAL);
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
+                        continue;
+                    };
+                    let rx = mux.register_stream(sid).await; // before spawn (race fix)
+                    let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+                    // Resizer is owned by the mux so it is freed on EVERY teardown
+                    // path (inbound l2-close, serve_pty exit, link death) — H-1.
+                    mux.register_resizer(sid, rtx).await;
+                    eprintln!("l2: pty granted to '{}' — {cols}x{rows}", dev.unwrap_or_default());
+                    let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
+                    tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(shell_user.as_deref()), rx, rrx, pty_guard));
+                }
+                Some("pty-resize") if l2_enabled => {
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                    if let Some(mux) = l2_muxes.get(&pid) {
+                        mux.resize_pty(sid, cols, rows).await;
                     }
                 }
                 Some("brb") => {
@@ -3421,19 +4419,31 @@ async fn recv_cmd(
                     let mac = v["mac"].as_str().unwrap_or_default();
                     let peer_uid = conn.link(&pid).and_then(|l| l.uid.clone()).unwrap_or_default();
                     let fps = match conn.link(&pid) {
-                        Some(l) => l.peer.fingerprints().await,
+                        Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
                         None => None,
                     };
                     let Some((my_fp, their_fp)) = fps else {
                         eprintln!("pair-proof received before fingerprints known — ignoring");
                         continue;
                     };
-                    let hit = devices
-                        .iter()
-                        .find(|(_, s)| proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp) == mac);
+                    // #9: pair secrets are symmetric — our own install holds
+                    // every secret we do, so a same-host process could prove
+                    // "pop2" and tunnel callers into the WRONG machine. Refuse.
+                    let hit = if is_self_uid(&conn.my_uid, Some(peer_uid.as_str())) {
+                        eprintln!("pair-proof from our own install — refusing (self-connect)");
+                        None
+                    } else {
+                        devices
+                            .iter()
+                            .find(|(_, s)| proof_for(s, &peer_uid, &peer_uid, &conn.my_uid, &my_fp, &their_fp) == mac)
+                    };
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
+                            // Record the proven devices.json petname — the cap
+                            // store key (the `shell` bootstrap gate looks up caps
+                            // under exactly this, not the presence display name).
+                            l.verified_name = Some(n.clone());
                         }
                         eprintln!("identity verified: '{n}' (auto-accepting)");
                         true
@@ -3733,6 +4743,14 @@ async fn recv_cmd(
             // after a successful transfer it's just closure (the quiet-exit
             // prints the same `done (N files).` the peer-left path would).
             Ev::Stuck(pid, generation) => {
+                // Bug 5: repeated stuck before ANY byte arrived → hint at the
+                // single-host mDNS wedge once.
+                if !ever_received {
+                    stuck_while_connecting += 1;
+                    if stuck_while_connecting >= 2 {
+                        maybe_hint_local_wedge(&mut wedge_hint_shown);
+                    }
+                }
                 if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open {
                     // G-k: the dropped link may have delivered every byte but
                     // lost its file-end — finalize before deciding it's fatal.
@@ -4022,6 +5040,62 @@ mod tests {
     }
 
     #[test]
+    fn shell_policy_gates_auto_shell() {
+        // `up` default: NOTHING auto-shells — a device needs an explicit grant.
+        let g = ShellPolicy::Granted;
+        assert!(!g.auto_allows("popos"));
+        assert!(!g.enables_l2(), "default must not silently enable the L2 acceptor");
+        // `up --shell`: every paired device auto-shells, and L2 is on.
+        let a = ShellPolicy::All;
+        assert!(a.auto_allows("popos") && a.auto_allows("anything"));
+        assert!(a.enables_l2());
+        // `up --shell-only popos,laptop`: only the listed petnames; others don't.
+        let o = ShellPolicy::Only(["popos".to_string(), "laptop".to_string()].into_iter().collect());
+        assert!(o.auto_allows("popos") && o.auto_allows("laptop"));
+        assert!(!o.auto_allows("stranger"), "shell-only must not auto-shell unlisted devices");
+        assert!(o.enables_l2());
+    }
+
+    #[test]
+    fn forget_and_store_preserve_other_devices_caps() {
+        // Regression: forgetting/pairing a device must NOT wipe the `shell`
+        // (or any v2) caps of the OTHER devices. The old (name, secret) tuple
+        // round-trip rewrote every survivor as bare {name, secret}, silently
+        // dropping their grants — a remembered device lost its shell on the
+        // next `forget`/`pair`.
+        let dir = std::env::temp_dir().join(format!("fil-store-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Serialize: these tests mutate the process-global FILAMENT_CONFIG_DIR.
+        unsafe { std::env::set_var("FILAMENT_CONFIG_DIR", &dir) };
+        let p = dir.join("devices.json");
+        let sec = "b".repeat(64);
+        std::fs::write(
+            &p,
+            serde_json::to_string(&json!([
+                {"name": "shellbox", "secret": sec, "v": 2, "caps": ["transfer", "shell"]},
+                {"name": "dupe",     "secret": sec, "v": 2, "caps": ["transfer"]},
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Forgetting 'dupe' must leave 'shellbox' with its shell cap intact.
+        devices_remove("dupe").unwrap();
+        assert!(device_allows_at(&p, "shellbox", "shell"), "forget wiped a survivor's shell cap");
+        assert!(device_caps_at(&p, "dupe").is_none(), "dupe should be gone");
+
+        // Storing a NEW pairing must also preserve 'shellbox'’s caps.
+        devices_store("newpeer", &sec).unwrap();
+        assert!(device_allows_at(&p, "shellbox", "shell"), "store wiped a survivor's shell cap");
+        // And re-storing an existing name keeps its caps (only the secret rotates).
+        devices_store("shellbox", &"c".repeat(64)).unwrap();
+        assert!(device_allows_at(&p, "shellbox", "shell"), "re-store dropped the device's own caps");
+
+        unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn proof_matches_browser() {
         // Pinned to the SAME external vector as frontend devices.js (computed
         // with `printf 'filament-proof2:u1|u1|u2|FPA|FPB' | openssl dgst
@@ -4156,5 +5230,50 @@ mod tests {
         let evil2 = "/absolute/path.bin";
         let name2 = Path::new(evil2).file_name().map(|n| n.to_string_lossy().into_owned());
         assert_eq!(name2.as_deref(), Some("path.bin"));
+    }
+
+    // Bug 1: `send --name X` is honored for a SINGLE regular file (offer name =
+    // override), the basename otherwise, and "stdin.bin" for bare stdin. This
+    // mirrors the send_cmd offer-name decision as a pure check.
+    #[test]
+    fn send_name_override_for_single_file() {
+        let offered = |name: Option<&str>, single: bool, basename: &str| -> String {
+            name.map(String::from)
+                .filter(|_| single)
+                .unwrap_or_else(|| basename.to_string())
+        };
+        // single file + --name → the override wins
+        assert_eq!(offered(Some("renamed.bin"), true, "original.txt"), "renamed.bin");
+        // single file, no --name → basename
+        assert_eq!(offered(None, true, "original.txt"), "original.txt");
+        // multiple paths (single=false) + --name → ignored, basename used
+        assert_eq!(offered(Some("renamed.bin"), false, "original.txt"), "original.txt");
+        // stdin default
+        let stdin = |name: Option<&str>, single: bool| {
+            name.map(String::from).filter(|_| single).unwrap_or_else(|| "stdin.bin".into())
+        };
+        assert_eq!(stdin(Some("logs.tar"), true), "logs.tar");
+        assert_eq!(stdin(None, true), "stdin.bin");
+    }
+
+    // Bug 4: the legacy 3-segment transfer code and the 4-segment PAKE pairing
+    // code are distinguishable, and never both match the same string.
+    #[test]
+    fn transfer_and_pairing_codes_are_distinguishable() {
+        // legacy transfer code: word-word-digits
+        assert!(regex_lite_code("brave-otter-37"));
+        assert!(!looks_like_pake_code("brave-otter-37"));
+        // PAKE pairing code: adj-animal-extra-NNNN
+        assert!(looks_like_pake_code("brave-otter-ruby-3141"));
+        assert!(!regex_lite_code("brave-otter-ruby-3141"));
+        // neither classifier ever claims the same string
+        for s in ["brave-otter-37", "brave-otter-ruby-3141", "calm-lynx-9", "swift-fox-teal-1000"] {
+            assert!(!(regex_lite_code(s) && looks_like_pake_code(s)), "{s} ambiguous");
+        }
+        // junk matches neither
+        assert!(!regex_lite_code("hello"));
+        assert!(!looks_like_pake_code("hello"));
+        assert!(!looks_like_pake_code("a-b-c-d")); // last seg not numeric
+        assert!(!looks_like_pake_code("Brave-otter-ruby-3141")); // uppercase
     }
 }

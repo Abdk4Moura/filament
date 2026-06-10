@@ -57,19 +57,22 @@ ASYNC_MODE = os.environ.get("FIL_ASYNC_MODE", "threading")
 # FIL_REDIS_URL turns on horizontal scaling: a shared message queue (so emits
 # reach peers on any replica) + a shared room registry. Unset = single instance.
 # ping_timeout/interval govern how long a transiently-unresponsive client is
-# tolerated before engine.io declares it gone. Defaults (20s/25s) are fine in
-# prod, but a CPU-STARVED headless browser in CI can't service pings in time,
-# gets disconnected, reconnects with a fresh sid, and triggers a stale-answer
-# negotiation glare — the gate-6/12 flake. FIL_PING_TIMEOUT (set generously by
-# the test fixture) keeps a briefly-starved tab connected, removing the trigger
-# deterministically. Real users aren't CPU-starved, so prod keeps the defaults.
+# tolerated before engine.io declares it gone. The engine.io defaults (25s
+# interval / 20s timeout) let a SIGKILL'd polling/half-open client haunt
+# channels as a ghost peer for up to ~45s; 5s/10s caps that window at ~15s
+# while still tolerating multi-second stalls on slow links. The liveness lease
+# in signaling.py keeps ghosts out of rosters in the meantime. A CPU-STARVED
+# headless browser in CI can't service pings in time, gets disconnected,
+# reconnects with a fresh sid, and triggers a stale-answer negotiation glare —
+# the gate-6/12 flake — so the test fixture overrides FIL_PING_TIMEOUT
+# generously to keep a briefly-starved tab connected.
 socketio = SocketIO(
     app,
     async_mode=ASYNC_MODE,
     cors_allowed_origins=_origins,
     message_queue=config.REDIS_URL or None,
-    ping_timeout=int(os.environ.get("FIL_PING_TIMEOUT", "20")),
-    ping_interval=int(os.environ.get("FIL_PING_INTERVAL", "25")),
+    ping_timeout=int(os.environ.get("FIL_PING_TIMEOUT", "10")),
+    ping_interval=int(os.environ.get("FIL_PING_INTERVAL", "5")),
 )
 signaling.register(socketio, signaling.make_registry(config.REDIS_URL))
 
@@ -79,6 +82,17 @@ signaling.register(socketio, signaling.make_registry(config.REDIS_URL))
 def api_config():
     """Everything the frontend needs to bootstrap (signaling kind, ICE, ...)."""
     return jsonify(config.public_config())
+
+
+@app.get("/api/whoami")
+def api_whoami():
+    """Echo the caller's public IP (CF-Connecting-IP behind Cloudflare).
+
+    Used by the direct CLI<->CLI transport (FILAMENT_DIRECT) to learn its own
+    public address — a one-line STUN-free substitute for advertising a public
+    candidate. No room, no auth: it reveals only the IP the caller already has.
+    """
+    return jsonify({"ip": _client_ip()})
 
 
 # Human-friendly code alphabet: no 0/O/1/I/L to avoid mistyping.

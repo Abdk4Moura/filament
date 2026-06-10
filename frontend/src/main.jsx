@@ -1,10 +1,29 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import App from './App.jsx'
 import './index.css'
+
+// Dev-only visual previews, gated by ?preview=… so the real app is untouched.
+// Both roots are lazy so the preview never pulls App's module graph (signaling,
+// firebase, etc.) and vice-versa.
+const preview = new URLSearchParams(window.location.search).get('preview')
+const Root = preview === 'terminal'
+  ? React.lazy(() => import('./ui/TerminalPreview.jsx'))
+  : preview === 'webterm'
+  ? React.lazy(() => import('./ui/WebTermPreview.jsx'))
+  : React.lazy(() => import('./App.jsx'))
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <App />
+    <React.Suspense fallback={null}>
+      <Root />
+    </React.Suspense>
   </React.StrictMode>,
 )
+
+// PWA: register the service worker only in production builds — in dev it would
+// cache Vite's module graph and fight HMR.
+if (import.meta.env.PROD && 'serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/sw.js').catch(() => {})
+  })
+}

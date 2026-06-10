@@ -1,0 +1,13 @@
+{"version":2,"width":80,"height":24,"timestamp":1781122695,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '07'","env":{"SHELL":"/bin/bash"}}
+[0.032254, "o", "\r\n"]
+[0.035693, "o", "\u001b[1;36m=== UX: introduce: vouch two of YOUR devices to each other (run on the device that knows both) ===\u001b[0m\r\n"]
+[0.125411, "o", "\u001b[2m  hub knows alice & bob; alice & bob do NOT yet know each other\u001b[0m\r\n\u001b[1;33m[A]$\u001b[0m alice: filament up   (online, waiting)\r\n\u001b[1;35m[B]$\u001b[0m bob:   filament up   (online, waiting)"]
+[0.125526, "o", "\r\n"]
+[0.859902, "o", "\u001b[1;33m[A]$\u001b[0m hub:   filament introduce alice bob\r\n"]
+[2.955244, "o", "  waiting for alice and bob to be online…\r\n  ✓ vouched to bob\r\n  ✓ vouched to alice\r\n  ✓ alice and bob now know each other (no codes needed)\r\n"]
+[3.01803, "o", "\u001b[1;33m[A]\u001b[0m alice now knows: hub  (channel fadd412f20c3) bob  (channel 31ee08b1bd76) "]
+[3.018163, "o", "\r\n"]
+[3.045084, "o", "\u001b[1;35m[B]\u001b[0m bob now knows:   hub  (channel f2b1bfabe4ad) alice  (channel 31ee08b1bd76) \r\n"]
+[3.055339, "o", "\r\n\u001b[1;32m  ✔ PASS\u001b[0m  introduce delivered a fresh mutual secret; alice<->bob now know each other"]
+[3.055922, "o", "\r\nRESULT 07 PASS introduce delivered a fresh mutual secret; alice<->bob now know each other\r\n"]
+[3.056588, "x", "0"]

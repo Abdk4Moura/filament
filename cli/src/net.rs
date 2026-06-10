@@ -33,7 +33,9 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::policy::ice_transport_policy::RTCIceTransportPolicy;
+use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc::peer_connection::signaling_state::RTCSignalingState;
 use webrtc::peer_connection::RTCPeerConnection;
 
 /// SCTP default max message size is 65535; keep payload + 4-byte header under it.
@@ -67,6 +69,15 @@ pub enum Ev {
     /// (peer sid, ...) — every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
+    /// rung-1 direct path (FILAMENT_DIRECT): an AUTHENTICATED QUIC transport for
+    /// (peer sid) won the simultaneous-open race and passed the pair-secret MAC.
+    /// Handled like ChannelReady but the link is pre-trusted (the MAC already
+    /// proved the secret — stronger than the post-DC pair-proof), so the
+    /// DTLS-bound pair-proof dance is skipped.
+    /// (peer sid, transport, route label). The route label is `direct-quic`
+    /// (rung-1) or `holepunched` (rung-2) — a direct link has no WebRTC
+    /// `route()` to query, so the winning rung tells us which path it used.
+    DirectReady(String, Arc<dyn Transport>, &'static str),
     Control(String, Value),
     Chunk(String, u32, Bytes),
     PcState(String, String),
@@ -102,6 +113,17 @@ pub trait Transport: Send + Sync {
     async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()>;
     /// Resolve once all queued bytes are flushed to the wire.
     async fn flush(&self) -> Result<()>;
+    /// FINAL-teardown drain: block until the peer has acknowledged *all* written
+    /// bytes, then end the send direction. Distinct from `flush()`, which is
+    /// called per-file (after each `file-end`) and must NOT end the stream.
+    /// Default delegates to `flush()` — correct for the DataChannel transport,
+    /// whose `flush()` already polls `buffered_amount` to zero before exit. The
+    /// direct-QUIC transport overrides this: dropping a quinn connection discards
+    /// un-acked send-buffer bytes, so a no-op here truncates the tail of the last
+    /// file on any link slower than loopback (the cross-machine bug).
+    async fn drain_finish(&self) -> Result<()> {
+        self.flush().await
+    }
     fn max_payload(&self) -> usize;
     /// Milliseconds since this link last moved a byte. `u64::MAX` means "no
     /// activity tracked / idle forever" — the safe default, so an untracked
@@ -368,6 +390,16 @@ struct PeerSignalState {
     has_remote: bool,
 }
 
+/// What `handle_signal` did with a relayed signal.
+#[derive(Debug)]
+pub enum SignalOutcome {
+    Handled,
+    /// Polite-side offer collision webrtc-rs can't roll back from: the owner
+    /// must drop this Peer, rebuild the link as a responder (polite, no local
+    /// offer), and re-apply the carried offer signal.
+    Glare(Value),
+}
+
 impl Peer {
     /// Build the RTCPeerConnection, wire callbacks into `tx`, and (if impolite)
     /// create the data channel + offer — exactly the browser's PeerLink dance.
@@ -549,13 +581,34 @@ impl Peer {
 
     /// Apply one relayed signal (description or candidate), browser-equivalent
     /// ordering rules: candidates buffer until a remote description lands.
-    pub async fn handle_signal(&self, data: Value) -> Result<()> {
+    ///
+    /// Offer-collision (glare) rules, mirroring webrtc.js perfect negotiation:
+    /// the impolite side IGNORES a colliding offer (its own offer stands; the
+    /// polite peer answers it), the polite side yields. webrtc-rs 0.17 cannot
+    /// SetLocal(rollback) out of have-local-offer (the transition table has no
+    /// arm for it), so the polite side can't recover in-place — it returns
+    /// `Glare(offer)` and the OWNER of this Peer must rebuild the link as a
+    /// pure responder and re-apply that offer.
+    pub async fn handle_signal(&self, data: Value) -> Result<SignalOutcome> {
         match data["type"].as_str() {
             Some("description") => {
                 let desc: RTCSessionDescription =
                     serde_json::from_value(data["description"].clone())
                         .context("parse remote description")?;
                 let is_offer = desc.sdp_type.to_string() == "offer";
+                let state = self.pc.signaling_state();
+                if desc.sdp_type == RTCSdpType::Offer && state != RTCSignalingState::Stable {
+                    if !self.polite {
+                        return Ok(SignalOutcome::Handled); // their polite side yields
+                    }
+                    return Ok(SignalOutcome::Glare(data));
+                }
+                if desc.sdp_type == RTCSdpType::Answer
+                    && state != RTCSignalingState::HaveLocalOffer
+                {
+                    // Stale answer (e.g. to an offer this side abandoned).
+                    return Ok(SignalOutcome::Handled);
+                }
                 self.fps.lock().await.1 = sdp_fingerprint(&desc.sdp);
                 self.pc.set_remote_description(desc).await?;
                 let pending = {
@@ -606,7 +659,7 @@ impl Peer {
             }
             _ => {}
         }
-        Ok(())
+        Ok(SignalOutcome::Handled)
     }
 
     /// C20: (our fp, their fp) once the handshake exchanged descriptions.
