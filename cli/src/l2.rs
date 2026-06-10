@@ -419,7 +419,10 @@ async fn bring_up_to_known(
     sio.emit("join", json!({ "room": solo, "uid": my_uid, "name": crate::display_name() }))
         .await
         .ok();
-    sio.emit("subscribe", json!({ "channels": [channel.clone()] })).await.ok();
+    // NOTE: subscribe is emitted on Ev::Welcome (below), not here — `welcome` is
+    // the proof the socket.io connection is fully established, so the subscribe
+    // can't be lost in the connect->emit race that intermittently left the client
+    // unsubscribed and "waiting for known device" forever (harness finding).
 
     let mut my_id: Option<String> = None;
     let mut peer: Option<Arc<Peer>> = None;
@@ -444,6 +447,12 @@ async fn bring_up_to_known(
         match ev {
             Ev::Welcome(v) => {
                 my_id = v["id"].as_str().map(|s| s.to_string());
+                // Subscribe now that the connection is confirmed (see the note
+                // at the join site). The server replies with known-peer for every
+                // live member already on the channel, so discovery is reliable.
+                sio.emit("subscribe", json!({ "channels": [channel.clone()] }))
+                    .await
+                    .ok();
             }
             Ev::KnownPeer(v) => {
                 if v["channel"].as_str() != Some(channel.as_str()) {
