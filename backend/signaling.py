@@ -69,19 +69,38 @@ def _norm_code(raw):
 
 
 class _MemRegistry:
-    """Process-local membership (single instance)."""
+    """Process-local membership (single instance).
+
+    Liveness (#10, dev parity): same lease idea as _RedisRegistry, backed by a
+    dict of monotonic expiries. Without it the in-proc backend advertised
+    SIGKILL'd sids (ghosts) until the engine.io ping timeout fired disconnect.
+    """
+
+    LIVE_TTL = 60  # liveness lease; refreshed by the lease loop + on activity
 
     def __init__(self):
         self._m = {}  # sid -> {"room", "name", "uid"}
+        self._live = {}  # sid -> lease expiry (monotonic)
+
+    def refresh(self, sids):
+        """Extend the liveness lease for connected sids."""
+        exp = _time.monotonic() + self.LIVE_TTL
+        for sid in sids:
+            self._live[sid] = exp
+
+    def _alive(self, sid):
+        return self._live.get(sid, 0) > _time.monotonic()
 
     def add(self, sid, room, name, uid=None):
         self._m[sid] = {"room": room, "name": name, "uid": uid}
+        self.refresh([sid])
 
     def room_of(self, sid):
         m = self._m.get(sid)
         return m["room"] if m else None
 
     def remove(self, sid):
+        self._live.pop(sid, None)
         m = self._m.pop(sid, None)
         return m["room"] if m else None
 
@@ -89,7 +108,7 @@ class _MemRegistry:
         return [
             {"id": s, "name": v["name"], "uid": v.get("uid")}
             for s, v in self._m.items()
-            if v["room"] == room and s != exclude
+            if v["room"] == room and s != exclude and self._alive(s)
         ]
 
     def meta(self, sid):
@@ -110,16 +129,18 @@ class _MemRegistry:
         out = {}
         for ch in channels:
             members = chans.setdefault(ch, set())
+            # lease-filter (#10) + lazy cleanup: dead sids vanish on first look
+            members -= {s for s in members if s != sid and not self._alive(s)}
             out[ch] = [s for s in members if s != sid]
             members.add(sid)
-        return out  # channel -> other sids already present
+        return out  # channel -> other live sids already present
 
     def unsubscribe_all(self, sid):
         affected = {}
         for ch in getattr(self, "_sidchan", {}).pop(sid, set()):
             members = getattr(self, "_chan", {}).get(ch, set())
             members.discard(sid)
-            others = list(members)
+            others = [s for s in members if self._alive(s)]
             if others:
                 affected[ch] = others
         return affected  # channel -> remaining sids to notify
@@ -154,7 +175,7 @@ class _RedisRegistry:
     """
 
     TTL = 86400  # room/sid bookkeeping
-    LIVE_TTL = 120  # liveness lease; refreshed every ~45s while connected
+    LIVE_TTL = 120  # liveness lease; refreshed every ~15s while connected
 
     def __init__(self, url):
         import redis  # lazy: only needed when scaling with Redis
@@ -319,21 +340,43 @@ def _tel(event, **kv):
 def register(socketio, registry):
     local_sids = set()  # connections owned by THIS instance (for lease refresh)
 
+    def _eio_alive(sid):
+        """Ground truth for sids THIS instance owns: is the underlying
+        engine.io socket still open? Catches a SIGKILL'd client the moment the
+        transport sees FIN/RST — long before any lease lapses or the ping
+        timeout fires."""
+        try:
+            eio_sid = socketio.server.manager.eio_sid_from_sid(sid, "/")
+            sock = socketio.server.eio.sockets.get(eio_sid)
+            return sock is not None and not sock.closed
+        except Exception:
+            return True  # never let introspection failure hide live peers
+
+    def _sid_alive(sid):
+        """Roster/known-peer gate (#10): a locally-owned sid must have a live
+        socket; a remote sid (another instance) is vouched for by the lease the
+        registry already filters on."""
+        return sid not in local_sids or _eio_alive(sid)
+
     @socketio.on("connect")
     def on_connect():
         local_sids.add(request.sid)
+        registry.refresh([request.sid])  # liveness lease from the first moment
         _tel("connect", sid=request.sid)
 
-    if hasattr(registry, "refresh"):
-        def _lease_loop():
-            while True:
-                socketio.sleep(45)
-                try:
-                    registry.refresh(list(local_sids))
-                except Exception:
-                    pass
+    def _lease_loop():
+        # Refresh every 15s (TTL is 60s mem / 120s Redis) but ONLY for sids
+        # whose engine.io socket is still open — a dead-but-undetected socket
+        # stops being refreshed, so its lease lapses and every roster filter
+        # stops advertising it even before disconnect fires.
+        while True:
+            socketio.sleep(15)
+            try:
+                registry.refresh([s for s in list(local_sids) if _eio_alive(s)])
+            except Exception:
+                pass
 
-        socketio.start_background_task(_lease_loop)
+    socketio.start_background_task(_lease_loop)
 
     def _do_join(sid, room, name, uid):
         """The room-join effect: leave any prior room, join the new one, and
@@ -343,12 +386,13 @@ def register(socketio, registry):
 
         join_room(room)
         registry.add(sid, room, name, uid)
-        _tel("join", sid=sid, uid=uid, room=room, peers=len(registry.peers_in(room, exclude=sid)))
+        peers = [p for p in registry.peers_in(room, exclude=sid) if _sid_alive(p["id"])]
+        _tel("join", sid=sid, uid=uid, room=room, peers=len(peers))
 
         # Tell the joiner who's already here (they initiate offers); tell the
         # room someone arrived. With the Redis message queue these reach peers
         # on every instance.
-        emit("welcome", {"id": sid, "peers": registry.peers_in(room, exclude=sid)})
+        emit("welcome", {"id": sid, "peers": peers})
         emit("peer-joined", {"id": sid, "name": name, "uid": uid}, room=room, include_self=False)
 
     @socketio.on("join")
@@ -504,13 +548,15 @@ def register(socketio, registry):
         chans = [c for c in (raw_channels or [])[:MAX_CHANNELS]
                  if isinstance(c, str) and CHAN_RE.match(c)]
         if not chans:
-            return 0
+            return 0, []
         me = registry.meta(sid)
         roster = []  # live existing members on these channels — returned in the
         # ack so the subscriber discovers DETERMINISTICALLY, not dependent on the
         # async known-peer push landing (which is unreliable across prod workers).
         for ch, others in registry.subscribe(sid, chans).items():
             for other in others:
+                if not _sid_alive(other):  # never advertise a dead sid (#10)
+                    continue
                 om = registry.meta(other)
                 if om:
                     emit("known-peer", {**om, "channel": ch})
@@ -521,6 +567,7 @@ def register(socketio, registry):
 
     @socketio.on("subscribe")
     def on_subscribe(data=None):
+        registry.refresh([request.sid])  # any inbound event proves liveness
         n, roster = _do_subscribe(request.sid, (data or {}).get("channels"))
         # C28: the return value is the socket.io ACK — subscribers VERIFY the
         # emit landed instead of assuming (a subscribe that dies in a half-open
@@ -559,10 +606,12 @@ def register(socketio, registry):
         _tel("sync", sid=sid, room_changed=room_changed, channels=n)
         # Roster (C30 phase 2): the digest carries everyone the server holds in
         # the caller's room (welcome-shaped, self excluded). registry.peers_in
-        # already lease-filters on Redis. Sort by sid THEN cap at 32 so an
-        # unchanged room yields a byte-identical digest across repeated syncs
-        # (the client's idempotency/reconciliation depends on it).
-        peers = sorted(registry.peers_in(room, exclude=sid), key=lambda p: p["id"])[:32]
+        # lease-filters; _sid_alive additionally drops locally-owned sids whose
+        # socket just died (#10). Sort by sid THEN cap at 32 so an unchanged
+        # room yields a byte-identical digest across repeated syncs (the
+        # client's idempotency/reconciliation depends on it).
+        peers = sorted((p for p in registry.peers_in(room, exclude=sid)
+                        if _sid_alive(p["id"])), key=lambda p: p["id"])[:32]
         # Ack carries the server's resulting beliefs for this sid; the client
         # compares (digest) instead of assuming any single emit landed.
         digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True,
