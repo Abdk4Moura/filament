@@ -72,7 +72,10 @@ pub enum Ev {
     /// Handled like ChannelReady but the link is pre-trusted (the MAC already
     /// proved the secret — stronger than the post-DC pair-proof), so the
     /// DTLS-bound pair-proof dance is skipped.
-    DirectReady(String, Arc<dyn Transport>),
+    /// (peer sid, transport, route label). The route label is `direct-quic`
+    /// (rung-1) or `holepunched` (rung-2) — a direct link has no WebRTC
+    /// `route()` to query, so the winning rung tells us which path it used.
+    DirectReady(String, Arc<dyn Transport>, &'static str),
     Control(String, Value),
     Chunk(String, u32, Bytes),
     PcState(String, String),

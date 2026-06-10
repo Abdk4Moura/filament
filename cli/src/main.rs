@@ -16,6 +16,7 @@
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod direct;
+mod holepunch;
 mod l2;
 mod net;
 mod session;
@@ -1347,6 +1348,9 @@ struct Link {
     /// QUIC connection — its pair-secret MAC already proved identity, so the
     /// post-channel DTLS pair-proof is skipped and the link is born trusted.
     direct: bool,
+    /// Route label for a direct link (no WebRTC `route()` to query): `direct-quic`
+    /// for rung-1, `holepunched` for rung-2. Ignored for WebRTC links.
+    direct_route: &'static str,
 }
 
 /// C26: per-peer presence for the static status roster.
@@ -1441,6 +1445,14 @@ struct DirectPending {
     racing: bool,
     /// kept alive so the bound UDP port stays ours until the race consumes it.
     endpoint: Option<quinn::Endpoint>,
+    /// rung-2 (FILAMENT_HOLEPUNCH): a SECOND raw UDP socket, already STUN'd, kept
+    /// raw (not connected) so its NAT mapping is the one we punch + run QUIC on.
+    /// Consumed by the chained ladder in `on_transport_offer` only if rung-1
+    /// fails. None when hole-punch is off or STUN discovery failed.
+    punch_sock: Option<std::net::UdpSocket>,
+    /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
+    #[allow(dead_code)]
+    my_srflx: Option<std::net::SocketAddr>,
 }
 
 impl Conn {
@@ -1646,6 +1658,7 @@ impl Conn {
                 expected_secret: None,
                 presence: Presence::Connecting,
                 direct: false,
+                direct_route: "direct-quic", // unused for WebRTC links (peer.is_some())
             },
         );
         Ok(())
@@ -1680,16 +1693,36 @@ impl Conn {
             }
         };
         let cands = direct::gather_candidates(&self.server, port).await;
+
+        // rung-2 (FILAMENT_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
+        // can advertise a server-reflexive candidate. This socket is kept RAW
+        // (not handed to quinn) — its NAT mapping is the one we'll punch + run
+        // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
+        // no srflx is advertised and rung-2 simply won't fire for this peer.
+        let (punch_sock, my_srflx) = if holepunch::holepunch_enabled() {
+            match self.gather_srflx().await {
+                Some((sock, srflx)) => (Some(sock), Some(srflx)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
         // transport-offer rides the OPAQUE signaling relay (same channel as ICE
         // signals); the server cannot read or forge it without failing the MAC.
+        let mut offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
+        if let Some(s) = my_srflx {
+            offer["srflx"] = json!(s.to_string());
+        }
         let _ = self
             .sio
-            .emit(
-                "signal",
-                json!({ "to": pid, "data": { "type": "transport-offer", "v": 1, "addrs": cands } }),
-            )
+            .emit("signal", json!({ "to": pid, "data": offer }))
             .await;
-        eprintln!("filament: DIRECT-OFFER sent to {name} ({pid}) — {} candidate(s)", port);
+        eprintln!(
+            "filament: DIRECT-OFFER sent to {name} ({pid}) — port {} srflx {}",
+            port,
+            my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
+        );
         self.direct_pending.insert(
             pid.to_string(),
             DirectPending {
@@ -1697,14 +1730,36 @@ impl Conn {
                 deadline: Instant::now() + direct::DIRECT_BUDGET,
                 racing: false,
                 endpoint: Some(ep),
+                punch_sock,
+                my_srflx,
             },
         );
+    }
+
+    /// rung-2: bind a raw punch socket and discover its srflx via STUN against
+    /// the ICE config's STUN server. Returns (raw socket, srflx) or None.
+    async fn gather_srflx(&self) -> Option<(std::net::UdpSocket, std::net::SocketAddr)> {
+        let cfg = net::fetch_config(&self.server).await.ok()?;
+        let stun_urls: Vec<String> = cfg
+            .ice_servers
+            .iter()
+            .flat_map(|s| s.urls.iter().cloned())
+            .collect();
+        let stun_addr = holepunch::stun_server_addr(&stun_urls)?;
+        let sock = holepunch::bind_punch_socket().ok()?;
+        // STUN is blocking UDP I/O — run it off the reactor.
+        tokio::task::spawn_blocking(move || {
+            holepunch::stun_srflx(&sock, stun_addr).map(|srflx| (sock, srflx))
+        })
+        .await
+        .ok()?
+        .ok()
     }
 
     /// The peer advertised its candidates. If we have a matching pending attempt
     /// and haven't started the race yet, consume the endpoint and spawn the
     /// simultaneous-open + auth race; the winner posts Ev::DirectReady.
-    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>) {
+    fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
         let Some(p) = self.direct_pending.get_mut(pid) else { return };
         if p.racing {
             return;
@@ -1712,13 +1767,43 @@ impl Conn {
         let Some(ep) = p.endpoint.take() else { return };
         p.racing = true;
         let secret = p.secret.1.clone();
+        // rung-2: hand the punch socket + peer's srflx to the chained ladder.
+        let punch_sock = p.punch_sock.take();
+        let peer_srflx_addr = peer_srflx
+            .as_deref()
+            .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
         tokio::spawn(async move {
+            // rung-1: direct-dial QUIC over host candidates (UNCHANGED).
             if let Some(t) =
                 direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone()).await
             {
-                let _ = tx.send(Ev::DirectReady(pid_s, t));
+                let _ = tx.send(Ev::DirectReady(pid_s, t, "direct-quic"));
+                return;
+            }
+            // rung-2: UDP hole-punch, then rung-1's QUIC race over the punched
+            // socket. Only fires with the flag on, a punch socket bound, and a
+            // peer srflx to punch toward. On failure (e.g. symmetric NAT) we fall
+            // through to the WebRTC step-down via the per-tick reaper.
+            if holepunch::holepunch_enabled() {
+                if let (Some(sock), Some(peer_srflx)) = (punch_sock, peer_srflx_addr) {
+                    eprintln!(
+                        "filament: rung-1 failed — attempting hole-punch to {peer_srflx}"
+                    );
+                    if let Some(t) = holepunch::connect(
+                        sock,
+                        peer_srflx,
+                        &secret,
+                        pid_s.clone(),
+                        tx.clone(),
+                    )
+                    .await
+                    {
+                        let _ = tx.send(Ev::DirectReady(pid_s, t, "holepunched"));
+                        return;
+                    }
+                }
             }
             // On None the per-tick reaper handles the WebRTC fallback at deadline.
         });
@@ -1727,7 +1812,7 @@ impl Conn {
     /// Create the Link for a direct connection that won the race. `peer: None`
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
     /// proved identity — at least as strong as the DTLS pair-proof it replaces).
-    fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>) {
+    fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
         let pend = self.direct_pending.remove(pid);
         let (name, secret) = match pend {
             Some(p) => p.secret,
@@ -1760,6 +1845,7 @@ impl Conn {
                 expected_secret,
                 presence: Presence::Ready,
                 direct: true,
+                direct_route: route,
             },
         );
     }
@@ -2640,7 +2726,9 @@ async fn send_cmd(
                         .as_array()
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    conn.on_transport_offer(&from, cands);
+                    // rung-2: optional server-reflexive candidate for hole-punch.
+                    let srflx = data["srflx"].as_str().map(String::from);
+                    conn.on_transport_offer(&from, cands, srflx);
                     continue;
                 }
                 // C18: an offer from an unlinked roster peer creates a polite
@@ -2658,8 +2746,8 @@ async fn send_cmd(
             // Create the (pre-trusted) Link, then funnel into the SAME ready
             // handler the WebRTC path uses (announce + offers) by re-emitting
             // ChannelReady — the transfer logic rides the trait unchanged.
-            Ev::DirectReady(pid, t) => {
-                conn.adopt_direct(&pid, t.clone());
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
@@ -2676,6 +2764,7 @@ async fn send_cmd(
                 if let Some(l) = conn.link(&pid) {
                     ui::say(&format!("  {} {}", ui::paint(ui::Tone::Ok, ui::glyph_ok()), ui::paint(ui::Tone::Bold, &l.name)));
                     let is_direct = l.direct;
+                    let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
                         tokio::spawn(async move {
                             // ICE may renominate; retry briefly (mirrors the
@@ -2690,7 +2779,7 @@ async fn send_cmd(
                             }
                         });
                     } else if is_direct {
-                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, "route: direct-quic")));
+                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                     // C12: prove identity to a known device (their daemon
                     // auto-accepts only after verifying); or hand over a new
@@ -3509,7 +3598,9 @@ async fn recv_cmd(
                         .as_array()
                         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    conn.on_transport_offer(&from, cands);
+                    // rung-2: optional server-reflexive candidate for hole-punch.
+                    let srflx = data["srflx"].as_str().map(String::from);
+                    conn.on_transport_offer(&from, cands, srflx);
                     continue;
                 }
                 // C18: an offer from an unlinked roster peer creates a polite
@@ -3525,8 +3616,8 @@ async fn recv_cmd(
             }
             // rung-1: authenticated direct-QUIC won the race — adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
-            Ev::DirectReady(pid, t) => {
-                conn.adopt_direct(&pid, t.clone());
+            Ev::DirectReady(pid, t, route) => {
+                conn.adopt_direct(&pid, t.clone(), route);
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             Ev::ChannelReady(pid, t) => {
@@ -3535,6 +3626,7 @@ async fn recv_cmd(
                     l.transport = Some(t.clone());
                     l.presence = Presence::Ready;
                     let is_direct = l.direct;
+                    let direct_route = l.direct_route;
                     if let Some(p) = l.peer.clone() {
                         tokio::spawn(async move {
                             // ICE may renominate; retry briefly (mirrors the
@@ -3549,7 +3641,7 @@ async fn recv_cmd(
                             }
                         });
                     } else if is_direct {
-                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, "route: direct-quic")));
+                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                 }
                 // C29: an in-session pairing — exactly one side hands over a

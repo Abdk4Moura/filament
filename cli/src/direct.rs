@@ -253,7 +253,9 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn server_config() -> Result<quinn::ServerConfig> {
+/// rung-2 reuses these QUIC configs verbatim — same ALPN, same accept-any-cert +
+/// keying-material auth — only the underlying socket differs (a punched one).
+pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
     let ck = rcgen::generate_simple_self_signed(vec!["filament-direct".to_string()])
         .context("self-signed cert")?;
     let cert_der = CertificateDer::from(ck.cert.der().clone());
@@ -272,7 +274,7 @@ fn server_config() -> Result<quinn::ServerConfig> {
     Ok(quinn::ServerConfig::with_crypto(Arc::new(qsc)))
 }
 
-fn client_config() -> Result<quinn::ClientConfig> {
+pub(crate) fn client_config() -> Result<quinn::ClientConfig> {
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .context("client tls versions")?
@@ -563,7 +565,24 @@ pub async fn race_connect(
     peer_id: String,
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
 ) -> Option<Arc<dyn Transport>> {
-    if test_block() {
+    race_connect_labeled(endpoint, peer_cands, secret, peer_id, tx, "direct-quic").await
+}
+
+/// Same race, but with the route label parameterized so rung-2 (hole-punch) can
+/// reuse this verbatim and emit `route: holepunched`. rung-1 calls the wrapper
+/// above with `direct-quic`; nothing else about the race changes.
+pub async fn race_connect_labeled(
+    endpoint: Endpoint,
+    peer_cands: Vec<String>,
+    secret: &str,
+    peer_id: String,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
+    route: &str,
+) -> Option<Arc<dyn Transport>> {
+    // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
+    // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2 — a
+    // hole-punch race carries a distinct label.
+    if route == "direct-quic" && test_block() {
         // Fallback gate: pretend the direct path is unreachable. Drop the
         // endpoint and let the budget expire so WebRTC takes over.
         eprintln!("filament: DIRECT-BLOCKED (test) — forcing WebRTC fallback");
@@ -641,7 +660,8 @@ pub async fn race_connect(
 
     let (conn, send, recv) = winner;
     eprintln!(
-        "filament: DIRECT-CONNECT ok (route: direct-quic) peer={} remote={}",
+        "filament: DIRECT-CONNECT ok (route: {}) peer={} remote={}",
+        route,
         peer_id,
         conn.remote_address()
     );
