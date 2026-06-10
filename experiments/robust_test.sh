@@ -18,7 +18,7 @@ for c in glob.glob('/proc/[0-9]*/cmdline'):
         try: os.kill(pid, 9)
         except Exception: pass
 PY
-  rm -f /root/.config/filament/*.lock /root/.config/filament/daemon.* 2>/dev/null
+  rm -f /root/.config/filament/*.lock /root/.config/filament/daemon.* /root/.config/filament/up.pid 2>/dev/null
 }
 
 rebuild() {
