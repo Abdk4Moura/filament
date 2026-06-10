@@ -434,6 +434,9 @@ async fn bring_up_to_known(
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
+    // The acceptor re-sends its transport-offer (a late initiator can miss the
+    // first). Race only the FIRST offer we get; later re-sends are duplicates.
+    let mut direct_racing = false;
 
     eprintln!("filament: waiting for known device '{peer_name}'...");
 
@@ -497,6 +500,9 @@ async fn bring_up_to_known(
                 // so the DirectTransport's reader funnels Chunk/Control/PcState to
                 // the rx the caller hands to `pump_initiator`.
                 if data["type"].as_str() == Some("transport-offer") {
+                    if direct_racing {
+                        continue; // already racing the first offer; ignore re-sends
+                    }
                     // Bind on-demand if the offer beat our own KnownPeer: on real
                     // WAN the already-running acceptor fires its offer the instant
                     // we appear, which can arrive BEFORE our presence event sets
@@ -507,6 +513,7 @@ async fn bring_up_to_known(
                         .take()
                         .or_else(|| crate::direct::bind_endpoint().ok().map(|(ep, _)| ep));
                     if let Some(ep) = ep {
+                        direct_racing = true;
                         let peer_cands: Vec<String> = data["addrs"]
                             .as_array()
                             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())

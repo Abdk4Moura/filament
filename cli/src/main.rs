@@ -1788,13 +1788,31 @@ impl Conn {
         }
         let _ = self
             .sio
-            .emit("signal", json!({ "to": pid, "data": offer }))
+            .emit("signal", json!({ "to": pid, "data": offer.clone() }))
             .await;
         eprintln!(
             "filament: DIRECT-OFFER sent to {name} ({pid}) — port {} srflx {}",
             port,
             my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
         );
+        // Re-send the offer periodically. The L2 initiator (netcat/ssh) subscribes
+        // to the channel AFTER us, so on a late join it can miss BOTH our single
+        // fire-once offer AND its own KnownPeer for us (presence delivery is racy)
+        // — the cross-machine stall. Re-emitting lets it catch a later offer and
+        // dial our (reachable) candidates; the initiator only races the FIRST
+        // offer it gets, so the extra emits are harmless once linked.
+        {
+            let sio = self.sio.clone();
+            let pid_c = pid.to_string();
+            tokio::spawn(async move {
+                for _ in 0..6 {
+                    tokio::time::sleep(Duration::from_millis(1200)).await;
+                    let _ = sio
+                        .emit("signal", json!({ "to": pid_c, "data": offer.clone() }))
+                        .await;
+                }
+            });
+        }
         // The WebRTC fallback reaper (`expired_direct`) fires at this deadline.
         // rung-1's race always burns the full DIRECT_BUDGET when it can't win
         // (its acceptor future never self-completes), so with hole-punch enabled
