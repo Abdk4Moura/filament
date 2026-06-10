@@ -2272,10 +2272,23 @@ impl Conn {
         if data["type"].as_str() == Some("description")
             && data["description"]["type"].as_str() == Some("offer")
         {
-            if let Some(info) = self.roster.get(from).cloned() {
-                if self.links.len() < MAX_LINKS {
-                    self.establish(info).await?;
-                }
+            // Answer a WebRTC offer from a channel-peer EVEN IF we never got its
+            // known-peer. The existing-member known-peer notification is
+            // unreliable on prod (proven via the signaling harness: the NEW
+            // joiner is reliably notified, but the EXISTING member often is NOT)
+            // — which left the acceptor ignoring a valid initiator's offer and
+            // looking like "stuck connecting". One-sided discovery is now enough:
+            // whoever discovers drives, the other answers. SAFE: trust still
+            // gates entirely on the pair-proof MAC (an attacker without the
+            // secret fails it and is never trusted) — we only answer the offer
+            // and let the proof decide. A later known-peer refreshes name/uid.
+            let info = self
+                .roster
+                .get(from)
+                .cloned()
+                .unwrap_or_else(|| json!({ "id": from }));
+            if self.links.len() < MAX_LINKS {
+                self.establish(info).await?;
             }
         }
         Ok(())

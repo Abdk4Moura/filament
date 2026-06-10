@@ -506,22 +506,27 @@ def register(socketio, registry):
         if not chans:
             return 0
         me = registry.meta(sid)
+        roster = []  # live existing members on these channels — returned in the
+        # ack so the subscriber discovers DETERMINISTICALLY, not dependent on the
+        # async known-peer push landing (which is unreliable across prod workers).
         for ch, others in registry.subscribe(sid, chans).items():
             for other in others:
                 om = registry.meta(other)
                 if om:
                     emit("known-peer", {**om, "channel": ch})
+                    roster.append({**om, "channel": ch})
                 if me:
                     emit("known-peer", {**me, "channel": ch}, to=other)
-        return len(chans)
+        return len(chans), roster
 
     @socketio.on("subscribe")
     def on_subscribe(data=None):
-        n = _do_subscribe(request.sid, (data or {}).get("channels"))
+        n, roster = _do_subscribe(request.sid, (data or {}).get("channels"))
         # C28: the return value is the socket.io ACK — subscribers VERIFY the
         # emit landed instead of assuming (a subscribe that dies in a half-open
-        # socket left devices mutually invisible until a page reload).
-        return {"ok": bool(n), "n": n}
+        # socket left devices mutually invisible until a page reload). `peers`
+        # carries the live channel roster so discovery is deterministic.
+        return {"ok": bool(n), "n": n, "peers": roster}
 
     # -- C30 convergent session: ONE idempotent, full-state event that ensures
     # membership + subscriptions + lease in a single ack'd round-trip. No emit
@@ -547,8 +552,9 @@ def register(socketio, registry):
         elif hasattr(registry, "refresh"):
             registry.refresh([sid])  # lease refresh only (Redis); no emits
 
-        # Subscriptions: union, idempotent, emits known-peer pairs as today.
-        n = _do_subscribe(sid, data.get("channels"))
+        # Subscriptions: union, idempotent, emits known-peer pairs as today AND
+        # returns the live channel roster (deterministic discovery).
+        n, chan_peers = _do_subscribe(sid, data.get("channels"))
 
         _tel("sync", sid=sid, room_changed=room_changed, channels=n)
         # Roster (C30 phase 2): the digest carries everyone the server holds in
@@ -559,7 +565,8 @@ def register(socketio, registry):
         peers = sorted(registry.peers_in(room, exclude=sid), key=lambda p: p["id"])[:32]
         # Ack carries the server's resulting beliefs for this sid; the client
         # compares (digest) instead of assuming any single emit landed.
-        digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True, "peers": peers}
+        digest = {"v": 1, "ok": True, "room": room, "channels": n, "lease": True,
+                  "peers": peers, "channel_peers": chan_peers}
         # Also emit the digest as a plain event: the Rust client consumes
         # events through one channel (Ev enum) and skips ack plumbing.
         emit("synced", digest)
