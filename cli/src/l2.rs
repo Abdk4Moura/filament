@@ -497,11 +497,24 @@ async fn bring_up_to_known(
                 // so the DirectTransport's reader funnels Chunk/Control/PcState to
                 // the rx the caller hands to `pump_initiator`.
                 if data["type"].as_str() == Some("transport-offer") {
-                    if let Some(ep) = endpoint.take() {
+                    // Bind on-demand if the offer beat our own KnownPeer: on real
+                    // WAN the already-running acceptor fires its offer the instant
+                    // we appear, which can arrive BEFORE our presence event sets
+                    // `endpoint`. The old `if let Some` silently DROPPED it and we
+                    // never dialed (the cross-machine stall). We DIAL the peer's
+                    // candidates, so we don't need to have sent our own offer first.
+                    let ep = endpoint
+                        .take()
+                        .or_else(|| crate::direct::bind_endpoint().ok().map(|(ep, _)| ep));
+                    if let Some(ep) = ep {
                         let peer_cands: Vec<String> = data["addrs"]
                             .as_array()
                             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                             .unwrap_or_default();
+                        eprintln!(
+                            "filament: got transport-offer ({} cand) — racing direct-quic",
+                            peer_cands.len()
+                        );
                         let secret = secret.clone();
                         let pid = v["from"].as_str().unwrap_or_default().to_string();
                         let tx = tx.clone();
