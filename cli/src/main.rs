@@ -873,11 +873,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
@@ -1292,11 +1288,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                     _ => {}
                 }
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
             }
             Ev::ChannelReady(pid, t) => {
                 let display = match conn.link_mut(&pid) {
@@ -1687,6 +1679,15 @@ impl Conn {
     }
 
     async fn establish(&mut self, info: Value) -> Result<()> {
+        self.establish_as(info, None).await
+    }
+
+    /// `force_polite: Some(true)` builds a pure responder link (no local offer)
+    /// regardless of uid comparison — required when the link exists to ANSWER
+    /// an incoming offer (ensure_responder / glare rebuild). The uid-based role
+    /// can come out impolite there (especially on the bare `{id}` roster-miss
+    /// fallback, which compares sids), making the "responder" offer too: glare.
+    async fn establish_as(&mut self, info: Value, force_polite: Option<bool>) -> Result<()> {
         let peer_id = info["id"].as_str().unwrap_or_default().to_string();
         // rung-1: a direct-QUIC attempt owns this peer until its budget expires.
         // Suppress the WebRTC offer so the path stays SEQUENTIAL (no two
@@ -1702,7 +1703,9 @@ impl Conn {
         // every attempt, not just the first.
         let cfg = net::fetch_config(&self.server).await?;
         self.chunk_size = cfg.chunk_size;
-        let polite = net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id);
+        let polite = force_polite.unwrap_or_else(|| {
+            net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id)
+        });
         self.next_gen += 1;
         let generation = self.next_gen;
         let peer = Peer::connect(
@@ -2265,6 +2268,33 @@ impl Conn {
 
     /// #7 for the CLI: an offer from a roster peer we haven't linked yet
     /// creates a polite responder link. Stray signals from unknowns drop.
+    /// Apply a relayed signal to `from`'s link. Never fatal (F6): the
+    /// watchdog/grace machinery owns failed negotiations. On polite-side
+    /// glare (webrtc-rs can't roll back out of have-local-offer) the link is
+    /// rebuilt as a pure responder and the colliding offer re-applied.
+    async fn apply_signal(&mut self, from: &str, data: Value) {
+        let peer = match self.link(from).and_then(|l| l.peer.clone()) {
+            Some(p) => p,
+            None => return,
+        };
+        match peer.handle_signal(data).await {
+            Ok(net::SignalOutcome::Handled) => {}
+            Ok(net::SignalOutcome::Glare(offer)) => {
+                self.drop_link(from);
+                if let Err(e) = self.ensure_responder(from, &offer).await {
+                    eprintln!("signal: glare rebuild failed: {e} (recovering)");
+                    return;
+                }
+                if let Some(p) = self.link(from).and_then(|l| l.peer.clone()) {
+                    if let Err(e) = p.handle_signal(offer).await {
+                        eprintln!("signal failed to apply: {e} (recovering)");
+                    }
+                }
+            }
+            Err(e) => eprintln!("signal failed to apply: {e} (recovering)"),
+        }
+    }
+
     async fn ensure_responder(&mut self, from: &str, data: &Value) -> Result<()> {
         if self.links.contains_key(from) {
             return Ok(());
@@ -2288,7 +2318,8 @@ impl Conn {
                 .cloned()
                 .unwrap_or_else(|| json!({ "id": from }));
             if self.links.len() < MAX_LINKS {
-                self.establish(info).await?;
+                // Forced responder: this link exists to answer THEIR offer.
+                self.establish_as(info, Some(true)).await?;
             }
         }
         Ok(())
@@ -2874,13 +2905,7 @@ async fn send_cmd(
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    // Never fatal (F6): the watchdog/grace machinery owns
-                    // failed negotiations.
-                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
             }
             // rung-1: the authenticated direct-QUIC connection won the race.
             // Create the (pre-trusted) Link, then funnel into the SAME ready
@@ -3746,13 +3771,7 @@ async fn recv_cmd(
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
                 conn.ensure_responder(&from, &data).await?;
-                if let Some(l) = conn.link(&from) {
-                    // Never fatal (F6): the watchdog/grace machinery owns
-                    // failed negotiations.
-                    if let Err(e) = async { match &l.peer { Some(p) => p.handle_signal(data).await, None => Ok(()) } }.await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
-                    }
-                }
+                conn.apply_signal(&from, data).await;
             }
             // rung-1: authenticated direct-QUIC won the race — adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
