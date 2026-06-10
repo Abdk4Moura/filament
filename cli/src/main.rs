@@ -228,6 +228,13 @@ enum Cmd {
         /// Remote port on the peer's localhost
         rport: u16,
     },
+    /// Open a PTY shell on a known device and bridge it to this terminal (the CLI
+    /// sibling of the browser web-shell). The peer must run `up --shell` (or grant
+    /// shell). Off by default; FILAMENT_L2=1 / --shell enables the acceptor.
+    Pty {
+        /// Known device (petname) to open a shell on
+        peer: String,
+    },
     /// Tunnel: local TCP listener; each connection becomes one stream to the
     /// peer's localhost:<rport>.
     Forward {
@@ -747,6 +754,15 @@ fn daemon_alive() -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(pidfile()).ok()?.trim().parse().ok()?;
     let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
     cmd.contains("filament").then_some(pid)
+}
+
+/// The argv for a web-shell PTY: the up user's login shell. `$SHELL -l`, falling
+/// back to bash/sh. (Privilege-drop to another account is a later `--shell-user`.)
+fn shell_argv() -> Vec<String> {
+    let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        if std::path::Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
+    });
+    vec![shell, "-l".into()]
 }
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
@@ -2586,6 +2602,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Netcat { peer, rport } => l2::netcat_cmd(&server, &peer, rport, cli.relay).await,
+        Cmd::Pty { peer } => l2::pty_cmd(&server, &peer, cli.relay).await,
         Cmd::Forward { lport, peer, rport } => l2::forward_cmd(&server, lport, &peer, rport, cli.relay).await,
         Cmd::Ssh { peer, args } => l2::ssh_cmd(&server, &peer, &args, cli.relay).await,
         Cmd::Grant { device, capability } => {
@@ -3583,6 +3600,8 @@ async fn recv_cmd(
     let l2_enabled = shell_policy.enables_l2()
         || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
+    // web-shell: per-sid resize senders so a `pty-resize` reaches its PTY task.
+    let mut pty_resizers: HashMap<u32, tokio::sync::mpsc::UnboundedSender<(u16, u16)>> = HashMap::new();
 
     loop {
         let ev = match tokio::time::timeout(
@@ -3971,6 +3990,12 @@ async fn recv_cmd(
                         }
                         l2::OpenVerdict::Ignore => {}
                     }
+                    // A PTY stream closing frees its resize channel.
+                    if v["type"].as_str() == Some("l2-close") {
+                        if let Some(sid) = v["sid"].as_u64() {
+                            pty_resizers.remove(&(sid as u32));
+                        }
+                    }
                 }
                 // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
@@ -4041,6 +4066,52 @@ async fn recv_cmd(
                                 }))
                                 .await;
                         }
+                    }
+                }
+                // web-shell (browser terminal): spawn a login shell in a PTY and
+                // bridge it to a sid stream. Same deny-by-default gate as
+                // shell-bootstrap — a PTY is a superset of ssh-key access, so it
+                // reuses the `shell` cap / --shell policy and requires `trusted`.
+                Some("pty-open") if l2_enabled => {
+                    let Some(t) = conn.transport_of(&pid) else { continue };
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    if !l2::is_l2_sid(sid) {
+                        continue;
+                    }
+                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
+                    let granted = trusted
+                        && dev
+                            .as_deref()
+                            .map(|n| shell_policy.auto_allows(n) || device_allows(n, "shell"))
+                            .unwrap_or(false);
+                    if !granted {
+                        let who = dev.as_deref().unwrap_or("<unverified>");
+                        eprintln!("l2: pty refused: {who} (no shell cap / untrusted)");
+                        let _ = t
+                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
+                            .await;
+                        continue;
+                    }
+                    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                    let mux = l2_muxes
+                        .entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    let rx = mux.register_stream(sid).await; // before spawn (race fix)
+                    let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+                    pty_resizers.insert(sid, rtx);
+                    eprintln!("l2: pty granted to '{}' — {cols}x{rows}", dev.unwrap_or_default());
+                    let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
+                    tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(), rx, rrx));
+                }
+                Some("pty-resize") if l2_enabled => {
+                    let sid = v["sid"].as_u64().unwrap_or(0) as u32;
+                    if let Some(tx) = pty_resizers.get(&sid) {
+                        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                        let _ = tx.send((cols, rows));
                     }
                 }
                 Some("brb") => {

@@ -115,6 +115,13 @@ impl Mux {
         }
     }
 
+    /// Register a stream's inbound pipe (public, for the PTY acceptor which
+    /// registers BEFORE spawning the shell — same pre-registration race fix as
+    /// l2-open's dial path).
+    pub async fn register_stream(&self, sid: u32) -> mpsc::Receiver<PipeItem> {
+        self.register(sid).await
+    }
+
     /// Drop a stream and abort its read pump. Idempotent.
     async fn drop_stream(&self, sid: u32) {
         if let Some(s) = self.streams.lock().await.remove(&sid) {
@@ -233,6 +240,116 @@ async fn serve_stream(
         };
         let _ = mux.transport.send_control(&close).await;
     }
+}
+
+/// web-shell acceptor: spawn a login shell in a PTY and bridge it to stream `sid`.
+/// PTY master output -> sid frames; inbound sid frames (`rx`) -> PTY input;
+/// `resize_rx` carries (cols, rows) from the browser. The blocking PTY fd reads/
+/// writes run on dedicated threads (portable-pty is sync) and funnel into this
+/// async task. The shell exiting (reader EOF) OR the browser closing tears it all
+/// down and sends a trailing l2-close.
+pub async fn serve_pty(
+    mux: Arc<Mux>,
+    sid: u32,
+    cols: u16,
+    rows: u16,
+    argv: Vec<String>,
+    mut rx: mpsc::Receiver<PipeItem>,
+    mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
+) {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read as _, Write as _};
+
+    let size = PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 };
+    let pair = match native_pty_system().openpty(size) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") })).await;
+            return;
+        }
+    };
+    let mut cmd = CommandBuilder::new(&argv[0]);
+    for a in &argv[1..] {
+        cmd.arg(a);
+    }
+    cmd.env("TERM", "xterm-256color");
+    if let Ok(home) = std::env::var("HOME") {
+        cmd.cwd(home);
+    }
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") })).await;
+            return;
+        }
+    };
+    drop(pair.slave); // close our copy of the slave so the shell owns the only one
+    let master = pair.master;
+    let mut reader = match master.try_clone_reader() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut writer = match master.take_writer() {
+        Ok(w) => w,
+        Err(_) => return,
+    };
+
+    // Blocking PTY-master reads -> async output channel.
+    let (otx, mut orx) = mpsc::channel::<Vec<u8>>(128);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break, // shell exited / PTY closed
+                Ok(n) => {
+                    if otx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    // Async input -> blocking PTY-master writes (dedicated thread).
+    let (wtx, wrx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        while let Ok(b) = wrx.recv() {
+            if writer.write_all(&b).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    let cap = mux.transport.max_payload();
+    loop {
+        tokio::select! {
+            out = orx.recv() => match out {
+                Some(bytes) => {
+                    for chunk in bytes.chunks(cap) {
+                        if mux.transport.send_frame(sid, chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                None => break, // shell exited
+            },
+            inp = rx.recv() => match inp {
+                Some(Some(bytes)) => { let _ = wtx.send(bytes.to_vec()); }
+                Some(None) | None => break, // browser FIN / pipe dropped
+            },
+            rs = resize_rx.recv() => {
+                if let Some((c, r)) = rs {
+                    let _ = master.resize(PtySize { rows: r.max(1), cols: c.max(1), pixel_width: 0, pixel_height: 0 });
+                }
+            }
+        }
+    }
+
+    drop(wtx); // stop the writer thread
+    let _ = child.kill(); // ensure the shell dies if the browser closed first
+    let _ = child.wait();
+    mux.streams.lock().await.remove(&sid);
+    let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid })).await;
 }
 
 // ------------------------------------------------------------- ACCEPTOR side --
@@ -785,6 +902,63 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
         .transport()
         .send_control(&json!({ "type": "l2-close", "sid": sid }))
         .await;
+    pump.abort();
+    Ok(())
+}
+
+/// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
+/// process's stdio (the CLI sibling of the browser terminal). No local raw-mode
+/// or resize handling yet — primarily a test/diagnostic of the `serve_pty`
+/// acceptor; the browser is the polished client.
+pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
+    let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
+    guard.forget();
+    let mux = Mux::new(t);
+    let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
+
+    let sid = mux.alloc_sid();
+    let mut rx_pipe = mux.register(sid).await;
+    let (cols, rows) = (
+        std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok()).unwrap_or(80u16),
+        std::env::var("LINES").ok().and_then(|s| s.parse().ok()).unwrap_or(24u16),
+    );
+    mux.transport()
+        .send_control(&json!({ "type": "pty-open", "sid": sid, "cols": cols, "rows": rows }))
+        .await?;
+
+    let t_in = mux.transport();
+    let reader = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let cap = t_in.max_payload();
+        let mut buf = vec![0u8; cap];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    let _ = t_in.send_frame(sid, &[]).await;
+                    break;
+                }
+                Ok(n) => {
+                    if t_in.send_frame(sid, &buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut stdout = tokio::io::stdout();
+    while let Some(item) = rx_pipe.recv().await {
+        match item {
+            Some(bytes) => {
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+            }
+            None => break,
+        }
+    }
+    let _ = reader.await;
+    mux.drop_stream(sid).await;
+    let _ = mux.transport().send_control(&json!({ "type": "l2-close", "sid": sid })).await;
     pump.abort();
     Ok(())
 }

@@ -40,6 +40,8 @@ clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
 flate2 = "1.1.9"
 qrcode = { version = "0.14.1", default-features = false }
+# web-shell: spawn a login shell in a PTY and bridge it to the browser terminal.
+portable-pty = "0.8"
 # L1-a: the shared SPAKE2 PAKE core (also compiles to wasm for the browser).
 filament-pake = { path = "../pake" }
 # rung-1 direct CLI<->CLI transport (FILAMENT_DIRECT=1). ring crypto to match
