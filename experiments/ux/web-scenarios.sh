@@ -19,6 +19,15 @@ RES="$UX_WORK/results-$ID.txt"
 GIF="$HERE/gallery/$ID.gif"
 mkdir -p "$HERE/gallery" "$HERE/casts"
 
+# ---- render speed (SPEED knob; per-scenario + raw overrides) ---------------
+# Mirrors record.sh: profile (UX_AGG_SPEED/UX_IDLE_LIMIT from lib.sh) → optional
+# SCENARIO_SPEED_<id>/SCENARIO_IDLE_<id> → raw AGG_SPEED/IDLE_LIMIT (always wins).
+_psv() { local v="$1"; echo "${!v:-}"; }
+AGG_SPEED_EFF="$(_psv "SCENARIO_SPEED_$ID")"; [ -n "$AGG_SPEED_EFF" ] || AGG_SPEED_EFF="$UX_AGG_SPEED"
+IDLE_EFF="$(_psv "SCENARIO_IDLE_$ID")";       [ -n "$IDLE_EFF" ]      || IDLE_EFF="$UX_IDLE_LIMIT"
+[ -n "${AGG_SPEED:-}" ] && AGG_SPEED_EFF="$AGG_SPEED"
+[ -n "${IDLE_LIMIT:-}" ] && IDLE_EFF="$IDLE_LIMIT"
+
 # ensure the frontend dist exists + is same-origin
 DIST="$REPO/frontend/dist/index.html"
 if [ ! -f "$DIST" ] || grep -ql "api.filament.autumated.com" "$REPO"/frontend/dist/assets/*.js 2>/dev/null; then
@@ -35,23 +44,32 @@ CLICAST="$HERE/casts/$ID-cli.cast"
 drive_browser() { :; }   # set per scenario
 
 if [ "$ID" = "08" ]; then
-  # CLI sends; browser (auto-room) receives + downloads.
+  # CLI sends; browser (auto-room) receives + downloads. Single-host CLI→browser
+  # ICE can wedge on a first attempt, so the whole offer/receive is bounded and
+  # retried (like 03). CRITICAL: the recorded `filament send` does NOT self-exit
+  # while waiting for a receiver, so the asciinema cast is `timeout`-boxed and the
+  # sender is killed BEFORE we wait on the cast — otherwise a browser failure
+  # would hang the cast (and the suite) forever.
   DS=$(fresh_cfg s08S)
-  # record the CLI sender as a cast; the browser runs alongside.
-  (
-    "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time-limit 1.4 -q --overwrite --cols 64 --rows 26 \
+  PASSWEB=no
+  for try in 1 2; do
+    rm -rf "$VID"; mkdir -p "$VID"
+    timeout -k 5 50 "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time-limit "$IDLE_EFF" -q --overwrite --cols 64 --rows 26 \
       -c "bash -c '
         printf \"\n\033[1;36m=== UX: CLI sends a file → the WEB app receives it ===\033[0m\n\"
         printf \"\033[1;33m[CLI]\$\033[0m filament send invoice.pdf\n\"
-        FILAMENT_CONFIG_DIR=$DS $FILAMENT send $UX_WORK/web-$ID.bin --name invoice.pdf --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | grep -vE \"waiting…|spinner\" | head -40
-      '" "$CLICAST" >/dev/null 2>&1
-  ) & CASTPID=$!
-  sleep 2
-  node web/recv-by-code.js "$UX_SERVER/" "x" "$VID" >"$UX_WORK/$ID-web.log" 2>&1
-  WEB_RC=$?
-  wait $CASTPID 2>/dev/null
-  for p in $(pgrep -f "$FILAMENT"); do tr '\0' ' ' </proc/$p/environ 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$DS" && kill $p 2>/dev/null; done
-  PASSWEB=$(grep -q "DOWNLOAD READY" "$UX_WORK/$ID-web.log" && echo yes || echo no)
+        FILAMENT_CONFIG_DIR=$DS timeout 40 $FILAMENT send $UX_WORK/web-$ID.bin --name invoice.pdf --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | grep -vE \"waiting…|spinner\" | head -40
+      '" "$CLICAST" >/dev/null 2>&1 & CASTPID=$!
+    # wait until the sender has registered (its banner text lands in the cast)
+    # before the browser joins the auto-room, instead of a blind 2s.
+    wait_log "$CLICAST" 'invoice.pdf|send:' 12 0.15 || sleep 2
+    node web/recv-by-code.js "$UX_SERVER/" "x" "$VID" >"$UX_WORK/$ID-web.log" 2>&1
+    # kill the sender FIRST so the timeout-boxed cast can exit, then reap the cast
+    for p in $(pgrep -f "$FILAMENT"); do tr '\0' ' ' </proc/$p/environ 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$DS" && kill $p 2>/dev/null; done
+    kill $CASTPID 2>/dev/null; wait $CASTPID 2>/dev/null
+    grep -q "DOWNLOAD READY" "$UX_WORK/$ID-web.log" && { PASSWEB=yes; break; }
+    echo "[web] 08 attempt $try did not reach DOWNLOAD READY — retrying"; sleep 2
+  done
   DETAIL="CLI offered invoice.pdf; browser accepted and reached the download (save) affordance"
   [ "$PASSWEB" = yes ] && VERDICT=PASS || VERDICT=FAIL
 
@@ -73,7 +91,8 @@ elif [ "$ID" = "09" ]; then
   for attempt in 1 2 3; do
     DR=$(fresh_cfg s09R); OUT=$(fresh_cfg s09out)
     FILAMENT_REJOIN_SECS=2 FILAMENT_CONFIG_DIR="$DR" timeout 40 "$FILAMENT" recv -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/09-recv.log" 2>&1 & RVPID=$!
-    sleep 2
+    # wait until the CLI receiver is listening (joined its room) before the browser sends
+    wait_log "$UX_WORK/09-recv.log" '● listening' 15 0.15 || sleep 2
     timeout 55 node web/send-to-cli-novideo.js "$UX_SERVER/" "$UX_WORK/web-$ID.bin" "$VID" >"$UX_WORK/09-verify.log" 2>&1
     for _ in $(seq 1 20); do RCV=$(ls "$OUT" 2>/dev/null | head -1); [ -n "$RCV" ] && [ "$(hashof "$OUT/$RCV" 2>/dev/null)" = "$H" ] && break; sleep 0.5; done
     kill $RVPID 2>/dev/null; wait $RVPID 2>/dev/null
@@ -86,7 +105,7 @@ elif [ "$ID" = "09" ]; then
   rm -rf "$VID"; mkdir -p "$VID"
   DR=$(fresh_cfg s09Rv); OUT=$(fresh_cfg s09outv)
   (
-    "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time-limit 1.4 -q --overwrite --cols 64 --rows 26 \
+    "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time-limit "$IDLE_EFF" -q --overwrite --cols 64 --rows 26 \
       -c "bash -c '
         printf \"\n\033[1;36m=== UX: the WEB app sends a file → CLI recv receives it ===\033[0m\n\"
         printf \"\033[1;33m[CLI]\$\033[0m filament recv -y\n\"
@@ -105,7 +124,7 @@ elif [ "$ID" = "10" ]; then
   # "pair with code" and stores the device (localStorage filament-known-devices).
   DS=$(fresh_cfg s10S)
   (
-    "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time-limit 1.4 -q --overwrite --cols 64 --rows 26 \
+    "$UX_BIN/asciinema" rec -f asciicast-v2 --idle-time-limit "$IDLE_EFF" -q --overwrite --cols 64 --rows 26 \
       -c "bash -c '
         printf \"\n\033[1;36m=== UX: pair the WEB app with the CLI (PAKE; key never crosses the server) ===\033[0m\n\"
         printf \"\033[1;33m[CLI]\$\033[0m filament pair --name browser\n\"
@@ -147,7 +166,7 @@ fi
 # then a gifsicle lossy+optimize pass. The browser webm dominates GIF size, so
 # it is scaled hardest.
 CLIGIF="$UX_WORK/$ID-cli.gif"; WEBGIF="$UX_WORK/$ID-web.gif"
-"$UX_BIN/agg" --cols 64 --rows 26 --font-size 15 --speed 1.4 --theme asciinema "$CLICAST" "$CLIGIF" >/dev/null 2>&1 || true
+"$UX_BIN/agg" --cols 64 --rows 26 --font-size 15 --speed "$AGG_SPEED_EFF" --theme asciinema "$CLICAST" "$CLIGIF" >/dev/null 2>&1 || true
 WEBM=$(ls -t "$VID"/*.webm 2>/dev/null | head -1)
 if [ -n "$WEBM" ]; then
   ffmpeg -y -i "$WEBM" -vf "fps=6,scale=440:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=96[p];[s1][p]paletteuse=dither=bayer:bayer_scale=3" "$WEBGIF" >/dev/null 2>&1 || true

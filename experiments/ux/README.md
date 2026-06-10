@@ -7,18 +7,55 @@ derived channel ids, stored devices, remote command output), and records a GIF a
 person can watch. Ten scenarios cover both `cli↔cli` and `cli↔web` directions.
 
 The harness is **self-safe**: every `filament` call points at a throwaway
-`FILAMENT_CONFIG_DIR` under `/tmp/ux`, the backend runs on a non-default port
-(8077), and teardown kills **only** processes this harness started. The user's
-real `~/.config/filament`, their running `filament up` daemon, and a Vite dev
-server on port 5180 are never touched.
+`FILAMENT_CONFIG_DIR` under `/tmp/ux`, each backend runs on a free loopback port
+(base 8071+, skipping ports other tenants own) and carries the marker
+`FIL_UX_RIG=1`, and teardown kills **only** processes this harness started
+(tracked children + backends bearing that marker). The user's real
+`~/.config/filament`, their running `filament up` daemon, the Vite dev servers on
+5180/5181, and a gallery server on 8095 are never touched.
 
 ## Run it
 
 ```bash
-./run.sh                 # all 10 scenarios, build gallery, tear down
+./run.sh                 # all 10 scenarios (parallel), build gallery, tear down
 ./run.sh 01 03 06        # a subset
-PARALLEL_CLI=1 ./run.sh  # (knob) run cli↔cli scenarios concurrently
+SEQUENTIAL=1 ./run.sh    # one-at-a-time (debugging / the old behaviour)
+JOBS=3 ./run.sh          # cap concurrency (default 4)
+SPEED=fast ./run.sh      # render faster (SPEED knob — see below)
 ```
+
+### Parallelism
+
+`run.sh` runs scenarios **concurrently in isolated rigs**. Each scenario gets its
+own backend on its own **free port** (the runner skips 5000/5077/5180/5181/8061/
+8077/8095 — the user's daemon, the dev servers, the gallery server, and another
+agent's rig), its own throwaway config root `/tmp/ux/<id>`, and its own scratch
+dir `.work/<id>`, so concurrent scenarios cannot interfere. A bounded job pool
+(`JOBS`, default 4) keeps load sane; wall-clock drops toward the slowest
+scenario. Every backend the harness starts carries the marker `FIL_UX_RIG=1`;
+teardown kills **only** tracked children and backends bearing that marker.
+
+Scenario **09** is a **solo tail**: its authoritative no-recorder verify pass of
+single-host browser→CLI WebRTC wedges if *any* other recorder/chromium runs on
+the same host (documented contention below), so it runs **alone after** the
+parallel batch drains, on a quiet host. `SOLO_IDS="09"` controls this set.
+
+### SPEED knob
+
+Render speed (asciinema idle trim + agg playback speed) is a tunable:
+
+```bash
+SPEED=normal ./run.sh    # agg --speed 1.3, idle 1.4   (default)
+SPEED=fast   ./run.sh    # agg --speed 2.5, idle 0.8   (snappier GIFs)
+SPEED=slow   ./run.sh    # agg --speed 1.0, idle 2.0   (dwell on each step)
+AGG_SPEED=2.0 IDLE_LIMIT=1.0 ./run.sh   # raw override (beats the profile)
+```
+
+A scenario can also request its own pace for a key moment via
+`SCENARIO_SPEED_<id>` / `SCENARIO_IDLE_<id>` (e.g. `SCENARIO_SPEED_01=1.0` to
+slow the pairing handshake). Precedence: raw `AGG_SPEED`/`IDLE_LIMIT` > per-
+scenario > `SPEED` profile. The knob threads through both `record.sh` (cli↔cli
+cast→GIF) and `web-scenarios.sh` (the cli cast + webm→GIF steps).
 
 Single scenario, manually:
 
@@ -59,29 +96,47 @@ Open `gallery/index.html` to see every flow with its caption and PASS/FAIL badge
 
 ## Measured runtimes
 
-Wall-clock per scenario (record + render), local backend, sequential, on this VM:
+Wall-clock per scenario (record + render), isolated local backends, on this
+4-core VM. The suite now runs **parallel** (light scenarios batched at `JOBS=2`,
+then the four single-host ICE flows — 03/06/08/09 — as a sequential **solo tail**
+on a quiet host so their fragile transfers don't wedge under contention). Old
+fully-sequential total was **~167 s**.
 
 <!-- TIMINGS:BEGIN -->
-| # | flow | wall-clock | notes |
-|---|---|---|---|
-| 01 | cli↔cli | 2 s | pair |
-| 02 | cli↔cli | 3 s | devices list/rename/forget + regression |
-| 03 | cli↔cli | 27 s | **decoupled**: verify ~4 s + 22 s best-effort cast box |
-| 04 | cli↔cli | 5 s | send --to known device |
-| 05 | cli↔cli | 7 s | up / status / down |
-| 06 | cli↔cli | 15 s | **decoupled**: verify ~6 s + best-effort cast box (ssh tunnel) |
-| 07 | cli↔cli | 6 s | introduce |
-| 08 | cli↔web | 7 s | CLI → web |
-| 09 | cli↔web | 79 s | **decoupled**: no-recorder verify pass + best-effort visual + webm→GIF |
-| 10 | cli↔web | 16 s | pair web ↔ CLI |
-| | **TOTAL** | **~167 s** | sequential, clean slate |
+Parallel run (`JOBS=2` batch + sequential solo tail), all 10 PASS, 4-core VM:
 
-> **Caveat measured the hard way:** scenario 06 clocked **549 s** in one pass —
-> caused entirely by leftover throwaway `sshd` processes from earlier runs piling
-> up and starving the single-host WebRTC/ssh handshakes. With self-cleaning sshd
-> (the scenario now tears down its own `sshd`) and a clean slate, 06 is **15 s**.
-> The decoupled scenarios' verdicts always come from their no-recorder verify
-> passes, so a wedged cast never produces a wrong PASS/FAIL.
+| # | flow | phase | wall-clock | notes |
+|---|---|---|---|---|
+| 01 | cli↔cli | batch | 3 s | pair |
+| 02 | cli↔cli | batch | 4 s | devices list/rename/forget + regression |
+| 04 | cli↔cli | batch | 4 s | send --to known device |
+| 05 | cli↔cli | batch | 5 s | up / status / down |
+| 07 | cli↔cli | batch | 6 s | introduce |
+| 10 | cli↔web | batch | 17 s | pair web ↔ CLI |
+| 03 | cli↔cli | **solo** | 27 s | **decoupled**: verify ~4 s + 22 s best-effort cast box |
+| 06 | cli↔cli | **solo** | 42 s | **decoupled** ssh tunnel: verify + best-effort cast + ssh retries |
+| 08 | cli↔web | **solo** | 7 s | CLI → web (timeout-boxed cast + ≤2 attempts) |
+| 09 | cli↔web | **solo** | 77 s | **decoupled**: no-recorder verify pass + best-effort visual + webm→GIF |
+| | | | **~179 s** | parallel batch (~26 s) + sequential solo tail (03·06·08·09) |
+
+The batch (six light scenarios) overlaps and finishes in ~26 s; the four
+single-host ICE flows (03·06·08·09) then run **one at a time** on a quiet host —
+that solo tail is the long pole. The old fully-sequential best case was ~167 s but
+flaky under contention; this layout trades a little wall-clock for a **reliable,
+deterministic 10/10** (no contention-induced failures, no leftover-process
+starvation between runs). Raise `JOBS` / shrink `SOLO_IDS` on a bigger box.
+
+> **Caveats measured the hard way:**
+> - Scenario 06 once clocked **549 s** purely from leftover throwaway `sshd`
+>   procs accumulating and starving the single-host handshakes; with self-cleaning
+>   sshd + clean-slate isolated rigs it's ~40 s.
+> - On this 4-core box, running >2 heavy scenarios at once (or any two recorder
+>   scenarios together) saturates the cores and wedges single-host WebRTC/ssh ICE
+>   and even eventlet backend boots — hence `JOBS` auto-caps at `nproc/2` and the
+>   ICE flows are a sequential solo tail. `backend_start` also retries on a fresh
+>   port if a boot gets starved.
+> - The decoupled scenarios' verdicts always come from their no-recorder verify
+>   passes, so a wedged cast never produces a wrong PASS/FAIL.
 <!-- TIMINGS:END -->
 
 **Dominant cost:** the `cli↔web` scenarios (08, 09, 10). The `cli↔cli` scenarios
@@ -92,10 +147,15 @@ twice over (a no-recorder verify pass **and** a best-effort visual pass).
 
 ### Mitigation knobs
 
-- **Own local backend** on `127.0.0.1:8077` — no WAN/TURN latency; both peers on
-  loopback share the same auto-room.
-- **`PARALLEL_CLI=1`** — record the independent `cli↔cli` scenarios concurrently
-  (each uses its own config dir + room).
+- **Own local backend** on a free loopback port (per-scenario, base 8071+) — no
+  WAN/TURN latency; both peers on loopback share the same auto-room.
+- **Parallel isolated rigs** (default `JOBS=4`) — every scenario runs in its own
+  backend + config root + room, so the suite finishes near the slowest scenario
+  (09's solo tail) rather than the sum. `SEQUENTIAL=1` falls back to one-at-a-time.
+- **Event waits, not blind sleeps** — scenarios now wait on deterministic signals
+  (the `filament up —` ready banner, `recv`'s `● listening` line, the sender's
+  `code <word>` line, the sshd port opening) via the `wait_for` / `wait_log`
+  helpers in `rig/lib.sh`, instead of fixed `sleep 3/4`. Faster and less flaky.
 - **`FILAMENT_REJOIN_SECS` low** (set to 2–3 in the scenarios) — a completed
   `recv -y` otherwise lingers the full rejoin window after the sender drops.
 - **agg `--speed` / `--idle-time-limit`** and **ffmpeg `fps` + `scale` + palette**

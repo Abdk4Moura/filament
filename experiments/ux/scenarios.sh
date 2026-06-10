@@ -40,7 +40,9 @@ wait_code() { local f="$1" n=0 c=""; while [ $n -lt 80 ]; do
 kill_by_cfg() { local pfx="$1"; for p in $(pgrep -f "$FILAMENT" 2>/dev/null); do
   tr '\0' ' ' < /proc/$p/environ 2>/dev/null | grep -q "FILAMENT_CONFIG_DIR=$pfx" && kill "$p" 2>/dev/null; done; }
 
-PAY="$UX_WORK/payload.bin"
+# Payload lives under the per-scenario UX_TMP so parallel rigs never race on a
+# shared file (each isolated rig gets its own /tmp/ux/<id>).
+PAY="$UX_TMP/payload.bin"
 ensure_payload() { [ -f "$PAY" ] || head -c 1500000 /dev/urandom > "$PAY"; }
 
 # ======================================================================== 01 ==
@@ -97,7 +99,9 @@ sc_03_code_xfer() {
     rm -rf "$OUT"; mkdir -p "$OUT"; W="ux-$RANDOM-demo"
     runA "filament send report.pdf --word $W"
     FILAMENT_CONFIG_DIR="$DS" timeout 30 "$FILAMENT" send "$PAY" --word "$W" --name report.pdf --server "$UX_SERVER" >"$UX_WORK/03s.log" 2>&1 & local SP=$!; track $SP
-    pause 1.5; a "code is $W — read it to the other device"
+    # wait until the sender has registered the code (it prints "code <word>")
+    wait_log "$UX_WORK/03s.log" "code +$W" 12 0.15 || pause 1.5
+    a "code is $W — read it to the other device"
     runB "filament recv $W -y"
     FILAMENT_CONFIG_DIR="$DR" timeout 28 "$FILAMENT" recv "$W" -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/03r.log" 2>&1
     wait $SP 2>/dev/null
@@ -120,7 +124,9 @@ sc_04_to_known() {
   note "phone and laptop already know each other (paired earlier)"
   runB "filament up   (laptop, always-on receiver)"
   FILAMENT_CONFIG_DIR="$DB" timeout 40 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/04up.log" 2>&1 & local UP=$!; track $UP
-  pause 3
+  # wait for the receiver to print its ready banner instead of a blind sleep
+  wait_log "$UX_WORK/04up.log" 'filament up —' 15 0.15 || note "up ready-banner not seen (continuing)"
+  pause 0.4   # tiny settle so the receiver has joined its room
   runA "filament send slides.key --to laptop"
   FILAMENT_CONFIG_DIR="$DA" timeout 30 "$FILAMENT" send "$PAY" --name slides.key --to laptop --server "$UX_SERVER" >"$UX_WORK/04s.log" 2>&1
   local rc=$?; pause 1; kill $UP 2>/dev/null
@@ -145,7 +151,8 @@ sc_05_up_status_down() {
   seed_store "$DB" "[{\"name\":\"phone\",\"secret\":\"$sec\"}]"
   runB "filament up   (laptop)"
   FILAMENT_CONFIG_DIR="$DB" timeout 45 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/05up.log" 2>&1 & local UP=$!; track $UP
-  pause 3
+  wait_log "$UX_WORK/05up.log" 'filament up —' 15 0.15 || note "up ready-banner not seen (continuing)"
+  pause 0.4
   runA "filament send backup.tar --to laptop"
   FILAMENT_CONFIG_DIR="$DA" timeout 30 "$FILAMENT" send "$PAY" --name backup.tar --to laptop --server "$UX_SERVER" >"$UX_WORK/05s.log" 2>&1; local rc=$?
   pause 1
@@ -182,7 +189,8 @@ UsePAM no
 StrictModes no
 CFG
   /usr/sbin/sshd -f "$SSHD/sshd_config" -E "$SSHD/sshd.log" -D & track $!
-  sleep 1
+  # wait for OUR throwaway sshd to actually accept on its port, not a blind sleep
+  wait_for 10 0.1 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PORT" || note "sshd not listening yet (continuing)"
   local DA="$W/A" DB="$W/B"; mkdir -p "$DA" "$DB"
   local sec; sec=$(mk_secret)
   seed_store "$DA" "[{\"name\":\"server\",\"secret\":\"$sec\"}]"
@@ -192,10 +200,12 @@ CFG
   env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" FILAMENT_L2=1 FILAMENT_NAME=laptop \
       FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" USER="$USERNAME" \
       "$FILAMENT" up --dir "$W/drop" --server "$UX_SERVER" >"$W/up.log" 2>&1 & local UP=$!; track $UP
-  sleep 4
+  # wait for the acceptor's ready banner instead of a fixed 4s
+  wait_log "$W/up.log" 'filament up —' 20 0.2 || note "L2 up ready-banner not seen (continuing)"
+  pause 0.5
   runB "filament grant laptop shell   (consent: deny-by-default)"
   env HOME="$BHOME" FILAMENT_CONFIG_DIR="$DB" "$FILAMENT" grant laptop shell 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
-  sleep 1
+  pause 0.5   # small settle so the grant propagates before the ssh attempt
   local AHOME="$W/Ahome"; mkdir -p "$AHOME"
   runA "filament ssh server -- echo OK"
   local OUT rc tries=0
@@ -231,7 +241,10 @@ sc_07_introduce() {
   FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=alice timeout 45 "$FILAMENT" up --dir "$UX_WORK/s07da" --server "$UX_SERVER" </dev/null >"$UX_WORK/07a.log" 2>&1 & local PA=$!; track $PA
   runB "bob:   filament up   (online, waiting)"
   FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=bob timeout 45 "$FILAMENT" up --dir "$UX_WORK/s07db" --server "$UX_SERVER" </dev/null >"$UX_WORK/07b.log" 2>&1 & local PB=$!; track $PB
-  sleep 3
+  # wait for BOTH waiters to be online (ready banners) instead of a fixed 3s
+  wait_log "$UX_WORK/07a.log" 'filament up —' 15 0.15 || note "alice up not seen (continuing)"
+  wait_log "$UX_WORK/07b.log" 'filament up —' 15 0.15 || note "bob up not seen (continuing)"
+  pause 0.5
   runA "hub:   filament introduce alice bob"
   FILAMENT_CONFIG_DIR="$DS" FILAMENT_NAME=hub timeout 35 "$FILAMENT" introduce alice bob --server "$UX_SERVER" >"$UX_WORK/07i.log" 2>&1; local rc=$?
   sleep 1; kill $PA $PB 2>/dev/null
