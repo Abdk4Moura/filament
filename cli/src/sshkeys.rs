@@ -89,12 +89,55 @@ pub fn authorized_keys_path() -> PathBuf {
     PathBuf::from(home).join(".ssh/authorized_keys")
 }
 
+/// M-3 (authorized_keys injection): validate that `pubkey` is a SINGLE, well-
+/// formed ssh public-key line before it is ever written. A trusted+shell peer
+/// could otherwise send a pubkey containing an interior `\n` (which `.trim()`
+/// does NOT strip) to inject EXTRA authorized_keys lines — extra keys, a
+/// `command=`/`from=` forced-command, etc. We reject anything with a control
+/// character (newline, CR, tab, …) or more than one whitespace-separated key
+/// line, and require the shape `<key-type> <base64-blob> [single-line comment]`.
+///
+/// Returns the trimmed, validated single-line key on success.
+pub fn validate_pubkey(pubkey: &str) -> Result<String> {
+    let key = pubkey.trim();
+    if key.is_empty() {
+        return Err(anyhow!("empty pubkey"));
+    }
+    // Reject ANY control character (covers \n, \r, \t, NUL, vertical tab, …).
+    // After trimming surrounding whitespace, a control char anywhere means the
+    // value is not a single clean line — refuse outright.
+    if key.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("pubkey contains a control character (multi-line injection?)"));
+    }
+    // Shape: 2 or 3 whitespace-separated fields. Field 0 is the key type, field 1
+    // is the base64 blob, optional field 2 is a single-line comment.
+    let mut fields = key.split_whitespace();
+    let key_type = fields.next().ok_or_else(|| anyhow!("pubkey missing key type"))?;
+    let blob = fields.next().ok_or_else(|| anyhow!("pubkey missing key material"))?;
+    // The comment may itself contain spaces, so collapse the rest into one field;
+    // what matters is there is no embedded newline (already rejected above).
+    let _comment: String = fields.collect::<Vec<_>>().join(" ");
+    if !(key_type.starts_with("ssh-") || key_type.starts_with("ecdsa-") || key_type.starts_with("sk-")) {
+        return Err(anyhow!("unrecognized pubkey type '{key_type}'"));
+    }
+    // base64 blob: non-empty and only the base64 alphabet (+ '=' padding).
+    if blob.is_empty()
+        || !blob.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return Err(anyhow!("pubkey key material is not base64"));
+    }
+    Ok(key.to_string())
+}
+
 /// Install (or replace) `pubkey` in a marked block for `device` in
 /// authorized_keys. Idempotent: a re-grant replaces that device's block rather
 /// than appending a duplicate. Creates ~/.ssh (0700) and the file (0600) if
 /// absent. SECURITY: the caller MUST have verified the trusted channel + `shell`
-/// cap before calling this.
+/// cap before calling this. The pubkey is re-validated here (M-3) — defense in
+/// depth — so a bad key is NEVER written even if a caller forgot to check.
 pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
+    let pubkey = validate_pubkey(pubkey)?;
+    let pubkey = pubkey.as_str();
     let path = authorized_keys_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("create ~/.ssh")?;
@@ -105,7 +148,7 @@ pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
     if !kept.is_empty() && !kept.ends_with('\n') {
         kept.push('\n');
     }
-    kept.push_str(&format!("{BEGIN} {device}\n{}\n{END} {device}\n", pubkey.trim()));
+    kept.push_str(&format!("{BEGIN} {device}\n{pubkey}\n{END} {device}\n"));
     std::fs::write(&path, kept).context("write authorized_keys")?;
     chmod(&path, 0o600);
     Ok(())
@@ -233,6 +276,33 @@ mod tests {
         assert!(out.contains("AAAAother"));
         assert!(out.contains("AAAAkeep"));
         assert!(!has_block(&out, "boxA"));
+    }
+
+    #[test]
+    fn validate_pubkey_accepts_a_single_well_formed_key() {
+        let ok = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIabcDEF123+/= filament-managed";
+        let v = validate_pubkey(ok).expect("a clean single-line key is accepted");
+        assert_eq!(v, ok);
+        // No-comment form is fine too.
+        assert!(validate_pubkey("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5").is_ok());
+    }
+
+    #[test]
+    fn validate_pubkey_rejects_multiline_injection() {
+        // M-3: a newline-bearing pubkey must be refused and NEVER reach the file.
+        let inj = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 ok\nssh-ed25519 AAAAEVILKEY attacker";
+        assert!(validate_pubkey(inj).is_err(), "interior newline must be rejected");
+        assert!(validate_pubkey("ssh-ed25519 AAAA\rmore").is_err(), "CR must be rejected");
+        assert!(validate_pubkey("ssh-ed25519\tAAAA").is_err(), "tab control char rejected");
+        assert!(validate_pubkey("not-a-key blob").is_err(), "bad key type rejected");
+        assert!(validate_pubkey("ssh-ed25519 not_base64!!").is_err(), "non-base64 blob rejected");
+        assert!(validate_pubkey("").is_err(), "empty rejected");
+
+        // And the install path must refuse it too (defense in depth): the
+        // validation runs BEFORE any filesystem write, so install_authorized_key
+        // errors out on a multi-line key and never touches authorized_keys.
+        let r = install_authorized_key("boxA", inj);
+        assert!(r.is_err(), "install must reject the multi-line key before writing");
     }
 
     #[test]

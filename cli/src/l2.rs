@@ -26,7 +26,7 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -63,6 +63,48 @@ struct StreamHandle {
     read_pump: Option<AbortHandle>,
 }
 
+/// H-1 (DoS): per-link cap on concurrently live streams (file + L2 + PTY share
+/// the `streams` table). Beyond this an `l2-open`/`pty-open` is refused. A
+/// generous bound — interactive use needs only a handful — that still stops a
+/// flaky/hostile paired device from spawning unbounded threads/sockets.
+pub const MAX_STREAMS_PER_LINK: usize = 8;
+
+/// H-1 (DoS): process-wide cap on concurrently live PTYs across ALL links. Each
+/// PTY is a login shell + threads, so this bounds total resource use even if many
+/// links each stay under the per-link cap. Refused opens get an `l2-close`.
+pub const MAX_PTYS_GLOBAL: usize = 32;
+
+/// Process-wide live-PTY counter (incremented just before a `serve_pty` task is
+/// spawned, decremented when it ends — see `PtyGuard`). The acceptor checks it
+/// against `MAX_PTYS_GLOBAL` before granting a `pty-open`.
+pub static LIVE_PTYS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that decrements `LIVE_PTYS` on drop, so the global PTY count is
+/// freed on EVERY `serve_pty` exit path (shell exit, browser FIN, error return).
+pub struct PtyGuard;
+impl PtyGuard {
+    /// Reserve a global PTY slot if one is free. Returns `None` (and reserves
+    /// nothing) when `MAX_PTYS_GLOBAL` live PTYs already exist.
+    pub fn try_acquire() -> Option<PtyGuard> {
+        // Optimistic CAS loop so the check + increment is atomic across links.
+        let mut cur = LIVE_PTYS.load(Ordering::Relaxed);
+        loop {
+            if cur >= MAX_PTYS_GLOBAL {
+                return None;
+            }
+            match LIVE_PTYS.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(PtyGuard),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+impl Drop for PtyGuard {
+    fn drop(&mut self) {
+        LIVE_PTYS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The multiplexer: routes inbound control/data frames to per-stream pipes and
 /// owns stream-id allocation. Transport-agnostic — it rides above the trait.
 pub struct Mux {
@@ -72,6 +114,11 @@ pub struct Mux {
     /// Acceptor only: sids we have seen `l2-open` for and accepted, so a late
     /// duplicate open is ignored. (Initiator allocates, so it can't double-open.)
     accepted: Mutex<HashMap<u32, ()>>,
+    /// web-shell: per-sid PTY resize senders. H-1: owning these HERE (rather than
+    /// in the main event loop) guarantees they are dropped on EVERY teardown path
+    /// — inbound `l2-close` (`on_close`), `serve_pty` exit (`drop_pty`), and
+    /// link/mux death (`shutdown_all`) — closing the resizer-map leak.
+    resizers: Mutex<HashMap<u32, mpsc::UnboundedSender<(u16, u16)>>>,
 }
 
 impl Mux {
@@ -81,6 +128,7 @@ impl Mux {
             streams: Mutex::new(HashMap::new()),
             next_sid: AtomicU32::new(L2_SID_BASE),
             accepted: Mutex::new(HashMap::new()),
+            resizers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -122,8 +170,22 @@ impl Mux {
         self.register(sid).await
     }
 
-    /// Drop a stream and abort its read pump. Idempotent.
+    /// Number of currently live streams on this link (file + L2 + PTY share the
+    /// table). H-1: the acceptor checks this against `MAX_STREAMS_PER_LINK`
+    /// before accepting a new `l2-open`/`pty-open`.
+    pub async fn live_streams(&self) -> usize {
+        self.streams.lock().await.len()
+    }
+
+    /// True if accepting one more stream would exceed `MAX_STREAMS_PER_LINK`.
+    pub async fn at_stream_cap(&self) -> bool {
+        self.live_streams().await >= MAX_STREAMS_PER_LINK
+    }
+
+    /// Drop a stream and abort its read pump. Idempotent. Also drops any PTY
+    /// resize sender for this sid (H-1: no resizer outlives its stream).
     async fn drop_stream(&self, sid: u32) {
+        self.resizers.lock().await.remove(&sid);
         if let Some(s) = self.streams.lock().await.remove(&sid) {
             if let Some(h) = s.read_pump {
                 h.abort();
@@ -131,6 +193,26 @@ impl Mux {
             // Dropping `s.tx` closes the pipe; the writer pump (dc_to_socket)
             // sees `recv()` return None and shuts the socket down.
         }
+    }
+
+    /// Register a PTY's resize sender (acceptor). Stored in the mux so it is freed
+    /// on every teardown path with the stream — see `resizers`.
+    pub async fn register_resizer(&self, sid: u32, tx: mpsc::UnboundedSender<(u16, u16)>) {
+        self.resizers.lock().await.insert(sid, tx);
+    }
+
+    /// Deliver a `pty-resize` to the PTY task for `sid`, if it is still live.
+    pub async fn resize_pty(&self, sid: u32, cols: u16, rows: u16) {
+        if let Some(tx) = self.resizers.lock().await.get(&sid) {
+            let _ = tx.send((cols, rows));
+        }
+    }
+
+    /// Free a PTY's stream + resize sender on `serve_pty` exit (the teardown path
+    /// that does NOT come from an inbound `l2-close`). Idempotent.
+    pub async fn drop_pty(&self, sid: u32) {
+        self.resizers.lock().await.remove(&sid);
+        self.streams.lock().await.remove(&sid);
     }
 
     /// Route an inbound data frame to its stream. Empty payload = clean EOF/FIN.
@@ -152,6 +234,7 @@ impl Mux {
     /// Data-channel died (or a send errored): tear down EVERY live stream so no
     /// pump hangs forever waiting on a peer that will never speak again.
     pub async fn shutdown_all(&self) {
+        self.resizers.lock().await.clear(); // H-1: no resizer outlives the mux
         let mut map = self.streams.lock().await;
         for (_, s) in map.drain() {
             if let Some(h) = s.read_pump {
@@ -256,6 +339,9 @@ pub async fn serve_pty(
     argv: Vec<String>,
     mut rx: mpsc::Receiver<PipeItem>,
     mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
+    // H-1: holding the guard for the whole task lifetime frees the global PTY
+    // slot on EVERY exit path (early error returns + the normal teardown).
+    _pty_guard: PtyGuard,
 ) {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read as _, Write as _};
@@ -264,6 +350,7 @@ pub async fn serve_pty(
     let pair = match native_pty_system().openpty(size) {
         Ok(p) => p,
         Err(e) => {
+            mux.drop_pty(sid).await;
             let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") })).await;
             return;
         }
@@ -279,6 +366,7 @@ pub async fn serve_pty(
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
+            mux.drop_pty(sid).await;
             let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") })).await;
             return;
         }
@@ -287,11 +375,17 @@ pub async fn serve_pty(
     let master = pair.master;
     let mut reader = match master.try_clone_reader() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => {
+            mux.drop_pty(sid).await;
+            return;
+        }
     };
     let mut writer = match master.take_writer() {
         Ok(w) => w,
-        Err(_) => return,
+        Err(_) => {
+            mux.drop_pty(sid).await;
+            return;
+        }
     };
 
     // Blocking PTY-master reads -> async output channel.
@@ -348,7 +442,7 @@ pub async fn serve_pty(
     drop(wtx); // stop the writer thread
     let _ = child.kill(); // ensure the shell dies if the browser closed first
     let _ = child.wait();
-    mux.streams.lock().await.remove(&sid);
+    mux.drop_pty(sid).await; // H-1: free stream + resize sender on this exit path
     let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid })).await;
 }
 
@@ -415,6 +509,14 @@ impl Mux {
                 // unless a future per-device allowlist opts in (TODO above).
                 if !host_is_loopback(&host) {
                     return OpenVerdict::Deny { sid, err: "non-loopback denied" };
+                }
+                // H-1 (DoS): cap concurrent streams per link. A flaky/hostile
+                // paired device can otherwise flood `l2-open` and exhaust
+                // sockets/threads. We drop the `accepted` marker so the same sid
+                // can be retried once others free up.
+                if self.at_stream_cap().await {
+                    self.accepted.lock().await.remove(&sid);
+                    return OpenVerdict::Deny { sid, err: "too many streams" };
                 }
                 let rx = self.register(sid).await; // BEFORE the async dial
                 OpenVerdict::Accept { sid, host, port, rx }
@@ -1119,4 +1221,145 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     }
     let status = cmd.status()?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod h1_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    /// Minimal in-memory Transport: records control messages, discards frames.
+    struct MockTransport {
+        controls: StdMutex<Vec<Value>>,
+    }
+    impl MockTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(MockTransport { controls: StdMutex::new(Vec::new()) })
+        }
+    }
+    #[async_trait]
+    impl Transport for MockTransport {
+        async fn send_control(&self, msg: &Value) -> Result<()> {
+            self.controls.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, _sid: u32, _payload: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+    }
+
+    fn open_msg(sid: u32) -> Value {
+        json!({ "type": "l2-open", "sid": sid, "host": "127.0.0.1", "rport": 9 })
+    }
+
+    /// H-1: opening + closing N PTY-style streams (register + resizer, then close)
+    /// leaves BOTH the stream table and the resizer map empty on every teardown
+    /// path, and the global PTY counter returns to zero.
+    #[tokio::test]
+    async fn pty_open_close_leaves_maps_empty() {
+        let start = LIVE_PTYS.load(Ordering::SeqCst);
+        let mux = Mux::new(MockTransport::new());
+        let n = 5u32;
+
+        // Path A: inbound l2-close frees stream + resizer.
+        for i in 0..n {
+            let sid = L2_SID_BASE | (1000 + i);
+            let guard = PtyGuard::try_acquire().expect("slot free");
+            let _rx = mux.register_stream(sid).await;
+            let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
+            mux.register_resizer(sid, tx).await;
+            assert_eq!(mux.live_streams().await, 1);
+            assert_eq!(mux.resizers.lock().await.len(), 1);
+            // Inbound l2-close (browser closed).
+            mux.on_close(sid, None).await;
+            drop(guard); // serve_pty task ending frees the global slot
+            assert_eq!(mux.live_streams().await, 0, "stream not freed on l2-close");
+            assert_eq!(mux.resizers.lock().await.len(), 0, "resizer leaked on l2-close");
+        }
+
+        // Path B: serve_pty exit (drop_pty) frees stream + resizer.
+        for i in 0..n {
+            let sid = L2_SID_BASE | (2000 + i);
+            let guard = PtyGuard::try_acquire().expect("slot free");
+            let _rx = mux.register_stream(sid).await;
+            let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
+            mux.register_resizer(sid, tx).await;
+            mux.drop_pty(sid).await; // serve_pty's own exit path
+            drop(guard);
+            assert_eq!(mux.live_streams().await, 0, "stream not freed on drop_pty");
+            assert_eq!(mux.resizers.lock().await.len(), 0, "resizer leaked on drop_pty");
+        }
+
+        // Path C: link/mux death (shutdown_all) frees everything.
+        let mut guards = Vec::new();
+        for i in 0..n {
+            let sid = L2_SID_BASE | (3000 + i);
+            guards.push(PtyGuard::try_acquire().expect("slot free"));
+            let _rx = mux.register_stream(sid).await;
+            let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
+            mux.register_resizer(sid, tx).await;
+        }
+        assert_eq!(mux.live_streams().await, n as usize);
+        mux.shutdown_all().await;
+        drop(guards);
+        assert_eq!(mux.live_streams().await, 0, "streams leaked past shutdown_all");
+        assert_eq!(mux.resizers.lock().await.len(), 0, "resizers leaked past shutdown_all");
+
+        assert_eq!(LIVE_PTYS.load(Ordering::SeqCst), start, "global PTY count must return to baseline");
+    }
+
+    /// H-1: the per-link stream cap refuses opens beyond MAX_STREAMS_PER_LINK with
+    /// an `l2-close{err:"too many streams"}`, and does NOT register the stream.
+    #[tokio::test]
+    async fn per_link_stream_cap_refuses_over_limit() {
+        let mux = Mux::new(MockTransport::new());
+        // Fill to the cap with accepted opens (they register pipes).
+        for i in 0..MAX_STREAMS_PER_LINK as u32 {
+            let sid = L2_SID_BASE | (i + 1);
+            match mux.accept_control(&open_msg(sid), true).await {
+                OpenVerdict::Accept { .. } => {}
+                other => panic!("expected Accept under cap, got {:?}", std::mem::discriminant(&other)),
+            }
+        }
+        assert_eq!(mux.live_streams().await, MAX_STREAMS_PER_LINK);
+        // One more must be denied with the cap error, leaving the table unchanged.
+        let over = L2_SID_BASE | 9999;
+        match mux.accept_control(&open_msg(over), true).await {
+            OpenVerdict::Deny { sid, err } => {
+                assert_eq!(sid, over);
+                assert_eq!(err, "too many streams");
+            }
+            other => panic!("expected Deny over cap, got {:?}", std::mem::discriminant(&other)),
+        }
+        assert_eq!(mux.live_streams().await, MAX_STREAMS_PER_LINK, "over-cap open must not register");
+        // The denied sid is not stuck in `accepted` (can retry once room frees).
+        assert!(!mux.accepted.lock().await.contains_key(&over));
+    }
+
+    /// H-1: the global PTY guard refuses acquisition once MAX_PTYS_GLOBAL slots
+    /// are held, and frees them on drop.
+    #[tokio::test]
+    async fn global_pty_cap_is_enforced() {
+        // Other tests may hold none here, but to be robust we only assert the
+        // guard refuses once at-capacity relative to the current baseline.
+        let mut held = Vec::new();
+        while LIVE_PTYS.load(Ordering::SeqCst) < MAX_PTYS_GLOBAL {
+            match PtyGuard::try_acquire() {
+                Some(g) => held.push(g),
+                None => break,
+            }
+        }
+        assert_eq!(LIVE_PTYS.load(Ordering::SeqCst), MAX_PTYS_GLOBAL);
+        assert!(PtyGuard::try_acquire().is_none(), "must refuse at global cap");
+        let before = held.len();
+        drop(held);
+        assert!(LIVE_PTYS.load(Ordering::SeqCst) <= MAX_PTYS_GLOBAL - before.min(1));
+    }
 }

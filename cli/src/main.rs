@@ -212,6 +212,12 @@ enum Cmd {
         /// every other device still needs an explicit `grant <dev> shell`.
         #[arg(long, value_name = "DEVICES")]
         shell_only: Option<String>,
+        /// Drop the web-shell / ssh PTY to this non-root account (via
+        /// `runuser -l <user>`). STRONGLY recommended when `up` runs as root:
+        /// without it, a granted device gets a shell as the up-process user
+        /// (often root). Requires `up` to run as root (runuser is setuid).
+        #[arg(long, value_name = "USER")]
+        shell_user: Option<String>,
     },
     /// Show whether the daemon runs and what it received recently
     Status,
@@ -789,13 +795,26 @@ fn daemon_alive() -> Option<u32> {
     cmd.contains("filament").then_some(pid)
 }
 
-/// The argv for a web-shell PTY: the up user's login shell. `$SHELL -l`, falling
-/// back to bash/sh. (Privilege-drop to another account is a later `--shell-user`.)
-fn shell_argv() -> Vec<String> {
+/// The argv for a web-shell PTY.
+///
+/// M-1 (privilege-drop): when `--shell-user <name>` is set, drop the PTY to that
+/// account via `runuser -l <user>` (a clean setuid+login-shell wrapper available
+/// on every systemd distro). `runuser` does no PAM password prompt, so it only
+/// works when `up` itself runs as root — which is exactly the case the flag is
+/// meant to de-fang (a root daemon should hand out a NON-root shell). Without the
+/// flag the PTY runs as the up-process user (often root on a server); this is an
+/// ACCEPTED RISK documented in docs/security/web-shell-review.md (M-1) and in the
+/// `up --shell` help. Operators are urged to pass `--shell-user`.
+fn shell_argv(shell_user: Option<&str>) -> Vec<String> {
     let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
         if std::path::Path::new("/bin/bash").exists() { "/bin/bash".into() } else { "/bin/sh".into() }
     });
-    vec![shell, "-l".into()]
+    match shell_user {
+        // `runuser -l <user>` opens a fresh login shell as <user>; we don't force
+        // a specific shell so the target account's own login shell is honored.
+        Some(user) => vec!["runuser".into(), "-l".into(), user.into()],
+        None => vec![shell, "-l".into()],
+    }
 }
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
@@ -805,7 +824,9 @@ fn shell_argv() -> Vec<String> {
 enum ShellPolicy {
     /// Default: only devices explicitly `grant`ed the `shell` cap.
     Granted,
-    /// `up --shell`: any paired device.
+    /// `up --shell`: any paired device. M-2: this INTENTIONALLY grants every
+    /// proof-verified paired device — including ones introduced later via
+    /// pair-intro. Use `Only`/`--shell-only` to scope it.
     All,
     /// `up --shell-only a,b`: only these petnames auto-shell; others need a grant.
     Only(std::collections::HashSet<String>),
@@ -832,6 +853,7 @@ async fn up_cmd(
     relay: bool,
     shell: bool,
     shell_only: Option<String>,
+    shell_user: Option<String>,
 ) -> Result<()> {
     let shell_policy = match &shell_only {
         Some(csv) => ShellPolicy::Only(
@@ -853,6 +875,9 @@ async fn up_cmd(
             up_args.push_str(&format!(" --shell-only {csv}"));
         } else if shell {
             up_args.push_str(" --shell");
+        }
+        if let Some(u) = &shell_user {
+            up_args.push_str(&format!(" --shell-user {u}"));
         }
         std::fs::write(&unit, format!(
             "[Unit]\nDescription=Filament drop target (trusted devices only)\nAfter=network-online.target\n\n[Service]\nExecStart={}{}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
@@ -879,8 +904,11 @@ async fn up_cmd(
     std::fs::create_dir_all(&dir)?;
     std::fs::write(pidfile(), std::process::id().to_string())?;
     match &shell_policy {
+        // M-2: --shell intentionally grants ALL proof-verified paired devices
+        // (current AND any introduced later via pair-intro). This is a broad,
+        // deliberate over-grant; --shell-only is the scoped, safer alternative.
         ShellPolicy::All => ui::say(&format!(
-            "  {} seamless shell ON — ANY paired device can `filament ssh` into this machine",
+            "  {} seamless shell ON — ANY paired device (now or paired later) can `filament ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
         )),
         ShellPolicy::Only(set) => {
@@ -894,7 +922,16 @@ async fn up_cmd(
         }
         ShellPolicy::Granted => {}
     }
-    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy).await;
+    // M-1: warn loudly when a shell policy is active but the PTY is NOT dropped to
+    // a non-root account. The granted device would get a shell as the up-process
+    // user (often root on a server). `--shell-user <name>` de-fangs this.
+    if shell_policy.enables_l2() && shell_user.is_none() {
+        ui::say(&format!(
+            "  {} shell PTYs run as THIS user (root if the daemon is root) — pass `--shell-user <name>` to drop to a non-root account",
+            ui::paint(ui::Tone::Warn, "!"),
+        ));
+    }
+    let res = recv_cmd(server, None, dir, false, None, None, true, relay, None, true, None, shell_policy, shell_user).await;
     let _ = std::fs::remove_file(pidfile());
     res
 }
@@ -2564,7 +2601,7 @@ async fn main() -> Result<()> {
             send_cmd(&server, paths, code || word.is_some(), word, room, to, name, cli.relay, remember).await
         }
         Cmd::Recv { code, dir, yes, room, to, keep_open, remember, output } => {
-            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output, ShellPolicy::Granted).await
+            recv_cmd(&server, code, dir, yes, room, to, keep_open, cli.relay, remember, false, output, ShellPolicy::Granted, None).await
         }
         Cmd::Config { key, value } => {
             match (key, value) {
@@ -2583,7 +2620,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Up { install, dir, shell, shell_only } => up_cmd(&server, install, dir, cli.relay, shell, shell_only).await,
+        Cmd::Up { install, dir, shell, shell_only, shell_user } => up_cmd(&server, install, dir, cli.relay, shell, shell_only, shell_user).await,
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
@@ -3507,6 +3544,9 @@ async fn recv_cmd(
     daemon: bool,
     output: Option<String>,
     shell_policy: ShellPolicy,
+    // M-1: optional non-root account the web-shell/ssh PTY is dropped to. `None`
+    // means the PTY runs as the up-process user (documented root risk).
+    shell_user: Option<String>,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
     // Bug 4: a 4-segment PAKE pairing code (adj-animal-extra-NNNN) was typed
@@ -3720,8 +3760,8 @@ async fn recv_cmd(
     let l2_enabled = shell_policy.enables_l2()
         || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
-    // web-shell: per-sid resize senders so a `pty-resize` reaches its PTY task.
-    let mut pty_resizers: HashMap<u32, tokio::sync::mpsc::UnboundedSender<(u16, u16)>> = HashMap::new();
+    // web-shell: per-sid resize senders are now owned by each Mux (l2.rs) so they
+    // are freed on every teardown path (H-1: closes the prior pty_resizers leak).
     // Bug 5: surface the single-host mDNS wedge hint once after repeated stuck.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
@@ -4140,12 +4180,9 @@ async fn recv_cmd(
                         }
                         l2::OpenVerdict::Ignore => {}
                     }
-                    // A PTY stream closing frees its resize channel.
-                    if v["type"].as_str() == Some("l2-close") {
-                        if let Some(sid) = v["sid"].as_u64() {
-                            pty_resizers.remove(&(sid as u32));
-                        }
-                    }
+                    // A PTY stream closing frees its resize channel — handled by
+                    // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
+                    // the mux now, so it can't leak past the stream).
                 }
                 // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
@@ -4180,18 +4217,24 @@ async fn recv_cmd(
                     }
                     let device = dev.unwrap();
                     let pubkey = v["pubkey"].as_str().unwrap_or_default().to_string();
-                    // Basic shape check: an ed25519/rsa/ecdsa pubkey line. Never
-                    // install junk.
-                    let looks_ok = pubkey.starts_with("ssh-") || pubkey.starts_with("ecdsa-");
-                    if pubkey.is_empty() || !looks_ok {
-                        let _ = t
-                            .send_control(&json!({
-                                "type": "shell-bootstrap-deny",
-                                "reason": "malformed pubkey"
-                            }))
-                            .await;
-                        continue;
-                    }
+                    // M-3 (authorized_keys injection): a single, well-formed key
+                    // line ONLY. validate_pubkey rejects interior newlines / CR /
+                    // control chars and multi-line payloads, so a trusted+shell
+                    // peer can't inject extra authorized_keys lines. Enforced here
+                    // AND again inside install_authorized_key (defense in depth).
+                    let pubkey = match sshkeys::validate_pubkey(&pubkey) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            eprintln!("l2: shell bootstrap refused: malformed pubkey from '{device}': {e}");
+                            let _ = t
+                                .send_control(&json!({
+                                    "type": "shell-bootstrap-deny",
+                                    "reason": "malformed pubkey"
+                                }))
+                                .await;
+                            continue;
+                        }
+                    };
                     match sshkeys::install_authorized_key(&device, &pubkey) {
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
@@ -4249,19 +4292,34 @@ async fn recv_cmd(
                         .entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();
+                    // H-1 (DoS): refuse over the per-link stream cap or the global
+                    // PTY cap BEFORE spawning a shell. A flaky/hostile paired
+                    // device can otherwise flood `pty-open` and exhaust threads.
+                    if mux.at_stream_cap().await {
+                        eprintln!("l2: pty refused: too many streams on this link");
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
+                        continue;
+                    }
+                    let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
+                        eprintln!("l2: pty refused: too many PTYs (global cap {})", l2::MAX_PTYS_GLOBAL);
+                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
+                        continue;
+                    };
                     let rx = mux.register_stream(sid).await; // before spawn (race fix)
                     let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-                    pty_resizers.insert(sid, rtx);
+                    // Resizer is owned by the mux so it is freed on EVERY teardown
+                    // path (inbound l2-close, serve_pty exit, link death) — H-1.
+                    mux.register_resizer(sid, rtx).await;
                     eprintln!("l2: pty granted to '{}' — {cols}x{rows}", dev.unwrap_or_default());
                     let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
-                    tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(), rx, rrx));
+                    tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(shell_user.as_deref()), rx, rrx, pty_guard));
                 }
                 Some("pty-resize") if l2_enabled => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
-                    if let Some(tx) = pty_resizers.get(&sid) {
-                        let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-                        let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                        let _ = tx.send((cols, rows));
+                    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+                    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                    if let Some(mux) = l2_muxes.get(&pid) {
+                        mux.resize_pty(sid, cols, rows).await;
                     }
                 }
                 Some("brb") => {
