@@ -821,7 +821,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
 /// device lacks the `shell` cap) or times out — in which case the caller MUST NOT
 /// fall through to a key-less ssh attempt (that would be a muddy auth failure
 /// instead of a clear "zero shell" denial).
-async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<String>> {
+async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<String>, Option<String>)> {
     // Managed keypair lives under the filament config dir — NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
@@ -833,7 +833,7 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<St
     // BEFORE returning, so the ssh data link (netcat ProxyCommand) is the only
     // boxA peer the acceptor sees — no concurrent same-device supersede churn.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
-    let verdict: Result<Vec<String>> = loop {
+    let verdict: Result<(Vec<String>, Option<String>)> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break Err(anyhow!(
@@ -847,7 +847,10 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<St
                         .as_array()
                         .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    break Ok(hostkeys);
+                    // The acceptor reports the account it installed our key into
+                    // — authoritative for the ssh login (see ssh_cmd).
+                    let user = v["user"].as_str().map(String::from);
+                    break Ok((hostkeys, user));
                 }
                 Some("shell-bootstrap-deny") => {
                     let why = v["reason"].as_str().unwrap_or("shell capability not granted");
@@ -878,20 +881,27 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<Vec<St
 /// ~/.ssh, no key copying. The bootstrap is the deny-by-default gate: if the
 /// peer lacks the `shell` cap we abort HERE, before invoking ssh.
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
-    // The destination token ssh uses; we control it, so the host-key pin is keyed
-    // to exactly this. `<login>@filament-<peer>` keeps it stable + recognizable.
-    let login = std::env::var("FILAMENT_SSH_USER")
-        .ok()
-        .or_else(|| std::env::var("USER").ok())
-        .unwrap_or_else(|| "root".into());
     // ssh matches known_hosts by HOST token only (never user@host), so the pin
     // MUST be keyed on the bare host or it is silently inert.
     let host = format!("filament-{peer}");
-    let dest_token = format!("{login}@{host}");
 
     // 1) Bootstrap auth material over the trusted channel (deny-by-default gate).
-    let hostkeys = shell_bootstrap(server, peer, relay).await?;
+    let (hostkeys, remote_user) = shell_bootstrap(server, peer, relay).await?;
     crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
+
+    // The login account is the one the ACCEPTOR actually installed our key into
+    // (reported in the bootstrap-ack) — authoritative over a guess from our local
+    // $USER, which is usually wrong cross-machine (agboola@laptop vs root@server).
+    // A killed earlier session left "agboola@filament-dovm: Permission denied
+    // (publickey)" precisely because of that mismatch. FILAMENT_SSH_USER still
+    // overrides for explicit control (`ssh -l user` via extra args also works).
+    let login = std::env::var("FILAMENT_SSH_USER")
+        .ok()
+        .or(remote_user)
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into());
+    // `<login>@filament-<peer>` keeps the destination stable + recognizable.
+    let dest_token = format!("{login}@{host}");
 
     // 2) Build the ProxyCommand: a fresh `filament netcat` link to peer:22 (or a
     // test port via FILAMENT_SSH_PORT, mirroring FILAMENT_L2_DIALHOST).
