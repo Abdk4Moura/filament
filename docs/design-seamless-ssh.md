@@ -130,11 +130,23 @@ ssh -o IdentityFile=<cfg>/ssh/id_ed25519 \
   backstop (and is itself safe — TOFU over the MITM-proof tunnel). A *wrong*
   pre-pin would be worse than none (hard mismatch), so the acceptor pins its
   **real** served host key; `accept-new` only fires if the pin is somehow absent.
-- known_hosts entry is keyed by the **exact destination token** ssh uses (we
-  control it in the seamless path); `HashKnownHosts` left default but we write the
-  plain token so the pin is not silently inert.
+- known_hosts entry is keyed by the **bare host token** ssh matches on
+  (`filament-<peer>`), NOT `user@host` — ssh looks host-only entries up, so a
+  `user@host` key would be silently inert. We write the plain host token. Proven
+  by GATE D (a `StrictHostKeyChecking=yes` connection against the pre-pinned file,
+  no `accept-new` backstop).
 
 ## Best transport, no flags (item 3)
+
+STATUS: **deferred this pass** (optimization, not correctness). The seamless ssh
+feature is fully functional over the existing WebRTC L2 transport — that is the
+status quo for `netcat`/`forward`/`ssh`, NOT a regression. A genuine direct-first
+preference for the L2 path is two-sided (both the initiator's `bring_up_to_known`
+AND the acceptor's `up` must dial direct), and `up` is also the file-transfer
+acceptor, so enabling direct there for `FILAMENT_L2` links without a flag risks
+the file-transfer/`FILAMENT_DIRECT` hard-rule. Doing only the initiator half is
+worse than nothing (it adds a transport-offer round-trip then falls back). Left
+as a follow-up; the design below is the intended shape.
 
 The L2/ssh path (the bootstrap link AND the ProxyCommand `netcat` child) should
 prefer the **direct-QUIC** transport to a known device, falling back to WebRTC,
