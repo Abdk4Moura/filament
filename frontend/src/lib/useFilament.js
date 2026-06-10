@@ -957,5 +957,6 @@ export function useFilament() {
     pendingKeeps, // C27: [{peerId, name}] — peers asking to be remembered
     acceptKeep, // C27: store the secret + ack; auto-connect from now on
     declineKeep, // C27: refuse; the sender discards its half too
+    getLink: (pid) => linksRef.current.get(pid), // web-shell: the live PeerLink for a peer
   }
 }

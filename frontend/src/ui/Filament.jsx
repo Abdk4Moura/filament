@@ -5,6 +5,8 @@
    omit it for sensible defaults (dark / green / airy). */
 
 import { useState, useRef, useCallback, useEffect } from 'react'
+import { createPortal } from 'react-dom'
+import WebTerminal from './WebTerminal.jsx'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
@@ -114,7 +116,7 @@ function RouteBadge({ route, T }) {
   )
 }
 
-function PeerTile({ peer, onSendFiles, T, D, accent }) {
+function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
   const ready = peer.status === 'ready'
   const [over, setOver] = useState(false)
   const [hov, setHov] = useState(false)
@@ -157,6 +159,21 @@ function PeerTile({ peer, onSendFiles, T, D, accent }) {
           <StatusDot color={sc} glow={ready} />
         </div>
       </div>
+      {/* web-shell: a paired, connected device can offer a terminal. The button
+          only appears for remembered + ready peers; the actual shell is still
+          gated server-side (the CLI must run `up --shell` / grant shell). */}
+      {ready && known && onOpenShell && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
+          title={`open a terminal on ${peer.name}`}
+          style={{
+            position: 'absolute', left: D.tilePad, bottom: D.tilePad, zIndex: 2,
+            display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: 'inherit', fontSize: 10.5,
+            padding: '4px 8px', cursor: 'pointer', letterSpacing: '.02em',
+            border: '1px solid ' + accent + '66', color: accent, background: accent + '14',
+          }}
+        ><span style={{ fontWeight: 700 }}>›_</span> shell</button>
+      )}
       <div>
         <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{peer.name}</div>
         <div style={{ fontSize: 10.5, display: 'flex', justifyContent: 'space-between', color: T.dim }}>
@@ -361,6 +378,8 @@ export default function Filament(props) {
   const rootRef = useRef(null)
   const [narrow, setNarrow] = useState(!!ui.forceMobile)
   const [tab, setTab] = useState('peers')
+  const [shellPeer, setShellPeer] = useState(null) // web-shell: the peer whose terminal is open
+  const shellLink = shellPeer && state.getLink ? state.getLink(shellPeer.id) : null
   useEffect(() => {
     if (ui.forceMobile) {
       setNarrow(true)
@@ -404,7 +423,7 @@ export default function Filament(props) {
   const peerGrid = (gridCols) =>
     hasPeers ? (
       <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: D.gap }}>
-        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} T={T} D={D} accent={accent} />)}
+        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenShell={setShellPeer} T={T} D={D} accent={accent} />)}
       </div>
     ) : (
       emptyPeers
@@ -449,6 +468,28 @@ export default function Filament(props) {
     backgroundSize: '34px 34px',
   }
 
+  // web-shell: the terminal renders as a full-window overlay (portal to body) so
+  // it works in both the desktop and mobile layouts from one place. Disclosure
+  // stays intact — it only exists once a shell button is clicked.
+  const terminalOverlay = shellPeer
+    ? createPortal(
+        <div style={{ position: 'fixed', inset: 0, zIndex: 4000, background: T.bg }}>
+          {shellLink
+            ? <WebTerminal link={shellLink} peerName={shellPeer.name} route={shellPeer.route}
+                T={T} accent={accent} font={font} onClose={() => setShellPeer(null)} />
+            : (
+              <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: T.dim, fontFamily: font }}>
+                <div style={{ textAlign: 'center' }}>
+                  <div>not connected to {shellPeer.name}</div>
+                  <button onClick={() => setShellPeer(null)} style={{ marginTop: 12, padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>close</button>
+                </div>
+              </div>
+            )}
+        </div>,
+        document.body,
+      )
+    : null
+
   // ── Mobile layout ──────────────────────────────────────────────
   if (narrow) {
     const tabBtn = (k, n) => (
@@ -461,6 +502,7 @@ export default function Filament(props) {
     )
     return (
       <div ref={rootRef} style={rootStyle}>
+        {terminalOverlay}
         {/* stacked top bar */}
         <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -510,6 +552,7 @@ export default function Filament(props) {
   // ── Desktop layout ─────────────────────────────────────────────
   return (
     <div ref={rootRef} style={rootStyle}>
+      {terminalOverlay}
       {/* top bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
         borderBottom: '1px solid ' + T.line, background: T.bg }}>
