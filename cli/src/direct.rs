@@ -40,8 +40,15 @@ use crate::net::Transport;
 
 /// Opt-in gate. The ENTIRE direct path is dead unless this is set; default
 /// behaviour (WebRTC) is byte-for-byte unchanged. CHECKPOINT before promoting.
+///
+/// Item 3: `FILAMENT_L2=1` ALSO implies direct. The L2/ssh use-case needs
+/// reliable CLI<->CLI and WebRTC is too flaky cross-machine (it gets "stuck
+/// while connecting" even over TURN), while direct-QUIC to a reachable peer is
+/// rock-solid. A plain `up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
+/// byte-for-byte unchanged — the file-transfer hard rule.
 pub fn direct_enabled() -> bool {
-    std::env::var("FILAMENT_DIRECT").map(|v| v == "1").unwrap_or(false)
+    let on = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
+    on("FILAMENT_DIRECT") || on("FILAMENT_L2")
 }
 
 /// Test-only: force the direct race to fail (simulate a blocked direct path)
