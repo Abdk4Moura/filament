@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filament — feature reels</title>
+<style>
+  :root{color-scheme:dark} *{box-sizing:border-box}
+  body{background:#0d1117;color:#c9d1d9;font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px}
+  h1{font-size:24px;margin:0 0 4px} .sub{color:#8b949e;margin:0 0 20px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(520px,100%),1fr));gap:20px}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;min-width:0}
+  h2{font-size:16px;margin:6px 0} .cap{color:#8b949e;font-size:13px;margin:0 0 10px}
+  video{width:100%;height:auto;border-radius:8px;background:#000;border:1px solid #30363d}
+  .tag{font:11px monospace;color:#7CF6C8;border:1px solid #7CF6C855;padding:2px 7px;border-radius:10px}
+  a{color:#58a6ff} @media(max-width:600px){body{padding:14px}}
+</style></head><body>
+<h1>Filament — feature reels</h1>
+<p class="sub">Recorded here, GPU-transcoded on a Tesla T4 (NVENC, ~19×), delivered over filament. <a href="./">← gallery</a></p>
+<div class="grid">
+  <section class="card"><span class="tag">web-shell</span>
+    <h2>Browser terminal + mobile key bar</h2>
+    <p class="cap">A real shell in the browser over the data channel — accessory keys (Esc/Tab/arrows), sticky Ctrl.</p>
+    <video controls preload="metadata" src="reel1-webshell.mp4"></video></section>
+  <section class="card"><span class="tag">disclosure</span>
+    <h2>Native-pane: per-device shell button</h2>
+    <p class="cap">The terminal stays invisible until a paired device offers it — click ›_ shell to open a scoped tab.</p>
+    <video controls preload="metadata" src="reel2-native.mp4"></video></section>
+</div></body></html>
