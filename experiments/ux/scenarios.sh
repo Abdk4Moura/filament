@@ -50,11 +50,11 @@ sc_01_pair() {
   cap "pair two devices — A mints a code, B claims it (PAKE, no key crosses the server)"
   local DA=$(fresh_cfg s01A) DB=$(fresh_cfg s01B)
   runA "filament pair --name phone"
-  FILAMENT_CONFIG_DIR="$DA" timeout 40 "$FILAMENT" pair --name phone --server "$UX_SERVER" >"$UX_WORK/01a.log" 2>&1 & local PA=$!; track $PA
+  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 40 "$FILAMENT" pair --name phone --server "$UX_SERVER" >"$UX_WORK/01a.log" 2>&1 & local PA=$!; track $PA
   local C; C=$(wait_code "$UX_WORK/01a.log") || { fail "code never minted"; return; }
   a "minted: ${C^^}"; pause
   runB "filament pair $C --name laptop"
-  FILAMENT_CONFIG_DIR="$DB" timeout 40 "$FILAMENT" pair "$C" --name laptop --server "$UX_SERVER" >"$UX_WORK/01b.log" 2>&1
+  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 40 "$FILAMENT" pair "$C" --name laptop --server "$UX_SERVER" >"$UX_WORK/01b.log" 2>&1
   wait $PA
   local CHA CHB
   CHA=$(FILAMENT_CONFIG_DIR="$DA" "$FILAMENT" devices 2>/dev/null | grep -oE 'channel [0-9a-f]+' | head -1)
@@ -98,12 +98,12 @@ sc_03_code_xfer() {
   for try in 1 2 3; do
     rm -rf "$OUT"; mkdir -p "$OUT"; W="ux-$RANDOM-demo"
     runA "filament send report.pdf --word $W"
-    FILAMENT_CONFIG_DIR="$DS" timeout 30 "$FILAMENT" send "$PAY" --word "$W" --name report.pdf --server "$UX_SERVER" >"$UX_WORK/03s.log" 2>&1 & local SP=$!; track $SP
+    FILAMENT_CONFIG_DIR="$DS" timeout -k 5 30 "$FILAMENT" send "$PAY" --word "$W" --name report.pdf --server "$UX_SERVER" >"$UX_WORK/03s.log" 2>&1 & local SP=$!; track $SP
     # wait until the sender has registered the code (it prints "code <word>")
     wait_log "$UX_WORK/03s.log" "code +$W" 12 0.15 || pause 1.5
     a "code is $W — read it to the other device"
     runB "filament recv $W -y"
-    FILAMENT_CONFIG_DIR="$DR" timeout 28 "$FILAMENT" recv "$W" -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/03r.log" 2>&1
+    FILAMENT_CONFIG_DIR="$DR" timeout -k 5 28 "$FILAMENT" recv "$W" -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/03r.log" 2>&1
     wait $SP 2>/dev/null
     RCV=$(ls "$OUT" 2>/dev/null | head -1); h2=$(hashof "$OUT/$RCV" 2>/dev/null || echo none)
     [ "$h2" = "$h1" ] && break
@@ -123,12 +123,12 @@ sc_04_to_known() {
   seed_store "$DB" "[{\"name\":\"phone\",\"secret\":\"$sec\"}]"
   note "phone and laptop already know each other (paired earlier)"
   runB "filament up   (laptop, always-on receiver)"
-  FILAMENT_CONFIG_DIR="$DB" timeout 40 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/04up.log" 2>&1 & local UP=$!; track $UP
+  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 40 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/04up.log" 2>&1 & local UP=$!; track $UP
   # wait for the receiver to print its ready banner instead of a blind sleep
   wait_log "$UX_WORK/04up.log" 'filament up —' 15 0.15 || note "up ready-banner not seen (continuing)"
   pause 0.4   # tiny settle so the receiver has joined its room
   runA "filament send slides.key --to laptop"
-  FILAMENT_CONFIG_DIR="$DA" timeout 30 "$FILAMENT" send "$PAY" --name slides.key --to laptop --server "$UX_SERVER" >"$UX_WORK/04s.log" 2>&1
+  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 30 "$FILAMENT" send "$PAY" --name slides.key --to laptop --server "$UX_SERVER" >"$UX_WORK/04s.log" 2>&1
   local rc=$?; pause 1; kill $UP 2>/dev/null
   b "$(grep -m1 'identity verified' "$UX_WORK/04up.log" | sed 's/\x1b\[[0-9;]*m//g')"
   # `up` writes the file under the SENDER's source basename — it ignores the
@@ -150,11 +150,11 @@ sc_05_up_status_down() {
   seed_store "$DA" "[{\"name\":\"laptop\",\"secret\":\"$sec\"}]"
   seed_store "$DB" "[{\"name\":\"phone\",\"secret\":\"$sec\"}]"
   runB "filament up   (laptop)"
-  FILAMENT_CONFIG_DIR="$DB" timeout 45 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/05up.log" 2>&1 & local UP=$!; track $UP
+  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 45 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/05up.log" 2>&1 & local UP=$!; track $UP
   wait_log "$UX_WORK/05up.log" 'filament up —' 15 0.15 || note "up ready-banner not seen (continuing)"
   pause 0.4
   runA "filament send backup.tar --to laptop"
-  FILAMENT_CONFIG_DIR="$DA" timeout 30 "$FILAMENT" send "$PAY" --name backup.tar --to laptop --server "$UX_SERVER" >"$UX_WORK/05s.log" 2>&1; local rc=$?
+  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 30 "$FILAMENT" send "$PAY" --name backup.tar --to laptop --server "$UX_SERVER" >"$UX_WORK/05s.log" 2>&1; local rc=$?
   pause 1
   runB "filament status"
   local ST; ST=$(FILAMENT_CONFIG_DIR="$DB" "$FILAMENT" status 2>&1 | sed 's/\x1b\[[0-9;]*m//g'); echo "$ST"
@@ -238,15 +238,15 @@ sc_07_introduce() {
   seed_store "$DB" "[{\"name\":\"hub\",\"secret\":\"$secB\"}]"
   note "hub knows alice & bob; alice & bob do NOT yet know each other"
   runA "alice: filament up   (online, waiting)"
-  FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=alice timeout 45 "$FILAMENT" up --dir "$UX_WORK/s07da" --server "$UX_SERVER" </dev/null >"$UX_WORK/07a.log" 2>&1 & local PA=$!; track $PA
+  FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=alice timeout -k 5 45 "$FILAMENT" up --dir "$UX_WORK/s07da" --server "$UX_SERVER" </dev/null >"$UX_WORK/07a.log" 2>&1 & local PA=$!; track $PA
   runB "bob:   filament up   (online, waiting)"
-  FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=bob timeout 45 "$FILAMENT" up --dir "$UX_WORK/s07db" --server "$UX_SERVER" </dev/null >"$UX_WORK/07b.log" 2>&1 & local PB=$!; track $PB
+  FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=bob timeout -k 5 45 "$FILAMENT" up --dir "$UX_WORK/s07db" --server "$UX_SERVER" </dev/null >"$UX_WORK/07b.log" 2>&1 & local PB=$!; track $PB
   # wait for BOTH waiters to be online (ready banners) instead of a fixed 3s
   wait_log "$UX_WORK/07a.log" 'filament up —' 15 0.15 || note "alice up not seen (continuing)"
   wait_log "$UX_WORK/07b.log" 'filament up —' 15 0.15 || note "bob up not seen (continuing)"
   pause 0.5
   runA "hub:   filament introduce alice bob"
-  FILAMENT_CONFIG_DIR="$DS" FILAMENT_NAME=hub timeout 35 "$FILAMENT" introduce alice bob --server "$UX_SERVER" >"$UX_WORK/07i.log" 2>&1; local rc=$?
+  FILAMENT_CONFIG_DIR="$DS" FILAMENT_NAME=hub timeout -k 5 35 "$FILAMENT" introduce alice bob --server "$UX_SERVER" >"$UX_WORK/07i.log" 2>&1; local rc=$?
   sleep 1; kill $PA $PB 2>/dev/null
   echo "$(tail -4 "$UX_WORK/07i.log" | sed 's/\x1b\[[0-9;]*m//g')"
   # success: alice's store now lists bob and bob's store lists alice (new petname),

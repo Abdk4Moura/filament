@@ -58,7 +58,7 @@ if [ "$ID" = "08" ]; then
       -c "bash -c '
         printf \"\n\033[1;36m=== UX: CLI sends a file → the WEB app receives it ===\033[0m\n\"
         printf \"\033[1;33m[CLI]\$\033[0m filament send invoice.pdf\n\"
-        FILAMENT_CONFIG_DIR=$DS timeout 40 $FILAMENT send $UX_WORK/web-$ID.bin --name invoice.pdf --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | grep -vE \"waiting…|spinner\" | head -40
+        FILAMENT_CONFIG_DIR=$DS timeout -k 5 40 $FILAMENT send $UX_WORK/web-$ID.bin --name invoice.pdf --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | grep -vE \"waiting…|spinner\" | head -40
       '" "$CLICAST" >/dev/null 2>&1 & CASTPID=$!
     # wait until the sender has registered (its banner text lands in the cast)
     # before the browser joins the auto-room, instead of a blind 2s.
@@ -90,7 +90,7 @@ elif [ "$ID" = "09" ]; then
   # ---- (1) verify pass: authoritative, no recorder ----
   for attempt in 1 2 3; do
     DR=$(fresh_cfg s09R); OUT=$(fresh_cfg s09out)
-    FILAMENT_REJOIN_SECS=2 FILAMENT_CONFIG_DIR="$DR" timeout 40 "$FILAMENT" recv -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/09-recv.log" 2>&1 & RVPID=$!
+    FILAMENT_REJOIN_SECS=2 FILAMENT_CONFIG_DIR="$DR" timeout -k 5 40 "$FILAMENT" recv -y --dir "$OUT" --server "$UX_SERVER" >"$UX_WORK/09-recv.log" 2>&1 & RVPID=$!
     # wait until the CLI receiver is listening (joined its room) before the browser sends
     wait_log "$UX_WORK/09-recv.log" '● listening' 15 0.15 || sleep 2
     timeout 55 node web/send-to-cli-novideo.js "$UX_SERVER/" "$UX_WORK/web-$ID.bin" "$VID" >"$UX_WORK/09-verify.log" 2>&1
@@ -109,7 +109,7 @@ elif [ "$ID" = "09" ]; then
       -c "bash -c '
         printf \"\n\033[1;36m=== UX: the WEB app sends a file → CLI recv receives it ===\033[0m\n\"
         printf \"\033[1;33m[CLI]\$\033[0m filament recv -y\n\"
-        FILAMENT_REJOIN_SECS=2 FILAMENT_CONFIG_DIR=$DR timeout 30 $FILAMENT recv -y --dir $OUT --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | head -40
+        FILAMENT_REJOIN_SECS=2 FILAMENT_CONFIG_DIR=$DR timeout -k 5 30 $FILAMENT recv -y --dir $OUT --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | head -40
       '" "$CLICAST" >/dev/null 2>&1
   ) & CASTPID=$!
   sleep 3
@@ -128,7 +128,7 @@ elif [ "$ID" = "10" ]; then
       -c "bash -c '
         printf \"\n\033[1;36m=== UX: pair the WEB app with the CLI (PAKE; key never crosses the server) ===\033[0m\n\"
         printf \"\033[1;33m[CLI]\$\033[0m filament pair --name browser\n\"
-        FILAMENT_CONFIG_DIR=$DS timeout 50 $FILAMENT pair --name browser --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | head -40
+        FILAMENT_CONFIG_DIR=$DS timeout -k 5 50 $FILAMENT pair --name browser --server $UX_SERVER 2>&1 | sed -u \"s/\\x1b\\[[0-9;]*m//g\" | head -40
       '" "$CLICAST" >/dev/null 2>&1
   ) & CASTPID=$!
   # poll the cast file for the minted 4-segment code

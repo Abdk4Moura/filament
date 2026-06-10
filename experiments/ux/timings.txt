@@ -1,23 +1,29 @@
-# per-scenario wall-clock (record+render), isolated rigs, all 10 PASS
-# mode: parallel — light scenarios batched at JOBS=2, then the four single-host
-# ICE flows (03 06 08 09) as a SEQUENTIAL SOLO TAIL on a quiet host.
-# (03/06/09 are DECOUPLE scenarios: authoritative no-recorder verify pass + a
-# time-boxed best-effort cast/visual for the GIF.)
-# --- batch (overlapped, ~26s wall) ---
-01  3s
-02  4s
-04  4s
-05  5s
+# per-scenario wall-clock (record+render), isolated rigs, ALL 10 PASS
+# mode: parallel — robust scenarios batched at JOBS=2 (auto nproc/2), then the
+# five live cross-peer handshakes (03 06 08 09 10) as a SEQUENTIAL SOLO TAIL on a
+# quiet host. (03/06/09 are DECOUPLE scenarios: authoritative no-recorder verify
+# pass + a time-boxed best-effort cast/visual for the GIF.)
+# --- batch (overlapped, ~25s wall) ---
+01  5s
+02  5s
+04  5s
+05  7s
 07  6s
-10  17s
-# --- solo tail (sequential, the long pole) ---
+# --- solo tail (sequential, the long pole; varies with per-scenario retries) ---
 03  27s
-06  42s
-08  7s
-09  77s
-TOTAL  179s
-# Old fully-sequential best case was ~167s but flaky under contention. This
-# layout is a reliable, deterministic 10/10. On a 4-core box JOBS auto-caps at
-# nproc/2; backend_start retries on a fresh port if an eventlet boot is starved;
-# every backend carries FIL_UX_RIG=1 and only our own marked procs are reaped, so
-# parallel runs clean up fully between runs (no leftover-sshd starvation).
+06  9s
+08  76s
+09  80s
+10  18s
+TOTAL  226s
+# Wall-clock varies ~180-230s across runs depending on how many solo scenarios
+# need a retry attempt (08's first single-host ICE can wedge and retry; 09 retries
+# its verify pass). Old fully-sequential best case was ~167s but flaky under
+# contention. This layout is a reliable, deterministic 10/10:
+#  - JOBS auto-caps at nproc/2 (oversubscribing wedges single-host WebRTC/ssh/PAKE)
+#  - backend_start retries on a fresh port if an eventlet boot is starved
+#  - per-scenario cleanup kills ONLY its own backend; a suite-wide FIL_UX_RIG=1
+#    marker sweep runs once at the very end (never while siblings are live)
+#  - all filament calls are `timeout -k 5`-boxed so a SIGTERM-ignoring recv linger
+#    gets SIGKILLed and can't hang the suite
+#  - parallel runs clean up fully between runs (no leftover-sshd starvation)

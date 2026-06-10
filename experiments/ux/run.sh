@@ -6,7 +6,7 @@
 #   ./run.sh                 run all 10 scenarios
 #   ./run.sh 01 03 06        run a subset
 #   SEQUENTIAL=1 ./run.sh    run one-at-a-time (debugging; old behaviour)
-#   JOBS=3 ./run.sh          cap concurrency (default 4)
+#   JOBS=3 ./run.sh          cap batch concurrency (default = nproc/2, clamped 2..4)
 #   SPEED=fast ./run.sh      render faster (see README → SPEED knob)
 #
 # PARALLELISM: scenarios run CONCURRENTLY in ISOLATED rigs. Each scenario gets
@@ -14,8 +14,10 @@
 #     8095 — the user's daemon, dev servers, gallery server, or another agent),
 #   - its own throwaway config root  /tmp/ux/<id>,
 #   - its own scratch/log dir        .work/<id>,
-# so concurrent scenarios cannot interfere. A bounded job pool (JOBS, default 4)
-# keeps load sane; wall-clock drops toward the slowest scenario.
+# so concurrent scenarios cannot interfere. A bounded job pool (JOBS) runs the
+# robust scenarios; the five live cross-peer handshakes (SOLO_IDS=03 06 08 09 10)
+# run as a sequential solo tail on a quiet host (their ICE/ssh/PAKE timing is
+# contention-sensitive on a small box). Wall-clock = batch + solo tail.
 #
 # SAFETY: every filament call sets a throwaway FILAMENT_CONFIG_DIR under /tmp/ux;
 # every backend we start carries the marker FIL_UX_RIG=1; teardown kills ONLY our
@@ -40,12 +42,13 @@ _NPROC=$(nproc 2>/dev/null || echo 4); _DEFJOBS=$(( _NPROC / 2 ))
 JOBS="${JOBS:-$_DEFJOBS}"
 SEQUENTIAL="${SEQUENTIAL:-}"
 # SOLO scenarios run ALONE, one at a time, after the parallel batch — each on a
-# quiet host. These are the single-host ICE flows whose transfer/verify is
-# contention-sensitive: 03 (word-code CLI↔CLI), 06 (ssh-over-tunnel), 08
-# (CLI→browser WebRTC), 09 (browser→CLI WebRTC). On a small box their fragile
-# ICE/data-channel timing wedges if other heavy scenarios share the cores, so we
-# don't let them. Everything else (01 02 04 05 07 10) parallelizes freely.
-SOLO_IDS="${SOLO_IDS:-03 06 08 09}"
+# quiet host. These are the live cross-peer handshakes (single-host ICE / PAKE /
+# ssh) whose timing is contention-sensitive: 03 (word-code CLI↔CLI), 06
+# (ssh-over-tunnel), 08 (CLI→browser WebRTC), 09 (browser→CLI WebRTC), 10
+# (CLI↔browser PAKE pairing). On a small box their handshakes wedge if other
+# heavy scenarios share the cores, so we don't let them. The rest
+# (01 02 04 05 07 — local store ops or fast known-peer transfers) parallelize.
+SOLO_IDS="${SOLO_IDS:-03 06 08 09 10}"
 
 echo "================ Filament UX harness ================"
 echo "binary  : $FILAMENT"
@@ -77,6 +80,10 @@ run_one() {
     # bring up this scenario's own backend (carries FIL_UX_RIG=1)
     source "$HERE/rig/lib.sh"
     backend_start >>"$swork/rig.log" 2>&1 || { echo "RESULT $id FAIL backend"; exit 0; }
+    # backend_start may have RETRIED onto a fresh port (if the first boot got
+    # starved); re-export the final port so the child scenario connects to the
+    # backend that's actually up, not the original one.
+    export UX_PORT UX_SERVER
     case " $ALL_CLI " in
       *" $id "*) echo "--- recording cli↔cli $id (port $UX_PORT) ---"
                  bash "$HERE/record.sh" "$id" 100 28 >>"$swork/run.log" 2>&1 || true ;;
@@ -139,6 +146,8 @@ for id in $SEL; do TIMES[$id]=$(cut -d' ' -f2 "$UX_WORK/time-$id.txt" 2>/dev/nul
 echo "===================================================="
 echo "gallery: $HERE/gallery/index.html"
 echo "total wall-clock: ${SUITE_T}s"
-# suite-wide safety net: reap any of OUR marked backends still lingering
-cleanup_all
-echo "rig torn down (own backends + tracked children killed; /tmp/ux preserved for inspection)."
+# suite-wide safety net: now that ALL scenarios have finished, reap any of OUR
+# marked backends that outlived their worker (matches FIL_UX_RIG=1 only). Safe to
+# sweep here because nothing of ours is still running.
+reap_marked_backends
+echo "rig torn down (own marked backends + tracked children killed; /tmp/ux preserved for inspection)."

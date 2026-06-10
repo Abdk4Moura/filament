@@ -31,14 +31,19 @@ own backend on its own **free port** (the runner skips 5000/5077/5180/5181/8061/
 8077/8095 — the user's daemon, the dev servers, the gallery server, and another
 agent's rig), its own throwaway config root `/tmp/ux/<id>`, and its own scratch
 dir `.work/<id>`, so concurrent scenarios cannot interfere. A bounded job pool
-(`JOBS`, default 4) keeps load sane; wall-clock drops toward the slowest
-scenario. Every backend the harness starts carries the marker `FIL_UX_RIG=1`;
-teardown kills **only** tracked children and backends bearing that marker.
+(`JOBS`, auto-capped at `nproc/2`, clamped 2–4) keeps load sane. Every backend
+the harness starts carries the marker `FIL_UX_RIG=1`; a per-scenario teardown
+kills **only that rig's own** backend + tracked children, and a single suite-wide
+marker sweep (matching `FIL_UX_RIG=1`) runs **once at the very end** — never while
+sibling rigs are still live.
 
-Scenario **09** is a **solo tail**: its authoritative no-recorder verify pass of
-single-host browser→CLI WebRTC wedges if *any* other recorder/chromium runs on
-the same host (documented contention below), so it runs **alone after** the
-parallel batch drains, on a quiet host. `SOLO_IDS="09"` controls this set.
+The five **live cross-peer handshakes** — `03` (word-code CLI↔CLI), `06`
+(ssh-over-tunnel), `08` (CLI→browser WebRTC), `09` (browser→CLI WebRTC), `10`
+(CLI↔browser PAKE) — run as a sequential **solo tail** *after* the parallel batch
+drains, each on a quiet host: on a small box their ICE/data-channel/PAKE timing
+wedges if other heavy scenarios share the cores (documented contention below).
+`SOLO_IDS="03 06 08 09 10"` controls this set (shrink it on a bigger box). The
+remaining six (`01 02 04 05 07`) parallelize in the batch.
 
 ### SPEED knob
 
@@ -97,44 +102,49 @@ Open `gallery/index.html` to see every flow with its caption and PASS/FAIL badge
 ## Measured runtimes
 
 Wall-clock per scenario (record + render), isolated local backends, on this
-4-core VM. The suite now runs **parallel** (light scenarios batched at `JOBS=2`,
-then the four single-host ICE flows — 03/06/08/09 — as a sequential **solo tail**
-on a quiet host so their fragile transfers don't wedge under contention). Old
-fully-sequential total was **~167 s**.
+**4-core** VM. The suite runs **parallel**: the six robust scenarios (local store
+ops + fast known-peer transfers) batch at `JOBS=2`; the five live cross-peer
+handshakes — 03/06/08/09/10 (single-host ICE / ssh / PAKE) — then run as a
+sequential **solo tail** on a quiet host so their contention-sensitive timing
+doesn't wedge. Old fully-sequential best case was **~167 s** but flaky.
 
 <!-- TIMINGS:BEGIN -->
-Parallel run (`JOBS=2` batch + sequential solo tail), all 10 PASS, 4-core VM:
+Parallel run (`JOBS=2` batch + sequential solo tail), **all 10 PASS**, 4-core VM:
 
 | # | flow | phase | wall-clock | notes |
 |---|---|---|---|---|
-| 01 | cli↔cli | batch | 3 s | pair |
-| 02 | cli↔cli | batch | 4 s | devices list/rename/forget + regression |
-| 04 | cli↔cli | batch | 4 s | send --to known device |
-| 05 | cli↔cli | batch | 5 s | up / status / down |
+| 01 | cli↔cli | batch | 5 s | pair |
+| 02 | cli↔cli | batch | 5 s | devices list/rename/forget + regression |
+| 04 | cli↔cli | batch | 5 s | send --to known device |
+| 05 | cli↔cli | batch | 7 s | up / status / down |
 | 07 | cli↔cli | batch | 6 s | introduce |
-| 10 | cli↔web | batch | 17 s | pair web ↔ CLI |
-| 03 | cli↔cli | **solo** | 27 s | **decoupled**: verify ~4 s + 22 s best-effort cast box |
-| 06 | cli↔cli | **solo** | 42 s | **decoupled** ssh tunnel: verify + best-effort cast + ssh retries |
-| 08 | cli↔web | **solo** | 7 s | CLI → web (timeout-boxed cast + ≤2 attempts) |
-| 09 | cli↔web | **solo** | 77 s | **decoupled**: no-recorder verify pass + best-effort visual + webm→GIF |
-| | | | **~179 s** | parallel batch (~26 s) + sequential solo tail (03·06·08·09) |
+| 03 | cli↔cli | **solo** | 27 s | **decoupled**: verify + 22 s best-effort cast box |
+| 06 | cli↔cli | **solo** | 9 s | **decoupled** ssh tunnel: verify + best-effort cast |
+| 08 | cli↔web | **solo** | 76 s | CLI → web (timeout-boxed cast + ≤2 attempts; a 1st-attempt ICE wedge adds a retry) |
+| 09 | cli↔web | **solo** | 80 s | **decoupled**: no-recorder verify pass + best-effort visual + webm→GIF |
+| 10 | cli↔web | **solo** | 18 s | pair web ↔ CLI (PAKE) |
+| | | | **~180–230 s** | parallel batch (~25 s) + sequential solo tail; varies with per-scenario retries |
 
-The batch (six light scenarios) overlaps and finishes in ~26 s; the four
-single-host ICE flows (03·06·08·09) then run **one at a time** on a quiet host —
-that solo tail is the long pole. The old fully-sequential best case was ~167 s but
-flaky under contention; this layout trades a little wall-clock for a **reliable,
-deterministic 10/10** (no contention-induced failures, no leftover-process
-starvation between runs). Raise `JOBS` / shrink `SOLO_IDS` on a bigger box.
+The batch overlaps and finishes in ~25 s; the five live-handshake flows then run
+**one at a time** on a quiet host — that solo tail is the long pole and its total
+varies (~150–200 s) with how many scenarios need a retry attempt. This trades a
+little wall-clock for a **reliable, deterministic 10/10**: no contention-induced
+failures, no leftover-process starvation between runs. Raise `JOBS` / shrink
+`SOLO_IDS` on a bigger box to push the wall-clock down.
 
-> **Caveats measured the hard way:**
+> **Caveats measured the hard way (all on this 4-core box):**
 > - Scenario 06 once clocked **549 s** purely from leftover throwaway `sshd`
 >   procs accumulating and starving the single-host handshakes; with self-cleaning
->   sshd + clean-slate isolated rigs it's ~40 s.
-> - On this 4-core box, running >2 heavy scenarios at once (or any two recorder
->   scenarios together) saturates the cores and wedges single-host WebRTC/ssh ICE
->   and even eventlet backend boots — hence `JOBS` auto-caps at `nproc/2` and the
->   ICE flows are a sequential solo tail. `backend_start` also retries on a fresh
->   port if a boot gets starved.
+>   sshd + clean-slate isolated rigs it's ~10 s.
+> - Running >2 heavy scenarios at once (or any two recorder/WebRTC scenarios
+>   together) saturates the cores and wedges single-host WebRTC/ssh/PAKE timing —
+>   *and* can starve an eventlet **backend boot**. Hence: `JOBS` auto-caps at
+>   `nproc/2`; the five live-handshake flows are a sequential solo tail;
+>   `backend_start` retries on a fresh port if a boot is starved; and a
+>   per-scenario `cleanup_all` only kills its **own** backend (a suite-wide marker
+>   sweep runs once, at the very end — never while siblings are live).
+> - All `filament` invocations are `timeout -k 5`-boxed so a `recv`/`send` that
+>   ignores SIGTERM (rejoin-window linger) gets SIGKILLed and can't hang the suite.
 > - The decoupled scenarios' verdicts always come from their no-recorder verify
 >   passes, so a wedged cast never produces a wrong PASS/FAIL.
 <!-- TIMINGS:END -->

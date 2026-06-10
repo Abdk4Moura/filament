@@ -116,19 +116,26 @@ kill_ours() {
   UX_PIDS=()
 }
 
-# Reap any backend WE started (carrying FIL_UX_RIG=1) that outlived its worker
-# shell. Matches ONLY our marker, so the user's daemon, the gallery server on
-# 8095, the leftover 8077 backend, and another agent's FIL_BUGFIX_RIG are spared.
-kill_marked_backends() {
+# SUITE-WIDE safety net: reap any backend WE started (carrying FIL_UX_RIG=1) that
+# outlived its worker shell. Matches ONLY our marker, so the user's daemon, the
+# gallery server on 8095, the leftover 8077 backend, and another agent's
+# FIL_BUGFIX_RIG are spared.
+#
+# DANGER: this kills ALL marked backends, including sibling scenarios' backends
+# that are still in use. It must therefore run ONLY at the very END of the suite
+# (top-level run.sh), NEVER inside a concurrent per-scenario worker — otherwise
+# one finishing scenario would tear down another's live backend.
+reap_marked_backends() {
   for p in $(pgrep -f "app.py" 2>/dev/null); do
     tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -qx "FIL_UX_RIG=1" && kill "$p" 2>/dev/null
   done
 }
 
+# Per-scenario teardown: kill ONLY this rig's own children + its own backend
+# (tracked PIDs). Does NOT touch sibling rigs' marked backends.
 cleanup_all() {
   kill_ours
   backend_stop
-  kill_marked_backends
 }
 
 # A throwaway config dir with a name pre-seeded (helper for direct-store rigs).
