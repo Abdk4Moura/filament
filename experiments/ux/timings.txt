@@ -1,0 +1,19 @@
+# per-scenario wall-clock (record+render), sequential, local backend, clean slate
+# cli↔cli 01–07 (03 and 06 are DECOUPLE scenarios: authoritative no-recorder
+# verify pass + a short time-boxed best-effort cast for the GIF)
+01  2s
+02  3s
+03  27s
+04  5s
+05  7s
+06  15s
+07  6s
+# cli↔web 08–10 (09 is a DECOUPLE scenario: verify pass + best-effort visual)
+08  7s
+09  79s
+10  16s
+TOTAL  167s
+# NOTE: 06 measured 549s in an earlier pass purely from contention by leftover
+# throwaway sshd procs accumulating across runs; with self-cleaning sshd + a
+# clean slate it is 15s. 03/06/09 boxed casts are time-boxed; the verdicts come
+# from their no-recorder verify passes.

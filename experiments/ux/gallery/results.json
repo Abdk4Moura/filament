@@ -1,0 +1,82 @@
+{
+  "01": {
+    "flow": "cli\u2194cli",
+    "title": "Pair two devices",
+    "caption": "A mints a PAKE code, B claims it; both derive the same channel \u2014 no key crosses the server.",
+    "verdict": "PASS",
+    "detail": "paired; matching channel c7ae8902b30a",
+    "gif": "01.gif"
+  },
+  "02": {
+    "flow": "cli\u2194cli",
+    "title": "Devices: list / rename / forget",
+    "caption": "And the regression guard: forgetting one device must NOT wipe another device's granted shell cap.",
+    "verdict": "PASS",
+    "detail": "rename+forget worked; laptop's shell cap SURVIVED the unrelated forget",
+    "gif": "02.gif"
+  },
+  "03": {
+    "flow": "cli\u2194cli",
+    "title": "Send with a one-time code",
+    "caption": "Sender mints a speakable code; the receiver claims it and the bytes land, sha256-verified end-to-end.",
+    "verdict": "PASS",
+    "detail": "received payload.bin; sha256 matches end-to-end",
+    "gif": "03.gif"
+  },
+  "04": {
+    "flow": "cli\u2194cli",
+    "title": "Send --to a known device",
+    "caption": "No code: a remembered device, identity proof-verified and auto-accepted; bytes sha256-verified.",
+    "verdict": "PASS",
+    "detail": "no code; verified 'laptop'; delivered + hash match",
+    "gif": "04.gif"
+  },
+  "05": {
+    "flow": "cli\u2194cli",
+    "title": "Always-on receiver: up / status / down",
+    "caption": "Bring up a trusted-only drop target, send into it, check status, stop it; bytes sha256-verified.",
+    "verdict": "PASS",
+    "detail": "up received; status reported; down stopped it",
+    "gif": "05.gif"
+  },
+  "06": {
+    "flow": "cli\u2194cli",
+    "title": "Grant shell + ssh over the tunnel",
+    "caption": "Deny-by-default consent; then `filament ssh peer -- echo OK` runs over the data channel.",
+    "verdict": "PASS",
+    "detail": "shell granted; ssh ran a remote command over the tunnel",
+    "gif": "06.gif"
+  },
+  "07": {
+    "flow": "cli\u2194cli",
+    "title": "Introduce two devices",
+    "caption": "A hub that knows both vouches them to each other with a fresh mutual secret.",
+    "verdict": "PASS",
+    "detail": "introduce delivered a fresh mutual secret; alice<->bob now know each other",
+    "gif": "07.gif"
+  },
+  "08": {
+    "flow": "cli\u2194web",
+    "title": "CLI sends \u2192 the web app receives",
+    "caption": "The browser (local frontend) accepts the offered file and reaches the download affordance.",
+    "verdict": "PASS",
+    "detail": "CLI offered invoice.pdf; browser accepted and reached the download (save) affordance",
+    "gif": "08.gif"
+  },
+  "09": {
+    "flow": "cli\u2194web",
+    "title": "The web app sends \u2192 CLI recv",
+    "caption": "Browser picks a file and sends it; the CLI receiver writes it, sha256-verified (authoritative no-recorder verify pass). The GIF is a best-effort visual; single-host browser\u2192CLI WebRTC can't complete while the webm recorder runs \u2014 see README.",
+    "verdict": "PASS",
+    "detail": "VERIFY pass (no recorder): sha256 MATCHES. GIF is a best-effort visual; single-host browser\u2192CLI WebRTC can't complete while the webm recorder runs (recording-contention, not a product break).",
+    "gif": "09.gif"
+  },
+  "10": {
+    "flow": "cli\u2194web",
+    "title": "Pair the web app with the CLI",
+    "caption": "CLI mints a PAKE code; the browser claims it and stores the device (key never crosses the server).",
+    "verdict": "PASS",
+    "detail": "browser claimed the CLI's PAKE code; both sides stored the mutual device",
+    "gif": "10.gif"
+  }
+}

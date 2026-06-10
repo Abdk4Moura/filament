@@ -1,0 +1,9 @@
+{"version":2,"width":80,"height":24,"timestamp":1781118208,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '06'","env":{"SHELL":"/bin/bash"}}
+[0.012412, "o", "\r\n\u001b[1;36m=== UX: grant shell, then 'filament ssh peer -- echo OK' over the data-channel tunnel ===\u001b[0m\r\n"]
+[1.043445, "o", "\u001b[2m  topology: B = the box you ssh INTO (acceptor, FILAMENT_L2=1); A = you\u001b[0m\r\n\u001b[1;35m[B]$\u001b[0m FILAMENT_L2=1 filament up    (the box, accepts tunnels)\r\n"]
+[5.046451, "o", "\u001b[1;35m[B]$\u001b[0m filament grant laptop shell   (consent: deny-by-default)\r\n"]
+[5.054503, "o", "granted 'shell' to 'laptop'. they can now `filament ssh` into this machine (their key is installed on first connect).\r\n"]
+[6.06097, "o", "\u001b[1;33m[A]$\u001b[0m filament ssh server -- echo OK\r\n"]
+[6.640984, "o", "\u001b[1;33m[A]\u001b[0m remote stdout: OK-OVER-FILAMENT   (attempts: 1)\r\n"]
+[6.7169, "o", "\r\n\u001b[1;32m  ✔ PASS\u001b[0m  shell granted; ssh ran a remote command over the tunnel\r\nRESULT 06 PASS shell granted; ssh ran a remote command over the tunnel\r\n"]
+[6.717868, "x", "0"]

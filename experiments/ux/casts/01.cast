@@ -1,0 +1,8 @@
+{"version":2,"width":80,"height":24,"timestamp":1781117212,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '01'","env":{"SHELL":"/bin/bash"}}
+[0.043689, "o", "\r\n\u001b[1;36m=== UX: pair two devices — A mints a code, B claims it (PAKE, no key crosses the server) ===\u001b[0m\r\n"]
+[0.075709, "o", "\u001b[1;33m[A]$\u001b[0m filament pair --name phone\r\n"]
+[0.33168, "o", "\u001b[1;33m[A]\u001b[0m minted: DEWY-RAVEN-EMERALD-3749\r\n"]
+[0.936761, "o", "\u001b[1;35m[B]$\u001b[0m filament pair dewy-raven-emerald-3749 --name laptop\r\n"]
+[1.473656, "o", "\u001b[1;33m[A]\u001b[0m phone  (channel c7ae8902b30a)\r\n"]
+[1.484808, "o", "\u001b[1;35m[B]\u001b[0m laptop  (channel c7ae8902b30a)\r\n\u001b[2m  both stores derived the SAME channel id from one mutual secret\u001b[0m\r\n\r\n\u001b[1;32m  ✔ PASS\u001b[0m  paired; matching channel c7ae8902b30a\r\nRESULT 01 PASS paired; matching channel c7ae8902b30a\r\n"]
+[1.484941, "x", "0"]

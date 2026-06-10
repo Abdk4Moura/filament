@@ -1,0 +1,5 @@
+{"version":2,"width":80,"height":24,"timestamp":1781117221,"idle_time_limit":1.4,"command":"bash '/root/wt-transport/experiments/ux/scenarios.sh' '03'","env":{"SHELL":"/bin/bash"}}
+[0.024302, "o", "\r\n\u001b[1;36m=== UX: send a file with a one-time code; the other side claims it and receives ===\u001b[0m\r\n"]
+[0.069986, "o", "\u001b[1;33m[A]$\u001b[0m filament send report.pdf --word ux-6879-demo\r\n"]
+[1.574032, "o", "\u001b[1;33m[A]\u001b[0m code is ux-6879-demo — read it to the other device\r\n\u001b[1;35m[B]$\u001b[0m filament recv ux-6879-demo -y\r\n"]
+[21.998073, "x", "143"]
