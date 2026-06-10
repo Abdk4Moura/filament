@@ -25,7 +25,7 @@ use crate::net::{self, Ev, Peer, Transport};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -428,6 +428,14 @@ async fn bring_up_to_known(
     let mut peer: Option<Arc<Peer>> = None;
     let mut peer_uid: Option<String> = None;
     let mut generation: u32 = 0;
+    // Ghost tolerance: the channel can hold DEAD sids (a SIGKILL'd process
+    // lingers until the server's ping-timeout) and WRONG peers (our own up
+    // subscribes the same pair channel). Locking onto the first known-peer
+    // forever was the dominant stall. Instead: one candidate AT A TIME (a
+    // parallel race glares — proven, see multicandidate-attempt.patch), a
+    // short per-candidate timer, and rotation through everything seen.
+    let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
+    const CANDIDATE_SECS: u64 = 7;
     // Item 3: the L2 initiator races a DIRECT-QUIC dial against WebRTC. On
     // KnownPeer we bind a quinn endpoint + advertise our candidates (mirrors
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
@@ -437,13 +445,71 @@ async fn bring_up_to_known(
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
+    // Candidates gathered once at first bind; re-advertised to each new
+    // candidate peer we rotate to (the endpoint accepts from any of them —
+    // the QUIC race is pair-secret-authenticated either way).
+    let mut direct_cands: Option<Vec<String>> = None;
     // The acceptor re-sends its transport-offer (a late initiator can miss the
     // first). Race only the FIRST offer we get; later re-sends are duplicates.
     let mut direct_racing = false;
 
+    let spawn_timer = |pid: String, g: u32| {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(CANDIDATE_SECS)).await;
+            let _ = tx.send(Ev::Stuck(pid, g));
+        });
+    };
+
     eprintln!("filament: waiting for known device '{peer_name}'...");
 
-    while let Some(ev) = rx.recv().await {
+    loop {
+        // One candidate at a time: start the next attempt whenever idle.
+        if peer.is_none() {
+            if let Some((pid, uid)) = queue.pop_front() {
+                let mine = my_id.clone().unwrap_or_default();
+                let polite = net::polite_role(&my_uid, uid.as_deref(), &mine, &pid);
+                generation += 1;
+                spawn_timer(pid.clone(), generation);
+                let p = Peer::connect(
+                    pid.clone(), polite, cfg.ice_servers.clone(), relay,
+                    sio.clone(), tx.clone(), generation,
+                )
+                .await?;
+                peer_uid = uid;
+                peer = Some(p);
+
+                // Item 3: also start a DIRECT-QUIC attempt racing the WebRTC
+                // dial. Bind once, advertise to whichever candidate is current
+                // (mirrors `start_direct`); the peer's own offer drives the
+                // race (handled in Ev::Signal below).
+                if !direct_racing {
+                    if endpoint.is_none() {
+                        match crate::direct::bind_endpoint() {
+                            Ok((ep, port)) => {
+                                direct_cands =
+                                    Some(crate::direct::gather_candidates(server, port).await);
+                                endpoint = Some(ep);
+                                eprintln!(
+                                    "filament: DIRECT-OFFER sent to '{peer_name}' — port {port}"
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("filament: direct disabled (endpoint bind failed: {e}) — WebRTC only");
+                            }
+                        }
+                    }
+                    if endpoint.is_some() {
+                        if let Some(c) = &direct_cands {
+                            let offer =
+                                json!({ "type": "transport-offer", "v": 1, "addrs": c });
+                            sio.emit("signal", json!({ "to": pid, "data": offer })).await.ok();
+                        }
+                    }
+                }
+            }
+        }
+        let Some(ev) = rx.recv().await else { break };
         match ev {
             Ev::Welcome(v) => {
                 my_id = v["id"].as_str().map(|s| s.to_string());
@@ -458,46 +524,20 @@ async fn bring_up_to_known(
                 if v["channel"].as_str() != Some(channel.as_str()) {
                     continue;
                 }
-                if peer.is_some() {
-                    continue;
-                }
                 let pid = match v["id"].as_str() {
                     Some(p) => p.to_string(),
                     None => continue,
                 };
-                peer_uid = v["uid"].as_str().map(|s| s.to_string());
-                let mine = my_id.clone().unwrap_or_default();
-                let polite = net::polite_role(&my_uid, peer_uid.as_deref(), &mine, &pid);
-                let pid_for_offer = pid.clone();
-                generation += 1;
-                let p = Peer::connect(
-                    pid, polite, cfg.ice_servers.clone(), relay,
-                    sio.clone(), tx.clone(), generation,
-                )
-                .await?;
-                peer = Some(p);
-
-                // Item 3: also start a DIRECT-QUIC attempt racing the WebRTC dial
-                // above. Bind our endpoint, gather candidates, and advertise them
-                // via a relayed `transport-offer` (mirrors `start_direct`). The
-                // peer's own offer drives the race (handled in Ev::Signal below).
-                // Keep the endpoint in scope; it's consumed when the race starts.
-                if endpoint.is_none() {
-                    match crate::direct::bind_endpoint() {
-                        Ok((ep, port)) => {
-                            let cands = crate::direct::gather_candidates(server, port).await;
-                            let offer = json!({ "type": "transport-offer", "v": 1, "addrs": cands });
-                            sio.emit("signal", json!({ "to": pid_for_offer, "data": offer }))
-                                .await
-                                .ok();
-                            eprintln!("filament: DIRECT-OFFER sent to '{peer_name}' — port {port}");
-                            endpoint = Some(ep);
-                        }
-                        Err(e) => {
-                            eprintln!("filament: direct disabled (endpoint bind failed: {e}) — WebRTC only");
-                        }
-                    }
+                if Some(pid.as_str()) == my_id.as_deref() {
+                    continue;
                 }
+                // Queue every distinct sid; the loop top rotates through them.
+                if peer.as_ref().is_some_and(|p| p.id == pid)
+                    || queue.iter().any(|(q, _)| *q == pid)
+                {
+                    continue;
+                }
+                queue.push_back((pid, v["uid"].as_str().map(|s| s.to_string())));
             }
             Ev::Signal(v) => {
                 let data = v["data"].clone();
@@ -547,10 +587,36 @@ async fn bring_up_to_known(
                     }
                     continue;
                 }
-                if let Some(p) = &peer {
-                    if let Err(e) = p.handle_signal(data).await {
-                        eprintln!("filament: signal: {e}");
+                // Route by sender: the channel is multi-party (our own up
+                // subscribes it too, plus lingering dead sids) — a stray offer
+                // applied to the current pc was a reliable glare generator.
+                let from = v["from"].as_str().unwrap_or_default();
+                let Some(p) = &peer else { continue };
+                if p.id != from {
+                    continue;
+                }
+                match p.handle_signal(data).await {
+                    Ok(net::SignalOutcome::Handled) => {}
+                    Ok(net::SignalOutcome::Glare(offer)) => {
+                        // Both sides offered (role confusion). Yield: rebuild
+                        // this attempt as a pure responder answering theirs.
+                        let old = peer.take().unwrap();
+                        let pid = old.id.clone();
+                        old.mark_closed();
+                        tokio::spawn(async move { old.close().await });
+                        generation += 1;
+                        spawn_timer(pid.clone(), generation);
+                        let p = Peer::connect(
+                            pid, true, cfg.ice_servers.clone(), relay,
+                            sio.clone(), tx.clone(), generation,
+                        )
+                        .await?;
+                        if let Err(e) = p.handle_signal(offer).await {
+                            eprintln!("filament: signal: {e}");
+                        }
+                        peer = Some(p);
                     }
+                    Err(e) => eprintln!("filament: signal: {e}"),
                 }
             }
             Ev::DirectReady(_pid, t, route) => {
@@ -569,7 +635,20 @@ async fn bring_up_to_known(
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
                 return Ok((t, rx, guard));
             }
-            Ev::ChannelReady(_pid, t) => {
+            Ev::Stuck(pid, g) => {
+                // Per-candidate timer (or the 15s watchdog) fired for the
+                // CURRENT attempt: drop it and rotate. The sid goes to the
+                // back of the queue — a slow-but-real peer gets retried, a
+                // ghost just cycles until the server evicts it.
+                if g == generation && peer.as_ref().is_some_and(|p| p.id == pid) {
+                    let p = peer.take().unwrap();
+                    p.mark_closed();
+                    tokio::spawn(async move { p.close().await });
+                    eprintln!("filament: candidate unresponsive — rotating");
+                    queue.push_back((pid, peer_uid.take()));
+                }
+            }
+            Ev::ChannelReady(pid, t) if peer.as_ref().is_some_and(|p| p.id == pid) => {
                 // Prove identity so the peer's up/recv marks this link trusted —
                 // the acceptor's capability gate keys on exactly that.
                 if let Some(p) = &peer {
@@ -588,8 +667,16 @@ async fn bring_up_to_known(
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
                 return Ok((t, rx, guard));
             }
-            Ev::PcState(_, s) if s == "failed" || s == "closed" => {
-                return Err(anyhow!("connection {s} before the tunnel came up"));
+            Ev::PcState(pid, s) if s == "failed" || s == "closed" => {
+                // Was fatal; now just rotate — the overall command timeout
+                // (or the user) bounds how long we keep trying.
+                if peer.as_ref().is_some_and(|p| p.id == pid) {
+                    let p = peer.take().unwrap();
+                    p.mark_closed();
+                    tokio::spawn(async move { p.close().await });
+                    eprintln!("filament: connection {s} — rotating");
+                    queue.push_back((pid, peer_uid.take()));
+                }
             }
             _ => {}
         }
