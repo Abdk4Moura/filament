@@ -98,11 +98,15 @@ stable shell to run the executor + read its sentinel-framed output, so it blocks
    **Fix** (commit `e6b97da`): replace the `pkill -f` cleanup with pid-file-based kills
    (`kill $(cat ctl.pid)`), which can never match the script's own argv. Run-as-file
    also sidesteps it.
-2. **Stale release binary.** The published `cli-v0.2.1-beta.4` musl asset is commit
-   `35221d5` — it predates `up --shell`, so it can't serve the control channel.
-   **Workaround:** published the fresh static-musl build (`f252ba1`, has `--shell` +
-   `--dir`) as asset `filament-x86_64-unknown-linux-musl-shell` on the same release.
-   *Proper fix (TODO): cut a real beta.5 via the CI release workflow.*
+2. **Stale release binary.** The published `cli-v0.2.1-beta.4` musl asset was commit
+   `35221d5` — it predated `up --shell`, so it couldn't serve the control channel.
+   **Stop-gap (now superseded):** a one-off static-musl build was published as asset
+   `filament-x86_64-unknown-linux-musl-shell` on the beta.4 release.
+   **Fixed:** cut `cli-v0.2.1-beta.5` (commit `4d7406f`) via the CI release workflow.
+   Its standard `filament-x86_64-unknown-linux-musl.tar.gz` asset is static-pie and has
+   `--shell` + `--dir`. The one-off `…-musl-shell` asset is now retired; repoint the T4
+   bring-up's `FILAMENT_URL` to the beta.5 standard musl asset:
+   `https://github.com/Abdk4Moura/filament/releases/download/cli-v0.2.1-beta.5/filament-x86_64-unknown-linux-musl.tar.gz`
 
 ---
 
@@ -149,7 +153,8 @@ dry run of exactly what the watcher will automate.
 - [ ] Confirm the box actually exposes **2× T4** to `nvidia-smi -L` (bring-up logged a
       single "Tesla T4"); then add per-GPU dispatch (`-hwaccel_device 0/1`) for parallel
       jobs across both cards.
-- [ ] Cut a proper `beta.5` release so the public musl binary has `--shell` (retire the
-      one-off `…-musl-shell` asset).
+- [x] Cut a proper `beta.5` release so the public musl binary has `--shell` (done:
+      `cli-v0.2.1-beta.5`, commit `4d7406f`; the one-off `…-musl-shell` asset is now
+      superseded and can be retired).
 - [ ] Add R2 durability (`rclone` is a no-op until creds are set) so artifacts survive
       the box dying even if the last-mile pull is mid-retry.
