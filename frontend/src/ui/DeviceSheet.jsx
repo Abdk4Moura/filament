@@ -22,9 +22,16 @@ import { createPortal } from 'react-dom'
 function routeMeta(route, T) {
   if (route === 'local') return { label: 'LAN', color: T.ok }
   if (route === 'direct') return { label: 'P2P', color: T.recv }
-  if (route === 'relayed') return { label: 'RELAY', color: T.warn }
+  // relayed is the only route with a middleman on the wire — loud amber ⚠ + the
+  // honest explainer (still E2E-encrypted). Wording mirrors Filament.jsx §3.5.
+  if (route === 'relayed') return { label: '⚠ RELAY', color: T.warn, relay: true }
   return null
 }
+
+// The honest one-line relay explainer, shown in the sheet's Info section so the
+// no-middleman caveat is legible on demand, not just a hover tooltip.
+const RELAY_EXPLAINER =
+  'Routed through a TURN server, not a direct link. Still end-to-end encrypted; the relay forwards bytes it can’t read.'
 
 const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away — be right back' }
 
@@ -131,6 +138,18 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
     <div style={{ padding: '10px 13px', borderTop: '1px solid ' + T.lineSoft, display: 'flex', flexDirection: 'column', gap: 5 }}>
       <div style={{ fontSize: 9, letterSpacing: '.14em', color: T.faint, marginBottom: 3 }}>INFO</div>
       {rm && <InfoLine label="route" value={rm.label} color={rm.color} T={T} />}
+      {/* Relay honesty: the route line alone is terse — when relayed, spell out
+          the no-middleman caveat in plain language right under it (still E2E). */}
+      {rm && rm.relay && (
+        <div data-testid="sheet-relay-explainer" style={{
+          fontSize: 10.5, lineHeight: 1.5, color: T.warn,
+          border: '1px solid ' + T.warn,
+          background: T.mode === 'light' ? 'rgba(154,107,0,.08)' : 'rgba(255,200,87,.10)',
+          padding: '7px 9px', marginTop: 2, marginBottom: 2,
+        }}>
+          {RELAY_EXPLAINER}
+        </div>
+      )}
       <InfoLine label="status" value={PEER_STATUS_LABEL[peer.status] || peer.status} color={sc} T={T} />
       <InfoLine label="shell" value={peer.shell ? 'capable' : 'no'} color={peer.shell ? accent : T.sub} T={T} />
       {known && <InfoLine label="paired" value="remembered" color={accent} T={T} />}

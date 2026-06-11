@@ -15,6 +15,9 @@ backend/dist/
 
 # Test build artifacts
 frontend/tests/.pakekeep-bundle.js
+frontend/tests/.relay-honesty-bundle.js
+frontend/tests/.relay-honesty-bundle.css
+frontend/tests/.relay-shots/
 
 # Build / coverage
 build

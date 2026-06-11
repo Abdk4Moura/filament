@@ -10,6 +10,15 @@ import WebTerminal from './WebTerminal.jsx'
 import DeviceSheet from './DeviceSheet.jsx'
 import CommandPalette from './CommandPalette.jsx'
 
+// Relay honesty (transport-resilience P1, §3.5). Relay (TURN) is still
+// end-to-end encrypted but is NOT a direct link — the "no middleman on the wire"
+// property is gone, so it must be LOUD and HONEST wherever it appears. The exact
+// words are chosen to neither over-claim ("insecure/exposed" — false, it's
+// encrypted) nor under-claim ("direct/private" — false, there IS a middleman on
+// the wire). Single source of truth so the tile, sheet and top bar all agree.
+const RELAY_EXPLAINER =
+  'On relay — routed through a TURN server, not a direct link. Still end-to-end encrypted; the relay forwards bytes it can’t read.'
+
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
   if (n == null) return '—'
@@ -96,9 +105,11 @@ function StatusDot({ color, glow }) {
 }
 
 function routeMeta(route, T) {
-  if (route === 'local') return { label: 'LAN', color: T.ok, tip: 'files go straight across your WiFi' }
-  if (route === 'direct') return { label: 'P2P', color: T.recv, tip: 'peer-to-peer over the internet' }
-  if (route === 'relayed') return { label: 'RELAY', color: T.warn, tip: 'via a relay' }
+  if (route === 'local') return { label: 'LAN', color: T.ok, tip: 'Direct link — bytes go straight between you, no middleman.' }
+  if (route === 'direct') return { label: 'P2P', color: T.recv, tip: 'Direct link — bytes go straight between you, no middleman.' }
+  // relayed is the ONLY route with a middleman on the wire — it gets the loud
+  // amber ⚠ treatment + the honest explainer (it is still E2E-encrypted).
+  if (route === 'relayed') return { label: 'RELAY', color: T.warn, relay: true, tip: RELAY_EXPLAINER }
   return null
 }
 
@@ -106,6 +117,20 @@ function RouteBadge({ route, T }) {
   const m = routeMeta(route, T)
   if (!m) return null
   const premium = route === 'local'
+  // Relay: LOUD. Amber ⚠ chip, amber border + amber tint, NOT calm. The honest
+  // explainer rides in the title (hover/tap) and is repeated in the device sheet.
+  if (m.relay) {
+    return (
+      <span data-testid="route-relay" title={m.tip} style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 9.5, letterSpacing: '.08em',
+        padding: '2px 6px', border: '1px solid ' + T.warn,
+        background: T.mode === 'light' ? 'rgba(154,107,0,.12)' : 'rgba(255,200,87,.14)',
+        color: T.warn, cursor: 'help', whiteSpace: 'nowrap',
+      }}>
+        <span aria-hidden="true">⚠</span>{m.label}
+      </span>
+    )
+  }
   return (
     <span title={m.tip} style={{
       display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 9.5, letterSpacing: '.08em',
@@ -167,6 +192,8 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
   return (
     <div
       ref={tileRef}
+      data-testid="peer-tile"
+      data-route={peer.route || ''}
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
       onClick={onTileClick}
       onDoubleClick={() => { if (!narrow && ready && inp.current) inp.current.click() }}
@@ -194,8 +221,13 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
             clipping the discoverability-critical SHELL chip. marginLeft:auto
             keeps the dot + ⋯ flush-right when there's spare width. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flexShrink: 1 }}>
+          {/* Relay honesty: when a peer is on relay its ⚠ chip is the SINGLE
+              most important top-row marker — silent relay breaks the no-middleman
+              promise — so it renders FIRST and never flex-shrinks. On a narrow
+              tile REMEMBERED/SHELL clip before the safety-critical relay chip. */}
+          {peer.route === 'relayed' && <RouteBadge route="relayed" T={T} />}
           {known && (
-            <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 0 }}>
+            <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 1, minWidth: 0, overflow: 'hidden' }}>
               REMEMBERED
             </span>
           )}
@@ -204,11 +236,10 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
               SHELL
             </span>
           )}
-          {/* Route badge is the lowest-priority top-row marker (it's also in the
-              device sheet). Drop it only when BOTH identity chips are present, so
-              a narrow tile keeps REMEMBERED + SHELL fully visible instead of
-              clipping the discoverability-critical SHELL chip. */}
-          {peer.route && !(known && isMachine) && <RouteBadge route={peer.route} T={T} />}
+          {/* Non-relay route badge is the lowest-priority top-row marker (also in
+              the device sheet), dropped when BOTH identity chips are present so a
+              narrow tile keeps REMEMBERED + SHELL visible. */}
+          {peer.route && peer.route !== 'relayed' && !(known && isMachine) && <RouteBadge route={peer.route} T={T} />}
         </div>
         {/* status dot stays OUTSIDE the badge group so it's always visible;
             marginLeft:auto floats it to the right edge. The model-H top-right ⋯
@@ -219,8 +250,13 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
       <div>
         <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
         <div style={{ fontSize: 10.5, display: 'flex', justifyContent: 'space-between', color: T.dim }}>
-          <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status]}</span>
-          <span>{peer.lastSeen}</span>
+          {/* Relay honesty: the status line ALSO says "· via relay" in amber, so
+              the warning survives even if the top-row ⚠ chip is scrolled past. */}
+          <span style={{ color: sc, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {PEER_STATUS_LABEL[peer.status]}
+            {peer.route === 'relayed' && <span style={{ color: T.warn }}> · via relay</span>}
+          </span>
+          <span style={{ flexShrink: 0 }}>{peer.lastSeen}</span>
         </div>
         {/* Hint line OR (desktop hover) the inline action bar — a SWAP, never a
             stack: exactly one of the two renders in this slot, so the bar
@@ -316,6 +352,32 @@ function TransferRow({ t, onAccept, onDecline, onSave, onClear, T, D, accent }) 
 
 function Pill({ children, T }) {
   return <span style={{ fontSize: 10.5, color: T.dim, border: '1px solid ' + T.line, padding: '2px 7px', whiteSpace: 'nowrap' }}>{children}</span>
+}
+
+// Global relay-honesty indicator (transport-resilience P1, §3.3). Appears ONLY
+// when ≥1 connected peer is on relay, so the user is never unaware even if the
+// relayed tile is scrolled off. Hidden entirely when everything is direct.
+// Loud amber ⚠, on-theme (reuses T.warn), with the same honest explainer.
+function RelayBanner({ peers, T }) {
+  const relayed = (peers || []).filter((p) => p.route === 'relayed')
+  const n = relayed.length
+  if (n === 0) return null
+  const names = relayed.map((p) => p.known || p.verified || p.name).join(', ')
+  return (
+    <span
+      data-testid="relay-banner"
+      title={RELAY_EXPLAINER + (names ? '\n\nOn relay: ' + names : '')}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11, letterSpacing: '.02em',
+        padding: '4px 9px', border: '1px solid ' + T.warn, color: T.warn,
+        background: T.mode === 'light' ? 'rgba(154,107,0,.10)' : 'rgba(255,200,87,.12)',
+        cursor: 'help', whiteSpace: 'nowrap',
+      }}
+    >
+      <span aria-hidden="true">⚠</span>
+      <span>{n} on relay</span>
+    </span>
+  )
 }
 
 function LanChip({ localHelper, T }) {
@@ -935,6 +997,7 @@ export default function Filament(props) {
             </span>
             <Pill T={T}>{state.roomId}</Pill>
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <RelayBanner peers={state.peers} T={T} />
               {paletteBtn}
               <StatusDot color={state.connected ? T.ok : T.bad} glow={state.connected} />
               {themeBtn}
@@ -991,6 +1054,7 @@ export default function Filament(props) {
         <span style={{ fontSize: 11, color: state.connected ? T.ok : T.bad, display: 'flex', alignItems: 'center', gap: 6 }}>
           <StatusDot color={state.connected ? T.ok : T.bad} glow={state.connected} />{state.connected ? 'online' : 'offline'}
         </span>
+        <RelayBanner peers={state.peers} T={T} />
 
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
           {state.me && (
