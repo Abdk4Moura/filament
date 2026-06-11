@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
-# Keep a long-lived `filament up` acceptor ALIVE across signaling drops.
+# DEPRECATED — superseded by core reconnect in filament v0.2.1-beta.5 (P2/GAP-2).
+# Kept for belt-and-suspenders only; bringup_t4.sh no longer wraps the acceptor.
 #
-# WHY: the filament socket.io client is built with reconnect(false) (cli/src/net.rs),
-# and `up`/`up --dir` runs ONE signaling connection with no outer reconnect loop. On
-# a flaky WAN link, when the signaling TCP is severed the acceptor's socket dies and
-# it never re-announces — it becomes a zombie that the sender can no longer discover
-# (reproduced deterministically by runner/sim/flaky_sim_test.sh). Short discrete
-# `filament send`s recover (each reconnects fresh), but a long-lived acceptor does not.
+# As of P2 (docs/design/transport-resilience.md §2.5), the long-lived `up`/`up --dir`
+# acceptor SELF-RECOVERS natively after a signaling drop: an in-core outer reconnect
+# loop (cli/src/main.rs) re-dials signaling, re-joins its room(s), re-subscribes to
+# its known-device channels, and re-announces presence within a bounded time — so a
+# fresh sender rediscovers it WITHOUT this external restarter. Proven by
+# runner/sim/signaling_drop_test.sh (in-core re-announce + rediscovery; the baseline
+# with the loop reverted ZOMBIES). Use this script only if you must run an OLDER
+# binary that predates the core fix.
 #
-# This supervisor makes the acceptor self-healing WITHOUT a core CLI change: it runs
+# WHY IT EXISTED: the filament socket.io client is built with reconnect(false)
+# (cli/src/net.rs), and `up`/`up --dir` USED TO run ONE signaling connection with no
+# outer reconnect loop. On a flaky WAN link, when the signaling TCP was severed the
+# acceptor's socket died and it never re-announced — a zombie the sender could no
+# longer discover (reproduced deterministically by runner/sim/flaky_sim_test.sh).
+# Short discrete `filament send`s recovered (each reconnects fresh); a long-lived
+# acceptor did not. P2 fixes that IN-CORE, retiring this crutch.
+#
+# This supervisor made the acceptor self-healing WITHOUT a core CLI change: it runs
 # the acceptor and PROACTIVELY RESTARTS it on a cadence (and immediately if it exits),
 # so a fresh acceptor — which re-announces and is rediscoverable — is always present
 # within `--cadence` seconds. Restarting `up --dir` is safe/idempotent: it just

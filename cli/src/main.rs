@@ -4053,7 +4053,11 @@ async fn recv_cmd(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let my_uid = mk_uid("r");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
-    let sio = net::connect_signaling(server, tx.clone()).await?;
+    // P2 (GAP-2): `mut` so the long-lived acceptor's outer reconnect loop can
+    // swap in a freshly-dialed signaling client after a drop (see below). The
+    // short-lived `recv`/`send` paths never reconnect — they re-invoke fresh —
+    // so this is only exercised by the daemon (`up`/`up --dir`).
+    let mut sio = net::connect_signaling(server, tx.clone()).await?;
 
     let mut paired = code.is_some();
     // C24: at most one typed claim in flight — a second typed code while one
@@ -4270,6 +4274,32 @@ async fn recv_cmd(
         devices.iter().map(|(_, s)| channel_of(s)).collect();
     let mut last_devices_scan = Instant::now();
 
+    // P2 (GAP-2): outer reconnect / re-announce loop state for the long-lived
+    // acceptor. `reconnect(false)` means a severed signaling TCP leaves the
+    // socket dead with NO further events — the acceptor zombies and the sender
+    // can't rediscover it (the documented `no peer connected` failure that
+    // up_supervisor.sh patched from outside the binary). We close it IN-CORE:
+    //  - `last_signaling`  : monotonic time of the last inbound signaling event;
+    //                        any inbound Ev that originates from the socket bumps
+    //                        it (welcome/synced/peer-*/signal/known-peer/...).
+    //  - silence watchdog  : if it goes silent past `signaling_silence_ms` (and
+    //                        a forced `sync` emit doesn't restore it), the link
+    //                        is dead — re-dial. This is the AUTHORITATIVE trigger
+    //                        because a hard TCP sever fires no close callback.
+    //  - Ev::SignalingDown : the socket.io close/error fast-path accelerant.
+    // Only the daemon acceptor self-heals (`signaling_self_heal`); the one-shot
+    // recv/send paths re-invoke fresh, so they keep failing fast (unchanged).
+    // FILAMENT_TEST_NO_SIGNALING_RECONNECT reverts to the OLD no-outer-loop path
+    // so the signaling-drop gate's A/B baseline can prove the acceptor ZOMBIES
+    // without the fix (the detector/loop is load-bearing, not incidental).
+    let signaling_self_heal =
+        daemon && std::env::var("FILAMENT_TEST_NO_SIGNALING_RECONNECT").is_err();
+    let mut last_signaling = Instant::now();
+    let mut signaling_down_since: Option<Instant> = None;
+    let mut reconnect_attempt: u32 = 0;
+    let mut last_reconnect_try = Instant::now();
+    let mut probed_silence = false; // fired one forced sync before declaring down
+
     loop {
         let ev = match tokio::time::timeout(
             Duration::from_secs(2),
@@ -4283,6 +4313,113 @@ async fn recv_cmd(
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
         sess.tick(&sio).await;
+
+        // P2 (GAP-2): the OUTER RECONNECT / RE-ANNOUNCE loop for the long-lived
+        // acceptor. Runs only in the daemon path; the one-shot recv/send paths
+        // re-invoke fresh on failure and so never need it.
+        if signaling_self_heal {
+            // (1) Liveness accounting. Any inbound signaling event proves the
+            // socket is alive; a successful `sync` ack (Ev::Synced) is the
+            // strongest signal (the server answered). The fast-path close/error
+            // callback marks the link down immediately.
+            let mut saw_down = false;
+            match &ev {
+                Some(Ev::SignalingDown(_)) => saw_down = true,
+                Some(
+                    Ev::Welcome(_) | Ev::Synced(_) | Ev::PeerJoined(_) | Ev::PeerLeft(_)
+                    | Ev::Signal(_) | Ev::KnownPeer(_) | Ev::KnownPeerLeft(_) | Ev::PairMatched(_)
+                    | Ev::PairOk(_) | Ev::PairCode(_) | Ev::PairUsed(_) | Ev::PairError(_),
+                ) => {
+                    last_signaling = Instant::now();
+                    signaling_down_since = None;
+                    probed_silence = false;
+                    reconnect_attempt = 0;
+                }
+                _ => {}
+            }
+
+            // (2) Silence watchdog — the AUTHORITATIVE trigger. A hard TCP sever
+            // fires no close callback, so we watch the inbound gap. Once it
+            // exceeds the threshold, fire ONE forced `sync` (the heartbeat); if
+            // the socket is alive the server's `synced` ack lands within a tick
+            // and resets the gap. If a second threshold passes with still no
+            // event, the socket is dead — declare it down.
+            let silence = net::signaling_silence_ms();
+            let silent_ms = last_signaling.elapsed().as_millis() as u64;
+            if signaling_down_since.is_none() {
+                if saw_down {
+                    signaling_down_since = Some(Instant::now());
+                    last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
+                    eprintln!("{}", ui::paint(ui::Tone::Warn, "  signaling link closed — reconnecting"));
+                } else if silent_ms >= silence {
+                    if !probed_silence {
+                        // Heartbeat probe: force a sync NOW (bypassing the C30
+                        // cadence). A live socket answers; a dead one won't.
+                        probed_silence = true;
+                        sess.touch();
+                        sess.tick(&sio).await;
+                    } else if silent_ms >= silence.saturating_mul(2) {
+                        signaling_down_since = Some(Instant::now());
+                        last_reconnect_try = Instant::now() - Duration::from_secs(60);
+                        eprintln!(
+                            "{}",
+                            ui::paint(ui::Tone::Warn, &format!("  signaling silent for {silent_ms}ms — reconnecting"))
+                        );
+                    }
+                }
+            }
+
+            // (3) Re-dial with backoff + jitter. Idempotent: a fresh `welcome`
+            // re-asserts room + channel subscriptions through the C30 session
+            // (sess.invalidate forces it next tick). Live DATA links are NOT torn
+            // down — they ride independent WebRTC/QUIC transports and keep
+            // flowing across the cosmetic signaling reconnect (the #28 contract).
+            if let Some(down_at) = signaling_down_since {
+                // backoff: 0.5s, 1s, 2s, 4s … capped at 8s, +/-25% jitter.
+                let base = 500u64.saturating_mul(1 << reconnect_attempt.min(4)).min(8_000);
+                let jitter = (down_at.elapsed().as_nanos() as u64 % (base / 2 + 1)) as i64 - (base as i64 / 4);
+                let backoff = Duration::from_millis((base as i64 + jitter).max(100) as u64);
+                if last_reconnect_try.elapsed() >= backoff {
+                    last_reconnect_try = Instant::now();
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    let _ = sio.disconnect().await; // drop the dead client (no-op if already gone)
+                    match net::reconnect_signaling(server, tx.clone()).await {
+                        Ok(new_sio) => {
+                            sio = new_sio;
+                            conn.sio = sio.clone();
+                            // C30: a fresh sid voids everything the server held —
+                            // re-assert room + channels on the next tick. Re-fire
+                            // the fast-path join/subscribe immediately too.
+                            sess.invalidate();
+                            if let Some(room) = sess.room.clone() {
+                                sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
+                            }
+                            if !sess.channels.is_empty() {
+                                let chans = sess.channels.clone();
+                                sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
+                            }
+                            sess.tick(&sio).await;
+                            // optimistic: a clean connect proves reachability; let
+                            // the welcome confirm it (which resets the counters).
+                            last_signaling = Instant::now();
+                            signaling_down_since = None;
+                            probed_silence = false;
+                            eprintln!(
+                                "{}",
+                                ui::paint(ui::Tone::Ok, "  signaling reconnected — re-announcing presence")
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "{}",
+                                ui::paint(ui::Tone::Dim, &format!("  signaling reconnect failed ({e}) — retrying with backoff"))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // C12 live-pairing: pick up devices paired AFTER we started (a separate
         // `filament pair` writes them into the shared store atomically). Re-read
         // every ~2s, subscribe to any channel we don't already watch, and feed

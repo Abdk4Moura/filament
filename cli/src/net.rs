@@ -63,6 +63,26 @@ pub fn stall_ms() -> u64 {
         .unwrap_or(STALL_MS_DEFAULT)
 }
 
+/// P2 (GAP-2): how long a long-lived acceptor's signaling link may go SILENT
+/// (no inbound socket.io event AND no successful `sync` ack) before the outer
+/// reconnect loop declares it dead and re-dials. The session ticks a `sync`
+/// every ≤5 s and the server acks it with `synced`, so a healthy link is never
+/// silent this long; a severed TCP (the flaky proxy) produces no events at all,
+/// so the silence climbs past this and trips the re-announce. Well above the 5 s
+/// sync cadence (so a single slow ack never false-trips) and well below the
+/// minute-scale rediscovery latency the supervisor's cadence imposed.
+/// Overridable via `FILAMENT_SIGNALING_SILENCE_MS`.
+pub const SIGNALING_SILENCE_MS_DEFAULT: u64 = 15_000;
+
+/// Read the configured signaling-silence threshold (`FILAMENT_SIGNALING_SILENCE_MS`).
+pub fn signaling_silence_ms() -> u64 {
+    std::env::var("FILAMENT_SIGNALING_SILENCE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(SIGNALING_SILENCE_MS_DEFAULT)
+}
+
 // ------------------------------------------------------------------ events --
 
 #[derive(Debug)]
@@ -119,6 +139,15 @@ pub enum Ev {
     TransferStalled(String, u64),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
+    /// P2 (GAP-2): the signaling socket reported a clean close/error (the
+    /// socket.io `close`/`error` callbacks). A FAST-PATH hint that the link is
+    /// gone — the long-lived acceptor's outer reconnect loop re-dials signaling
+    /// and re-announces. NOTE this fires only on a server-sent disconnect or a
+    /// protocol error; a hard TCP sever (the flaky-proxy case) produces NO
+    /// callback at all, so the silence watchdog (`signaling_silence_ms`) is the
+    /// authoritative trigger and this is purely an accelerant.
+    #[allow(dead_code)] // reason kept for logs/debug; the loop only needs the wake-up
+    SignalingDown(String),
     /// Ctrl-C: park state, print the resume hint, leave cleanly.
     Interrupted,
     /// A line typed into a listening recv (claim-a-code convenience).
@@ -373,9 +402,37 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         }
     };
 
+    // P2 (GAP-2): forward socket.io's close/error to the event loop as
+    // Ev::SignalingDown. `down` carries a reason string but the loop only needs
+    // the wake-up — the outer reconnect re-dials regardless of cause.
+    let down = {
+        let tx = tx.clone();
+        move |reason: &'static str| {
+            let tx = tx.clone();
+            move |_p: Payload, _c: Client| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(Ev::SignalingDown(reason.to_string()));
+                }
+                .boxed()
+            }
+        }
+    };
+
+    // We keep `reconnect(false)` ON PURPOSE (the explicit-outer-loop decision,
+    // P2): socket.io's own reconnect would silently bring a FRESH sid back
+    // without re-firing our join/subscribe/sync, and it can't be observed
+    // cleanly from the event loop where the C-series perfect-negotiation / glare
+    // handling lives. Owning the loop ourselves means every reconnect re-asserts
+    // presence through the C30 session module on a fresh `welcome`, integrating
+    // with the existing machinery rather than racing it. The triggers are the
+    // close/error callbacks below (fast path) PLUS the silence watchdog in the
+    // acceptor loop (the authoritative path — a hard TCP sever fires no callback).
     let sio = ClientBuilder::new(server)
         .reconnect(false)
         .on(SioEvent::Connect, |_p: Payload, _c: Client| async {}.boxed())
+        .on(SioEvent::Close, down("close"))
+        .on(SioEvent::Error, down("error"))
         .on("welcome", fwd(Ev::Welcome, tx.clone()))
         .on("peer-joined", fwd(Ev::PeerJoined, tx.clone()))
         .on("peer-left", fwd(Ev::PeerLeft, tx.clone()))
@@ -392,6 +449,16 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
         .await
         .with_context(|| format!("socket.io connect to {server}"))?;
     Ok(sio)
+}
+
+/// P2 (GAP-2): re-dial signaling for a long-lived acceptor whose socket died.
+/// A fresh `connect_signaling` with the SAME event sender — so the new client
+/// emits into the same loop, gets a fresh `welcome`/sid, and the C30 session
+/// module re-asserts room + channel subscriptions on the next tick. Returns the
+/// new `Client` to swap into the loop's `conn.sio` / `sess` emit target. The
+/// caller owns the backoff (so it can also keep ticking the rest of the loop).
+pub async fn reconnect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> Result<Client> {
+    connect_signaling(server, tx).await
 }
 
 // --------------------------------------------------------------------- peer --
