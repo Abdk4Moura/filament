@@ -7,6 +7,7 @@
 import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react'
 import { createPortal } from 'react-dom'
 import WebTerminal from './WebTerminal.jsx'
+import DeviceSheet from './DeviceSheet.jsx'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
@@ -116,11 +117,13 @@ function RouteBadge({ route, T }) {
   )
 }
 
-function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
+function PeerTile({ peer, onSendFiles, onOpenSheet, T, D, accent }) {
   const ready = peer.status === 'ready'
   const [over, setOver] = useState(false)
   const [hov, setHov] = useState(false)
+  const [moreHov, setMoreHov] = useState(false)
   const inp = useRef(null)
+  const tileRef = useRef(null)
   // 'away' (C21): the peer announced a benign absence (e.g. it is choosing a
   // file on a phone) — amber, calm, explicitly not an error.
   const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
@@ -131,14 +134,22 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
   // peer announces (e.g. show "my-laptop", not the broadcast "root@do-vm").
   // Strangers/unknown peers keep their announced name.
   const displayName = peer.known || peer.verified || peer.name
-  // The web-shell button (same condition used to render it below). When it
-  // shows, the idle caption is redundant with it, so we shorten the caption to
-  // 'click to send' — that's what keeps the hint a single line on a narrow tile.
-  const showShell = ready && known && peer.shell && onOpenShell
+  // SHELL badge: this device ADVERTISED a terminal (peer.shell, from the CLI's
+  // `caps` message — `up --shell` / FILAMENT_L2). Pure presentation — it makes
+  // "this device is a machine" visible at rest. The actual Open-terminal action
+  // lives in the DeviceSheet, gated server-side on top of this hint.
+  const isMachine = !!peer.shell
+  // Model H: the tap/click on a tile STILL sends (opens the picker). The `⋯`
+  // button and desktop right-click open the per-device DeviceSheet instead, so
+  // the send affordance is never in conflict with the secondary actions.
+  const showMore = ready && known && onOpenSheet
+  const openSheet = () => onOpenSheet && onOpenSheet(peer, tileRef.current ? tileRef.current.getBoundingClientRect() : null)
   return (
     <div
+      ref={tileRef}
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
       onClick={() => ready && inp.current && inp.current.click()}
+      onContextMenu={(e) => { if (showMore) { e.preventDefault(); openSheet() } }}
       onDragOver={(e) => { if (ready) { e.preventDefault(); setOver(true) } }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); setOver(false); if (ready && e.dataTransfer.files.length) onSendFiles(peer.id, e.dataTransfer.files) }}
@@ -155,17 +166,53 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
     >
       <input ref={inp} type="file" multiple style={{ display: 'none' }}
         onChange={(e) => { if (e.target.files.length) onSendFiles(peer.id, e.target.files); e.target.value = '' }} />
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, flexWrap: 'wrap' }}>
         <span style={{ width: 14, height: 14, background: peer.color, display: 'block', flexShrink: 0 }} />
-        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
+        {/* badge group: sizes to its content. The status dot + ⋯ trigger sit to
+            its right; on a very narrow tile the whole row wraps rather than
+            clipping the discoverability-critical SHELL chip. marginLeft:auto
+            keeps the dot + ⋯ flush-right when there's spare width. */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flexShrink: 1 }}>
           {known && (
-            <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap' }}>
+            <span style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px dashed ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 0 }}>
               REMEMBERED
             </span>
           )}
-          {peer.route && <RouteBadge route={peer.route} T={T} />}
-          <StatusDot color={sc} glow={ready} />
+          {isMachine && (
+            <span title="this device offers a terminal" style={{ fontSize: 8.5, letterSpacing: '.1em', color: accent, border: '1px solid ' + accent, padding: '2px 5px', whiteSpace: 'nowrap', flexShrink: 0 }}>
+              SHELL
+            </span>
+          )}
+          {/* Route badge is the lowest-priority top-row marker (it's also in the
+              device sheet). Drop it only when BOTH identity chips are present, so
+              a narrow tile keeps REMEMBERED + SHELL fully visible instead of
+              clipping the discoverability-critical SHELL chip. */}
+          {peer.route && !(known && isMachine) && <RouteBadge route={peer.route} T={T} />}
         </div>
+        {/* status dot stays OUTSIDE the badge group so it's always visible;
+            marginLeft:auto floats it + the ⋯ to the right edge. */}
+        <span style={{ flexShrink: 0, display: 'flex', marginLeft: 'auto' }}><StatusDot color={sc} glow={ready} /></span>
+        {/* ⋯ device-actions trigger (model H): touch-discoverable, opens the
+            sheet. A real flex item (not absolute) so it reserves its own space
+            and never overlaps the badges. stopPropagation so it never trips the
+            tile's own click-to-send. */}
+        {showMore && (
+          <button
+            onClick={(e) => { e.stopPropagation(); openSheet() }}
+            onMouseEnter={() => setMoreHov(true)} onMouseLeave={() => setMoreHov(false)}
+            title={`device actions for ${displayName}`}
+            aria-label={`device actions for ${displayName}`}
+            style={{
+              flexShrink: 0, marginTop: -4, marginRight: -4, zIndex: 2,
+              width: 24, height: 22, lineHeight: '20px', padding: 0, cursor: 'pointer',
+              font: 'inherit', fontSize: 15, fontWeight: 700, letterSpacing: '.04em',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              border: '1px solid ' + (moreHov ? accent : 'transparent'),
+              color: moreHov ? accent : T.dim, background: moreHov ? T.panel : 'transparent',
+              transition: 'color .12s, border-color .12s',
+            }}
+          >⋯</button>
+        )}
       </div>
       <div>
         <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
@@ -175,27 +222,9 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
         </div>
         <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .12s' }}>
           {ready
-            ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? (showShell ? 'click to send' : 'remembered · click to send') : 'click · drop to send')
+            ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
             : known ? 'remembered · reaches you in any room' : '—'}
         </div>
-        {/* web-shell: the button appears only for a remembered + connected device
-            that ADVERTISED a shell (peer.shell, from the CLI's `caps` message — set
-            when it runs `up --shell` / FILAMENT_L2). The pty-open is still gated
-            server-side, so this is purely about hiding the button for the 90%. It
-            stacks in normal flow under the caption (not absolute) so it never
-            overlaps the send-hint text. */}
-        {showShell && (
-          <button
-            onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
-            title={`open a terminal on ${displayName}`}
-            style={{
-              display: 'inline-flex', alignItems: 'center', gap: 5, marginTop: 8,
-              fontFamily: 'inherit', fontSize: 10.5,
-              padding: '4px 8px', cursor: 'pointer', letterSpacing: '.02em',
-              border: '1px solid ' + accent + '66', color: accent, background: accent + '14',
-            }}
-          ><span style={{ fontWeight: 700 }}>›_</span> shell</button>
-        )}
       </div>
     </div>
   )
@@ -486,7 +515,7 @@ function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, D, accent }
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
-    onAcceptPakeKeep, onDeclinePakeKeep, ui = {} } = props
+    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, ui = {} } = props
   const mode = ui.theme === 'light' ? 'light' : 'dark'
   const accentSet = ACCENTS[ui.accent] || ACCENTS.green
   const accent = accentSet[mode === 'light' ? 'l' : 'd']
@@ -506,6 +535,13 @@ export default function Filament(props) {
   const [tab, setTab] = useState('peers')
   const [shellPeer, setShellPeer] = useState(null) // web-shell: the peer whose terminal is open
   const shellLink = shellPeer && state.getLink ? state.getLink(shellPeer.id) : null
+  // model H: the per-device actions sheet. { peer, rect } — rect anchors the
+  // desktop popover near the invoking tile (null = a sensible default position).
+  const [sheet, setSheet] = useState(null)
+  const openSheet = useCallback((peer, rect) => setSheet({ peer, rect }), [])
+  const closeSheet = useCallback(() => setSheet(null), [])
+  // Keep the open sheet's peer fresh as the roster updates (status/route/shell).
+  const sheetPeer = sheet ? (state.peers.find((p) => p.id === sheet.peer.id) || sheet.peer) : null
   useEffect(() => {
     if (ui.forceMobile) {
       setNarrow(true)
@@ -549,7 +585,7 @@ export default function Filament(props) {
   const peerGrid = (gridCols) =>
     hasPeers ? (
       <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: D.gap }}>
-        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenShell={setShellPeer} T={T} D={D} accent={accent} />)}
+        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenSheet={openSheet} T={T} D={D} accent={accent} />)}
       </div>
     ) : (
       emptyPeers
@@ -623,6 +659,26 @@ export default function Filament(props) {
       )
     : null
 
+  // model H: the per-device actions sheet — a bottom sheet on mobile, an anchored
+  // popover on desktop. `Open terminal` here closes the sheet and opens the same
+  // WebTerminal overlay as before (setShellPeer), so the terminal path is
+  // unchanged. It itself portals to body, so render it from either layout.
+  const deviceSheet = sheetPeer ? (
+    <DeviceSheet
+      peer={sheetPeer}
+      anchorRect={sheet.rect}
+      narrow={narrow}
+      T={T}
+      D={D}
+      accent={accent}
+      font={font}
+      onOpenShell={setShellPeer}
+      onSendFiles={onSendFiles}
+      onForget={onForgetDevice}
+      onClose={closeSheet}
+    />
+  ) : null
+
   // ── Mobile layout ──────────────────────────────────────────────
   if (narrow) {
     const tabBtn = (k, n) => (
@@ -636,6 +692,7 @@ export default function Filament(props) {
     return (
       <div ref={rootRef} style={rootStyle}>
         {terminalOverlay}
+        {deviceSheet}
         {/* stacked top bar */}
         <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -686,6 +743,7 @@ export default function Filament(props) {
   return (
     <div ref={rootRef} style={rootStyle}>
       {terminalOverlay}
+      {deviceSheet}
       {/* top bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
         borderBottom: '1px solid ' + T.line, background: T.bg }}>

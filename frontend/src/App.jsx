@@ -53,6 +53,7 @@ export default function App() {
       onDeclineKeep={qs.declineKeep}
       onAcceptPakeKeep={qs.acceptPakeKeep}
       onDeclinePakeKeep={qs.declinePakeKeep}
+      onForgetDevice={qs.forgetDevice}
     />
   )
 }
