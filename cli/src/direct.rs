@@ -58,6 +58,30 @@ fn test_block() -> bool {
     std::env::var("FILAMENT_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
 }
 
+/// P0 stall-detector PROOF hook (test-only): `FILAMENT_TEST_FREEZE_AFTER_BYTES=N`
+/// makes the FIRST direct transport's data path go silently dark after it has
+/// written ~N bytes of *file data* — `send_frame` parks forever while the QUIC
+/// connection stays UP and CONTROL frames keep flowing. That is the exact
+/// "open channel, zero data bytes" black-hole (the Pixel-at-0% hang / a NAT
+/// rebind that strands only the data 5-tuple), reproduced deterministically.
+///
+/// It is ONE-SHOT across the process (a process-global latch): once one
+/// transport has frozen, a *fresh* transport built by the correction ladder's
+/// in-place repair (rung c) is NOT frozen — so the test proves the stall is
+/// both DETECTED and AUTO-RECOVERED on the re-dialled path, not merely detected.
+/// Never a product knob; only the data-path-freeze sim sets it.
+fn freeze_after_bytes() -> Option<u64> {
+    std::env::var("FILAMENT_TEST_FREEZE_AFTER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// Process-global "a transport has already frozen once" latch (see
+/// `freeze_after_bytes`). `false` until the first transport freezes; once `true`
+/// every later transport streams normally, so rung-c's fresh dial recovers.
+static FROZE_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Total budget for the whole direct attempt before falling back to WebRTC.
 pub const DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -199,8 +223,22 @@ fn suppress_public() -> bool {
     std::env::var("FILAMENT_DIRECT_NO_PUBLIC").map(|v| v == "1").unwrap_or(false)
 }
 
+/// Test-only: pin candidates to loopback (`127.0.0.1`). A multi-homed host (a
+/// cloud box with eth0/private/docker/tailscale/bridge IPs) advertises many
+/// local candidates; the simultaneous-open race can then pick a pair that can't
+/// actually carry data, so even a CLEAN same-host transfer is flaky. This knob
+/// makes same-host gates deterministic by advertising ONLY loopback. NOT a
+/// product knob — only the local sim gates set it.
+fn loopback_only() -> bool {
+    std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Gather all advertisable candidates for our bound endpoint port.
 pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
+    if loopback_only() {
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        return vec![cand_str(lo, port)];
+    }
     let mut cands: Vec<String> = local_ips().into_iter().map(|ip| cand_str(ip, port)).collect();
     if !suppress_public() {
         if let Some(pip) = public_ip(server).await {
@@ -390,6 +428,15 @@ pub struct DirectTransport {
     send: Arc<Mutex<SendStream>>,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Running count of file-data bytes this transport has written. Only read by
+    /// the data-path-freeze PROOF hook (`freeze_after_bytes`); zero overhead when
+    /// the hook is off (a single relaxed add per frame).
+    sent_data: std::sync::atomic::AtomicU64,
+    /// PROOF hook: set once THIS transport's data path has gone dark, so EVERY
+    /// subsequent `send_frame` on it parks too (a black-holed path stays dark,
+    /// not just the one stream that tripped it) — faithful to a NAT-rebind that
+    /// strands the data 5-tuple. A fresh transport (rung c) has this clear.
+    frozen: std::sync::atomic::AtomicBool,
 }
 
 const KIND_CONTROL: u8 = 0;
@@ -435,6 +482,38 @@ impl Transport for DirectTransport {
     }
 
     async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+        // P0 PROOF hook: black-hole the data path after N bytes on the FIRST
+        // transport. We DON'T write and DON'T stamp last_activity — so this
+        // transport's idle_ms() climbs while the connection stays up and control
+        // frames keep flowing, exactly the stall the bytes-moved watchdog must
+        // catch. Parking here (not erroring) mimics a wire that silently drops
+        // data: the sender just stops making progress. One-shot via FROZE_ONCE,
+        // so the ladder's fresh re-dial (rung c) streams normally and recovers.
+        if let Some(limit) = freeze_after_bytes() {
+            // Engage the freeze the first time THIS transport crosses the byte
+            // threshold AND no transport has frozen yet (one episode per process).
+            if !self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
+                let prior = self
+                    .sent_data
+                    .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                if prior + (payload.len() as u64) >= limit
+                    && !FROZE_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("[test] data-path FREEZE engaged at {} bytes — black-holing this transport", prior);
+                }
+            }
+            // Once dark, EVERY send_frame on this transport parks — the path
+            // stays black-holed until the ladder tears it down (rung c).
+            if self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
+                loop {
+                    if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(anyhow!("direct connection closed (frozen path repaired)"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
         let mut framed = Vec::with_capacity(4 + payload.len());
         framed.extend_from_slice(&sid.to_be_bytes());
         framed.extend_from_slice(payload);
@@ -566,6 +645,8 @@ fn make_transport(
         send: Arc::new(Mutex::new(send)),
         last_activity,
         dead,
+        sent_data: std::sync::atomic::AtomicU64::new(0),
+        frozen: std::sync::atomic::AtomicBool::new(false),
     })
 }
 

@@ -64,6 +64,15 @@ fn quiet_exit_window() -> Duration {
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// P0 (GAP-1): stall-correction ladder bound. Attempt 0 is rung (a) (resume on
+/// the same transport); attempts 1..STALL_MAX_REPAIRS are rung (c) (repair the
+/// transport in place — a fresh direct dial / ICE-restart). At the ceiling the
+/// ladder is exhausted (P1's relay fallback is the next rung — a clean hook).
+/// Slightly above MAX_ATTEMPTS because a fresh direct dial needs BOTH ends to
+/// re-offer within one race budget, which can take a couple of aligned ticks;
+/// a re-dial is cheap, so a few extra are worth a deterministic recovery.
+const STALL_MAX_REPAIRS: u32 = 5;
+
 /// Gate-18 Mode B: the single predicate that decides whether a stuck/lost link
 /// should be DROPPED (transfer is complete; nothing left to fetch) rather than
 /// reconnected. Pulled out as a pure function so the gate-2 / gate-11c fence
@@ -1014,6 +1023,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         deferred_left: HashMap::new(),
         recv_done: false,
     direct_pending: HashMap::new(),
+    stall_repairs: HashMap::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1247,6 +1257,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         deferred_left: HashMap::new(),
         recv_done: false,
     direct_pending: HashMap::new(),
+    stall_repairs: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -1690,6 +1701,33 @@ struct Conn {
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
     direct_pending: HashMap<String, DirectPending>,
+    /// P0 (GAP-1): per-peer stall-repair bookkeeping for the bytes-moved
+    /// watchdog. Tracks how many correction-ladder repairs we've already run for
+    /// the current stall episode (bounded by MAX_ATTEMPTS) and whether a repair
+    /// is in flight, so a single stall can't re-fire the ladder every tick while
+    /// a repair is converging. Reset once the link starts flowing again.
+    stall_repairs: HashMap<String, StallState>,
+}
+
+/// P0: one peer's stall-repair episode state.
+#[derive(Default)]
+struct StallState {
+    /// Repairs attempted in the current episode (rung a is the first).
+    attempts: u32,
+    /// `true` between firing the ladder and the next observed byte of progress,
+    /// so the per-tick watchdog doesn't re-arm while a repair is converging.
+    pending: bool,
+}
+
+/// P0: which correction rung the stall ladder took (see `Conn::correct_stall`).
+#[derive(Debug, PartialEq)]
+enum Rung {
+    /// (a) re-offer unfinished transfers on the SAME transport (resume:true).
+    Resume,
+    /// (c) the transport was repaired in place (fresh direct dial / ICE-restart).
+    Repaired,
+    /// rungs a→c spent; P1's relay fallback is the next rung (clean hook here).
+    Exhausted,
 }
 
 /// rung-1: state for one in-flight direct-QUIC attempt.
@@ -2261,6 +2299,180 @@ impl Conn {
             self.active = Some(pid.to_string());
         }
         Ok(false)
+    }
+
+    // --- P0 (GAP-1): the bytes-moved STALL watchdog + correction ladder ------
+    //
+    // The single byte-flow primitive `Transport::idle_ms()` already exists
+    // (net.rs) and is stamped at the unambiguous "a data byte moved" point on
+    // both send and receive. #28 wired it ONLY to the supersede decision; this
+    // is the second consumer the audit calls the core gap: a watchdog that
+    // declares an OPEN, ALIVE link bad when an in-flight transfer moves zero
+    // bytes — the "stuck at 0%" hang — and drives the least-disruptive
+    // correction. Run from the main event loop's tick (no new concurrency: F8).
+
+    /// Per-tick check: if a transfer is in flight (`in_flight`) on a link whose
+    /// `idle_ms()` has crossed the stall threshold, return its (pid, idle_ms) so
+    /// the loop can emit `Ev::TransferStalled`. Returns `None` for a flowing or
+    /// idle-but-empty link. Resetting bookkeeping on observed progress lives in
+    /// `note_progress`, so a slow-but-MOVING link (which keeps advancing
+    /// idle_ms's baseline) never trips — the threshold is on time-since-last-byte,
+    /// never on throughput.
+    fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
+        let in_episode = self.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
+        // Transport recency is the ground truth for "are bytes moving NOW".
+        let idle = self.links.get(pid).and_then(|l| l.transport.as_ref()).map(|t| t.idle_ms());
+        let threshold = net::stall_ms();
+
+        // FLOWING again: a transport exists and moved a byte within the window.
+        // This is the ONLY thing that clears an open episode — so the brief
+        // windows during a repair (by_sid flushed empty, or the new transport
+        // not yet up) do NOT reset the attempt counter and re-arm rung (a).
+        if matches!(idle, Some(ms) if ms < threshold) {
+            self.note_progress(pid);
+            return None;
+        }
+
+        if !in_episode {
+            // No episode open yet. A stall can only START while a transfer is in
+            // flight on a transport that has gone idle past the threshold.
+            match (in_flight, idle) {
+                (true, Some(ms)) if ms >= threshold => return Some(ms),
+                _ => {
+                    // Idle-but-empty / still establishing / flowing — clear stray
+                    // bookkeeping and do nothing.
+                    self.stall_repairs.remove(pid);
+                    return None;
+                }
+            }
+        }
+
+        // An episode is OPEN and we have NOT yet seen fresh progress. Keep
+        // driving the ladder: if a repair is in flight wait for it to converge
+        // (re-emitting every tick would thrash); otherwise (the prior repair's
+        // new transport itself went idle past the threshold) escalate again.
+        match idle {
+            Some(ms) if ms >= threshold && !self.repair_in_flight(pid) => Some(ms),
+            _ => None,
+        }
+    }
+
+    /// Is a repair for this peer's stall episode currently converging (a re-dial
+    /// in flight or the ladder mid-step)? Used to avoid re-firing every tick.
+    fn repair_in_flight(&self, pid: &str) -> bool {
+        // A direct re-dial is pending, OR the ladder just acted and we're waiting
+        // on the next observation. We treat `direct_pending` as the convergence
+        // signal for rung (c)'s fresh dial.
+        self.direct_pending.contains_key(pid)
+    }
+
+    /// Clear a peer's stall episode — called when bytes are observed moving
+    /// again (the link recovered) or nothing is in flight.
+    fn note_progress(&mut self, pid: &str) {
+        self.stall_repairs.remove(pid);
+    }
+
+    /// P0 liveness cross-check: is the link's CONTROL path still answering? A
+    /// black-holed *data* path (the case we recover) still carries reliable,
+    /// ordered control frames, so a successful control send distinguishes
+    /// "data wedged, link alive" (→ correction ladder) from "link dead" (→ the
+    /// established C3/C4 establishment-retry path, which already handles it).
+    /// We send a cheap `ping` control frame; success ⇒ alive. We do NOT await a
+    /// pong (F8: the event loop must never block on something a remote controls)
+    /// — a send that returns Ok over a reliable channel is sufficient evidence
+    /// the transport itself is up; a dead transport errors or is flagged dead and
+    /// returns Err here.
+    async fn link_alive(&self, pid: &str) -> bool {
+        match self.transport_of(pid) {
+            Some(t) => t
+                .send_control(&json!({ "type": "ping", "v": 1, "reason": "stall-probe" }))
+                .await
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Decide the correction RUNG for the current stall episode and (for rung c)
+    /// repair the transport in place WITHOUT tearing the session down. Returns:
+    ///   `Rung::Resume`  — rung (a): caller re-offers unfinished transfers with
+    ///                     resume:true on the SAME transport (cheapest).
+    ///   `Rung::Repaired`— rung (c): the transport was repaired in place
+    ///                     (direct: fresh QUIC dial of the known device;
+    ///                     WebRTC: restart_ice) — caller re-offers once it's back.
+    ///   `Rung::Exhausted`— rungs a→c spent (MAX_ATTEMPTS) — P1 would escalate to
+    ///                     relay here (clean hook, not built in P0).
+    /// Bounds the episode by MAX_ATTEMPTS, reusing the same ceiling as on_stuck.
+    async fn correct_stall(&mut self, pid: &str) -> Rung {
+        let st = self.stall_repairs.entry(pid.to_string()).or_default();
+        st.pending = true;
+        let attempt = st.attempts;
+        st.attempts += 1;
+        if attempt == 0 {
+            // Rung (a): cheapest — re-issue on the same transport. The caller
+            // owns `outgoing`, so it does the actual re-offer; we just classify.
+            ui::say(&ui::paint(ui::Tone::Warn, "  transfer stalled — resuming on the same link"));
+            return Rung::Resume;
+        }
+        if attempt >= STALL_MAX_REPAIRS {
+            // Rungs (a)+(c) spent. P1 escalates to relay (the --relay ICE policy)
+            // here; P0 stops at a clear status line and leaves the partial on disk
+            // for a manual resume. This is the documented P0/P1 seam.
+            ui::say(&ui::paint(
+                ui::Tone::Warn,
+                "  transfer still stalled after repair attempts — partial kept on disk; \
+                 relay fallback is the next rung (P1, not yet automatic). Re-run to resume.",
+            ));
+            return Rung::Exhausted;
+        }
+        // Rung (c): repair the transport IN PLACE under the live session.
+        ui::say(&ui::paint(
+            ui::Tone::Warn,
+            &format!("  transfer stalled — repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
+        ));
+        self.repair_link_in_place(pid).await;
+        Rung::Repaired
+    }
+
+    /// Rung (c): rebuild a path under the LIVE session, preserving the on-disk
+    /// partial (C7 resume re-offers from the saved offset on the new transport).
+    /// - direct-QUIC link: drop the wedged transport and re-arm the known-device
+    ///   direct dial (`start_direct`), which re-advertises candidates; the peer's
+    ///   matching re-dial (it runs the same watchdog) completes a FRESH
+    ///   authenticated QUIC connection → `Ev::DirectReady` → `adopt_direct` swaps
+    ///   in the new transport → ChannelReady re-offers the unfinished transfers.
+    /// - WebRTC link: `restart_ice()` — keeps the RTCPeerConnection + DTLS keys;
+    ///   only ICE re-gathers, so transfers resume on the same channel once ICE
+    ///   re-converges (no re-key, the preferred repair when available).
+    async fn repair_link_in_place(&mut self, pid: &str) {
+        let Some(l) = self.links.get(pid) else { return };
+        if l.direct {
+            // Fresh QUIC dial of the known device. Pull the (name,secret) the
+            // link was born with so the re-dial re-authenticates to the SAME pair
+            // secret (session identity is stable across the swap; only the wire
+            // keys rotate — documented in §2.5).
+            let known = l.expected_secret.clone();
+            let info = l.info.clone();
+            let was_active = self.is_active(pid);
+            self.drop_link(pid); // tears down the wedged transport (frees the port)
+            if let Some((name, secret)) = known {
+                self.start_direct(pid, &name, &secret).await;
+                if was_active {
+                    // start_direct creates no Link yet; keep the slot pointed here
+                    // so adopt_direct's ChannelReady re-offers to the right target.
+                    self.active = Some(pid.to_string());
+                }
+            } else {
+                // No stored secret to re-dial direct — fall back to a WebRTC
+                // re-establish under the session (still preserves the partial).
+                let _ = self.establish(info).await;
+                if was_active {
+                    self.active = Some(pid.to_string());
+                }
+            }
+        } else if let Some(p) = l.peer.clone() {
+            // WebRTC: ICE-restart in place — no teardown, no re-key.
+            p.restart_ice().await;
+        }
     }
 
     /// C4: transient `disconnected` — nudge ICE from the impolite side and
@@ -2988,6 +3200,7 @@ async fn send_cmd(
         deferred_left: HashMap::new(),
         recv_done: false,
     direct_pending: HashMap::new(),
+    stall_repairs: HashMap::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -3086,6 +3299,27 @@ async fn send_cmd(
                             "away": false,
                         }))
                         .await;
+                }
+            }
+        }
+        // P0 (GAP-1): bytes-moved STALL watchdog (send side). A transfer is in
+        // flight once the active peer accepted an offer that isn't done; if that
+        // link then moves zero bytes past the stall threshold (a black-holed data
+        // path — the 0% hang) we emit Ev::TransferStalled, which drives the
+        // correction ladder below. The control-channel liveness probe gates it so
+        // a genuinely DEAD link falls to the C3/C4 path instead.
+        if let Some(active) = conn.active.clone() {
+            let in_flight = {
+                let out = outgoing.lock().await;
+                out.iter().any(|o| o.accepted_once && !o.done)
+            };
+            if let Some(idle) = conn.detect_stall(&active, in_flight) {
+                if conn.link_alive(&active).await {
+                    let _ = tx.send(Ev::TransferStalled(active, idle));
+                } else {
+                    // Control path also dead → not a data-only stall; let the
+                    // establishment watchdog (C3/C4) own it. Clear the episode.
+                    conn.note_progress(&active);
                 }
             }
         }
@@ -3393,6 +3627,48 @@ async fn send_cmd(
                 let name = out.iter().find(|o| o.id == id).map(|o| o.name.as_str()).unwrap_or("?");
                 eprintln!("{name}: interrupted ({err}) — will resume on reconnect");
             }
+            // P0 (GAP-1): the bytes-moved watchdog declared this transfer stalled.
+            // Drive the least-disruptive correction ladder, preserving the on-disk
+            // partial at every rung (C7 resume).
+            Ev::TransferStalled(pid, idle_ms) => {
+                if !conn.is_active(&pid) {
+                    continue; // only the transfer-target peer's stall matters
+                }
+                eprintln!(
+                    "{}",
+                    ui::paint(ui::Tone::Warn, &format!("  stall detected: {idle_ms}ms with no data — correcting"))
+                );
+                match conn.correct_stall(&pid).await {
+                    Rung::Resume => {
+                        // Rung (a): re-issue every unfinished transfer with
+                        // resume:true on the SAME transport. The receiver's
+                        // file-accept carries its `.part` offset, so streaming
+                        // continues from where it stalled (no restart-from-zero).
+                        if let Some(t) = conn.transport_of(&pid) {
+                            let out = outgoing.lock().await;
+                            for o in out.iter().filter(|o| o.accepted_once && !o.done) {
+                                let mut offer = json!({
+                                    "type": "file-offer", "id": o.id, "sid": o.sid,
+                                    "name": o.name, "size": o.size,
+                                    "mime": "application/octet-stream", "resume": true,
+                                });
+                                if let Some(h) = &o.head {
+                                    offer["head"] = json!(h);
+                                }
+                                let _ = t.send_control(&offer).await;
+                            }
+                        }
+                    }
+                    // Rung (c): the transport was repaired in place inside
+                    // correct_stall (fresh direct dial / ICE-restart). The new
+                    // transport's ChannelReady re-offers the unfinished transfers
+                    // (resume:true) — nothing more to do here.
+                    Rung::Repaired => {}
+                    // P1 seam: relay fallback would fire here. P0 leaves the
+                    // partial on disk and stops the ladder (message already shown).
+                    Rung::Exhausted => {}
+                }
+            }
             Ev::Interrupted => {
                 ui::say(&format!("  {} interrupted — the receiver keeps its partial; re-run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
                 let _ = sio.disconnect().await;
@@ -3669,6 +3945,7 @@ async fn recv_cmd(
         deferred_left: HashMap::new(),
         recv_done: false,
     direct_pending: HashMap::new(),
+    stall_repairs: HashMap::new(),
     };
     {
         let tx = tx.clone();
@@ -3866,6 +4143,33 @@ async fn recv_cmd(
         conn.recv_done = recv_transfer_done(completed, keep_open, by_sid.is_empty());
         if completed > 0 || !by_sid.is_empty() {
             ever_received = true; // a channel was up; Bug-5 wedge hint no longer applies
+        }
+
+        // P0 (GAP-1): bytes-moved STALL watchdog (RECEIVE side). The receiver is
+        // the peer that visibly hangs at 0%: when an inbound transfer is in
+        // flight (`by_sid` non-empty for a link) but no data byte has arrived
+        // past the stall threshold, its transport's idle_ms() climbs. The
+        // RECEIVER must also act so a direct-QUIC repair is SYMMETRIC — a fresh
+        // authenticated QUIC connection needs both ends to re-dial. We emit
+        // Ev::TransferStalled for each such link (liveness-gated), whose handler
+        // re-arms this side's direct dial (rung c). The on-disk `.part` is kept,
+        // so the resumed stream continues from the saved offset.
+        {
+            // Per-link: in_flight = this peer has an inbound file mid-transfer
+            // (a by_sid entry) OR a stall episode is already open for it (the
+            // .part was flushed to disk mid-repair, so by_sid is momentarily
+            // empty — detect_stall keeps the episode alive until fresh progress).
+            let all_pids: Vec<String> = conn.links.keys().cloned().collect();
+            for pid in all_pids {
+                let in_flight = by_sid.keys().any(|(p, _)| *p == pid);
+                if let Some(idle) = conn.detect_stall(&pid, in_flight) {
+                    if conn.link_alive(&pid).await {
+                        let _ = tx.send(Ev::TransferStalled(pid, idle));
+                    } else {
+                        conn.note_progress(&pid);
+                    }
+                }
+            }
         }
 
         // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
@@ -4596,12 +4900,46 @@ async fn recv_cmd(
                     // can re-offer a file whose first stream is still live;
                     // accepting both corrupted the path and crashed on the
                     // second rename. First stream wins.
-                    if !to_stdout
-                        && by_sid.values().any(|inc| inc.part_path == dir.join(format!("{name}.part")))
-                    {
-                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  (duplicate offer for {name} ignored — already receiving it)")));
-                        t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
-                        continue;
+                    //
+                    // P0 (GAP-1) exception: a STALL repair re-offers the same file
+                    // (resume:true) on a FRESH transport while the OLD stream's
+                    // by_sid entry may still linger (its data path went dark). If
+                    // the existing stream's transport is itself STALLED past the
+                    // threshold, the "first stream" is the wedged one — flush it to
+                    // its .part and accept the resume on the live link instead of
+                    // declining (a decline would mark the SENDER's transfer done
+                    // and abort the recovery). A genuinely FLOWING duplicate still
+                    // wins as before.
+                    let want_part = dir.join(format!("{name}.part"));
+                    if !to_stdout {
+                        let dup_keys: Vec<(String, u32)> = by_sid
+                            .iter()
+                            .filter(|(_, inc)| inc.part_path == want_part)
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        if !dup_keys.is_empty() {
+                            // Is ANY existing stream for this file still flowing?
+                            let any_flowing = dup_keys.iter().any(|(p, _)| {
+                                conn.transport_of(p)
+                                    .map(|t| t.idle_ms() < net::stall_ms())
+                                    .unwrap_or(false)
+                            });
+                            if any_flowing {
+                                // A real concurrent duplicate — first (flowing)
+                                // stream wins. Ignore WITHOUT marking the sender
+                                // done (a benign skip, not a user decline).
+                                ui::say(&ui::paint(ui::Tone::Dim, &format!("  (duplicate offer for {name} ignored — already receiving it)")));
+                                continue;
+                            }
+                            // The lingering stream(s) are STALLED — flush their
+                            // partials to disk and drop them so the resume below
+                            // re-opens the .part from its saved offset.
+                            for k in dup_keys {
+                                if let Some(mut inc) = by_sid.remove(&k) {
+                                    let _ = inc.file.flush().await;
+                                }
+                            }
+                        }
                     }
 
                     if to_stdout {
@@ -4778,6 +5116,41 @@ async fn recv_cmd(
                 }
                 let _ = sio.disconnect().await;
                 std::process::exit(130);
+            }
+            // P0 (GAP-1): the inbound transfer stalled (zero bytes, link alive).
+            // The receiver participates in the SYMMETRIC direct-QUIC repair: it
+            // re-arms its own direct dial so the fresh authenticated connection
+            // can form. The `.part` stays on disk; the sender re-offers
+            // resume:true on the new transport, so the file continues from its
+            // saved offset (no restart-from-zero). For a WebRTC link the repair
+            // is the impolite-side ICE-restart inside correct_stall.
+            Ev::TransferStalled(pid, idle_ms) => {
+                eprintln!(
+                    "{}",
+                    ui::paint(ui::Tone::Warn, &format!("  inbound stall: {idle_ms}ms with no data from peer — repairing link"))
+                );
+                // P0 partial-preservation: flush THIS peer's in-flight partials
+                // to their `.part` on disk and release the in-memory handles, so
+                // the C23 "already receiving" guard doesn't reject the sender's
+                // resume-offer on the FRESH repair link. The `.part` + `.meta`
+                // stay on disk; the resume re-opens them from the saved offset
+                // (no restart-from-zero). Only this peer's streams are dropped —
+                // other links keep flowing.
+                let stale: Vec<(String, u32)> =
+                    by_sid.keys().filter(|(p, _)| *p == pid).cloned().collect();
+                for key in stale {
+                    if let Some(mut inc) = by_sid.remove(&key) {
+                        let _ = inc.file.flush().await;
+                        eprintln!("{}: parked at {} for resume", inc.name, human(inc.received));
+                    }
+                }
+                match conn.correct_stall(&pid).await {
+                    // Receiver has nothing to re-offer; the sender owns the offer.
+                    // Rung (a) is a no-op here — wait for the sender's re-offer.
+                    Rung::Resume => {}
+                    Rung::Repaired => {}
+                    Rung::Exhausted => {}
+                }
             }
             // Losing the sender is only an ERROR when nothing completed —
             // after a successful transfer it's just closure (the quiet-exit

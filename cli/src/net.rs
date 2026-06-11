@@ -44,6 +44,25 @@ const HIGH_WATER: usize = 4 * 1024 * 1024;
 const LOW_WATER: usize = 1024 * 1024;
 pub const WATCHDOG_SECS: u64 = 15;
 
+/// P0 (GAP-1): default no-progress threshold (ms) for the bytes-moved stall
+/// watchdog. An in-flight transfer whose link's `idle_ms()` exceeds this — while
+/// the control channel is still alive — is declared STALLED (the 0% hang). 6 s
+/// sits well above a slow-but-moving link's inter-chunk gap on a bad mobile
+/// uplink (the threshold is on *time since the last byte*, never on throughput,
+/// so a slow link that still advances resets it) and well below human patience.
+/// Overridable via `FILAMENT_STALL_MS`, mirroring the `FILAMENT_ADOPT_ACTIVE_MS`
+/// / `FILAMENT_REJOIN_SECS` knob style.
+pub const STALL_MS_DEFAULT: u64 = 6_000;
+
+/// Read the configured stall threshold (`FILAMENT_STALL_MS`, default 6 s).
+pub fn stall_ms() -> u64 {
+    std::env::var("FILAMENT_STALL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(STALL_MS_DEFAULT)
+}
+
 // ------------------------------------------------------------------ events --
 
 #[derive(Debug)]
@@ -90,6 +109,14 @@ pub enum Ev {
     TransferFailed { id: String, err: String },
     /// C3: the establishment watchdog fired for (peer sid, attempt generation).
     Stuck(String, u32),
+    /// P0 (GAP-1): the bytes-moved watchdog declared an in-flight transfer
+    /// STALLED — the link is open and its control channel is alive (liveness
+    /// probe passed) but `idle_ms()` crossed the stall threshold, i.e. the data
+    /// path is moving zero bytes (the "stuck at 0%" hang). Carries (peer sid,
+    /// link_idle_ms) and drives the least-disruptive correction ladder in the
+    /// main loop — never the establishment retry path. Distinct from `Stuck`
+    /// (establishment never completed) and `GraceExpired` (the link itself died).
+    TransferStalled(String, u64),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
     /// Ctrl-C: park state, print the resume hint, leave cleanly.
