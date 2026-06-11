@@ -128,9 +128,11 @@ fetch_py() { # $1 = env URL value, $2 = local fallback name, $3 = dest
     log "ERROR: no source for $2 (set ${2%%.py}_URL or place it next to this script)"; exit 1
   fi
 }
-fetch_py "${WATCHER_URL:-}"  watcher.py      "$ROOT_DIR/watcher.py"
-fetch_py "${EXECUTOR_URL:-}" box_executor.py "$ROOT_DIR/box_executor.py"
-log "box-side python in place: watcher.py + box_executor.py"
+fetch_py "${WATCHER_URL:-}"   watcher.py       "$ROOT_DIR/watcher.py"
+fetch_py "${EXECUTOR_URL:-}"  box_executor.py  "$ROOT_DIR/box_executor.py"
+fetch_py "${SUPERVISOR_URL:-}" up_supervisor.sh "$ROOT_DIR/up_supervisor.sh"
+chmod +x "$ROOT_DIR/up_supervisor.sh"
+log "box-side files in place: watcher.py + box_executor.py + up_supervisor.sh"
 
 # --- 3. plant the pairing secrets (isolated config dirs) --------------------
 # Each role gets its OWN config dir holding exactly ONE secret, so no daemon ever
@@ -161,11 +163,17 @@ for p in "$ROOT_DIR/ctl.pid" "$ROOT_DIR/din.pid" "$ROOT_DIR/watcher.pid"; do
 done
 sleep 1
 
-log "starting din acceptor (input sink -> $INBOX)"
+log "starting din acceptor (SUPERVISED, --relay -> $INBOX)"
+# Wrap in up_supervisor.sh: filament's socket.io is reconnect(false), so a severed
+# long-lived `up --dir` zombies out and the host can't rediscover it (the exact
+# 'no peer connected' failure we hit on the real WAN). The supervisor recycles it on
+# a cadence so a fresh, re-announcing acceptor is always present; partials resume.
+# This is the pattern validated by runner/sim/flaky_sim_test.sh.
 FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-din" HOME="$ROOT_DIR/cfg-din" \
-  nohup "$BIN" up --server "$FILJOB_SERVER" --name-as filjob-box-din \
-  --dir "$INBOX" >"$ROOT_DIR/din.log" 2>&1 &
-echo $! > "$ROOT_DIR/din.pid"
+  nohup bash "$ROOT_DIR/up_supervisor.sh" --cadence "${FILJOB_DIN_CADENCE:-90}" \
+    --log "$ROOT_DIR/din.log" --pidfile "$ROOT_DIR/din.pid" -- \
+    "$BIN" up --server "$FILJOB_SERVER" --name-as filjob-box-din --dir "$INBOX" --relay \
+  >>"$ROOT_DIR/din.log" 2>&1 &
 
 log "starting file-driven watcher (--relay results on dout)"
 FILJOB_ROOT="$ROOT_DIR" FILJOB_SERVER="$FILJOB_SERVER" FILAMENT_BIN="$BIN" \
