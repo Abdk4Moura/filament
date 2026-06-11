@@ -1,0 +1,34 @@
+{
+  // ── Filament Showcase Worker ────────────────────────────────────────────────
+  // A *dedicated, isolated* Worker that serves the dev-effort + reels showcase at
+  //   https://filament.autumated.com/showcase/*
+  // backed entirely by R2 (zero egress, no big mp4s in git or the app's dist).
+  //
+  // This Worker is INTENTIONALLY separate from the main `filament` app Worker.
+  // The main app is bound to the *whole hostname* filament.autumated.com via a
+  // Worker Custom Domain. This Worker attaches a zone route for the more-specific
+  // path pattern `/showcase/*`, which Cloudflare resolves ahead of the catch-all
+  // Custom Domain for that path only. `/` and the SPA keep hitting `filament`,
+  // untouched. Publishing = uploading objects to R2 (no Worker redeploy needed).
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "filament-showcase",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-23",
+  "observability": { "enabled": true },
+
+  "r2_buckets": [
+    {
+      "binding": "SHOWCASE",
+      "bucket_name": "filament-showcase"
+    }
+  ],
+
+  // Zone route — more specific than the `filament` Custom Domain, so only
+  // /showcase/* is captured here; everything else stays on the main app.
+  "routes": [
+    {
+      "pattern": "filament.autumated.com/showcase/*",
+      "zone_name": "autumated.com"
+    }
+  ]
+}
