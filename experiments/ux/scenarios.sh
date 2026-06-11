@@ -263,6 +263,51 @@ sc_07_introduce() {
   fi
 }
 
+# ======================================================================== 11 ==
+# Regression demo for the live-pairing bug: a device paired AFTER the always-on
+# daemon started used to be invisible until restart. Now the running daemon
+# picks it up live ("new device 'X' paired — now reachable") and it connects.
+sc_11_live_pairing() {
+  cap "always-on 'up'; pair a NEW device MID-SESSION; it connects live — no restart"
+  ensure_payload
+  local sec_old=$(mk_secret) sec_new=$(mk_secret)
+  local DUP=$(fresh_cfg s11up) DOLD=$(fresh_cfg s11old) DNEW=$(fresh_cfg s11new) DD=$(fresh_cfg s11drop)
+  # The daemon starts knowing ONLY 'old'. 'new' is paired later, while it runs.
+  seed_store "$DUP"  "[{\"name\":\"old\",\"secret\":\"$sec_old\"}]"
+  seed_store "$DOLD" "[{\"name\":\"box\",\"secret\":\"$sec_old\"}]"
+  seed_store "$DNEW" "[{\"name\":\"box\",\"secret\":\"$sec_new\"}]"
+  runB "filament up   (the box — knows only 'old' right now)"
+  FILAMENT_CONFIG_DIR="$DUP" timeout -k 5 60 "$FILAMENT" up --dir "$DD" --server "$UX_SERVER" </dev/null >"$UX_WORK/11up.log" 2>&1 & local UP=$!; track $UP
+  wait_log "$UX_WORK/11up.log" 'filament up —' 15 0.15 || note "up ready-banner not seen (continuing)"
+  pause 0.6
+  b "roster at startup: { old }   (the daemon is now running, untouched from here on)"
+  pause 0.8
+  note "── now, WITHOUT restarting the daemon, a separate 'pair' adds a NEW device ──"
+  runA "filament pair  →  writes 'new' into the box's shared store"
+  # A separate pair process writes the new record into the SAME store the daemon
+  # reads. (We write the record directly; the on-disk shape is what `pair` mints.)
+  seed_store "$DUP" "[{\"name\":\"old\",\"secret\":\"$sec_old\"},{\"name\":\"new\",\"secret\":\"$sec_new\"}]"
+  b "store is now { old, new } — the daemon was NOT restarted"
+  # The fixed daemon re-scans the store every ~2s and subscribes live.
+  if wait_log "$UX_WORK/11up.log" "new device 'new' paired — now reachable" 10 0.25; then
+    b "$(grep -h "now reachable" "$UX_WORK/11up.log" | tail -1)"
+  else
+    note "(daemon did not log live pickup — on an UNFIXED build it never would)"
+  fi
+  pause 0.8
+  runA "new device:  filament send report.pdf --to box   (no restart, no code)"
+  FILAMENT_CONFIG_DIR="$DNEW" timeout -k 5 30 "$FILAMENT" send "$PAY" --name report.pdf --to box --server "$UX_SERVER" >"$UX_WORK/11s.log" 2>&1; local rc=$?
+  pause 1
+  kill $UP 2>/dev/null
+  local h2 RCV; RCV=$(ls "$DD" 2>/dev/null | head -1); h2=$(hashof "$DD/$RCV" 2>/dev/null || echo none)
+  local logged=0; grep -q "new device 'new' paired — now reachable" "$UX_WORK/11up.log" && logged=1
+  if [ $rc -eq 0 ] && [ "$h2" = "$(hashof "$PAY")" ] && [ "$logged" -eq 1 ]; then
+    pass "device paired mid-session connected live and delivered — no restart needed"
+  else
+    fail "mid-session-paired device did not connect live (rc=$rc logged=$logged)"
+  fi
+}
+
 # dispatcher: run one scenario by id
 SC_ID="${1:-}"
 case "$SC_ID" in
@@ -273,5 +318,6 @@ case "$SC_ID" in
   05) sc_05_up_status_down ;;
   06) sc_06_ssh ;;
   07) sc_07_introduce ;;
-  *) echo "usage: scenarios.sh <01..07>"; exit 2 ;;
+  11) sc_11_live_pairing ;;
+  *) echo "usage: scenarios.sh <01..07|11>"; exit 2 ;;
 esac

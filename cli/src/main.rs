@@ -3766,6 +3766,18 @@ async fn recv_cmd(
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
     let mut ever_received = false;
+    // C12 live-pairing: the roster (`devices`) is loaded ONCE at startup, and
+    // KnownPeer events only fire for channels we've SUBSCRIBED. A device paired
+    // into the shared store by a SEPARATE `filament pair` process AFTER the
+    // daemon is up was therefore invisible until restart — it never got a
+    // subscription, so its "appeared — connecting" flow never fired and it
+    // could not connect (no transfer, no web-shell). We now re-scan the store
+    // on a modest cadence and subscribe to any NEW device's channel live; the
+    // session digest (which includes `sess.channels`) repairs a lost subscribe
+    // on the next tick. Existing channels and live links are untouched.
+    let mut known_channels: std::collections::HashSet<String> =
+        devices.iter().map(|(_, s)| channel_of(s)).collect();
+    let mut last_devices_scan = Instant::now();
 
     loop {
         let ev = match tokio::time::timeout(
@@ -3780,6 +3792,34 @@ async fn recv_cmd(
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
         sess.tick(&sio).await;
+        // C12 live-pairing: pick up devices paired AFTER we started (a separate
+        // `filament pair` writes them into the shared store atomically). Re-read
+        // every ~2s, subscribe to any channel we don't already watch, and feed
+        // them into `devices` so the KnownPeer handler recognizes them. We never
+        // re-subscribe existing channels or touch live links. Daemon-only: a
+        // one-shot `recv`/`send` has a fixed roster for its short lifetime.
+        if daemon && last_devices_scan.elapsed() >= Duration::from_secs(2) {
+            last_devices_scan = Instant::now();
+            let mut new_chans: Vec<String> = Vec::new();
+            for (n, s) in devices_load() {
+                let ch = channel_of(&s);
+                if known_channels.insert(ch.clone()) {
+                    eprintln!("new device '{n}' paired — now reachable");
+                    devices.push((n, s));
+                    new_chans.push(ch);
+                }
+            }
+            if !new_chans.is_empty() {
+                // Fast-path emit now; the session digest carries the durable
+                // subscription so a dropped emit self-repairs on the next tick.
+                for ch in &new_chans {
+                    if !sess.channels.contains(ch) {
+                        sess.channels.push(ch.clone());
+                    }
+                }
+                sess.emit(&sio, "subscribe", json!({ "channels": new_chans })).await;
+            }
+        }
         // #28: discharge any deferred peer-left whose channel has gone idle/dead.
         conn.reap_deferred();
         // rung-1: direct attempt timed out → fall back to WebRTC (unchanged).

@@ -21,6 +21,7 @@ META = {
     "08": ("cli↔web", "CLI sends → the web app receives", "The browser (local frontend) accepts the offered file and reaches the download affordance."),
     "09": ("cli↔web", "The web app sends → CLI recv", "Browser picks a file and sends it; the CLI receiver writes it, sha256-verified (authoritative no-recorder verify pass). The GIF is a best-effort visual; single-host browser→CLI WebRTC can't complete while the webm recorder runs — see README."),
     "10": ("cli↔web", "Pair the web app with the CLI", "CLI mints a PAKE code; the browser claims it and stores the device (key never crosses the server)."),
+    "11": ("cli↔cli", "Pair a new device mid-session (live)", "An always-on `up` daemon picks up a device paired AFTER it started — it logs 'now reachable', subscribes live, and the new device connects and delivers WITHOUT a restart. Regression guard for the live-pairing bug."),
 }
 
 def load_results():

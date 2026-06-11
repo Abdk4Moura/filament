@@ -30,7 +30,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # top-level rig (for shared work dir + the suite-wide cleanup of marked backends)
 source "$HERE/rig/lib.sh"
 
-ALL_CLI="01 02 03 04 05 06 07"
+ALL_CLI="01 02 03 04 05 06 07 11"
 ALL_WEB="08 09 10"
 SEL="${*:-$ALL_CLI $ALL_WEB}"
 # Default concurrency scales to the box: single-host WebRTC/ssh ICE timing (03,

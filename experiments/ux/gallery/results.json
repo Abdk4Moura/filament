@@ -78,5 +78,13 @@
     "verdict": "PASS",
     "detail": "browser claimed the CLI's PAKE code; both sides stored the mutual device",
     "gif": "10.gif"
+  },
+  "11": {
+    "flow": "cli\u2194cli",
+    "title": "Pair a new device mid-session (live)",
+    "caption": "An always-on `up` daemon picks up a device paired AFTER it started \u2014 it logs 'now reachable', subscribes live, and the new device connects and delivers WITHOUT a restart. Regression guard for the live-pairing bug.",
+    "verdict": "PASS",
+    "detail": "device paired mid-session connected live and delivered \u2014 no restart needed",
+    "gif": "11.gif"
   }
 }

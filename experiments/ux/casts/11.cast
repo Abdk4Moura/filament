@@ -1,0 +1,10 @@
+{"version":2,"width":80,"height":24,"timestamp":1781137231,"idle_time_limit":1.4,"command":"bash '/root/wt-livepair/experiments/ux/scenarios.sh' '11'","env":{"SHELL":"/bin/bash"}}
+[0.016241, "o", "\r\n\u001b[1;36m=== UX: always-on 'up'; pair a NEW device MID-SESSION; it connects live — no restart ===\u001b[0m\r\n"]
+[0.058819, "o", "\u001b[1;35m[B]$\u001b[0m filament up   (the box — knows only 'old' right now)\r\n"]
+[0.829984, "o", "\u001b[1;35m[B]\u001b[0m roster at startup: { old }   (the daemon is now running, untouched from here on)\r\n"]
+[1.632822, "o", "\u001b[2m  ── now, WITHOUT restarting the daemon, a separate 'pair' adds a NEW device ──\u001b[0m\r\n\u001b[1;33m[A]$\u001b[0m filament pair  →  writes 'new' into the box's shared store\r\n"]
+[1.636006, "o", "\u001b[1;35m[B]\u001b[0m store is now { old, new } — the daemon was NOT restarted\r\n"]
+[2.177123, "o", "\u001b[1;35m[B]\u001b[0m new device 'new' paired — now reachable\r\n"]
+[2.980059, "o", "\u001b[1;33m[A]$\u001b[0m new device:  filament send report.pdf --to box   (no restart, no code)\r\n"]
+[5.023041, "o", "\r\n\u001b[1;32m  ✔ PASS\u001b[0m  device paired mid-session connected live and delivered — no restart needed\r\nRESULT 11 PASS device paired mid-session connected live and delivered — no restart needed\r\n"]
+[5.024148, "x", "0"]

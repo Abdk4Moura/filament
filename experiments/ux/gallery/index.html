@@ -28,8 +28,7 @@
 </style></head><body>
   <h1>Filament CLI — UX flow gallery</h1>
   <p class="sub">Human-watchable recordings of each CLI UX flow (cli↔cli and cli↔web), driven against a local backend.</p>
-  <p class="summary"><b style="color:#1f9d55">10 PASS</b> &nbsp; <b style="color:#c0392b">0 FAIL</b> &nbsp; <b style="color:#888">0 BLOCKED</b> &nbsp; / 10 scenarios</p>
-  <p style="margin:-12px 0 22px"><a href="reels.html" style="color:#7CF6C8;text-decoration:none">▶ watch the feature reels</a> <span style="color:#6e7681">— GPU-transcoded on a Tesla T4</span></p>
+  <p class="summary"><b style="color:#1f9d55">11 PASS</b> &nbsp; <b style="color:#c0392b">0 FAIL</b> &nbsp; <b style="color:#888">0 BLOCKED</b> &nbsp; / 10 scenarios</p>
   <div class="grid">
       <section class="card">
         <div class="hd"><span class="flow">cli↔cli</span>
@@ -110,5 +109,13 @@
         <p class="cap">CLI mints a PAKE code; the browser claims it and stores the device (key never crosses the server).</p>
         <img loading="lazy" src="10.gif" alt="Pair the web app with the CLI">
         <p class="detail">browser claimed the CLI's PAKE code; both sides stored the mutual device</p>
+      </section>
+      <section class="card">
+        <div class="hd"><span class="flow">cli↔cli</span>
+          <span class="badge" style="background:#1f9d55">PASS</span></div>
+        <h2>11 · Pair a new device mid-session (live)</h2>
+        <p class="cap">An always-on `up` daemon picks up a device paired AFTER it started — it logs 'now reachable', subscribes live, and the new device connects and delivers WITHOUT a restart. Regression guard for the live-pairing bug.</p>
+        <img loading="lazy" src="11.gif" alt="Pair a new device mid-session (live)">
+        <p class="detail">device paired mid-session connected live and delivered — no restart needed</p>
       </section></div>
 </body></html>
