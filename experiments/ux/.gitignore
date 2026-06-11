@@ -1,4 +1,8 @@
 # scratch: logs, payloads, raw webm, timings, render screenshots
 .work/
+# pipeline scratch: logs, payloads, recorded webm, background jobs
+.pipe/
+# signaling venv created on first run
+.venv/
 # npm deps + cached chromium (re-installed via `npm i` + `npx playwright install`)
 node_modules/

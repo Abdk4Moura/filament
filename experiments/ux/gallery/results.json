@@ -1,90 +1,30 @@
 {
-  "01": {
-    "flow": "cli\u2194cli",
-    "title": "Pair two devices",
-    "caption": "A mints a PAKE code, B claims it; both derive the same channel \u2014 no key crosses the server.",
+  "pair-device": {
     "verdict": "PASS",
-    "detail": "paired; matching channel b96e3d0218c6",
-    "gif": "01.gif"
+    "detail": "CLI minted a PAKE code; browser claimed it; device mutually remembered (stored=1, live tile=false)"
   },
-  "02": {
-    "flow": "cli\u2194cli",
-    "title": "Devices: list / rename / forget",
-    "caption": "And the regression guard: forgetting one device must NOT wipe another device's granted shell cap.",
+  "web-shell": {
     "verdict": "PASS",
-    "detail": "rename+forget worked; laptop's shell cap SURVIVED the unrelated forget",
-    "gif": "02.gif"
+    "detail": "paired up --shell peer; opened a real terminal; typed a command; saw its output over the data channel"
   },
-  "03": {
-    "flow": "cli\u2194cli",
-    "title": "Send with a one-time code",
-    "caption": "Sender mints a speakable code; the receiver claims it and the bytes land, sha256-verified end-to-end.",
+  "device-sheet-mobile": {
     "verdict": "PASS",
-    "detail": "received payload.bin; sha256 matches end-to-end",
-    "gif": "03.gif"
+    "detail": "tile-v2 mobile tap\u2192sheet (Send leads) verified on a real remembered device"
   },
-  "04": {
-    "flow": "cli\u2194cli",
-    "title": "Send --to a known device",
-    "caption": "No code: a remembered device, identity proof-verified and auto-accepted; bytes sha256-verified.",
+  "device-sheet-desktop": {
     "verdict": "PASS",
-    "detail": "no code; verified 'laptop'; delivered + hash match",
-    "gif": "04.gif"
+    "detail": "tile-v2 desktop hover bar\u2192sheet verified on a real remembered device"
   },
-  "05": {
-    "flow": "cli\u2194cli",
-    "title": "Always-on receiver: up / status / down",
-    "caption": "Bring up a trusted-only drop target, send into it, check status, stop it; bytes sha256-verified.",
+  "sessions-dock": {
     "verdict": "PASS",
-    "detail": "up received; status reported; down stopped it",
-    "gif": "05.gif"
+    "detail": "sessions dock: opened a real terminal, backgrounded (PTY survived), switched, and closed"
   },
-  "06": {
-    "flow": "cli\u2194cli",
-    "title": "Grant shell + ssh over the tunnel",
-    "caption": "Deny-by-default consent; then `filament ssh peer -- echo OK` runs over the data channel.",
+  "cmd-k": {
     "verdict": "PASS",
-    "detail": "shell granted; ssh ran a remote command over the tunnel",
-    "gif": "06.gif"
+    "detail": "\u2318K palette: opened, filtered, and ran the open-terminal action against a real shell device"
   },
-  "07": {
-    "flow": "cli\u2194cli",
-    "title": "Introduce two devices",
-    "caption": "A hub that knows both vouches them to each other with a fresh mutual secret.",
+  "pwa-update": {
     "verdict": "PASS",
-    "detail": "introduce delivered a fresh mutual secret; alice<->bob now know each other",
-    "gif": "07.gif"
-  },
-  "08": {
-    "flow": "cli\u2194web",
-    "title": "CLI sends \u2192 the web app receives",
-    "caption": "The browser (local frontend) accepts the offered file and reaches the download affordance.",
-    "verdict": "PASS",
-    "detail": "CLI offered invoice.pdf; browser accepted and reached the download (save) affordance",
-    "gif": "08.gif"
-  },
-  "09": {
-    "flow": "cli\u2194web",
-    "title": "The web app sends \u2192 CLI recv",
-    "caption": "Browser picks a file and sends it; the CLI receiver writes it, sha256-verified (authoritative no-recorder verify pass). The GIF is a best-effort visual; single-host browser\u2192CLI WebRTC can't complete while the webm recorder runs \u2014 see README.",
-    "verdict": "PASS",
-    "detail": "VERIFY pass (no recorder): sha256 MATCHES. GIF is a best-effort visual; single-host browser\u2192CLI WebRTC can't complete while the webm recorder runs (recording-contention, not a product break).",
-    "gif": "09.gif"
-  },
-  "10": {
-    "flow": "cli\u2194web",
-    "title": "Pair the web app with the CLI",
-    "caption": "CLI mints a PAKE code; the browser claims it and stores the device (key never crosses the server).",
-    "verdict": "PASS",
-    "detail": "browser claimed the CLI's PAKE code; both sides stored the mutual device",
-    "gif": "10.gif"
-  },
-  "11": {
-    "flow": "cli\u2194cli",
-    "title": "Pair a new device mid-session (live)",
-    "caption": "An always-on `up` daemon picks up a device paired AFTER it started \u2014 it logs 'now reachable', subscribes live, and the new device connects and delivers WITHOUT a restart. Regression guard for the live-pairing bug.",
-    "verdict": "PASS",
-    "detail": "device paired mid-session connected live and delivered \u2014 no restart needed",
-    "gif": "11.gif"
+    "detail": "two builds \u2192 real SW update: new service worker took control (auto-reload via skipWaiting/controllerchange, controller=true)"
   }
 }

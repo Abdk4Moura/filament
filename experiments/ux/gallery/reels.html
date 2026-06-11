@@ -1,41 +1,67 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Filament — feature reels</title>
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Filament — e2e reels (real peers)</title>
 <style>
   :root{color-scheme:dark} *{box-sizing:border-box}
-  body{background:#0d1117;color:#c9d1d9;font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;margin:0;padding:24px}
-  h1{font-size:24px;margin:0 0 4px} .sub{color:#8b949e;margin:0 0 20px}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(520px,100%),1fr));gap:20px}
-  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:14px;min-width:0}
-  h2{font-size:16px;margin:6px 0} .cap{color:#8b949e;font-size:13px;margin:0 0 10px}
-  video{width:100%;height:auto;border-radius:8px;background:#000;border:1px solid #30363d}
-  .tag{font:11px monospace;color:#7CF6C8;border:1px solid #7CF6C855;padding:2px 7px;border-radius:10px}
-  a{color:#58a6ff} @media(max-width:600px){body{padding:14px}}
+  body{background:#0B0D0F;color:#D9DEE3;font:15px/1.5 ui-monospace,'JetBrains Mono',Menlo,monospace;margin:0;padding:26px}
+  h1{font-size:21px;margin:0 0 4px;letter-spacing:.01em}
+  .sub{color:#6E7681;margin:0 0 18px;font-size:13px}
+  .summary{margin:10px 0 24px;font-size:13px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(480px,100%),1fr));gap:18px}
+  .card{background:#0F1113;border:1px solid #1E2227;border-radius:8px;padding:14px;min-width:0}
+  .hd{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .tag{font-size:11px;color:#7CF6C8;border:1px solid #7CF6C855;padding:2px 8px;border-radius:9px;letter-spacing:.04em}
+  .badge{color:#0B0D0F;font-size:11px;font-weight:700;padding:2px 9px;border-radius:9px}
+  h2{font-size:15px;margin:9px 0 4px}
+  .cap{color:#8A929B;font-size:12.5px;margin:0 0 10px}
+  .detail{color:#5A626B;font-size:11.5px;margin:8px 0 0;overflow-wrap:anywhere}
+  video,img{width:100%;height:auto;border-radius:6px;background:#000;border:1px solid #1E2227}
+  .nomedia{height:120px;display:flex;align-items:center;justify-content:center;color:#444;border:1px dashed #1E2227;border-radius:6px;font-size:12px}
+  a{color:#7CF6C8}
 </style></head><body>
-<h1>Filament — feature reels</h1>
-<p class="sub">Recorded here, GPU-transcoded on a Tesla T4 (NVENC, ~19×), delivered over filament. <a href="./">← gallery</a></p>
+<h1>Filament — e2e reels (real peers)</h1>
+<p class="sub">Live Playwright recordings driving the REAL app against REAL filament peers — real PAKE pairing, real PTYs, real WebRTC. webm→mp4, GPU-aware encode. <a href='./index.html'>← results</a></p>
 <div class="grid">
-  <section class="card"><span class="tag">web-shell</span>
-    <h2>Browser terminal + mobile key bar</h2>
-    <p class="cap">A real shell in the browser over the data channel — accessory keys (Esc/Tab/arrows), sticky Ctrl.</p>
-    <video controls preload="metadata" src="reel1-webshell.mp4"></video></section>
-  <section class="card"><span class="tag">disclosure</span>
-    <h2>Native-pane: per-device shell button</h2>
-    <p class="cap">The terminal stays invisible until a paired device offers it — click ›_ shell to open a scoped tab.</p>
-    <video controls preload="metadata" src="reel2-native.mp4"></video></section>
-  <section class="card"><span class="tag">themes</span>
-    <h2>Terminal style switcher</h2>
-    <p class="cap">Three presentations — Native pane, Floating glass, Full-bleed — plus a dark/light flip and live accent colors (cyan, amber, magenta, green).</p>
-    <video controls preload="metadata" src="reel3-styleswitch.mp4"></video></section>
-  <section class="card"><span class="tag">annotate</span>
-    <h2>In-page annotator</h2>
-    <p class="cap">The floating ✎ tool draws arrows and notes straight over the live UI — for marking up a session before sharing.</p>
-    <video controls preload="metadata" src="reel4-annotate.mp4"></video></section>
-  <section class="card"><span class="tag">mobile</span>
-    <h2>Phone web-shell + accessory keys</h2>
-    <p class="cap">On a phone viewport: a real shell with the accessory key bar — Esc/Tab/arrows, pipes, and sticky Ctrl for the keys a soft keyboard can't reach.</p>
-    <video controls preload="metadata" src="reel5-mobilekeys.mp4"></video></section>
-  <section class="card"><span class="tag">live-pairing</span>
-    <h2>Pair a new device mid-session — no restart</h2>
-    <p class="cap">An always-on <code>filament up</code> daemon starts knowing only one device. A second device is paired into the shared store WHILE it runs — the daemon picks it up live ("new device 'X' paired — now reachable"), subscribes, and the new device connects and delivers a file without a restart. Regression guard for the live-pairing bug.</p>
-    <video controls preload="metadata" src="reel6-livepair.mp4"></video></section>
-</div></body></html>
+  <section class="card">
+    <div class="hd"><span class="tag">pairing</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Pair → device appears</h2><p class="cap">A real CLI peer mints a PAKE code; the browser types it into the real pair box. The device is stored and a REMEMBERED tile appears — key never crosses the server.</p>
+    <video controls preload="metadata" src="reel-pair-device.mp4"></video>
+    <p class="detail">CLI minted a PAKE code; browser claimed it; device mutually remembered (stored=1, live tile=false)</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">web-shell</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Web-shell over the data channel</h2><p class="cap">Pair a real `up --shell` peer, open its terminal (›_), type a command, and watch the output stream back through the WebRTC data channel — a real PTY.</p>
+    <video controls preload="metadata" src="reel-webshell.mp4"></video>
+    <p class="detail">paired up --shell peer; opened a real terminal; typed a command; saw its output over the data channel</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">tile-v2</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Mobile: tap tile → sheet (Send first)</h2><p class="cap">tile-interaction-v2: tapping a remembered tile on a phone opens the DeviceSheet with Send leading.</p>
+    <video controls preload="metadata" src="reel-device-sheet-mobile.mp4"></video>
+    <p class="detail">tile-v2 mobile tap→sheet (Send leads) verified on a real remembered device</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">tile-v2</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Desktop: hover action bar → sheet</h2><p class="cap">tile-interaction-v2: hovering a remembered tile reveals the action bar; ⋯ more opens the same DeviceSheet.</p>
+    <video controls preload="metadata" src="reel-device-sheet-desktop.mp4"></video>
+    <p class="detail">tile-v2 desktop hover bar→sheet verified on a real remembered device</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">sessions</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Sessions dock: switch / background / close</h2><p class="cap">Open a real terminal, background it (the PTY and scrollback survive), reopen via its chip, and close it — the session dock against a live shell peer.</p>
+    <video controls preload="metadata" src="reel-sessions-dock.mp4"></video>
+    <p class="detail">sessions dock: opened a real terminal, backgrounded (PTY survived), switched, and closed</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">palette</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>⌘K command palette</h2><p class="cap">Open the real command palette, filter, and run the open-terminal action against a paired shell device.</p>
+    <video controls preload="metadata" src="reel-cmd-k.mp4"></video>
+    <p class="detail">⌘K palette: opened, filtered, and ran the open-terminal action against a real shell device</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">pwa</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>PWA update — two builds</h2><p class="cap">Build A is serving; build B is deployed (a fresh /sw.js). The running service worker discovers the update — the 'New version available' nudge or a controllerchange takes over.</p>
+    <video controls preload="metadata" src="reel-pwa-update.mp4"></video>
+    <p class="detail">two builds → real SW update: new service worker took control (auto-reload via skipWaiting/controllerchange, controller=true)</p>
+  </section></div>
+</body></html>

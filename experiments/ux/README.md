@@ -1,5 +1,14 @@
 # Filament CLI — visual UX test harness
 
+> **New: the e2e TEST + live-record pipeline (`pipeline.sh`).** A flag-controlled,
+> async, GPU-aware pipeline that drives the **REAL built app** against **REAL
+> local filament peers** (no mock seams) — real PAKE pairing typed into the real
+> pair box, real PTYs over the data channel, live Playwright video → mp4 reels. It
+> is a TEST first (nonzero exit on any failure). Entry point: `make e2e` (or
+> `./pipeline.sh --help`). See **[README.pipeline.md](README.pipeline.md)** for the
+> real-peer model, flags, quality tiers, async, and workflow integration. The
+> cli↔cli/cli↔web GIF harness below (`run.sh`) is the older recorder and still works.
+
 A self-contained, human-watchable test harness for the Filament CLI's user-facing
 flows. Each scenario drives the **real** `/root/.local/bin/filament` against a
 **local** signaling backend, asserts the outcome (sha256 of transferred bytes,
