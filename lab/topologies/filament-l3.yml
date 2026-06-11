@@ -1,0 +1,24 @@
+# filament-l3 — two nodes carried by filament's data channel (THE integration
+# target). Today this realizes the L2-forward APPROXIMATION (TUN packets tunneled
+# over a filament L2 forward/netcat stream between two isolated filament
+# identities). When native `filament serve_tun` lands, the SAME topology will run
+# over it unchanged.
+#
+# Requires the locally-built cli/target/release/filament and outbound signaling
+# reachability (the filament endpoints handshake over the signaling server, then
+# usually connect direct). Two fully-isolated FILAMENT_CONFIG_DIRs are used; the
+# running `up` daemon and ~/.config/filament are never touched.
+name: filament-l3
+subnet: 10.52.0.0/24
+defaults:
+  mtu: 1280            # leave headroom for the data-channel/relay framing
+nodes:
+  a:
+    addr: 10.52.0.1
+  b:
+    addr: 10.52.0.2
+link:
+  provider: filament
+  crypto: none          # the data channel is already DTLS + pair-proof
+  endpoints: [a, b]
+  transport_subnet: 10.79.0.0/24

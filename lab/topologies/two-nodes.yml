@@ -1,0 +1,21 @@
+# two-nodes — the canonical baseline topology.
+#
+# Two namespace "machines" (a, b) joined by one link. The SAME topology runs over
+# any carrier: `lab up two-nodes --link pipe|udp|wg|filament`. A ping from a's
+# overlay address to b's proves the chosen carrier works as an L3 path.
+#
+# overlay subnet  = the tunnel/TUN addresses the probes target (10.50.0.0/24)
+# transport_subnet = the underlay (veth/udp/wg endpoint) addresses (10.77.0.0/24)
+name: two-nodes
+subnet: 10.50.0.0/24
+defaults:
+  mtu: 1380
+nodes:
+  a:
+    addr: 10.50.0.1
+  b:
+    addr: 10.50.0.2
+link:
+  provider: pipe          # default carrier; override with `lab up ... --link`
+  endpoints: [a, b]
+  transport_subnet: 10.77.0.0/24

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# lab — the filament networking dev-lab CLI.
+#
+# A thin launcher around the `labkit` Python engine (stdlib-only). Works without
+# the Claude skill; the skill drives this same binary.
+#
+#   lab up <topology> [--link pipe|udp|wg|filament] [--crypto ...]
+#   lab down [<lab>] [--all] [--purge-logs]
+#   lab status [<lab>]
+#   lab probe <ping|iperf|curl|counters> [<lab>]
+#   lab fault <loss|latency|bandwidth|stall|clear> [<lab>] [params]
+#   lab compose <topology> [--link ...]
+#   lab doctor [--link ...]
+#   lab list
+#
+# Add --json to any command for machine-readable output.
+#
+# SAFETY: everything is sandboxed in network namespaces; the lab NEVER modifies
+# host networking, the running filament daemon, or the installed binary. Root is
+# required for netns/tun/wg (the CLI checks and fails clearly otherwise).
+set -euo pipefail
+
+LAB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="${LAB_DIR}:${PYTHONPATH:-}"
+
+# Root check up front with a clear message (doctor re-checks per-link).
+if [[ "${1:-}" != "list" && "${1:-}" != "compose" && "${1:-}" != "doctor" \
+      && "${1:-}" != "-h" && "${1:-}" != "--help" && "${1:-}" != "" ]]; then
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "lab: this command needs root (netns/tun/wg). Re-run with sudo." >&2
+    echo "     (try: sudo $0 $*)" >&2
+    exit 1
+  fi
+fi
+
+exec python3 -m labkit.cli "$@"

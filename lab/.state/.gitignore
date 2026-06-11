@@ -1,0 +1,4 @@
+# runtime ledgers + logs — never committed
+*.json
+*.json.tmp
+logs/

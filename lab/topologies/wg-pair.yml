@@ -1,0 +1,19 @@
+# wg-pair — two nodes whose default carrier is a real WireGuard tunnel.
+#
+# Identical shape to two-nodes, but the link defaults to the `wg` provider and
+# declares crypto: wg-noise explicitly. Useful as a ready-made WireGuard example;
+# `lab up wg-pair` needs no --link flag.
+name: wg-pair
+subnet: 10.51.0.0/24
+defaults:
+  mtu: 1380
+nodes:
+  a:
+    addr: 10.51.0.1
+  b:
+    addr: 10.51.0.2
+link:
+  provider: wg
+  crypto: wg-noise
+  endpoints: [a, b]
+  transport_subnet: 10.78.0.0/24
