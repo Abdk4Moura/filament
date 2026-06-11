@@ -91,7 +91,7 @@ def new_box():
         # retry-until-peer: each send bounded at 30s (abandon+re-invoke a wedge),
         # the loop retries up to the submit deadline.
         cli_send_timeout_s=30, submit_deadline_s=360, send_retry_gap_s=2.0,
-        ack_attempts=20, sink_cadence_s=25.0,
+        ack_attempts=20, sink_cadence_s=60.0,
     )
 
 

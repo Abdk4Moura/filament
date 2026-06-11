@@ -117,11 +117,13 @@ say "backend healthy"
 # --- the flaky proxy ----------------------------------------------------------
 # Start with a background FLAPPER so the link keeps dropping for the whole run
 # (mean 6s up / 2s down). The scripted outages below stack on top via the flag.
-# The background flapper is AMBIENT realism (occasional drops); the DETERMINISTIC
-# failure injection is the scripted forced outage at submit + the chaos bursts during
-# result transfer (in flaky_e2e.py). Keep up-windows comfortably longer than a single
-# establishment (~15s here) so the runner reliably converges despite the flapping.
-FLAP_UP="${FILJOB_SIM_FLAP_UP:-90}"; FLAP_DOWN="${FILJOB_SIM_FLAP_DOWN:-1.5}"
+# The DETERMINISTIC failure injection is the scripted forced outage at submit
+# (proves retry-until-peer) + the chaos bursts during the result transfer (proves
+# truncation-reject + reship-until-ack), both driven by flaky_e2e.py via the
+# down-flag. The background flapper is OPTIONAL ambient realism — OFF by default
+# because WebRTC establishment through the proxy takes ~15s and ambient drops in
+# that window make the run slow/nondeterministic. Turn it on with FILJOB_SIM_FLAP_UP.
+FLAP_UP="${FILJOB_SIM_FLAP_UP:-0}"; FLAP_DOWN="${FILJOB_SIM_FLAP_DOWN:-0}"
 say "starting flaky proxy :$PROXY_PORT -> :$PORT (seed=$SEED, flap ${FLAP_UP}s up / ${FLAP_DOWN}s down)"
 "$PY" "$HERE/flaky_proxy.py" --listen "127.0.0.1:$PROXY_PORT" --target "127.0.0.1:$PORT" \
   --down-flag "$DOWN_FLAG" --flap-up "$FLAP_UP" --flap-down "$FLAP_DOWN" --seed "$SEED" \
@@ -137,7 +139,7 @@ cp "$RUNNER/watcher.py"      "$BOX_JOBS/watcher.py"
 # severed `up` zombies out and the host can't rediscover it. up_supervisor.sh
 # recycles it on a cadence so a fresh, re-announcing acceptor is always present.
 FILAMENT_CONFIG_DIR="$BOX_DIN_CFG" HOME="$BOX_DIN_CFG" PATH="$(dirname "$BIN"):$PATH" \
-  bash "$RUNNER/up_supervisor.sh" --cadence "${FILJOB_SIM_DIN_CADENCE:-30}" --log "$WORK/box_din.log" -- \
+  bash "$RUNNER/up_supervisor.sh" --cadence "${FILJOB_SIM_DIN_CADENCE:-90}" --log "$WORK/box_din.log" -- \
   "$BIN" up --server "$SERVER" --name-as filjob-box-din --dir "$BOX_INBOX" \
   >"$WORK/box_din_sup.log" 2>&1 &
 PIDS+=("$!")

@@ -250,6 +250,18 @@ outages and asserts:
 The job still returns complete + byte-correct (sha256 == manifest). See
 `docs/runner/jobrunner-challenges.md` (Transport robustness pass) for the design.
 
+For a **deterministic** check of the same three guarantees in seconds (no transport,
+no WebRTC timing) — used as the regression gate:
+
+```bash
+runner/sim/test_resilience_unit.py
+```
+
+It drives `FileRunnerBox` + the watcher against a scriptable fake `filament` and
+asserts: submit survives 3 forced `no peer connected` failures; a 7 KB truncated
+output is rejected by the sha256 gate; the box stops re-shipping the instant the
+host's `ack-<id>` lands.
+
 ---
 
 ## Not a dead end: lifting onto Modal / SkyPilot

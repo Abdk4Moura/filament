@@ -255,7 +255,22 @@ Per-file changes (`runner/filament_runner.py`, `runner/watcher.py`,
 - `--relay` stays the default; all new knobs are env/flag-configurable with sane
   defaults.
 
-**Validation:** `runner/sim/flaky_sim_test.sh` shows a job succeed (output byte-correct
-+ sha256-verified, manifest acked) despite induced drops, a truncated transfer
-detected+recovered, and a lost manifest re-shipped until acked; `runner/run_local_test.sh`
-(clean link) stays green. Still pending: live-T4 confirmation over the real WAN path.
+**Validation:** two complementary tests.
+
+- `runner/sim/test_resilience_unit.py` — **deterministic** (seconds, no transport): drives
+  `FileRunnerBox` + `watcher.Watcher` against a scriptable fake `filament` CLI and pins all
+  three guarantees exactly: (1) `submit` survives 3 forced `no peer connected` failures and
+  lands (retry-until-peer); (2) a 7 KB truncated `out.bin` is **rejected** by the sha256
+  integrity gate and only the byte-correct copy is accepted; (3) the host sends `ack-<id>`
+  only after sha256 verification and the box reship loop **stops on the ack** (4 rounds, not
+  the safety cap). Green 3/3.
+- `runner/sim/flaky_sim_test.sh` — the **real-transport** flaky-link e2e (filament WebRTC
+  through the dropping proxy). Confirmed end-to-end: submit recovered after a forced outage,
+  result returned byte-correct + sha256-verified through induced result-transfer drops (the
+  host out dir holds `out.mp4.1/.2` resend copies — truncation rejected, byte-correct copy
+  selected), manifest re-shipped and `host ACKed … stopping re-ship` observed in the watcher
+  log. Its wall-clock varies with WebRTC establishment timing under the proxy, so the unit
+  test is the deterministic gate; the e2e is the integration proof.
+
+`runner/run_local_test.sh` (clean link, real transport) stays green. Still pending:
+live-T4 confirmation over the real WAN path.
