@@ -46,6 +46,10 @@ import box_executor  # noqa: E402  (reuse the FIXED job-execution logic)
 _DUP_RE = re.compile(r"^(?P<base>.+?)(?:\.(?P<n>\d+))?$")
 # job spec files are job<anything>.json (e.g. job.json, job-<id>.json)
 _SPEC_RE = re.compile(r"^job.*\.json(?:\.\d+)?$")
+# the host's completion ACK lands in the inbox as `ack-<job_id>` (possibly with a
+# `.N` resend suffix). Its presence means the host has the FULL, sha256-verified
+# result set, so the watcher can stop re-shipping that job.
+_ACK_RE = re.compile(r"^ack-(?P<job_id>.+?)(?:\.\d+)?$")
 
 
 def log(msg):
@@ -102,7 +106,9 @@ def _stable_size(path, settle_s=1.0):
 class Watcher:
     def __init__(self, jobs_root, server, filament_bin, dout_config_dir,
                  host_dout_peer="host-out", relay=True, poll_s=2.0,
-                 settle_s=1.0, reship_attempts=8, reship_gap_s=8.0):
+                 settle_s=1.0, reship_attempts=8, reship_gap_s=8.0,
+                 reship_deadline_s=1800.0, send_timeout_s=0,
+                 send_retry_attempts=6, send_retry_gap_s=4.0):
         self.jobs_root = os.path.abspath(os.path.expanduser(jobs_root))
         self.inbox = os.path.join(self.jobs_root, ".inbox")
         self.done = os.path.join(self.inbox, "done")
@@ -115,11 +121,49 @@ class Watcher:
         self.relay = relay
         self.poll_s = poll_s
         self.settle_s = settle_s
+        # re-ship is now ACK-driven, not a blind fixed count: keep re-shipping
+        # the result set until the host ACKs it (over din) OR reship_deadline_s
+        # elapses. reship_attempts is a SAFETY CAP on rounds so a never-acking
+        # host can't loop forever; the deadline is the primary bound.
         self.reship_attempts = reship_attempts
         self.reship_gap_s = reship_gap_s
+        self.reship_deadline_s = reship_deadline_s
+        # each individual `filament send` should NOT give up at the stock 60s
+        # FILAMENT_SEND_TIMEOUT on a flaky link — 0 disables that internal bound
+        # so the send waits for the peer; the retry loop + deadline bound it.
+        self.send_timeout_s = send_timeout_s
+        self.send_retry_attempts = send_retry_attempts
+        self.send_retry_gap_s = send_retry_gap_s
         self._ship_threads = []
         for d in (self.inbox, self.done, self.outbox, self.scratch_root):
             os.makedirs(d, exist_ok=True)
+
+    # ---- host completion ACK (over din) ----------------------------------
+
+    def _ack_seen(self, job_id):
+        """True once the host's `ack-<job_id>` file has landed in the inbox —
+        meaning the host has the full, sha256-verified result set."""
+        for fn in os.listdir(self.inbox):
+            m = _ACK_RE.match(fn)
+            if m and m.group("job_id") == job_id and os.path.isfile(
+                    os.path.join(self.inbox, fn)):
+                return True
+        return False
+
+    def _consume_acks(self):
+        """Move any ack-* files out of the inbox so they aren't mistaken for a
+        spec/input and don't accumulate. Idempotent."""
+        for fn in os.listdir(self.inbox):
+            if _ACK_RE.match(fn):
+                src = os.path.join(self.inbox, fn)
+                if os.path.isfile(src):
+                    try:
+                        shutil.move(src, os.path.join(self.done, fn))
+                    except Exception:
+                        try:
+                            os.remove(src)
+                        except OSError:
+                            pass
 
     # ---- readiness -------------------------------------------------------
 
@@ -245,23 +289,57 @@ class Watcher:
         # next job can run immediately (pipelining; no sequential stall on the
         # flaky link). The host stands up its dout sink only when it starts
         # awaiting, which races with a fast job finishing here — a single send can
-        # land in a reconnect window and be lost. So RE-SHIP repeatedly, spaced
-        # out, for a bounded total time: the host dedups by job_id, and the
-        # diagnosis proved resends eventually land. Outputs first, manifest LAST
-        # each round (manifest = completion signal).
+        # land in a reconnect window and be lost.
+        #
+        # RESULT-ACK LOOP (close the loop): keep RE-SHIPPING the result set until
+        # the host tells us — via an `ack-<job_id>` file pushed back over din —
+        # that it has the FULL, sha256-verified set. This means neither side gives
+        # up prematurely: a lost manifest or a truncated output simply triggers
+        # another round. Bounded by reship_deadline_s (primary) and a safety cap of
+        # reship_attempts rounds. Outputs first, manifest LAST each round (manifest
+        # = completion signal).
         def _ship_loop():
-            reship = max(1, self.reship_attempts)
-            for i in range(reship):
+            cap = max(1, self.reship_attempts)
+            deadline = time.monotonic() + self.reship_deadline_s
+            i = 0
+            while True:
+                if self._ack_seen(job_id):
+                    log(f"host ACKed {job_id} — result set confirmed received; "
+                        f"stopping re-ship after {i} round(s)")
+                    self._consume_acks()
+                    return
+                i += 1
                 try:
                     if shipped_outputs:
                         self._send(shipped_outputs)
                     self._send([manifest_dst])
-                    log(f"sent results for {job_id} (round {i + 1}/{reship}): "
-                        f"{len(shipped_outputs)} output(s) + manifest")
+                    log(f"sent results for {job_id} (round {i}): "
+                        f"{len(shipped_outputs)} output(s) + manifest "
+                        f"(awaiting host ack)")
                 except Exception as e:
-                    log(f"ship round {i + 1} for {job_id} errored: {e}")
-                if i + 1 < reship:
-                    time.sleep(self.reship_gap_s)
+                    log(f"ship round {i} for {job_id} errored: {e}")
+                # stop conditions: ack arrived, deadline passed, or safety cap hit
+                if self._ack_seen(job_id):
+                    log(f"host ACKed {job_id} after round {i}; stopping re-ship")
+                    self._consume_acks()
+                    return
+                if time.monotonic() >= deadline:
+                    log(f"GIVE UP re-shipping {job_id}: no host ack within "
+                        f"{self.reship_deadline_s:.0f}s ({i} round(s) sent). "
+                        f"Result is on disk in {ob}.")
+                    return
+                if i >= cap:
+                    log(f"GIVE UP re-shipping {job_id}: hit safety cap of {cap} "
+                        f"rounds with no host ack. Result is on disk in {ob}.")
+                    return
+                # poll the inbox for the ack while we wait out the gap, so we react
+                # to an ack promptly instead of after a full reship_gap_s sleep.
+                waited = 0.0
+                while waited < self.reship_gap_s:
+                    if self._ack_seen(job_id):
+                        break
+                    time.sleep(min(0.5, self.reship_gap_s - waited))
+                    waited += 0.5
 
         import threading
         t = threading.Thread(target=_ship_loop, name=f"ship-{job_id}", daemon=True)
@@ -277,17 +355,33 @@ class Watcher:
         env["FILAMENT_CONFIG_DIR"] = self.dout_cfg
         env["HOME"] = self.dout_cfg
         env["FILAMENT_L2"] = "1"
-        # retry: the WAN link drops; a discrete send retries/resumes and the bytes
-        # eventually land. We re-invoke a few times on a hard failure too.
+        # RETRY-UNTIL-PEER: on a flaky link the host's dout sink may not be
+        # subscribed yet (or the signaling link is mid-reconnect), so a single
+        # `send` would hit "no peer connected" and give up. We (a) stop the CLI
+        # from giving up early by setting FILAMENT_SEND_TIMEOUT (0 = wait for the
+        # peer), and (b) re-invoke on a hard failure with backoff. The outer
+        # _ship_loop bounds total time via the ACK deadline.
+        env["FILAMENT_SEND_TIMEOUT"] = str(self.send_timeout_s)
         last = None
-        for attempt in range(4):
-            r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        attempts = max(1, self.send_retry_attempts)
+        for attempt in range(attempts):
+            # cap per-invocation wall time so a wedged send can't block the whole
+            # ship loop forever; the loop will re-invoke (a fresh connect often
+            # clears a wedged candidate pair).
+            try:
+                r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                   timeout=600)
+            except subprocess.TimeoutExpired:
+                last = "send invocation exceeded 600s (wedged); re-invoking"
+                log(f"send attempt {attempt + 1} {last}")
+                continue
             if r.returncode == 0:
                 return
             last = r.stderr.strip()[-300:]
-            log(f"send attempt {attempt + 1} failed ({r.returncode}): {last}; retrying")
-            time.sleep(3 + 2 * attempt)
-        log(f"WARNING: send ultimately failed after retries: {last}")
+            log(f"send attempt {attempt + 1}/{attempts} failed ({r.returncode}): "
+                f"{last}; retrying")
+            time.sleep(self.send_retry_gap_s + 2 * attempt)
+        log(f"WARNING: send ultimately failed after {attempts} attempts: {last}")
 
     def process_one(self, spec_fname, job):
         job_id = job["id"]
@@ -315,6 +409,9 @@ class Watcher:
             try:
                 claim = self._claim_next()
                 if claim is None:
+                    # tidy any late/duplicate acks out of the inbox so they don't
+                    # accumulate (the per-job ship loop also consumes its own ack).
+                    self._consume_acks()
                     time.sleep(self.poll_s)
                     continue
                 spec_fname, job = claim
@@ -342,11 +439,23 @@ def main(argv):
     ap.add_argument("--poll", type=float, default=float(os.environ.get("FILJOB_POLL_S", "2.0")))
     ap.add_argument("--settle", type=float, default=float(os.environ.get("FILJOB_SETTLE_S", "1.0")))
     ap.add_argument("--reship-attempts", type=int,
-                    default=int(os.environ.get("FILJOB_RESHIP_ATTEMPTS", "8")),
-                    help="re-send the result set N times (host dedups; resends survive drops)")
+                    default=int(os.environ.get("FILJOB_RESHIP_ATTEMPTS", "200")),
+                    help="SAFETY CAP on re-ship rounds (ACK is the primary stop)")
     ap.add_argument("--reship-gap", type=float,
                     default=float(os.environ.get("FILJOB_RESHIP_GAP_S", "8.0")),
                     help="seconds between re-ship attempts")
+    ap.add_argument("--reship-deadline", type=float,
+                    default=float(os.environ.get("FILJOB_RESHIP_DEADLINE_S", "1800")),
+                    help="give up re-shipping a job after this many seconds with no host ack")
+    ap.add_argument("--send-timeout", type=int,
+                    default=int(os.environ.get("FILJOB_SEND_TIMEOUT_S", "0")),
+                    help="FILAMENT_SEND_TIMEOUT for each send (0 = wait for peer, no early give-up)")
+    ap.add_argument("--send-retries", type=int,
+                    default=int(os.environ.get("FILJOB_SEND_RETRIES", "6")),
+                    help="re-invoke a failed `send` this many times before the round errors")
+    ap.add_argument("--send-retry-gap", type=float,
+                    default=float(os.environ.get("FILJOB_SEND_RETRY_GAP_S", "4.0")),
+                    help="base backoff seconds between send re-invocations")
     # relay defaults ON for WAN robustness; the local loopback test passes --no-relay.
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--relay", dest="relay", action="store_true", default=True)
@@ -358,6 +467,8 @@ def main(argv):
         dout_config_dir=args.dout_cfg, host_dout_peer=args.host_dout_peer,
         relay=args.relay, poll_s=args.poll, settle_s=args.settle,
         reship_attempts=args.reship_attempts, reship_gap_s=args.reship_gap,
+        reship_deadline_s=args.reship_deadline, send_timeout_s=args.send_timeout,
+        send_retry_attempts=args.send_retries, send_retry_gap_s=args.send_retry_gap,
     )
     w.run_forever()
     return 0

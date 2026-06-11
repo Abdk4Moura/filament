@@ -58,6 +58,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -603,6 +604,11 @@ class FileRunnerBox:
         remote_inbox: str = "~/filament-jobs/.inbox",  # informational
         relay: bool = True,          # force TURN relay for WAN robustness
         send_timeout_s: int = 1800,
+        # retry-until-peer knobs:
+        cli_send_timeout_s: int = 0,      # FILAMENT_SEND_TIMEOUT per send (0=wait for peer)
+        submit_deadline_s: float = 1800,  # overall window to land a din push
+        send_retry_gap_s: float = 4.0,    # base backoff between send re-invocations
+        ack_attempts: int = 6,            # how hard to push the completion ack
     ):
         self.box_din = petname_box_din
         self.server = server
@@ -612,6 +618,10 @@ class FileRunnerBox:
         self.remote_inbox = remote_inbox
         self.relay = relay
         self.send_timeout_s = send_timeout_s
+        self.cli_send_timeout_s = cli_send_timeout_s
+        self.submit_deadline_s = submit_deadline_s
+        self.send_retry_gap_s = send_retry_gap_s
+        self.ack_attempts = ack_attempts
         self._manifests = {}
 
     def _env(self, config_dir):
@@ -654,20 +664,82 @@ class FileRunnerBox:
         print(f"  submitted {job.id}: {len(job.inputs)} input(s) + spec "
               f"({'relay' if self.relay else 'direct'})", flush=True)
 
-    def _send(self, paths, timeout=None):
+    def _send(self, paths, timeout=None, overall_deadline_s=None):
+        """Push `paths` to the box on din, RETRYING UNTIL THE PEER APPEARS.
+
+        On a flaky link the box's din acceptor may be mid-reconnect when we push,
+        so a single `send` would hit "no peer connected" and give up at the stock
+        60s. We (a) set FILAMENT_SEND_TIMEOUT so the CLI itself doesn't give up
+        early (0 = wait for the peer), and (b) re-invoke with backoff until it
+        succeeds or a generous OVERALL deadline elapses. No more single-shot
+        give-ups."""
         cmd = [self.bin, "send", *paths, "--to", self.box_din,
                "--server", self.server, *self._relay_args()]
+        env = self._env(self.cfg)
+        env["FILAMENT_SEND_TIMEOUT"] = str(self.cli_send_timeout_s)
+        deadline = time.monotonic() + (
+            overall_deadline_s if overall_deadline_s is not None else self.submit_deadline_s)
         last = None
-        for attempt in range(4):
-            r = subprocess.run(cmd, env=self._env(self.cfg), capture_output=True,
-                               text=True, timeout=timeout or self.send_timeout_s)
-            if r.returncode == 0:
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                   timeout=timeout or 600)
+            except subprocess.TimeoutExpired:
+                last = "send invocation exceeded 600s (wedged); re-invoking"
+                print(f"  send attempt {attempt}: {last}", flush=True)
+                r = None
+            if r is not None and r.returncode == 0:
                 return r
-            last = r.stderr.strip()[-300:]
-            print(f"  send attempt {attempt + 1} failed ({r.returncode}): {last}; "
-                  f"retrying", flush=True)
-            time.sleep(3 + 2 * attempt)
-        raise RunnerError(f"send to {self.box_din} failed after retries: {last}")
+            if r is not None:
+                last = r.stderr.strip()[-300:]
+            if time.monotonic() >= deadline:
+                raise RunnerError(
+                    f"send to {self.box_din} failed within {self.submit_deadline_s:.0f}s "
+                    f"deadline after {attempt} attempt(s): {last}")
+            print(f"  send attempt {attempt} failed: {last}; retrying "
+                  f"(retry-until-peer, deadline in {deadline - time.monotonic():.0f}s)",
+                  flush=True)
+            time.sleep(min(self.send_retry_gap_s + 2 * attempt, 20))
+
+    def _send_ack(self, job_id: str):
+        """Push a tiny `ack-<job_id>` file to the box inbox over din so the box
+        watcher knows we have the full verified result set and can stop re-shipping.
+
+        Best-effort + persistent: we try a handful of times with FILAMENT_SEND_TIMEOUT
+        set so each send waits for the peer rather than giving up at 60s. A lost ack
+        is self-healing — the box keeps re-shipping until an ack lands, so at worst
+        the box does one extra round. We never raise: the result is already in hand."""
+        ack_dir = os.path.join(tempfile.mkdtemp(prefix="filjob_ack_"))
+        ack_path = os.path.join(ack_dir, f"ack-{job_id}")
+        try:
+            with open(ack_path, "w") as f:
+                f.write(f"ok {job_id}\n")
+            cmd = [self.bin, "send", ack_path, "--to", self.box_din,
+                   "--server", self.server, *self._relay_args()]
+            env = self._env(self.cfg)
+            env["FILAMENT_SEND_TIMEOUT"] = str(self.cli_send_timeout_s)
+            attempts = max(1, self.ack_attempts)
+            for attempt in range(attempts):
+                try:
+                    r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                                       timeout=300)
+                except subprocess.TimeoutExpired:
+                    print(f"  ack send attempt {attempt + 1} wedged; retrying", flush=True)
+                    continue
+                if r.returncode == 0:
+                    print(f"  sent completion ack-{job_id} to box (din)", flush=True)
+                    return
+                if attempt + 1 < attempts:
+                    time.sleep(self.send_retry_gap_s + 2 * attempt)
+            print(f"  WARNING: completion ack-{job_id} not confirmed delivered "
+                  f"(box re-ship loop will still self-terminate on deadline)", flush=True)
+        finally:
+            try:
+                shutil.rmtree(ack_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     # ---- await -----------------------------------------------------------
 
@@ -708,11 +780,21 @@ class FileRunnerBox:
             deadline = time.monotonic() + overall_timeout_s
             printed_wait = False
             while time.monotonic() < deadline:
+                # INTEGRITY GATE: only accept when a manifest for THIS job is here
+                # AND every declared (non-missing) output's sha256 matches the
+                # manifest. A truncated/partial output fails _outputs_verified, so
+                # the host NEVER accepts it as success — it keeps awaiting while the
+                # box re-ships (resume-to-completion).
                 m = self._scan_manifest(local_output_dir, job.id)
                 if m is not None and self._outputs_verified(m, job, local_output_dir):
                     self._manifests[job.id] = m
                     print(f"  results complete for {job.id}: manifest + "
-                          f"{len(job.outputs)} output(s) verified", flush=True)
+                          f"{len(job.outputs)} output(s) sha256-verified", flush=True)
+                    # CLOSE THE LOOP: tell the box we have the full, verified set so
+                    # its watcher stops re-shipping. Best-effort but persistent — the
+                    # box's ship loop keeps re-sending until it sees this ack, so a
+                    # lost ack just costs an extra round, never correctness.
+                    self._send_ack(job.id)
                     return m
                 if not printed_wait:
                     print(f"  awaiting results for {job.id} (sink up, "

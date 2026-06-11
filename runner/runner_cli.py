@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=1800, help="per-job compute timeout (s)")
     ap.add_argument("--await-timeout", type=int, default=None,
                     help="overall host-side wait for results (default: job timeout + 600s)")
+    ap.add_argument("--submit-deadline", type=int,
+                    default=int(os.environ.get("FILJOB_SUBMIT_DEADLINE_S", "1800")),
+                    help="overall window to land the job push on the box (retry-until-peer)")
     ap.add_argument("--rclone-dest", default=None, help="optional R2 durability target, e.g. r2:reel/")
     ap.add_argument("--id", default=None, help="job id (default: auto)")
     # --relay is the WAN default; --no-relay for local/direct paths.
@@ -72,13 +75,29 @@ def main():
         host_dout_config_dir=args.dout_cfg, filament_bin=args.bin,
         remote_inbox=args.remote_inbox, relay=args.relay,
         send_timeout_s=max(args.timeout, 1800),
+        submit_deadline_s=args.submit_deadline,
     )
 
-    print(f"submitting {job.id}: {' '.join(cmd)}", file=sys.stderr)
-    manifest = rb.run(job, local_input_dir=args.indir, local_output_dir=args.outdir,
-                      overall_timeout_s=args.await_timeout)
-    print(json.dumps(manifest, indent=2))
-    return 0 if manifest and manifest.get("exit_code") == 0 else 1
+    print(f"submitting {job.id}: {' '.join(cmd)}", file=sys.stderr, flush=True)
+    try:
+        manifest = rb.run(job, local_input_dir=args.indir, local_output_dir=args.outdir,
+                          overall_timeout_s=args.await_timeout)
+    except Exception as e:
+        # No silent hangs: emit a clear terminal outcome, unbuffered.
+        print(f"FAILED {job.id}: {e}", file=sys.stderr, flush=True)
+        return 2
+    print(json.dumps(manifest, indent=2), flush=True)
+    if manifest and manifest.get("exit_code") == 0 and not manifest.get("timed_out"):
+        print(f"SUCCEEDED {job.id}", file=sys.stderr, flush=True)
+        return 0
+    if manifest and manifest.get("timed_out"):
+        print(f"TIMED-OUT {job.id} (job exceeded its compute timeout on the box)",
+              file=sys.stderr, flush=True)
+        return 1
+    print(f"FAILED {job.id}: job exit_code="
+          f"{manifest.get('exit_code') if manifest else None}",
+          file=sys.stderr, flush=True)
+    return 1
 
 
 if __name__ == "__main__":
