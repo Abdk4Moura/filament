@@ -131,6 +131,10 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
   // peer announces (e.g. show "my-laptop", not the broadcast "root@do-vm").
   // Strangers/unknown peers keep their announced name.
   const displayName = peer.known || peer.verified || peer.name
+  // The web-shell button (same condition used to render it below). When it
+  // shows, the idle caption is redundant with it, so we shorten the caption to
+  // 'click to send' — that's what keeps the hint a single line on a narrow tile.
+  const showShell = ready && known && peer.shell && onOpenShell
   return (
     <div
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
@@ -169,9 +173,9 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
           <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status]}</span>
           <span>{peer.lastSeen}</span>
         </div>
-        <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, height: 12, transition: 'color .12s' }}>
+        <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .12s' }}>
           {ready
-            ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
+            ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? (showShell ? 'click to send' : 'remembered · click to send') : 'click · drop to send')
             : known ? 'remembered · reaches you in any room' : '—'}
         </div>
         {/* web-shell: the button appears only for a remembered + connected device
@@ -180,7 +184,7 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
             server-side, so this is purely about hiding the button for the 90%. It
             stacks in normal flow under the caption (not absolute) so it never
             overlaps the send-hint text. */}
-        {ready && known && peer.shell && onOpenShell && (
+        {showShell && (
           <button
             onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
             title={`open a terminal on ${displayName}`}
