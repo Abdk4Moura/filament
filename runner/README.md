@@ -226,6 +226,30 @@ CPU `libx264`. **Relay note:** the test uses the **direct** route (`--no-relay`)
 because TURN isn't available on localhost; the bring-up and host default to
 `--relay` for the WAN. Validated 3/3 deterministic runs.
 
+## Flaky-link simulation (prove the resilience without a T4)
+
+```bash
+runner/sim/flaky_sim_test.sh        # FILJOB_KEEP=1 to keep the work dir + logs
+```
+
+Reproduces the three failure modes that broke the runner over the real Colab→do-vm
+WAN link and proves the resilience fixes recover from each — **all locally**. A
+stdlib TCP proxy (`runner/sim/flaky_proxy.py`) sits between every filament client
+and the local backend and severs the signaling link on command (plus a background
+randomised flapper); `flaky_e2e.py` drives a real job through it while inducing
+outages and asserts:
+
+- **(a) discovery race** — link DOWN at submit; the single-shot `send` fails, but
+  **retry-until-peer** lands the push after the link heals.
+- **(b) truncation** — the link drops mid result-transfer; the host's **sha256
+  integrity gate** rejects the partial and keeps awaiting until a byte-correct copy
+  lands (resume-to-completion). The host never accepts a truncated output.
+- **(c) lost manifest** — drops land in the manifest's arrival window; the box
+  **re-ships until the host ACKs** (a tiny `ack-<job_id>` pushed back over din).
+
+The job still returns complete + byte-correct (sha256 == manifest). See
+`docs/runner/jobrunner-challenges.md` (Transport robustness pass) for the design.
+
 ---
 
 ## Not a dead end: lifting onto Modal / SkyPilot

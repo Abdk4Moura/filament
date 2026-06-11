@@ -107,8 +107,8 @@ class Watcher:
     def __init__(self, jobs_root, server, filament_bin, dout_config_dir,
                  host_dout_peer="host-out", relay=True, poll_s=2.0,
                  settle_s=1.0, reship_attempts=8, reship_gap_s=8.0,
-                 reship_deadline_s=1800.0, send_timeout_s=0,
-                 send_retry_attempts=6, send_retry_gap_s=4.0):
+                 reship_deadline_s=1800.0, send_timeout_s=45,
+                 send_retry_attempts=8, send_retry_gap_s=4.0):
         self.jobs_root = os.path.abspath(os.path.expanduser(jobs_root))
         self.inbox = os.path.join(self.jobs_root, ".inbox")
         self.done = os.path.join(self.inbox, "done")
@@ -128,9 +128,11 @@ class Watcher:
         self.reship_attempts = reship_attempts
         self.reship_gap_s = reship_gap_s
         self.reship_deadline_s = reship_deadline_s
-        # each individual `filament send` should NOT give up at the stock 60s
-        # FILAMENT_SEND_TIMEOUT on a flaky link — 0 disables that internal bound
-        # so the send waits for the peer; the retry loop + deadline bound it.
+        # each individual `filament send` is BOUNDED (FILAMENT_SEND_TIMEOUT) so a
+        # wedged establishment is abandoned and re-invoked (a fresh connect clears
+        # a stuck candidate pair); the retry loop + reship deadline are what wait
+        # "until the peer appears". 0 would disable the bound (wait forever) —
+        # avoid it: a single wedged send would stall the whole ship loop.
         self.send_timeout_s = send_timeout_s
         self.send_retry_attempts = send_retry_attempts
         self.send_retry_gap_s = send_retry_gap_s
@@ -448,8 +450,9 @@ def main(argv):
                     default=float(os.environ.get("FILJOB_RESHIP_DEADLINE_S", "1800")),
                     help="give up re-shipping a job after this many seconds with no host ack")
     ap.add_argument("--send-timeout", type=int,
-                    default=int(os.environ.get("FILJOB_SEND_TIMEOUT_S", "0")),
-                    help="FILAMENT_SEND_TIMEOUT for each send (0 = wait for peer, no early give-up)")
+                    default=int(os.environ.get("FILJOB_SEND_TIMEOUT_S", "45")),
+                    help="FILAMENT_SEND_TIMEOUT bounding each send invocation (the retry "
+                         "loop + reship deadline wait for the peer; 0 = wait forever, avoid)")
     ap.add_argument("--send-retries", type=int,
                     default=int(os.environ.get("FILJOB_SEND_RETRIES", "6")),
                     help="re-invoke a failed `send` this many times before the round errors")

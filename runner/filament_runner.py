@@ -604,11 +604,15 @@ class FileRunnerBox:
         remote_inbox: str = "~/filament-jobs/.inbox",  # informational
         relay: bool = True,          # force TURN relay for WAN robustness
         send_timeout_s: int = 1800,
-        # retry-until-peer knobs:
-        cli_send_timeout_s: int = 0,      # FILAMENT_SEND_TIMEOUT per send (0=wait for peer)
+        # retry-until-peer knobs. Each `send` is BOUNDED (cli_send_timeout_s) so a
+        # wedged establishment is abandoned and re-invoked — a fresh connect clears
+        # a stuck candidate pair. The LOOP (submit_deadline_s) is what waits "until
+        # the peer appears": bounded attempts, unbounded-until-deadline retries.
+        cli_send_timeout_s: int = 45,     # FILAMENT_SEND_TIMEOUT per send invocation
         submit_deadline_s: float = 1800,  # overall window to land a din push
         send_retry_gap_s: float = 4.0,    # base backoff between send re-invocations
-        ack_attempts: int = 6,            # how hard to push the completion ack
+        ack_attempts: int = 8,            # how hard to push the completion ack
+        sink_cadence_s: float = 30.0,     # recycle the dout sink every N s (reconnect(false) heal)
     ):
         self.box_din = petname_box_din
         self.server = server
@@ -622,6 +626,7 @@ class FileRunnerBox:
         self.submit_deadline_s = submit_deadline_s
         self.send_retry_gap_s = send_retry_gap_s
         self.ack_attempts = ack_attempts
+        self.sink_cadence_s = sink_cadence_s
         self._manifests = {}
 
     def _env(self, config_dir):
@@ -759,22 +764,61 @@ class FileRunnerBox:
             except (FileNotFoundError, IsADirectoryError, PermissionError):
                 pass
 
-        up = subprocess.Popen(
-            [self.bin, "up", "--server", self.server, "--name-as", "filjob-host-sink",
-             "--dir", local_output_dir, *self._relay_args()],
-            env=self._env(self.dout_cfg),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        )
-        # drain the sink's stdout so it never blocks on a full pipe
+        # SUPERVISED dout SINK: the filament socket.io client is reconnect(false),
+        # so on a flaky link a long-lived `up` sink can be severed and zombie out —
+        # then the box's resends have nothing to land on and await would hang to the
+        # deadline. We instead RESTART the sink on a cadence (and immediately if it
+        # dies), so a fresh, re-announcing sink is always available within
+        # sink_cadence_s. Restarting `up --dir` is idempotent (it just receives into
+        # local_output_dir; filament keeps partials), and the integrity gate below
+        # still guarantees we only accept a complete, sha256-correct set.
         import threading as _threading
+        stop_sink = _threading.Event()
 
-        def _drain():
-            try:
-                for _ in iter(up.stdout.readline, b""):
+        def _spawn_sink():
+            p = subprocess.Popen(
+                [self.bin, "up", "--server", self.server, "--name-as",
+                 "filjob-host-sink", "--dir", local_output_dir, *self._relay_args()],
+                env=self._env(self.dout_cfg),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            )
+
+            def _drain():
+                try:
+                    for _ in iter(p.stdout.readline, b""):
+                        pass
+                except Exception:
                     pass
-            except Exception:
-                pass
-        _threading.Thread(target=_drain, daemon=True).start()
+            _threading.Thread(target=_drain, daemon=True).start()
+            return p
+
+        sink_box = {"p": _spawn_sink()}
+
+        def _supervise():
+            while not stop_sink.is_set():
+                # wait out the cadence, but react if the sink exits early
+                waited = 0.0
+                while waited < self.sink_cadence_s and not stop_sink.is_set():
+                    if sink_box["p"].poll() is not None:
+                        break
+                    time.sleep(0.5)
+                    waited += 0.5
+                if stop_sink.is_set():
+                    return
+                # proactive recycle: replace a possibly-zombied sink with a fresh one
+                old = sink_box["p"]
+                try:
+                    old.terminate()
+                    old.wait(timeout=5)
+                except Exception:
+                    try:
+                        old.kill()
+                    except Exception:
+                        pass
+                if not stop_sink.is_set():
+                    sink_box["p"] = _spawn_sink()
+        sup = _threading.Thread(target=_supervise, daemon=True)
+        sup.start()
 
         try:
             deadline = time.monotonic() + overall_timeout_s
@@ -797,7 +841,7 @@ class FileRunnerBox:
                     self._send_ack(job.id)
                     return m
                 if not printed_wait:
-                    print(f"  awaiting results for {job.id} (sink up, "
+                    print(f"  awaiting results for {job.id} (supervised sink up, "
                           f"{'relay' if self.relay else 'direct'}) ...", flush=True)
                     printed_wait = True
                 time.sleep(2.0)
@@ -806,11 +850,16 @@ class FileRunnerBox:
                 f"for {job.id} in {local_output_dir} "
                 f"(have: {sorted(os.listdir(local_output_dir))})")
         finally:
-            up.terminate()
+            stop_sink.set()
             try:
-                up.wait(timeout=8)
+                sink_box["p"].terminate()
+                sink_box["p"].wait(timeout=8)
             except Exception:
-                up.kill()
+                try:
+                    sink_box["p"].kill()
+                except Exception:
+                    pass
+            sup.join(timeout=3)
 
     def _scan_manifest(self, results_dir, job_id):
         """Return the manifest dict for job_id if a manifest.json (or a `.N`

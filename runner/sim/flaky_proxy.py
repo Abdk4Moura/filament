@@ -86,12 +86,13 @@ class FlakyProxy:
                 # peer observes a truncated/closed stream (real drop behaviour).
                 if self.is_down():
                     break
-                src.settimeout(0.5)
                 try:
+                    src.settimeout(0.5)
                     data = src.recv(_BUF)
                 except socket.timeout:
                     continue
-                except OSError:
+                except (OSError, ValueError):
+                    # peer socket was closed by the other pump / a sever — done
                     break
                 if not data:
                     break

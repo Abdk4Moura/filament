@@ -171,3 +171,91 @@ dry run of exactly what the watcher will automate.
       superseded and can be retired).
 - [ ] Add R2 durability (`rclone` is a no-op until creds are set) so artifacts survive
       the box dying even if the last-mile pull is mid-retry.
+
+---
+
+## Transport robustness pass (2026-06-11) — local flaky-link repro + runner resilience
+
+The file-driven control plane removed the long-lived PTY, but the *file transfers
+themselves* still failed intermittently over the real Colab→do-vm link in BOTH
+directions: `send` couldn't always find the peer within 60s (`no peer connected`),
+and the box→host result transfers truncated (a 7 KB partial of a multi-MB file,
+`moov` missing) with the small `manifest.json` completion signal never arriving.
+This pass makes the runner robust against that instability and adds a deterministic
+LOCAL reproduction so the fix is validated without a real T4.
+
+### Layer A — the core discovery race (investigated; already fixed in `main`'s CLI)
+
+The chronic cross-machine discovery flakiness diagnosed in the Python signaling
+harness (`experiments/`, memory `filament-signaling-harness.md`) was a **Rust client
+discovery race**, with a fix set on `transport-direct-quic`:
+
+| commit | fix |
+|--------|-----|
+| `a78de6a` | subscribe on `welcome` (don't subscribe before the socket.io connection is proven up — the original race) |
+| `8f1ef99` | perfect-negotiation glare rules (impolite ignores colliding offers; polite rebuilds as responder) |
+| `fcf13b1` | L2 candidate rotation (one attempt at a time; signals applied only for the current attempt) |
+| `cc083a7` | server liveness (lease + alive-gates on roster/known-peer emission) |
+| `a95f049` | self-connect refusal (#9 security) |
+
+**Finding: ALL FIVE are already ancestors of `origin/main`** (verified with
+`git merge-base --is-ancestor`), and of the exact binary the runner builds and runs
+(`cli/target/release/filament`, commit `2d3cdd0`). So the runner already uses a CLI
+with the discovery-race fixes; there is **no tractable, un-merged core fix left to make
+in this pass**. The harness gate (`experiments/robust_test.sh suite`) is the regression
+guard for that layer. The *residual* WAN intermittency is transport/path instability
+(NAT, link drops, mid-stream resets) — not a signaling-logic bug — and is handled by
+Layer B. We deliberately made **no speculative core changes** we couldn't validate here.
+
+### Deliverable 1 — deterministic LOCAL flaky-link reproduction
+
+`runner/sim/` reproduces the three failure modes with NO remote box:
+
+- `flaky_proxy.py` — a stdlib TCP proxy between every filament CLI client and the
+  LOCAL signaling backend. filament's discovery + SDP/ICE ride that socket.io link,
+  so when a control file is present the proxy **severs live connections and refuses
+  new ones** (the local equivalent of the WAN path dropping). A background *flapper*
+  also drops the link on a randomised schedule for the whole run.
+- `flaky_e2e.py` + `flaky_sim_test.sh` — boot an isolated topology (own backend port,
+  isolated config dirs, the locally-built binary) with the proxy in the middle, then:
+  - **(a) discovery race**: force the link DOWN at submit. A single `send` fails at
+    `/api/room` / establishment; the host's retry-until-peer loop lands the push after
+    healing.
+  - **(b) truncation**: a chaos thread drops the link mid result-transfer; the host's
+    sha256 integrity gate rejects the partial and keeps awaiting.
+  - **(c) lost manifest**: drops land in the manifest's arrival window; the box re-ships
+    until the host ACKs.
+  - Run: `runner/sim/flaky_sim_test.sh` (`FILJOB_KEEP=1` to keep the work dir).
+
+### Layer B — runner resilience (the guaranteed deliverable)
+
+Per-file changes (`runner/filament_runner.py`, `runner/watcher.py`,
+`runner/runner_cli.py`):
+
+- **Retry-until-peer.** Host `FileRunnerBox._send` and box `Watcher._send` set
+  `FILAMENT_SEND_TIMEOUT` to a *bounded* per-invocation value (default 45s) — a wedged
+  establishment is abandoned and **re-invoked** (a fresh connect clears a stuck
+  candidate pair), and the retry LOOP keeps re-invoking with backoff until the peer
+  appears or a generous overall deadline (`submit_deadline_s` / `reship_deadline_s`,
+  default 1800s). No more single-shot 60s give-ups. (0 = wait-forever is supported but
+  discouraged: one hung send would stall the loop.)
+- **Integrity + resume-to-completion.** `await_results` accepts a result set ONLY when
+  a manifest for the job is present AND every declared non-missing output's sha256
+  matches the manifest. A truncated/partial output fails verification, so the host
+  never accepts it; it keeps awaiting while the box re-ships (filament keeps partials;
+  `.N` resends are deduped by basename and the byte-correct copy is selected).
+- **Result-ACK loop.** When the host has the full verified set it pushes a tiny
+  `ack-<job_id>` back to the box over **din** (host→box, the direction that already
+  works). The box watcher re-ships outputs+manifest each round and **stops the instant
+  it sees the ack** in its inbox — bounded by `reship_deadline_s` and a safety cap of
+  rounds, then it gives up cleanly and logs (the result stays on disk). A lost manifest
+  is re-shipped until acked; a lost ack just costs one extra round.
+- **No silent hangs.** `runner_cli` emits an unbuffered terminal outcome
+  (`SUCCEEDED` / `FAILED <reason>` / `TIMED-OUT`); every wait has a deadline.
+- `--relay` stays the default; all new knobs are env/flag-configurable with sane
+  defaults.
+
+**Validation:** `runner/sim/flaky_sim_test.sh` shows a job succeed (output byte-correct
++ sha256-verified, manifest acked) despite induced drops, a truncated transfer
+detected+recovered, and a lost manifest re-shipped until acked; `runner/run_local_test.sh`
+(clean link) stays green. Still pending: live-T4 confirmation over the real WAN path.
