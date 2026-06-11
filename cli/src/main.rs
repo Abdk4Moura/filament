@@ -64,6 +64,32 @@ fn quiet_exit_window() -> Duration {
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// P1 (GAP-4): process-global "the user forbade relay" flag, set once from the
+/// `--no-relay` CLI flag at startup. Read by `Conn::relay_forbidden` so the
+/// stall ladder knows, at `Rung::Exhausted`, whether it MAY auto-escalate to a
+/// TURN relay (the never-flaky promise) or must FAIL CLEANLY (the hard
+/// direct-only promise the user asked for). A global rather than a threaded
+/// param so the many `Conn` construction sites stay untouched; written exactly
+/// once, before the runtime spawns any worker (mirrors the `FILAMENT_NAME`
+/// single-threaded-set pattern in `run`).
+static NO_RELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when the user passed `--no-relay`: relay fallback is forbidden.
+fn relay_forbidden() -> bool {
+    NO_RELAY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The one honest CLI line shown whenever a transfer/connection is actually on
+/// the TURN relay route (rung d). Relay is still end-to-end encrypted, but it is
+/// NOT a direct link — the "no middleman on the wire" property is gone, so we say
+/// so, loudly (amber ⚠), reusing `ui::Tone::Warn`. §3.3 of the design.
+fn relay_banner() -> String {
+    ui::paint(
+        ui::Tone::Warn,
+        "⚠ on relay — via a TURN server, not a direct link (still end-to-end encrypted)",
+    )
+}
+
 /// P0 (GAP-1): stall-correction ladder bound. Attempt 0 is rung (a) (resume on
 /// the same transport); attempts 1..STALL_MAX_REPAIRS are rung (c) (repair the
 /// transport in place — a fresh direct dial / ICE-restart). At the ceiling the
@@ -131,6 +157,12 @@ struct Cli {
     /// Force TURN relay (testing/privacy; hides your IP from the peer)
     #[arg(long, global = true)]
     relay: bool,
+    /// Forbid relay: keep a hard direct-only promise. The never-flaky guarantee
+    /// is traded for "no middleman, ever" — a path that can't go direct FAILS
+    /// CLEANLY (a clear error, a kept partial) instead of falling back to a TURN
+    /// relay. Conflicts with --relay (which forces relay).
+    #[arg(long, global = true, conflicts_with = "relay")]
+    no_relay: bool,
     /// Display name shown to peers (default: config file, then user@host)
     #[arg(long, global = true)]
     name_as: Option<String>,
@@ -1024,6 +1056,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         recv_done: false,
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
+    relay_committed: std::collections::HashSet::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1258,6 +1291,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         recv_done: false,
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
+    relay_committed: std::collections::HashSet::new(),
     };
     {
         let tx = tx.clone();
@@ -1707,6 +1741,13 @@ struct Conn {
     /// is in flight, so a single stall can't re-fire the ladder every tick while
     /// a repair is converging. Reset once the link starts flowing again.
     stall_repairs: HashMap<String, StallState>,
+    /// P1 (GAP-4): peers this session has COMMITTED to the relay route after the
+    /// direct ladder exhausted (rung d). Once a pid is in here, we stop dialing /
+    /// answering direct-QUIC for it (the direct path is what just failed and would
+    /// only re-freeze, racing the relay link); all (re)establishment for it goes
+    /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
+    /// Link), so a re-establish never bounces back to the known-bad direct path.
+    relay_committed: std::collections::HashSet<String>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -1717,6 +1758,13 @@ struct StallState {
     /// `true` between firing the ladder and the next observed byte of progress,
     /// so the per-tick watchdog doesn't re-arm while a repair is converging.
     pending: bool,
+    /// P1 (GAP-4): `true` once this episode escalated to relay (rung d) and a
+    /// FRESH relay WebRTC link is establishing (no transport yet). The new link
+    /// isn't tracked by `direct_pending`, so without this latch `detect_stall`
+    /// would keep seeing the (transport-less) link idle and re-fire the ladder
+    /// into a premature `Exhausted` before relay even connects. Cleared by
+    /// `note_progress` on the first byte over the relay path.
+    relayed: bool,
 }
 
 /// P0: which correction rung the stall ladder took (see `Conn::correct_stall`).
@@ -1726,7 +1774,14 @@ enum Rung {
     Resume,
     /// (c) the transport was repaired in place (fresh direct dial / ICE-restart).
     Repaired,
-    /// rungs a→c spent; P1's relay fallback is the next rung (clean hook here).
+    /// (d) P1: direct rungs a→c spent → the link was RE-ESTABLISHED over the TURN
+    /// relay (relay-only ICE), preserving the on-disk partial. The fresh relay
+    /// transport's ChannelReady re-offers the unfinished transfers (resume:true)
+    /// and prints the honest relay banner.
+    Relayed,
+    /// rungs a→d unavailable: direct rungs spent AND relay is forbidden
+    /// (`--no-relay`) or we were already on relay. The caller FAILS CLEANLY — a
+    /// kept partial, a clear error, never a hang.
     Exhausted,
 }
 
@@ -1929,23 +1984,51 @@ impl Conn {
         if self.direct_pending.contains_key(&peer_id) {
             return Ok(());
         }
+        // P1 (GAP-4): once a peer is committed to relay, a live link already
+        // carries (or is converging on) the relay route. Re-establish events
+        // (KnownPeer re-announce, expired_direct fallback, a watchdog tick) must
+        // NOT tear it down and rebuild mid-handshake — that thrash is exactly why
+        // the relay link got "stuck while connecting". A genuinely failed link is
+        // removed by the normal drop path (on_pc_state/GraceExpired) FIRST, so when
+        // no link is present here we DO proceed to (re)build the relay link.
+        if self.relay_committed.contains(&peer_id) && self.links.contains_key(&peer_id) {
+            return Ok(());
+        }
         self.drop_link(&peer_id); // re-establish replaces any same-sid link
         let peer_uid = info["uid"].as_str().map(|s| s.to_string());
         let name = info["name"].as_str().unwrap_or("peer").to_string();
         // C5: fresh ICE config (TURN creds are expiry-stamped HMACs) for
         // every attempt, not just the first.
-        let cfg = net::fetch_config(&self.server).await?;
+        let mut cfg = net::fetch_config(&self.server).await?;
         self.chunk_size = cfg.chunk_size;
         let polite = force_polite.unwrap_or_else(|| {
             net::polite_role(&self.my_uid, peer_uid.as_deref(), &self.my_id, &peer_id)
         });
         self.next_gen += 1;
         let generation = self.next_gen;
+        // P1 relay-fallback gate (test-only): FILAMENT_TEST_WEBRTC_RELAY_ONLY=1
+        // models a peer with NO direct WebRTC path (hard NAT) — every WebRTC link
+        // is relay-only, so when the direct-QUIC ladder freezes/exhausts the
+        // transfer can ONLY complete over the TURN relay. Faithful to the real
+        // "direct can't, relay can" condition the auto-fallback exists for; never a
+        // product knob. OR'd with the real relay_only (set by --relay or by an
+        // auto escalate_to_relay).
+        let relay_ice = self.relay_only
+            || std::env::var("FILAMENT_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false);
+        // P1 (GAP-4): --no-relay is a HARD direct-only promise — never traverse a
+        // relay. Strip TURN servers from the ICE config so no relay candidate can
+        // ever be gathered. A peer reachable ONLY via relay then simply fails to
+        // connect — honestly, by the user's own choice — instead of silently using
+        // a middleman. (The ICE policy is left as-is: a relay-only policy with no
+        // relay servers has no candidates and fails cleanly, which is the point.)
+        if relay_forbidden() {
+            cfg.ice_servers.retain(|s| net::is_stun_only(s));
+        }
         let peer = Peer::connect(
             peer_id.clone(),
             polite,
             cfg.ice_servers,
-            self.relay_only,
+            relay_ice,
             self.sio.clone(),
             self.tx.clone(),
             generation,
@@ -1988,6 +2071,20 @@ impl Conn {
     /// transport-offer (Ev::TransportOffer) drives the race.
     async fn start_direct(&mut self, pid: &str, name: &str, secret: &str) {
         if !direct::direct_enabled() {
+            return;
+        }
+        if self.relay_committed.contains(pid) {
+            // P1: this peer escalated to relay — never re-dial direct (it would
+            // only re-freeze and race the relay link). If a link already exists
+            // (the relay link that escalate_to_relay built, possibly still
+            // converging), DON'T rebuild it — repeated KnownPeer/`appeared` events
+            // would otherwise tear it down and re-establish mid-handshake, so it
+            // never connects ("stuck while connecting"). Only (re)establish over
+            // relay when there is no link at all to carry the session.
+            if !self.links.contains_key(pid) {
+                let info = json!({ "id": pid, "name": name });
+                let _ = self.establish(info).await;
+            }
             return;
         }
         if self.direct_pending.contains_key(pid) || self.links.contains_key(pid) {
@@ -2362,8 +2459,14 @@ impl Conn {
     fn repair_in_flight(&self, pid: &str) -> bool {
         // A direct re-dial is pending, OR the ladder just acted and we're waiting
         // on the next observation. We treat `direct_pending` as the convergence
-        // signal for rung (c)'s fresh dial.
-        self.direct_pending.contains_key(pid)
+        // signal for rung (c)'s fresh dial. P1: a relay escalation (rung d) builds
+        // a fresh WebRTC link NOT tracked by `direct_pending`, so the per-episode
+        // `relayed` latch is its convergence signal — both keep the watchdog from
+        // re-firing while the replacement transport is still establishing.
+        if self.direct_pending.contains_key(pid) {
+            return true;
+        }
+        self.stall_repairs.get(pid).map(|s| s.relayed).unwrap_or(false)
     }
 
     /// Clear a peer's stall episode — called when bytes are observed moving
@@ -2414,15 +2517,47 @@ impl Conn {
             return Rung::Resume;
         }
         if attempt >= STALL_MAX_REPAIRS {
-            // Rungs (a)+(c) spent. P1 escalates to relay (the --relay ICE policy)
-            // here; P0 stops at a clear status line and leaves the partial on disk
-            // for a manual resume. This is the documented P0/P1 seam.
+            // Rungs (a)+(c) spent — the direct/in-place-repair ladder is exhausted.
+            // P1 (GAP-4): this is the rung-(d) seam. Either auto-escalate to the
+            // TURN relay (the never-flaky promise) or, if the user forbade relay
+            // / we're already on relay, FAIL CLEANLY with a kept partial.
+            let already_relayed = self.relay_only;
+            if relay_forbidden() {
+                // The hard direct-only promise: never silently fall to a relay.
+                ui::say(&ui::paint(
+                    ui::Tone::Warn,
+                    "  couldn't establish a direct path; relay disabled (--no-relay) \
+                     — partial kept on disk. Re-run to resume, or drop --no-relay to \
+                     allow relay fallback.",
+                ));
+                return Rung::Exhausted;
+            }
+            if already_relayed {
+                // We already re-established over relay and it ALSO stalled — there
+                // is no harder rung. Stop honestly with the partial preserved
+                // (this is the genuine out-of-scope case: no path exists).
+                ui::say(&ui::paint(
+                    ui::Tone::Warn,
+                    "  transfer still stalled on the relay route — partial kept on disk. \
+                     Re-run to resume.",
+                ));
+                return Rung::Exhausted;
+            }
+            // Rung (d): re-establish this transfer over the TURN relay, preserving
+            // the on-disk partial (C7 resume). Bounded: one escalation per episode.
             ui::say(&ui::paint(
                 ui::Tone::Warn,
-                "  transfer still stalled after repair attempts — partial kept on disk; \
-                 relay fallback is the next rung (P1, not yet automatic). Re-run to resume.",
+                "  direct paths exhausted — falling back to the TURN relay",
             ));
-            return Rung::Exhausted;
+            // Latch the episode as "relaying": the fresh relay link establishes
+            // with no transport yet, so this stops detect_stall from re-firing the
+            // ladder (into a premature Exhausted) until the relay path moves a byte
+            // (which clears the whole episode via note_progress).
+            if let Some(st) = self.stall_repairs.get_mut(pid) {
+                st.relayed = true;
+            }
+            self.escalate_to_relay(pid).await;
+            return Rung::Relayed;
         }
         // Rung (c): repair the transport IN PLACE under the live session.
         ui::say(&ui::paint(
@@ -2473,6 +2608,55 @@ impl Conn {
             // WebRTC: ICE-restart in place — no teardown, no re-key.
             p.restart_ice().await;
         }
+    }
+
+    /// Rung (d) — P1 (GAP-4): the direct/in-place ladder is exhausted, so
+    /// RE-ESTABLISH this transfer over the TURN relay (relay-only ICE), the
+    /// automatic version of the manual `--relay` the Pixel delivery and the runner
+    /// both had to perform by hand. The on-disk partial is preserved at the seam:
+    /// we re-establish a fresh WebRTC link with `RTCIceTransportPolicy::Relay`, and
+    /// its ChannelReady re-offers the unfinished transfers with `resume:true` from
+    /// the saved `.part` offset (no restart-from-zero, C7). Flipping the
+    /// connection-wide `relay_only` flag also makes any subsequent repair on this
+    /// session relay-only, so we don't bounce back to a known-bad direct path.
+    /// Session identity (the pair secret / verified petname) is stable across the
+    /// swap — only the wire keys rotate (§2.5). Bounded: one escalation per stall
+    /// episode (the caller returns `Rung::Relayed` and the `stall_repairs` counter
+    /// is already at the ceiling, so the ladder can't re-fire until progress
+    /// resumes and resets it).
+    async fn escalate_to_relay(&mut self, pid: &str) {
+        // Latch the whole connection onto relay-only ICE: the re-establish below
+        // and every later (re)establish for this session now forces TURN.
+        self.relay_only = true;
+        // Commit THIS peer to relay: stop dialing/answering direct-QUIC for it, so
+        // the known-bad direct path can't keep winning the race and re-freezing
+        // while the relay link tries to form (the exact thrash the sim exposed).
+        self.relay_committed.insert(pid.to_string());
+        let Some(l) = self.links.get(pid) else { return };
+        let info = l.info.clone();
+        let known = l.expected_secret.clone();
+        let was_active = self.is_active(pid);
+        // Tear down the wedged (direct) transport, then re-establish over WebRTC
+        // relay-only. We deliberately do NOT re-arm the direct-QUIC dial here even
+        // if a secret is known: direct is what just failed, and relay is a WebRTC
+        // path, so we go straight to `establish` (relay-only ICE).
+        self.drop_link(pid);
+        // Clear any stray pending direct attempt so `establish` (which early-
+        // returns while a direct attempt owns the peer, to keep the ladder
+        // sequential) is never suppressed for the relay re-establish.
+        self.direct_pending.remove(pid);
+        // Carry the proven identity into the fresh relay link so the post-channel
+        // pair-proof still binds to the same device (set after establish creates
+        // the Link below).
+        let _ = self.establish(info).await;
+        if let (Some(l), Some(ks)) = (self.links.get_mut(pid), known) {
+            l.expected_secret = Some(ks);
+        }
+        if was_active {
+            self.active = Some(pid.to_string());
+        }
+        // Honest, loud: the user must know this session is now on a relay.
+        ui::say(&format!("  {}", relay_banner()));
     }
 
     /// C4: transient `disconnected` — nudge ICE from the impolite side and
@@ -2801,6 +2985,10 @@ async fn main() -> Result<()> {
     if let Some(n) = &cli.name_as {
         // single-threaded at this point (before the runtime spawns workers)
         unsafe { std::env::set_var("FILAMENT_NAME", n) };
+    }
+    // P1 (GAP-4): record the hard direct-only choice before any worker spawns.
+    if cli.no_relay {
+        NO_RELAY.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let server = if cli.server == DEFAULT_SERVER {
         config_get("server").unwrap_or(cli.server.clone())
@@ -3201,6 +3389,7 @@ async fn send_cmd(
         recv_done: false,
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
+    relay_committed: std::collections::HashSet::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -3439,6 +3628,14 @@ async fn send_cmd(
                                 tokio::time::sleep(Duration::from_millis(400)).await;
                                 if let Some(r) = p.route().await {
                                     ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    // Relay honesty (§3.3): the quiet `route:` line
+                                    // is legible but not loud. When the route is
+                                    // actually the TURN relay, print the honest
+                                    // one-line banner so the user is never unaware
+                                    // they're on a middleman path.
+                                    if r == "relayed" {
+                                        ui::say(&format!("    {}", relay_banner()));
+                                    }
                                     break;
                                 }
                             }
@@ -3664,9 +3861,25 @@ async fn send_cmd(
                     // transport's ChannelReady re-offers the unfinished transfers
                     // (resume:true) — nothing more to do here.
                     Rung::Repaired => {}
-                    // P1 seam: relay fallback would fire here. P0 leaves the
-                    // partial on disk and stops the ladder (message already shown).
-                    Rung::Exhausted => {}
+                    // Rung (d) P1: correct_stall re-established this transfer over
+                    // the TURN relay (relay-only ICE), preserving the partial. The
+                    // fresh relay link's ChannelReady re-offers the unfinished
+                    // transfers (resume:true) and prints the route — nothing more
+                    // to do here.
+                    Rung::Relayed => {}
+                    // Direct rungs spent AND relay forbidden (--no-relay) or relay
+                    // itself stalled: the ladder failed CLEANLY (a kept partial, the
+                    // clear cause already shown in correct_stall). PROMPTLY end the
+                    // send rather than letting the frozen transfer hang to a timeout
+                    // — the hard direct-only promise is "fail clean, fast", never a
+                    // hang. The receiver kept its `.part`, so re-running resumes.
+                    Rung::Exhausted => {
+                        let _ = sio.disconnect().await;
+                        if relay_forbidden() {
+                            bail!("couldn't establish a direct path and relay is disabled (--no-relay) — partial kept; re-run to resume, or drop --no-relay");
+                        }
+                        bail!("transfer stalled and no usable path remains — partial kept; re-run to resume");
+                    }
                 }
             }
             Ev::Interrupted => {
@@ -3946,6 +4159,7 @@ async fn recv_cmd(
         recv_done: false,
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
+    relay_committed: std::collections::HashSet::new(),
     };
     {
         let tx = tx.clone();
@@ -4463,6 +4677,14 @@ async fn recv_cmd(
                                 tokio::time::sleep(Duration::from_millis(400)).await;
                                 if let Some(r) = p.route().await {
                                     ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    // Relay honesty (§3.3): the quiet `route:` line
+                                    // is legible but not loud. When the route is
+                                    // actually the TURN relay, print the honest
+                                    // one-line banner so the user is never unaware
+                                    // they're on a middleman path.
+                                    if r == "relayed" {
+                                        ui::say(&format!("    {}", relay_banner()));
+                                    }
                                     break;
                                 }
                             }
@@ -5149,6 +5371,13 @@ async fn recv_cmd(
                     // Rung (a) is a no-op here — wait for the sender's re-offer.
                     Rung::Resume => {}
                     Rung::Repaired => {}
+                    // Rung (d) P1: the receiver re-established over the TURN relay
+                    // (relay-only ICE), preserving its `.part`. The sender re-offers
+                    // resume:true on the fresh relay link — the file continues from
+                    // its saved offset. Nothing to do here.
+                    Rung::Relayed => {}
+                    // Direct rungs spent AND relay forbidden / already on relay:
+                    // failed CLEANLY, partial kept on disk (message already shown).
                     Rung::Exhausted => {}
                 }
             }

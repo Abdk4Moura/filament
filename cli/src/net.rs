@@ -278,6 +278,18 @@ pub struct ServerConfig {
     pub chunk_size: usize,
 }
 
+/// True when an ICE server is STUN-only (no relay). `--no-relay` keeps only these
+/// so the connection can still discover its public address (srflx) but can never
+/// fall onto a TURN relay. A server whose every url is `stun:` is relay-free; a
+/// `turn:`/`turns:` url makes it a relay.
+pub fn is_stun_only(s: &RTCIceServer) -> bool {
+    !s.urls.is_empty()
+        && s.urls.iter().all(|u| {
+            let u = u.trim().to_ascii_lowercase();
+            u.starts_with("stun:") || u.starts_with("stuns:")
+        })
+}
+
 /// C5: callers fetch this fresh before EVERY peer connection — TURN
 /// credentials are expiry-stamped HMACs and go stale in long-lived processes.
 pub async fn fetch_config(server: &str) -> Result<ServerConfig> {

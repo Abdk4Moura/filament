@@ -77,6 +77,18 @@ fn freeze_after_bytes() -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// P1 relay-fallback PROOF hook (test-only): `FILAMENT_TEST_FREEZE_PERSIST=1`
+/// makes the data-path freeze PERSISTENT instead of one-shot — EVERY fresh direct
+/// transport (including the correction ladder's rung-c re-dials) freezes after the
+/// byte threshold. So the direct/in-place-repair ladder can never recover; it
+/// EXHAUSTS, and the only way the transfer completes is the rung-(d) escalation
+/// to the TURN relay (a WebRTC path that doesn't ride this direct-QUIC freeze).
+/// This is how the relay-fallback gate forces the exact "direct can't, relay can"
+/// condition deterministically. Only that sim sets it.
+fn freeze_persist() -> bool {
+    std::env::var("FILAMENT_TEST_FREEZE_PERSIST").map(|v| v == "1").unwrap_or(false)
+}
+
 /// Process-global "a transport has already frozen once" latch (see
 /// `freeze_after_bytes`). `false` until the first transport freezes; once `true`
 /// every later transport streams normally, so rung-c's fresh dial recovers.
@@ -496,9 +508,30 @@ impl Transport for DirectTransport {
                 let prior = self
                     .sent_data
                     .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                if prior + (payload.len() as u64) >= limit
+                if freeze_persist() {
+                    // Persistent mode (P1 relay-fallback gate): EVERY direct
+                    // transport freezes. The FIRST one freezes after `limit` bytes
+                    // (so the receiver builds a real .part to resume from); once
+                    // that first freeze has happened (FROZE_ONCE latched), every
+                    // SUBSEQUENT fresh direct transport — the ladder's rung-c
+                    // re-dials — freezes IMMEDIATELY (at byte 0), making zero
+                    // progress. So direct can NEVER carry the file forward and the
+                    // ladder must exhaust → escalate to relay (rung d). Without the
+                    // immediate-freeze, each re-dial would ship another `limit`
+                    // bytes, note_progress would reset the episode, and the ladder
+                    // would loop on direct forever instead of escalating.
+                    let already_froze = FROZE_ONCE.load(std::sync::atomic::Ordering::SeqCst);
+                    let cross = prior + (payload.len() as u64) >= limit;
+                    if already_froze || cross {
+                        FROZE_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
+                        self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("[test] data-path FREEZE engaged at {} bytes — black-holing this transport", prior);
+                    }
+                } else if prior + (payload.len() as u64) >= limit
                     && !FROZE_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
+                    // One-shot (P0): only the FIRST transport freezes; rung-c's
+                    // fresh re-dial streams normally and recovers.
                     self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("[test] data-path FREEZE engaged at {} bytes — black-holing this transport", prior);
                 }
