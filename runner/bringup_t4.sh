@@ -83,7 +83,20 @@ fi
 if [ ! -x "$BIN" ]; then
   if [ -n "$FILAMENT_URL" ]; then
     log "fetching static filament binary from $FILAMENT_URL"
-    curl -fsSL "$FILAMENT_URL" -o "$BIN"
+    dl="$ROOT_DIR/.filament.dl"
+    curl -fsSL "$FILAMENT_URL" -o "$dl"
+    # Standard release assets are .tar.gz; the one-off asset is a raw binary.
+    # Detect and handle BOTH (tar -tzf succeeds only on a real gzip tarball).
+    if tar -tzf "$dl" >/dev/null 2>&1; then
+      log "  asset is a tarball — extracting the filament binary"
+      tar -xzf "$dl" -C "$ROOT_DIR"
+      f="$(find "$ROOT_DIR" -maxdepth 2 -type f -name filament 2>/dev/null | head -1)"
+      [ -n "$f" ] || { log "ERROR: no 'filament' binary inside the tarball"; exit 1; }
+      mv "$f" "$BIN"
+    else
+      mv "$dl" "$BIN"
+    fi
+    rm -f "$dl"
     chmod +x "$BIN"
   elif [ -x "$(dirname "$0")/filament" ]; then
     cp "$(dirname "$0")/filament" "$BIN"; chmod +x "$BIN"
