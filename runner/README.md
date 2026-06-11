@@ -1,23 +1,35 @@
 # filament-native job runner
 
 A thin **compute-job orchestration layer** on top of filament's existing P2P
-transport (PTY + file channel). It offloads a *declared* compute job — e.g. an
-NVENC transcode or a headless render — to a remote filament-reachable box (an
-ephemeral Tesla T4 we cannot SSH into), streams structured progress, pulls the
-artifacts back, and records a manifest.
+transport (file channel). It offloads a *declared* compute job — e.g. an NVENC
+transcode or a headless render — to a remote filament-reachable box (an ephemeral
+Tesla T4 we cannot SSH into), runs it, pulls the artifacts back, and records a
+manifest.
 
 It deliberately replaces the ad-hoc "open a shell and run commands, copy files
 off" pattern with **"submit / await / fetch a named job"**: the host pushes a job
-*spec* plus a *fixed* box-side executor, then invokes that single executor — it
-never pipes arbitrary commands across a shell. This is the structural reframing
-argued in [`../docs/research/remote-accelerator-offload.md`](../docs/research/remote-accelerator-offload.md)
+*spec* plus a *fixed* box-side executor, then a box-side **watcher** runs that
+single executor — it never pipes arbitrary commands across a shell. This is the
+structural reframing argued in
+[`../docs/research/remote-accelerator-offload.md`](../docs/research/remote-accelerator-offload.md)
 (see §3 for the *why* and §4 for the contract).
 
-> Status: the runner **mechanics, manifest, artifact return, and timeout
-> handling are validated end-to-end on a local loopback peer** (CPU `libx264`
-> fallback). NVENC specifically gets validated on the real T4 (the T4 is
-> ephemeral and currently down). R2 durability is implemented but a no-op unless
-> rclone + creds are configured.
+> **Control plane: FILE-DRIVEN (default).** The v1 runner drove the box over a
+> long-lived interactive **PTY** (`ctl` channel); on the unstable Colab→do-vm WAN
+> link that stream dropped every few seconds and the host hung forever in
+> `open_session()` (see [`../docs/runner/jobrunner-challenges.md`](../docs/runner/jobrunner-challenges.md)).
+> The runner now uses **only discrete file transfers** — which the diagnosis
+> proved survive the drops (they retry/resume and the bytes land): the host
+> **pushes** the job spec + inputs, a box-side **`watcher.py`** runs the job and
+> **sends** the manifest + outputs back (manifest LAST = completion signal).
+> **`--relay` (TURN) is the default** for WAN robustness. The PTY `ctl` channel is
+> **deprecated** (the `RunnerBox` PTY class is kept only for reference/parity).
+
+> Status: the file-driven runner **mechanics, manifest, artifact return, and
+> timeout handling are validated end-to-end on a local loopback peer** (CPU
+> `libx264` fallback, `--no-relay`), 3/3 deterministic runs. NVENC + the real
+> `--relay` WAN path get validated on the real T4 (ephemeral; validated with the
+> user). R2 durability is implemented but a no-op unless rclone + creds are set.
 
 ---
 
@@ -25,12 +37,13 @@ argued in [`../docs/research/remote-accelerator-offload.md`](../docs/research/re
 
 | file | what |
 |------|------|
-| `box_executor.py` | the **FIXED** box-side program. Reads `job.json`, runs the declared `cmd` in the scratch dir under a timeout, captures exit code + per-output sha256/size + wall-clock + GPU name, writes `manifest.json`, streams `-progress`-style structured lines, and optionally `rclone`-copies outputs to R2 before the box dies. Stdlib only. |
-| `filament_runner.py` | host-side library: `RunnerBox` with `submit` / `stream` / `fetch` / `manifest` (+ `run()` convenience). Drives the `filament` CLI (`pty`, `send`, `up`). Stdlib only. |
-| `runner_cli.py` | host CLI to submit one job and fetch its artifacts. |
-| `bringup_t4.sh` | **SSH-FREE** T4 bring-up: install ffmpeg(NVENC)/python3/(rclone), drop the static musl binary, plant pairing secrets, start the box acceptors. No sshd. |
-| `pair_host.sh` | host pairing helper: generates the three secrets, plants host config, prints the env block to paste on the T4. |
-| `run_local_test.sh` + `test_e2e.py` | the loopback acceptance test (boots an isolated topology + runs a real job). |
+| `box_executor.py` | the **FIXED** box-side job-execution core. `run_job(job_dir)` reads `job.json`, runs the declared `cmd` in the scratch dir under a watchdog timeout, captures exit code + per-output sha256/size + wall-clock + **all** GPU names (`nvidia-smi -L`), writes `manifest.json`, and optionally `rclone`-copies outputs to R2 before the box dies. Shared by both the watcher and the legacy PTY path. Stdlib only. |
+| `watcher.py` | **box-side file-driven control plane.** A local poll loop: watches `.inbox/` for a job spec + its inputs (dedups `.N` resends by basename, guards on input-presence + size-stability), runs the job via `box_executor.run_job`, writes an `.outbox/<id>/`, then **`filament send --relay`**s the manifest + outputs back on the dout channel (manifest LAST). Idempotent/crash-safe (retires the spec to `.inbox/done/`); ships results in a background thread so jobs pipeline. Stdlib only. |
+| `filament_runner.py` | host-side library. **`FileRunnerBox`** (DEFAULT): `submit` (`send --relay` job+inputs on din) / `await_results` (stand up a `up --dir --relay` sink on dout, poll for the manifest + verify each output's sha256) / `run()`. **`RunnerBox`** (DEPRECATED): the legacy PTY `submit`/`stream`/`fetch`. Stdlib only. |
+| `runner_cli.py` | host CLI to submit one job and fetch its artifacts (routes through `FileRunnerBox`; `--relay` default, `--no-relay` to opt out). |
+| `bringup_t4.sh` | **SSH-FREE** T4 bring-up: install ffmpeg(NVENC)/python3/(rclone), drop the static musl binary + `watcher.py`/`box_executor.py`, plant pairing secrets, start the **din acceptor + the watcher** (no PTY, no sshd), and tail their logs to keep the cell alive. |
+| `pair_host.sh` | host pairing helper: generates the secrets, plants host config, prints the env block to paste on the T4. (`ctl` is still planted but unused — din/dout are reused, so no re-pairing when moving off the PTY.) |
+| `run_local_test.sh` + `test_e2e.py` | the loopback acceptance test (boots an isolated topology — din acceptor + watcher — and runs a real job through the file-driven flow, `--no-relay`). |
 
 ---
 
@@ -68,6 +81,7 @@ The executor records a **manifest**:
   "outputs": [{"name": "out_720p.mp4", "sha256": "…", "bytes": 188683}],
   "duration_s": 0.231,
   "gpu": "Tesla T4",
+  "gpus": ["Tesla T4", "Tesla T4"],
   "durability": {"ran": false, "reason": "no rclone_dest configured"},
   "executor_proto": "FILJOB v1"
 }
@@ -75,19 +89,18 @@ The executor records a **manifest**:
 
 ---
 
-## API
+## API (file-driven — default)
 
 ```python
-from filament_runner import RunnerBox, Job
+from filament_runner import FileRunnerBox, Job
 
-rb = RunnerBox(
-    petname_ctl="box", petname_din="box-in", petname_dout="box-out",
+rb = FileRunnerBox(
+    petname_box_din="box-in",                       # how the host names the box on din
     server="https://api.filament.autumated.com",
-    host_config_dir="~/.filament-jobrunner/host",
+    host_config_dir="~/.filament-jobrunner/host",   # knows box-in (the `send` target)
+    host_dout_config_dir="~/.filament-jobrunner/host-dout",  # the results sink (box-out)
     filament_bin="filament",
-    remote_jobs_root="~/filament-jobs",
-    remote_inbox="~/filament-jobs/.inbox",
-    box_dout_config_dir="~/filament-jobs/cfg-dout",
+    relay=True,                                     # force TURN relay (WAN default)
 )
 
 job = Job.new(
@@ -97,54 +110,56 @@ job = Job.new(
     inputs=["input.mov"], outputs=["out_720p.mp4"], timeout_s=1800,
 )
 
-rb.submit(job, local_input_dir="./in")      # scratch dir + push inputs + push the fixed executor
-for ev in rb.stream(job):                    # run the executor ONCE; parse frame=/out_time=/fps=
-    if ev.kind == "progress":
-        print(ev.data)                       # {'frame': 123, 'out_time': '00:00:04.1', 'fps': 58.0}
-rb.fetch(job, local_output_dir="./out")      # pull declared outputs + manifest.json
-print(rb.manifest(job))                      # {exit_code, outputs:[{sha256,bytes}], duration_s, gpu, ...}
+rb.submit(job, local_input_dir="./in")              # send --relay job-<id>.json + inputs on din
+m = rb.await_results(job, "./out", overall_timeout_s=2400)  # sink up; poll for manifest+outputs; verify sha256
+print(m)                                            # {exit_code, outputs:[{sha256,bytes}], duration_s, gpu, gpus, ...}
 
-# or all four in one persistent control session:
-rb.run(job, "./in", "./out", on_progress=lambda e: ...)
+# or both in one call:
+rb.run(job, "./in", "./out")
 ```
 
-The host **never** sends `cmd` over a shell. `submit` pushes a spec + the fixed
-executor; `stream` invokes `python3 box_executor.py <scratch>` — a single fixed
-program that reads `cmd` from `job.json` and runs it. That is the policy-clean
-property (§3): *submit a named job*, not *shell into a host*.
+There is **no PTY and no shell**. The host pushes a spec + inputs; a box-side
+`watcher.py` runs `box_executor.run_job(<scratch>)` (a fixed program that reads
+`cmd` from `job.json` and runs it) and sends the manifest + outputs back. That is
+the policy-clean property (§3): *submit a named job*, not *shell into a host* —
+now with no interactive stream to drop on a flaky link.
 
 ### CLI
 
 ```bash
 runner/runner_cli.py \
   --host-cfg ~/.filament-jobrunner/host --dout-cfg ~/.filament-jobrunner/host-dout \
-  --remote-root '~/filament-jobs' --remote-inbox '~/filament-jobs/.inbox' \
-  --box-dout-cfg '~/filament-jobs/cfg-dout' \
   --in ./in --out ./out --input input.mov --output out_720p.mp4 \
+  --relay \
   -- ffmpeg -y -hwaccel cuda -hwaccel_output_format cuda -i input.mov \
      -vf scale_cuda=-2:720 -c:v h264_nvenc -preset p5 -b:v 5M -c:a aac \
      -progress pipe:1 -nostats out_720p.mp4
 ```
 
+`--relay` is the default; pass `--no-relay` for a good/local link.
+
 ---
 
 ## How it maps onto filament (transport model)
 
-A filament "device" is a pair secret; a petname is a local alias. To keep each
-signaling channel to **exactly one acceptor** (two acceptors on one channel
-glare), the runner uses **three channels**, each with a single fixed-role
-acceptor:
+A filament "device" is a pair secret; a petname is a local alias. The file-driven
+runner uses **two file channels** (the `ctl` PTY is dropped):
 
 | channel | box side | host side | carries |
 |---|---|---|---|
-| `ctl`  | `up --shell` (PTY acceptor) | `filament pty` (initiator) | control + the single executor invocation |
-| `din`  | `up --dir <inbox>` (file acceptor) | `filament send` (initiator) | push inputs |
-| `dout` | `filament send` (initiator, via the ctl PTY) | `up --dir <out>` (transient sink) | pull outputs + manifest |
+| `din`  | `up --dir <inbox>` (file acceptor) | `send --relay` (initiator) | push the job spec + inputs |
+| `dout` | `send --relay` (initiator, run by the watcher) | `up --dir <out> --relay` (transient sink) | manifest + outputs back |
 
-Structured progress is sentinel-framed (`FILJOB v1 <id> progress {…}`) so the
-host parses it out of the interactive PTY stream (which also carries shell
-prompts/echo). The box-side `dout` send runs under its own dout-only config dir
-so it never co-subscribes the ctl/din channels.
+Everything is **discrete file transfers**, which retry/resume across the WAN link
+drops (proven in the diagnosis). The box-side `dout` send runs under its own
+dout-only config dir so it never co-subscribes the din channel. Resends collide
+to `name.N` on each side; both ends normalise by basename. The box ships the
+manifest LAST and re-ships the result set a few times (background thread) so a
+send that lands in a host-side reconnect window is recovered — the host dedups by
+`job_id`.
+
+The legacy three-channel **PTY** model (`ctl`=`up --shell`/`pty`) is **deprecated**
+(it hung on the flaky link); `RunnerBox` is retained for reference only.
 
 ---
 
@@ -174,10 +189,15 @@ FILAMENT_URL="https://…/filament-musl"  bash bringup_t4.sh
 ```
 
 `bringup_t4.sh` installs only ffmpeg(NVENC)/python3/(optional rclone), drops the
-static binary, plants the three secrets in isolated config dirs, and starts
-`up --shell` (ctl) + `up --dir` (din). **No openssh/sshd** (that shuts the box
-down). The box self-terminates when the ephemeral runtime ends; the runner just
-flushes artifacts first.
+static binary + `watcher.py`/`box_executor.py`, plants the secrets in isolated
+config dirs, and starts the **din acceptor + the file-driven watcher** (no PTY).
+It then `tail -F`s the watcher + din logs so the launching cell stays alive (and
+you see live "job picked up / done / sent results"); set `FILJOB_NO_TAIL=1` for
+non-interactive use. **No openssh/sshd** (that shuts the box down). Deliver the
+two python files by hosting them and setting `WATCHER_URL`/`EXECUTOR_URL`, or by
+running the script from the `runner/` checkout (it copies them from alongside
+itself). The box self-terminates when the ephemeral runtime ends; the watcher
+ships artifacts first (and re-ships to survive link drops).
 
 ### R2 durability (optional)
 
@@ -194,13 +214,17 @@ config` / `~/secret_keys` piped in — never on the command line). Then pass
 runner/run_local_test.sh
 ```
 
-Boots a SEPARATE filament acceptor on this host (locally-built binary + isolated
+Boots a SEPARATE filament topology on this host (locally-built binary + isolated
 `FILAMENT_CONFIG_DIR`s + a local signaling backend — never the live daemon or the
-installed binary), pairs it over the three channels, and runs a **real** ffmpeg
-job end-to-end. It asserts: outputs come back byte-correct (manifest sha256 ==
-sha256 of the pulled file), `exit_code==0`, progress was parsed (non-empty
-frame/out_time), and a timeout job is killed and reported (`exit 124`,
-`timed_out: true`). Uses NVENC if this host has a GPU, else CPU `libx264`.
+installed binary): a box **din acceptor + watcher**, paired over din/dout, and
+runs a **real** ffmpeg job through the file-driven `submit` → watcher → `await`
+flow. It asserts: the manifest comes back **over the file channel** with a
+matching `job_id`, each declared output is byte-correct (manifest sha256 ==
+sha256 of the pulled file), `exit_code==0`, and a timeout job is killed and
+reported (`exit 124`, `timed_out: true`). Uses NVENC if this host has a GPU, else
+CPU `libx264`. **Relay note:** the test uses the **direct** route (`--no-relay`)
+because TURN isn't available on localhost; the bring-up and host default to
+`--relay` for the WAN. Validated 3/3 deterministic runs.
 
 ---
 

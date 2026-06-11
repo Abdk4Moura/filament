@@ -4,11 +4,19 @@
 # Paste this on a fresh, ephemeral Tesla T4 (Colab-style, glibc 2.35, no inbound
 # SSH) to turn it into a filament job-runner NODE. It installs only what jobs
 # need, drops the STATIC musl `filament` binary (a dynamic binary won't run on the
-# T4's glibc), plants the three pairing secrets, and starts the box-side
-# acceptors. It NEVER installs openssh/sshd (that shuts the box down).
+# T4's glibc), plants the pairing secrets, and starts the box-side din acceptor +
+# the FILE-DRIVEN WATCHER. It NEVER installs openssh/sshd (that shuts the box down).
+#
+# CONTROL PLANE: file-driven (watcher.py), NOT an interactive PTY. The watcher
+# polls the inbox for a job spec + its inputs, runs the job, and `filament send
+# --relay`s the manifest + outputs back to the host on the dout channel. This
+# survives the unstable Colab->do-vm WAN link that killed the v1 PTY control
+# session (see docs/runner/jobrunner-challenges.md). The `ctl` PTY is DEPRECATED;
+# this script no longer starts it (the secret is still planted so no re-pairing is
+# needed — din/dout are reused unchanged).
 #
 # It does NOT drive the box; it just makes the box reachable as a job runner. The
-# HOST then submits jobs with runner/filament_runner.py.
+# HOST then submits jobs with runner/runner_cli.py (file-driven, --relay default).
 #
 # ---------------------------------------------------------------------------
 # WHAT YOU PROVIDE (env or edit the CONFIG block):
@@ -90,12 +98,32 @@ fi
 "$BIN" --version >/dev/null 2>&1 || { log "ERROR: filament binary does not run here (not static?)"; exit 1; }
 log "filament binary OK: $("$BIN" --version 2>/dev/null | head -1)"
 
-# put filament on PATH for the PTY login shell (host invokes `filament send` there)
+# put filament on PATH (the watcher invokes `filament send` for results)
 ln -sf "$BIN" /usr/local/bin/filament 2>/dev/null || true
 
-# --- 3. plant the three pairing secrets (isolated config dirs) --------------
-# Each acceptor/initiator role gets its OWN config dir holding exactly ONE secret,
-# so no daemon ever subscribes to a channel it shouldn't (which would glare).
+# --- 2b. deliver the box-side python (watcher + executor) -------------------
+# The watcher runs the job and ships results; it imports box_executor for the
+# job-execution logic. Get both onto the box: fetch from URL, else copy from the
+# script's own dir (when run-as-file with the runner/ checkout present).
+SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo .)"
+fetch_py() { # $1 = env URL value, $2 = local fallback name, $3 = dest
+  if [ -n "${1:-}" ]; then
+    log "fetching $(basename "$3") from $1"; curl -fsSL "$1" -o "$3"
+  elif [ -f "$SRC_DIR/$2" ]; then
+    cp "$SRC_DIR/$2" "$3"
+  else
+    log "ERROR: no source for $2 (set ${2%%.py}_URL or place it next to this script)"; exit 1
+  fi
+}
+fetch_py "${WATCHER_URL:-}"  watcher.py      "$ROOT_DIR/watcher.py"
+fetch_py "${EXECUTOR_URL:-}" box_executor.py "$ROOT_DIR/box_executor.py"
+log "box-side python in place: watcher.py + box_executor.py"
+
+# --- 3. plant the pairing secrets (isolated config dirs) --------------------
+# Each role gets its OWN config dir holding exactly ONE secret, so no daemon ever
+# subscribes to a channel it shouldn't (which would glare). The ctl secret is
+# still planted (so din/dout pairing is UNCHANGED — no re-pairing needed), but
+# the ctl PTY acceptor is no longer started (file-driven control plane).
 python3 - "$ROOT_DIR" "$SEC_CTL" "$SEC_DIN" "$SEC_DOUT" \
          "$HOST_CTL_NAME" "$HOST_DIN_NAME" "$HOST_DOUT_NAME" <<'PY'
 import json, sys
@@ -103,28 +131,22 @@ root, ctl, din, dout, n_ctl, n_din, n_dout = sys.argv[1:8]
 json.dump([{"name": n_ctl,  "secret": ctl}],  open(f"{root}/cfg-ctl/devices.json",  "w"))
 json.dump([{"name": n_din,  "secret": din}],  open(f"{root}/cfg-din/devices.json",  "w"))
 json.dump([{"name": n_dout, "secret": dout}], open(f"{root}/cfg-dout/devices.json", "w"))
-print("[bringup] planted ctl/din/dout device secrets")
+print("[bringup] planted ctl/din/dout device secrets (ctl unused; reused for no re-pair)")
 PY
 
-# --- 4. start the box-side acceptors (NO sshd) ------------------------------
-# ctl : up --shell  -> serves the control PTY the host drives the executor over.
-# din : up --dir    -> receives pushed inputs (host `send`) into the inbox.
-# The dout channel needs NO daemon on the box: the box only `send`s on it (the
-# host stands up the dout sink transiently during fetch).
-# Kill only PREVIOUSLY-tracked acceptors via their pid files — never pkill -f on
+# --- 4. start the din acceptor + the FILE-DRIVEN WATCHER (NO sshd, NO PTY) ---
+# din    : up --dir   -> receives the pushed job spec + inputs into the inbox.
+# watcher: polls the inbox, runs jobs, `filament send --relay`s results on dout.
+# The dout channel needs NO daemon on the box: the watcher only `send`s on it
+# (the host stands up the dout sink transiently while awaiting results).
+# Kill only PREVIOUSLY-tracked processes via their pid files — never pkill -f on
 # a pattern that also appears in THIS script's own command line (when the script
 # is run via `bash -c "$(curl …)"`, the whole script text is the process argv, so
-# a `pkill -f "filament up …cfg-ctl"` would match and SIGTERM this very process).
-for p in "$ROOT_DIR/ctl.pid" "$ROOT_DIR/din.pid"; do
+# a `pkill -f "filament up …cfg-din"` would match and SIGTERM this very process).
+for p in "$ROOT_DIR/ctl.pid" "$ROOT_DIR/din.pid" "$ROOT_DIR/watcher.pid"; do
   [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true
 done
 sleep 1
-
-log "starting ctl acceptor (up --shell)"
-FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-ctl" HOME="$ROOT_DIR/cfg-ctl" FILAMENT_L2=1 \
-  nohup "$BIN" up --server "$FILJOB_SERVER" --shell --name-as filjob-box-ctl \
-  --dir "$ROOT_DIR/ctldrop" >"$ROOT_DIR/ctl.log" 2>&1 &
-echo $! > "$ROOT_DIR/ctl.pid"
 
 log "starting din acceptor (input sink -> $INBOX)"
 FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-din" HOME="$ROOT_DIR/cfg-din" \
@@ -132,9 +154,26 @@ FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-din" HOME="$ROOT_DIR/cfg-din" \
   --dir "$INBOX" >"$ROOT_DIR/din.log" 2>&1 &
 echo $! > "$ROOT_DIR/din.pid"
 
+log "starting file-driven watcher (--relay results on dout)"
+FILJOB_ROOT="$ROOT_DIR" FILJOB_SERVER="$FILJOB_SERVER" FILAMENT_BIN="$BIN" \
+  FILJOB_BOX_DOUT_CFG="$ROOT_DIR/cfg-dout" FILJOB_HOST_DOUT_PEER="$HOST_DOUT_NAME" \
+  nohup python3 "$ROOT_DIR/watcher.py" --relay >"$ROOT_DIR/watcher.log" 2>&1 &
+echo $! > "$ROOT_DIR/watcher.pid"
+log "watcher up — pid $(cat "$ROOT_DIR/watcher.pid"), log: $ROOT_DIR/watcher.log"
+
 sleep 3
-log "acceptors up. logs: $ROOT_DIR/ctl.log  $ROOT_DIR/din.log"
-log "node ready. On the HOST, point RunnerBox at:"
-log "  remote_jobs_root = $ROOT_DIR     remote_inbox = $INBOX"
-log "  box_dout_config_dir = $ROOT_DIR/cfg-dout"
-log "DONE — this box is now a filament job-runner node (no SSH, jobs only)."
+log "din acceptor + watcher up. logs: $ROOT_DIR/din.log  $ROOT_DIR/watcher.log"
+log "node ready. On the HOST, point FileRunnerBox / runner_cli at:"
+log "  remote_inbox = $INBOX     (host pushes job+inputs here via din)"
+log "  host-cfg knows box-in (din); dout-cfg is the host results sink (box-out)"
+log "DONE — this box is now a file-driven filament job-runner node (no SSH, no PTY)."
+
+# --- 5. keep the launching cell alive (persistence) -------------------------
+# Colab-style cells stay alive only while the foreground command runs. Tail the
+# watcher + din logs so the cell blocks here, the backgrounded processes keep
+# running, and the user sees live "job picked up / done / sent results" output.
+# (Skip the tail when FILJOB_NO_TAIL=1, e.g. for scripted/non-interactive use.)
+if [ "${FILJOB_NO_TAIL:-0}" != "1" ]; then
+  log "tailing watcher + din logs (Ctrl-C / kill the cell to stop the node) ..."
+  exec tail -n +1 -F "$ROOT_DIR/watcher.log" "$ROOT_DIR/din.log"
+fi

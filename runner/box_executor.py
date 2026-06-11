@@ -75,23 +75,34 @@ def _gpu_name():
     """`nvidia-smi --query-gpu=name` — the GPU the job actually ran on. Best-effort:
     on a CPU-only host (e.g. the local loopback test) there is no nvidia-smi, so we
     record None rather than failing the job."""
+    names = _gpu_names()
+    return names[0] if names else None
+
+
+def _gpu_names():
+    """`nvidia-smi -L` — names of ALL gpus on the box (the T4 box may expose 2×).
+    Best-effort: returns [] on a CPU-only host (no nvidia-smi). Used so the
+    manifest records every card, enabling per-GPU dispatch later."""
     smi = shutil.which("nvidia-smi")
     if not smi:
-        return None
+        return []
     try:
         out = subprocess.run(
-            [smi, "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=10,
+            [smi, "-L"], capture_output=True, text=True, timeout=10,
         )
         if out.returncode == 0:
-            name = out.stdout.strip().splitlines()
-            return name[0].strip() if name else None
+            names = []
+            # lines look like: "GPU 0: Tesla T4 (UUID: GPU-...)"
+            for line in out.stdout.strip().splitlines():
+                m = re.match(r"^GPU \d+:\s*(.+?)(?:\s*\(UUID:.*\))?$", line.strip())
+                names.append(m.group(1).strip() if m else line.strip())
+            return names
     except Exception:
         pass
-    return None
+    return []
 
 
-def _run_with_progress(cmd, job_dir, job_id, timeout_s):
+def _run_with_progress(cmd, job_dir, job_id, timeout_s, emit=None):
     """Run `cmd` in job_dir, parsing ffmpeg -progress lines off its stdout and
     re-emitting them as structured `progress` events. Returns (exit_code, timed_out).
 
@@ -99,8 +110,14 @@ def _run_with_progress(cmd, job_dir, job_id, timeout_s):
     tree (ffmpeg + any helpers), not just the parent. A dedicated watchdog thread
     enforces the timeout REGARDLESS of whether the child emits any output — a job
     like `sleep` produces no stdout, so a between-lines check alone would never
-    fire."""
+    fire.
+
+    `emit(verb, payload)` receives structured progress; the PTY path passes the
+    sentinel-framed `_emit`, the file-driven watcher passes a no-op."""
     import threading
+
+    if emit is None:
+        emit = lambda verb, payload="": _emit(job_id, verb, payload)
 
     proc = subprocess.Popen(
         cmd,
@@ -158,7 +175,7 @@ def _run_with_progress(cmd, job_dir, job_id, timeout_s):
             elif line.strip() == "progress=end" or line.strip() == "progress=continue":
                 # flush an accumulated progress frame at each ffmpeg boundary
                 if acc:
-                    _emit(job_id, "progress", json.dumps(acc, separators=(",", ":")))
+                    emit("progress", json.dumps(acc, separators=(",", ":")))
                     acc = {}
     except Exception:
         pass
@@ -170,7 +187,7 @@ def _run_with_progress(cmd, job_dir, job_id, timeout_s):
     if timed_out["v"]:
         return (124, True)  # 124 == timeout, matching coreutils `timeout`
     if acc:
-        _emit(job_id, "progress", json.dumps(acc, separators=(",", ":")))
+        emit("progress", json.dumps(acc, separators=(",", ":")))
     return (rc, False)
 
 
@@ -197,11 +214,20 @@ def _maybe_rclone(job_dir, dest, outputs, job_id):
     return {"ran": True, "dest": dest, "results": results}
 
 
-def main(argv):
-    if len(argv) < 2:
-        sys.stderr.write("usage: box_executor.py <job_dir>\n")
-        return 2
-    job_dir = os.path.abspath(argv[1])
+def run_job(job_dir, emit=None):
+    """Execute the job described by `<job_dir>/job.json`, in `job_dir`, and write
+    `<job_dir>/manifest.json`. Returns the manifest dict.
+
+    This is the single execution core shared by BOTH control planes:
+      * the file-driven watcher (watcher.py) calls run_job() directly with a
+        no-op `emit` (progress isn't streamed; it just runs + writes the manifest);
+      * the legacy PTY `main()` passes the sentinel-framed `_emit` so the host can
+        parse live progress off the interactive stream.
+
+    `emit(verb, payload)` is the structured-progress sink; defaults to the
+    sentinel-framed stdout emitter.
+    """
+    job_dir = os.path.abspath(job_dir)
     spec_path = os.path.join(job_dir, "job.json")
     with open(spec_path) as f:
         job = json.load(f)
@@ -212,13 +238,16 @@ def main(argv):
     timeout_s = job.get("timeout_s", 0)
     rclone_dest = job.get("rclone_dest") or None
 
-    _emit(job_id, "begin")
+    if emit is None:
+        emit = lambda verb, payload="": _emit(job_id, verb, payload)
+
+    emit("begin")
     wall_start = time.time()
 
-    exit_code, timed_out = _run_with_progress(cmd, job_dir, job_id, timeout_s)
+    exit_code, timed_out = _run_with_progress(cmd, job_dir, job_id, timeout_s, emit=emit)
 
     duration_s = round(time.time() - wall_start, 3)
-    gpu = _gpu_name()
+    gpus = _gpu_names()
 
     out_manifest = []
     for name in outputs:
@@ -237,7 +266,8 @@ def main(argv):
         "timed_out": timed_out,
         "outputs": out_manifest,
         "duration_s": duration_s,
-        "gpu": gpu,
+        "gpu": gpus[0] if gpus else None,   # back-compat single-gpu field
+        "gpus": gpus,                        # ALL gpus (nvidia-smi -L)
         "durability": durability,
         "executor_proto": PROTO,
     }
@@ -246,8 +276,16 @@ def main(argv):
         json.dump(manifest, f, indent=2)
 
     # one-line manifest on the wire too, so the host has it even before fetch
-    _emit(job_id, "manifest", json.dumps(manifest, separators=(",", ":")))
-    _emit(job_id, "done", f"exit={exit_code}")
+    emit("manifest", json.dumps(manifest, separators=(",", ":")))
+    emit("done", f"exit={exit_code}")
+    return manifest
+
+
+def main(argv):
+    if len(argv) < 2:
+        sys.stderr.write("usage: box_executor.py <job_dir>\n")
+        return 2
+    run_job(argv[1])
     return 0
 
 

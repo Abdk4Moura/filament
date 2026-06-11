@@ -12,19 +12,29 @@ This is "submit / await / fetch a named job", not "shell into a host".
 See docs/research/remote-accelerator-offload.md §3-§4.
 
 ------------------------------------------------------------------------------
-Transport model (validated on loopback — see test_e2e.py)
+Transport model
 ------------------------------------------------------------------------------
-A filament "device" is a pair secret; a petname is a local alias. To avoid two
-acceptors ever sharing one signaling channel (which glares), the runner uses
-THREE channels between host and box, each with exactly one acceptor:
+DEFAULT (file-driven, robust over an unstable WAN link) — use `FileRunnerBox`:
 
-  ctl  : box runs `up --shell`          ; host runs `filament pty`   (control)
-  din  : box runs `up --dir <inbox>`    ; host runs `filament send`  (push inputs)
-  dout : host runs `up --dir <outbox>`  ; box  runs `filament send`  (pull outputs)
+  din  : host `send --relay`               ; box `up --dir <inbox>`  (push job+inputs)
+  dout : host `up --dir <results> --relay` ; box `send --relay`      (pull results)
 
-The box-side `send` for `dout` is launched *inside the ctl PTY* — i.e. the host
-drives it over the control shell, but the bytes flow on the dedicated `dout`
-file channel.
+Everything is discrete FILE TRANSFERS — no long-lived interactive stream to drop.
+A box-side `watcher.py` picks the job up off the inbox, runs it, and sends the
+manifest + outputs back (manifest LAST = completion signal). `--relay` is forced
+on for stability. This replaces the v1 PTY control plane that hung on the flaky
+Colab->do-vm link (docs/runner/jobrunner-challenges.md).
+
+LEGACY (PTY control, DEPRECATED for WAN) — `RunnerBox`, kept for reference/local
+parity. A filament "device" is a pair secret; a petname is a local alias. It used
+THREE channels, each with exactly one acceptor:
+
+  ctl  : box `up --shell`        ; host `filament pty`   (control — DROPS on a flaky link)
+  din  : box `up --dir <inbox>`  ; host `filament send`  (push inputs)
+  dout : host `up --dir <outbox>`; box  `filament send`  (pull outputs)
+
+The file-driven path REUSES the same din/dout secrets — `ctl` is simply unused,
+so no re-pairing is needed when moving off the PTY.
 
 ------------------------------------------------------------------------------
 API
@@ -46,6 +56,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -549,3 +560,258 @@ class RunnerBox:
     def __exit__(self, *exc):
         self.close_session()
         return False
+
+
+# ============================================================================
+# File-driven control plane (DEFAULT) — no PTY, robust over an unstable WAN link.
+# ============================================================================
+#
+# The PTY-based RunnerBox above keeps ONE long-lived interactive stream up for the
+# whole job; on the flaky Colab->do-vm link that stream drops every few seconds and
+# the host hangs forever in open_session() (docs/runner/jobrunner-challenges.md).
+#
+# FileRunnerBox uses ONLY discrete file transfers, which the diagnosis proved
+# survive the drops (they retry/resume and the bytes land):
+#
+#   submit : `filament send --relay` job<id>.json + inputs -> box inbox (din).
+#            A box-side watcher.py picks the job up, runs it, and sends results.
+#   await  : stand up a transient `up --dir <results> --relay` sink (host-dout
+#            config) and POLL for manifest.json (which the box sends LAST) + the
+#            declared outputs; verify each output's sha256 against the manifest.
+#
+# There is NO open_session / NO PTY here. `--relay` is forced on by default (set
+# relay=False only for the local loopback test, where TURN may be unavailable).
+
+class FileRunnerBox:
+    """Host side of the file-driven runner. Pairs with the box-side watcher.py.
+
+    Reuses the SAME din/dout pair secrets as the v1 runner (the `ctl` PTY secret
+    is simply unused), so no re-pairing is needed.
+
+      din  : host `send --relay`  -> box `up --dir <inbox>`   (push job + inputs)
+      dout : host `up --dir <results> --relay` (transient sink) <- box `send`
+             (results: manifest sent LAST, signalling completion)
+    """
+
+    def __init__(
+        self,
+        petname_box_din: str,        # how the host names the box on din (`box-in`)
+        server: str,
+        host_config_dir: str,        # host config (knows box-in for the `send`)
+        host_dout_config_dir: str,   # host dout sink config (knows `box-out`)
+        filament_bin: str = "filament",
+        remote_inbox: str = "~/filament-jobs/.inbox",  # informational
+        relay: bool = True,          # force TURN relay for WAN robustness
+        send_timeout_s: int = 1800,
+    ):
+        self.box_din = petname_box_din
+        self.server = server
+        self.cfg = host_config_dir
+        self.dout_cfg = host_dout_config_dir
+        self.bin = filament_bin
+        self.remote_inbox = remote_inbox
+        self.relay = relay
+        self.send_timeout_s = send_timeout_s
+        self._manifests = {}
+
+    def _env(self, config_dir):
+        env = dict(os.environ)
+        env["FILAMENT_CONFIG_DIR"] = config_dir
+        env["HOME"] = config_dir
+        env["FILAMENT_L2"] = "1"
+        return env
+
+    def _relay_args(self):
+        return ["--relay"] if self.relay else []
+
+    # ---- submit ----------------------------------------------------------
+
+    def submit(self, job: Job, local_input_dir: str, stage_dir: Optional[str] = None):
+        """Push the job spec (as job-<id>.json) + declared inputs to the box inbox
+        over din. The watcher acts once the spec AND all inputs have landed.
+
+        Files are sent with their plain basenames; resends collide to `.N` on the
+        box and the watcher dedups them by basename (newest index wins)."""
+        stage = stage_dir or os.path.join(local_input_dir, f".__job_{job.id}")
+        os.makedirs(stage, exist_ok=True)
+        spec_name = f"job-{job.id}.json"
+        spec_path = os.path.join(stage, spec_name)
+        with open(spec_path, "w") as f:
+            json.dump(job.spec_dict(), f, indent=2)
+
+        to_push = []
+        for name in job.inputs:
+            ip = os.path.join(local_input_dir, name)
+            if not os.path.exists(ip):
+                raise RunnerError(f"declared input missing locally: {ip}")
+            to_push.append(ip)
+        # send inputs FIRST, spec LAST, so when the watcher sees the spec the
+        # inputs are already (mostly) there — the watcher still guards on
+        # input-presence + size-stability, so order is an optimisation only.
+        if to_push:
+            self._send(to_push)
+        self._send([spec_path])
+        print(f"  submitted {job.id}: {len(job.inputs)} input(s) + spec "
+              f"({'relay' if self.relay else 'direct'})", flush=True)
+
+    def _send(self, paths, timeout=None):
+        cmd = [self.bin, "send", *paths, "--to", self.box_din,
+               "--server", self.server, *self._relay_args()]
+        last = None
+        for attempt in range(4):
+            r = subprocess.run(cmd, env=self._env(self.cfg), capture_output=True,
+                               text=True, timeout=timeout or self.send_timeout_s)
+            if r.returncode == 0:
+                return r
+            last = r.stderr.strip()[-300:]
+            print(f"  send attempt {attempt + 1} failed ({r.returncode}): {last}; "
+                  f"retrying", flush=True)
+            time.sleep(3 + 2 * attempt)
+        raise RunnerError(f"send to {self.box_din} failed after retries: {last}")
+
+    # ---- await -----------------------------------------------------------
+
+    def await_results(self, job: Job, local_output_dir: str, overall_timeout_s: int):
+        """Stand up the dout sink and POLL for this job's manifest.json + declared
+        outputs to arrive, up to overall_timeout_s. Verifies each output's sha256
+        against the manifest. Returns the manifest dict.
+
+        The box sends the manifest LAST, so a manifest for THIS job id is the
+        completion signal. Files may arrive with `.N` suffixes on resend; we match
+        by basename and pick the byte-correct copy (sha256 == manifest)."""
+        os.makedirs(local_output_dir, exist_ok=True)
+        # start clean so a stale manifest/output can't masquerade as success
+        for fn in list(os.listdir(local_output_dir)):
+            try:
+                os.remove(os.path.join(local_output_dir, fn))
+            except (FileNotFoundError, IsADirectoryError, PermissionError):
+                pass
+
+        up = subprocess.Popen(
+            [self.bin, "up", "--server", self.server, "--name-as", "filjob-host-sink",
+             "--dir", local_output_dir, *self._relay_args()],
+            env=self._env(self.dout_cfg),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        # drain the sink's stdout so it never blocks on a full pipe
+        import threading as _threading
+
+        def _drain():
+            try:
+                for _ in iter(up.stdout.readline, b""):
+                    pass
+            except Exception:
+                pass
+        _threading.Thread(target=_drain, daemon=True).start()
+
+        try:
+            deadline = time.monotonic() + overall_timeout_s
+            printed_wait = False
+            while time.monotonic() < deadline:
+                m = self._scan_manifest(local_output_dir, job.id)
+                if m is not None and self._outputs_verified(m, job, local_output_dir):
+                    self._manifests[job.id] = m
+                    print(f"  results complete for {job.id}: manifest + "
+                          f"{len(job.outputs)} output(s) verified", flush=True)
+                    return m
+                if not printed_wait:
+                    print(f"  awaiting results for {job.id} (sink up, "
+                          f"{'relay' if self.relay else 'direct'}) ...", flush=True)
+                    printed_wait = True
+                time.sleep(2.0)
+            raise RunnerError(
+                f"await timed out after {overall_timeout_s}s; no complete result set "
+                f"for {job.id} in {local_output_dir} "
+                f"(have: {sorted(os.listdir(local_output_dir))})")
+        finally:
+            up.terminate()
+            try:
+                up.wait(timeout=8)
+            except Exception:
+                up.kill()
+
+    def _scan_manifest(self, results_dir, job_id):
+        """Return the manifest dict for job_id if a manifest.json (or a `.N`
+        resend) for it has landed; else None."""
+        for fn in os.listdir(results_dir):
+            base = re.sub(r"\.\d+$", "", fn)
+            if base != "manifest.json":
+                continue
+            try:
+                with open(os.path.join(results_dir, fn)) as f:
+                    m = json.load(f)
+                if m.get("job_id") == job_id:
+                    return m
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _sha256_file(path):
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for c in iter(lambda: f.read(1 << 20), b""):
+                h.update(c)
+        return h.hexdigest()
+
+    def _resolve_output(self, results_dir, name):
+        """Find the landed file for declared output `name`, allowing for `.N`
+        resend suffixes; return the path of the byte-correct copy if any sha
+        matches later, else the highest-index copy."""
+        base = os.path.basename(name)
+        cands = []
+        for fn in os.listdir(results_dir):
+            stripped = re.sub(r"\.\d+$", "", fn)
+            idx_m = re.search(r"\.(\d+)$", fn)
+            idx = int(idx_m.group(1)) if idx_m else 0
+            if stripped == base:
+                cands.append((idx, os.path.join(results_dir, fn)))
+        if not cands:
+            return None
+        cands.sort()  # ascending index; we'll check all for an sha match
+        return cands
+
+    def _outputs_verified(self, manifest, job, results_dir):
+        """Every declared, non-missing output must have a landed copy whose sha256
+        matches the manifest. Returns True only when ALL are present + correct."""
+        by_name = {o["name"]: o for o in manifest.get("outputs", [])}
+        for name in job.outputs:
+            entry = by_name.get(name)
+            if entry is None or entry.get("missing"):
+                # the job didn't produce it (e.g. it failed/timed out); only
+                # require presence of outputs the manifest says exist.
+                continue
+            cands = self._resolve_output(results_dir, name)
+            if not cands:
+                return False
+            ok = False
+            for _idx, path in cands:
+                try:
+                    if self._sha256_file(path) == entry.get("sha256"):
+                        # canonicalise to the plain basename for the caller
+                        final = os.path.join(results_dir, os.path.basename(name))
+                        if os.path.abspath(path) != os.path.abspath(final):
+                            try:
+                                shutil.move(path, final)
+                            except Exception:
+                                pass
+                        ok = True
+                        break
+                except OSError:
+                    continue
+            if not ok:
+                return False
+        return True
+
+    def manifest(self, job: Job) -> Optional[dict]:
+        return self._manifests.get(job.id)
+
+    # ---- convenience -----------------------------------------------------
+
+    def run(self, job: Job, local_input_dir: str, local_output_dir: str,
+            overall_timeout_s: Optional[int] = None) -> Optional[dict]:
+        """submit -> await -> manifest, file-driven, no PTY."""
+        self.submit(job, local_input_dir)
+        to = overall_timeout_s if overall_timeout_s is not None else (job.timeout_s + 600)
+        return self.await_results(job, local_output_dir, overall_timeout_s=to)

@@ -148,11 +148,24 @@ dry run of exactly what the watcher will automate.
 
 ## Open items
 
-- [ ] Build the file-driven watcher control plane (box `watcher.py` + host submit/await).
-- [ ] Default the runner to **relay** for WAN boxes (or auto-fall-back on N direct drops).
+- [x] Build the file-driven watcher control plane (box `watcher.py` + host submit/await).
+      **Done** — `runner/watcher.py` (box poll loop: inbox → run via `box_executor.run_job`
+      → ship manifest+outputs on dout) + `FileRunnerBox` in `runner/filament_runner.py`
+      (host `submit`/`await_results`, no PTY). The `ctl` PTY is dropped from the control
+      flow; din/dout secrets are reused unchanged (no re-pairing). Loopback e2e passes
+      deterministically (real transcode byte-correct via sha256, timeout → exit 124),
+      3/3 runs.
+- [x] Default the runner to **relay** for WAN boxes. **Done** — `--relay` is the default
+      on both the box watcher's result `send` and the host's `send`/`up` (the local
+      loopback test passes `--no-relay` since TURN isn't available on localhost).
+      *(Auto-fall-back on N direct drops is not implemented; relay is simply the default —
+      a cleaner choice than racing direct first.)*
 - [ ] Confirm the box actually exposes **2× T4** to `nvidia-smi -L` (bring-up logged a
       single "Tesla T4"); then add per-GPU dispatch (`-hwaccel_device 0/1`) for parallel
-      jobs across both cards.
+      jobs across both cards. *(Manifest now records ALL gpus via `nvidia-smi -L` as
+      `gpus`; the watcher has a documented DISPATCH HOOK (`_claim_next`) — result-shipping
+      already runs in a background thread so jobs pipeline; only per-GPU concurrent
+      execution remains.)*
 - [x] Cut a proper `beta.5` release so the public musl binary has `--shell` (done:
       `cli-v0.2.1-beta.5`, commit `4d7406f`; the one-off `…-musl-shell` asset is now
       superseded and can be retired).
