@@ -3,6 +3,12 @@
 Owners: **C** = Claude (drafts/ships directly) · **A** = Abdul (account actions).
 Drafts land in `docs/launch/` ready to paste.
 
+**Strategy / why:** `docs/launch/CASE-STUDY-takeoff.md` — how the analogues
+(LocalSend, Snapdrop/PairDrop, magic-wormhole/croc, Syncthing/Tailscale/ngrok)
+actually took off, the 2026 channel reality, the Quick-Share↔AirDrop pivot, and
+Filament's positioning + sequenced plan + leading indicators. Read it before
+executing the phases below.
+
 ## Phase 0 — Foundation ✅
 - [x] On-page SEO: title/description/canonical, OG + Twitter cards, WebApplication JSON-LD (C)
 - [x] Indexable `/about` + `/faq` pages with FAQPage structured data (C)
