@@ -163,22 +163,6 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
           <StatusDot color={sc} glow={ready} />
         </div>
       </div>
-      {/* web-shell: the button appears only for a remembered + connected device
-          that ADVERTISED a shell (peer.shell, from the CLI's `caps` message — set
-          when it runs `up --shell` / FILAMENT_L2). The pty-open is still gated
-          server-side, so this is purely about hiding the button for the 90%. */}
-      {ready && known && peer.shell && onOpenShell && (
-        <button
-          onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
-          title={`open a terminal on ${displayName}`}
-          style={{
-            position: 'absolute', left: D.tilePad, bottom: D.tilePad, zIndex: 2,
-            display: 'inline-flex', alignItems: 'center', gap: 5, fontFamily: 'inherit', fontSize: 10.5,
-            padding: '4px 8px', cursor: 'pointer', letterSpacing: '.02em',
-            border: '1px solid ' + accent + '66', color: accent, background: accent + '14',
-          }}
-        ><span style={{ fontWeight: 700 }}>›_</span> shell</button>
-      )}
       <div>
         <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
         <div style={{ fontSize: 10.5, display: 'flex', justifyContent: 'space-between', color: T.dim }}>
@@ -190,6 +174,24 @@ function PeerTile({ peer, onSendFiles, onOpenShell, T, D, accent }) {
             ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
             : known ? 'remembered · reaches you in any room' : '—'}
         </div>
+        {/* web-shell: the button appears only for a remembered + connected device
+            that ADVERTISED a shell (peer.shell, from the CLI's `caps` message — set
+            when it runs `up --shell` / FILAMENT_L2). The pty-open is still gated
+            server-side, so this is purely about hiding the button for the 90%. It
+            stacks in normal flow under the caption (not absolute) so it never
+            overlaps the send-hint text. */}
+        {ready && known && peer.shell && onOpenShell && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onOpenShell(peer) }}
+            title={`open a terminal on ${displayName}`}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 5, marginTop: 8,
+              fontFamily: 'inherit', fontSize: 10.5,
+              padding: '4px 8px', cursor: 'pointer', letterSpacing: '.02em',
+              border: '1px solid ' + accent + '66', color: accent, background: accent + '14',
+            }}
+          ><span style={{ fontWeight: 700 }}>›_</span> shell</button>
+        )}
       </div>
     </div>
   )
