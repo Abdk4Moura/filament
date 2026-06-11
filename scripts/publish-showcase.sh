@@ -118,6 +118,44 @@ HTMLHEAD
     echo '  </section>'
   }
 
+  # ── Live end-to-end recordings: real app, real peers, real pairing, no mocks ─
+  echo '  <section class="entry wide"><div class="entry-head"><span class="tag">live e2e</span><h2>Recorded live — real app, real peers, no mocks</h2></div><p class="caption">Each reel below is a real browser paired to a real CLI peer via real PAKE pairing, driven exactly as a human would and recorded as the test runs. Web suite: 7 pass / 0 fail.</p></section>'
+
+  entry "e2e · pairing" \
+    "Pair a device — real PAKE, in the browser" \
+    "A real CLI peer mints a code; the browser types it into the pair box and the device is mutually remembered. No mock state — the actual human gesture; the key never crosses the server." \
+    "reel-pair-device.mp4"
+
+  entry "e2e · web-shell" \
+    "Web-shell — real PTY, end to end" \
+    "Pair an <code>up --shell</code> peer, open its terminal, type a command, and watch the output stream back over the data channel — all through the real UI." \
+    "reel-webshell.mp4"
+
+  entry "e2e · sheet (mobile)" \
+    "Device sheet — tap to act (mobile)" \
+    "On a phone-width viewport, tapping a tile opens the bottom sheet with Send files leading; the tiny ⋯ is gone and drag-drop still sends instantly." \
+    "reel-device-sheet-mobile.mp4"
+
+  entry "e2e · sheet (desktop)" \
+    "Device sheet — hover actions (desktop)" \
+    "On desktop, single-click still sends; hovering reveals the action bar (›_ terminal · ⋯ more) in the hint line's place — a clean swap, no overlap." \
+    "reel-device-sheet-desktop.mp4"
+
+  entry "e2e · sessions" \
+    "Sessions dock — background a live shell" \
+    "Open a terminal, background it (the PTY stays alive, scrollback intact), switch, close — multiple real sessions managed from the dock." \
+    "reel-sessions-dock.mp4"
+
+  entry "e2e · ⌘K" \
+    "Command palette" \
+    "⌘K opens the palette against the live roster; filter and fire — open a real terminal on a paired device." \
+    "reel-cmd-k.mp4"
+
+  entry "e2e · pwa" \
+    "PWA self-update" \
+    "Two builds: the service worker detects the new version and activates (controllerchange), so installs stop getting pinned to a stale bundle." \
+    "reel-pwa-update.mp4"
+
   entry "web-shell" \
     "Web-shell over the data channel" \
     "Pair an <code>up --shell</code> peer, open its terminal, type a command, and watch the output stream straight back through the WebRTC data channel — a real PTY, no SSH server on the box." \
