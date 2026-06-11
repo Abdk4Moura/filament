@@ -18,6 +18,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/lib/peers.sh"
 source "$HERE/lib/pairing.sh"
 source "$HERE/lib/quality.sh"
+# usecases suite is sourced AFTER the web-case helpers it builds on are defined
+# (web_setup / finalize_reel / bg_run / emit) — see "source journeys.sh" below.
 
 # ---------------------------------------------------------------- defaults ----
 RECORD=1
@@ -43,7 +45,7 @@ FLAGS
   --record / --no-record     record live Playwright video for each web case (default: record)
   --only <csv>               run only these case ids        (e.g. --only pair-device,web-shell)
   --skip <csv>               skip these case ids
-  --suite <cli|web|runner|all>   which family of cases (default: all)
+  --suite <cli|web|runner|usecases|all>   which family of cases (default: all)
   --speed <x>                playback/gesture speed hint    (default: 1)
   --parallel <n>             max concurrent web cases       (default: 1 — single-host ICE-safe)
   --quality <auto|high|min>  encode tier (default: auto — GPU→high/NVENC, else CPU/min)
@@ -59,6 +61,9 @@ CASES (ids)
   web:    pair-device, web-shell, device-sheet-mobile, device-sheet-desktop,
           sessions-dock, cmd-k, pwa-update   (REAL app + REAL peers, real PAKE pairing)
   runner: runner-local                (loopback file-driven runner via runner/run_local_test.sh)
+  usecases: maya-send-big-file (HERO), maya-phone-to-laptop, maya-gpu-render,
+            sam-phone-shell, sam-drag-build   (real user "journeys" — REAL peers,
+            recorded + an ergonomics step-counter burned into each reel)
 
 MODEL
   * Peers are REAL: locally-built cli/target/release/filament, isolated configs,
@@ -115,8 +120,15 @@ register cmd-k                web    case_cmd_k
 register pwa-update           web    case_pwa_update
 for n in 01 02 03 04 05 06 07 11; do register "cli-$n" cli "case_cli"; done
 register runner-local         runner case_runner_local
+# usecases "journey" suite — real user stories, real peers, recorded + annotated.
+register maya-send-big-file    usecases case_maya_send_big_file
+register maya-phone-to-laptop  usecases case_maya_phone_to_laptop
+register maya-gpu-render       usecases case_maya_gpu_render
+register sam-phone-shell       usecases case_sam_phone_shell
+register sam-drag-build        usecases case_sam_drag_build
 ALL_IDS=(pair-device web-shell device-sheet-mobile device-sheet-desktop sessions-dock cmd-k pwa-update \
-         cli-01 cli-02 cli-03 cli-04 cli-05 cli-06 cli-07 cli-11 runner-local)
+         cli-01 cli-02 cli-03 cli-04 cli-05 cli-06 cli-07 cli-11 runner-local \
+         maya-send-big-file maya-phone-to-laptop maya-gpu-render sam-phone-shell sam-drag-build)
 
 in_csv() { case ",$1," in *",$2,"*) return 0;; esac; return 1; }
 
@@ -310,6 +322,11 @@ case_runner_local() {
   fi
   return 1
 }
+
+# ---------------------------------------------------------------- usecases -----
+# The journey suite builds ON the web-case helpers above (web_setup, finalize_reel,
+# bg_run, emit, run_web_driver). Source it now that they're all defined.
+source "$HERE/lib/journeys.sh"
 
 # ---------------------------------------------------------------- run ----------
 echo "================= filament e2e pipeline ================="

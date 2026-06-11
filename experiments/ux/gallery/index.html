@@ -20,41 +20,31 @@
   a{color:#7CF6C8}
 </style></head><body>
 <h1>Filament — e2e pipeline results</h1>
-<p class="sub"><b style='color:#7CF6C8'>7 PASS</b> &nbsp; <b style='color:#F26D6D'>0 FAIL</b> &nbsp;·&nbsp; real-app + real-peer e2e + live reels. <a href='./reels.html'>reels →</a></p>
+<p class="sub"><b style='color:#7CF6C8'>5 PASS</b> &nbsp; <b style='color:#F26D6D'>0 FAIL</b> &nbsp;·&nbsp; real-app + real-peer e2e + live reels. <a href='./reels.html'>reels →</a></p>
 <div class="grid">
   <section class="card">
-    <div class="hd"><span class="tag">palette</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>cmd-k</h2><p class="cap">⌘K command palette</p>
-    <p class="detail">⌘K palette: opened, filtered, and ran the open-terminal action against a real shell device</p>
+    <div class="hd"><span class="tag">journey · maya</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>maya-gpu-render</h2><p class="cap">Render on the home box</p>
+    <p class="detail">ERGO[submit · render on the home box · artifact returns] — Maya submitted a render to the home box (loopback runner): the job ran and the finished out.mp4 came back, sha-verified</p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">tile-v2</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>device-sheet-desktop</h2><p class="cap">Desktop: hover action bar → sheet</p>
-    <p class="detail">tile-v2 desktop hover bar→sheet verified on a real remembered device</p>
+    <div class="hd"><span class="tag">journey · maya</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>maya-phone-to-laptop</h2><p class="cap">Phone → laptop, one tap</p>
+    <p class="detail">ERGO[no code · 1 tap · it's on the laptop] — phone→laptop transfer arrived (save ready, name "from-phone.clip" shown)</p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">tile-v2</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>device-sheet-mobile</h2><p class="cap">Mobile: tap tile → sheet (Send first)</p>
-    <p class="detail">tile-v2 mobile tap→sheet (Send leads) verified on a real remembered device</p>
+    <div class="hd"><span class="tag">journey · maya</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>maya-send-big-file</h2><p class="cap">Hero: drag a big file home — survives café wifi</p>
+    <p class="detail">ERGO[paired once · 1 drag · auto-healed 1 blip] — Maya dragged a 3.5MB export onto her home desktop (byte-correct), and a mid-transfer café-wifi stall self-healed byte-exact with zero user action [HERO]</p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">pairing</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>pair-device</h2><p class="cap">Pair → device appears</p>
-    <p class="detail">CLI minted a PAKE code; browser claimed it; device mutually remembered (stored=1, live tile=false)</p>
+    <div class="hd"><span class="tag">journey · sam</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>sam-drag-build</h2><p class="cap">Drag a build onto the box</p>
+    <p class="detail">ERGO[1 drag · it's on the box] — Sam dragged a 2.2MB build artifact onto his home server; it landed BYTE-CORRECT (sam-drag-build-app.tar)</p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">pwa</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>pwa-update</h2><p class="cap">PWA update — two builds</p>
-    <p class="detail">two builds → real SW update: new service worker took control (auto-reload via skipWaiting/controllerchange, controller=true)</p>
-  </section>
-  <section class="card">
-    <div class="hd"><span class="tag">sessions</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>sessions-dock</h2><p class="cap">Sessions dock: switch / background / close</p>
-    <p class="detail">sessions dock: opened a real terminal, backgrounded (PTY survived), switched, and closed</p>
-  </section>
-  <section class="card">
-    <div class="hd"><span class="tag">web-shell</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
-    <h2>web-shell</h2><p class="cap">Web-shell over the data channel</p>
-    <p class="detail">paired up --shell peer; opened a real terminal; typed a command; saw its output over the data channel</p>
+    <div class="hd"><span class="tag">journey · sam</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>sam-phone-shell</h2><p class="cap">Shell from anywhere (phone)</p>
+    <p class="detail">ERGO[paired once · open · type · output] — opened the home server shell from a phone and ran a real command; output streamed back over the data channel (no SSH server, no port-forward)</p>
   </section></div>
 </body></html>

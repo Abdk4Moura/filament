@@ -118,6 +118,43 @@ HTMLHEAD
     echo '  </section>'
   }
 
+  # ── "What you can do with filament" — the use-case JOURNEY suite. ───────────
+  # Real user stories (persona → journey → reel), each enacted with REAL peers,
+  # recorded live, with an ergonomics step-counter burned into the footage. This
+  # section leads (it's the "why"); the feature/e2e reels below are the "how".
+  echo '  <section class="entry wide journeys"><div class="entry-head"><span class="tag">what you can do</span><h2>What you can do with filament</h2></div><p class="caption">Real people, real tasks, real peers — each journey is enacted in the actual app against genuine filament CLI peers, recorded as it runs, with an ergonomics step-counter (&ldquo;paired once · 1 drag · auto-healed 1 blip&rdquo;) burned into the reel so the EASE is visible, not just claimed.</p></section>'
+
+  # Maya — motion designer (café → home)
+  echo '  <section class="entry wide persona"><div class="entry-head"><span class="tag">persona · maya</span><h2>Maya — motion designer (café → home)</h2></div><p class="caption">Big exports, a flaky café uplink, a render box at home.</p></section>'
+
+  entry "journey · maya · HERO" \
+    "Drag a big file home — and it survives café wifi" \
+    "Maya pairs her home desktop once, then drags a multi-MB export straight onto its tile — byte-correct. Mid-transfer a café-wifi stall is injected (the data-path-freeze); the bytes-moved watchdog detects it and the link self-heals byte-exact with <strong>zero</strong> user action. Paired once · 1 drag · auto-healed 1 blip." \
+    "reel-maya-send-big-file.mp4"
+
+  entry "journey · maya" \
+    "Phone → laptop, one tap" \
+    "A paired phone peer sends a clip into the shared room; Maya's laptop shows the offer, she taps once, and it's there — no code to retype." \
+    "reel-maya-phone-to-laptop.mp4"
+
+  entry "journey · maya" \
+    "Render on the home box" \
+    "Maya submits a small render to the home box (loopback runner — never the live GPU) and the finished artifact returns, sha-verified." \
+    "reel-maya-gpu-render.mp4"
+
+  # Sam — developer (home server)
+  echo '  <section class="entry wide persona"><div class="entry-head"><span class="tag">persona · sam</span><h2>Sam — developer (home server)</h2></div><p class="caption">A box at home, a shell he wants from anywhere, builds to ship to it.</p></section>'
+
+  entry "journey · sam" \
+    "Shell from anywhere (from his phone)" \
+    "Sam pairs his home server's terminal from his phone, opens it, runs a real command, and watches the output stream back over the data channel — no SSH server, no port-forward, no VPN." \
+    "reel-sam-phone-shell.mp4"
+
+  entry "journey · sam" \
+    "Drag a build onto the box" \
+    "Sam drags a build artifact straight onto his home server's tile and it lands byte-correct — ship-to-the-box in one drag." \
+    "reel-sam-drag-build.mp4"
+
   # ── Live end-to-end recordings: real app, real peers, real pairing, no mocks ─
   echo '  <section class="entry wide"><div class="entry-head"><span class="tag">live e2e</span><h2>Recorded live — real app, real peers, no mocks</h2></div><p class="caption">Each reel below is a real browser paired to a real CLI peer via real PAKE pairing, driven exactly as a human would and recorded as the test runs. Web suite: 7 pass / 0 fail.</p></section>'
 
@@ -255,6 +292,11 @@ main{padding:28px 0 10px;display:grid;grid-template-columns:repeat(2,1fr);gap:18
 }
 .entry:hover{border-color:var(--line2);transform:translateY(-1px)}
 .entry.wide{grid-column:1 / -1}
+.entry.journeys{background:linear-gradient(180deg,#0d1714,#0c0e10);border-color:#7CF6C84d}
+.entry.journeys h2{font-size:18px}
+.entry.persona{background:transparent;border:none;border-bottom:1px solid var(--line);border-radius:0;padding:14px 2px 6px}
+.entry.persona:hover{transform:none}
+.entry.persona h2{font-size:16.5px;color:var(--accent)}
 .entry-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:8px}
 .tag{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);border:1px solid #7CF6C84d;border-radius:999px;padding:3px 9px;white-space:nowrap}
 .entry h2{font-size:15.5px;margin:0;font-weight:600;letter-spacing:-.005em}

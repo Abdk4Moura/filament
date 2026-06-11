@@ -1,30 +1,22 @@
 {
-  "pair-device": {
+  "maya-send-big-file": {
     "verdict": "PASS",
-    "detail": "CLI minted a PAKE code; browser claimed it; device mutually remembered (stored=1, live tile=false)"
+    "detail": "ERGO[paired once \u00b7 1 drag \u00b7 auto-healed 1 blip] \u2014 Maya dragged a 3.5MB export onto her home desktop (byte-correct), and a mid-transfer caf\u00e9-wifi stall self-healed byte-exact with zero user action [HERO]"
   },
-  "web-shell": {
+  "maya-phone-to-laptop": {
     "verdict": "PASS",
-    "detail": "paired up --shell peer; opened a real terminal; typed a command; saw its output over the data channel"
+    "detail": "ERGO[no code \u00b7 1 tap \u00b7 it's on the laptop] \u2014 phone\u2192laptop transfer arrived (save ready, name \"from-phone.clip\" shown)"
   },
-  "device-sheet-mobile": {
+  "maya-gpu-render": {
     "verdict": "PASS",
-    "detail": "tile-v2 mobile tap\u2192sheet (Send leads) verified on a real remembered device"
+    "detail": "ERGO[submit \u00b7 render on the home box \u00b7 artifact returns] \u2014 Maya submitted a render to the home box (loopback runner): the job ran and the finished out.mp4 came back, sha-verified"
   },
-  "device-sheet-desktop": {
+  "sam-phone-shell": {
     "verdict": "PASS",
-    "detail": "tile-v2 desktop hover bar\u2192sheet verified on a real remembered device"
+    "detail": "ERGO[paired once \u00b7 open \u00b7 type \u00b7 output] \u2014 opened the home server shell from a phone and ran a real command; output streamed back over the data channel (no SSH server, no port-forward)"
   },
-  "sessions-dock": {
+  "sam-drag-build": {
     "verdict": "PASS",
-    "detail": "sessions dock: opened a real terminal, backgrounded (PTY survived), switched, and closed"
-  },
-  "cmd-k": {
-    "verdict": "PASS",
-    "detail": "\u2318K palette: opened, filtered, and ran the open-terminal action against a real shell device"
-  },
-  "pwa-update": {
-    "verdict": "PASS",
-    "detail": "two builds \u2192 real SW update: new service worker took control (auto-reload via skipWaiting/controllerchange, controller=true)"
+    "detail": "ERGO[1 drag \u00b7 it's on the box] \u2014 Sam dragged a 2.2MB build artifact onto his home server; it landed BYTE-CORRECT (sam-drag-build-app.tar)"
   }
 }

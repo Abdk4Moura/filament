@@ -23,45 +23,75 @@
 <p class="sub">Live Playwright recordings driving the REAL app against REAL filament peers — real PAKE pairing, real PTYs, real WebRTC. webm→mp4, GPU-aware encode. <a href='./index.html'>← results</a></p>
 <div class="grid">
   <section class="card">
-    <div class="hd"><span class="tag">pairing</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">pairing</span></div>
     <h2>Pair → device appears</h2><p class="cap">A real CLI peer mints a PAKE code; the browser types it into the real pair box. The device is stored and a REMEMBERED tile appears — key never crosses the server.</p>
     <video controls preload="metadata" src="reel-pair-device.mp4"></video>
-    <p class="detail">CLI minted a PAKE code; browser claimed it; device mutually remembered (stored=1, live tile=false)</p>
+    <p class="detail"></p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">web-shell</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">web-shell</span></div>
     <h2>Web-shell over the data channel</h2><p class="cap">Pair a real `up --shell` peer, open its terminal (›_), type a command, and watch the output stream back through the WebRTC data channel — a real PTY.</p>
     <video controls preload="metadata" src="reel-webshell.mp4"></video>
-    <p class="detail">paired up --shell peer; opened a real terminal; typed a command; saw its output over the data channel</p>
+    <p class="detail"></p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">tile-v2</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">tile-v2</span></div>
     <h2>Mobile: tap tile → sheet (Send first)</h2><p class="cap">tile-interaction-v2: tapping a remembered tile on a phone opens the DeviceSheet with Send leading.</p>
     <video controls preload="metadata" src="reel-device-sheet-mobile.mp4"></video>
-    <p class="detail">tile-v2 mobile tap→sheet (Send leads) verified on a real remembered device</p>
+    <p class="detail"></p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">tile-v2</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">tile-v2</span></div>
     <h2>Desktop: hover action bar → sheet</h2><p class="cap">tile-interaction-v2: hovering a remembered tile reveals the action bar; ⋯ more opens the same DeviceSheet.</p>
     <video controls preload="metadata" src="reel-device-sheet-desktop.mp4"></video>
-    <p class="detail">tile-v2 desktop hover bar→sheet verified on a real remembered device</p>
+    <p class="detail"></p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">sessions</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">sessions</span></div>
     <h2>Sessions dock: switch / background / close</h2><p class="cap">Open a real terminal, background it (the PTY and scrollback survive), reopen via its chip, and close it — the session dock against a live shell peer.</p>
     <video controls preload="metadata" src="reel-sessions-dock.mp4"></video>
-    <p class="detail">sessions dock: opened a real terminal, backgrounded (PTY survived), switched, and closed</p>
+    <p class="detail"></p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">palette</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">palette</span></div>
     <h2>⌘K command palette</h2><p class="cap">Open the real command palette, filter, and run the open-terminal action against a paired shell device.</p>
     <video controls preload="metadata" src="reel-cmd-k.mp4"></video>
-    <p class="detail">⌘K palette: opened, filtered, and ran the open-terminal action against a real shell device</p>
+    <p class="detail"></p>
   </section>
   <section class="card">
-    <div class="hd"><span class="tag">pwa</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <div class="hd"><span class="tag">pwa</span></div>
     <h2>PWA update — two builds</h2><p class="cap">Build A is serving; build B is deployed (a fresh /sw.js). The running service worker discovers the update — the 'New version available' nudge or a controllerchange takes over.</p>
     <video controls preload="metadata" src="reel-pwa-update.mp4"></video>
-    <p class="detail">two builds → real SW update: new service worker took control (auto-reload via skipWaiting/controllerchange, controller=true)</p>
+    <p class="detail"></p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">journey · maya</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Hero: drag a big file home — survives café wifi</h2><p class="cap">Maya pairs her home desktop once, then DRAGS a multi-MB export onto its tile — byte-correct. Mid-transfer, a café-wifi stall is injected (the data-path-freeze) and it AUTO-HEALS byte-exact with zero user action. Paired once · 1 drag · auto-healed 1 blip.</p>
+    <video controls preload="metadata" src="reel-maya-send-big-file.mp4"></video>
+    <p class="detail">ERGO[paired once · 1 drag · auto-healed 1 blip] — Maya dragged a 3.5MB export onto her home desktop (byte-correct), and a mid-transfer café-wifi stall self-healed byte-exact with zero user action [HERO]</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">journey · maya</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Phone → laptop, one tap</h2><p class="cap">A paired phone peer sends a clip; Maya's laptop shows the offer, she taps once, and it's there. No code to retype.</p>
+    <video controls preload="metadata" src="reel-maya-phone-to-laptop.mp4"></video>
+    <p class="detail">ERGO[no code · 1 tap · it's on the laptop] — phone→laptop transfer arrived (save ready, name "from-phone.clip" shown)</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">journey · maya</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Render on the home box</h2><p class="cap">Maya submits a small render to the home box (loopback runner) and the finished artifact returns, sha-verified.</p>
+    <div class="nomedia">no reel (case failed or not recorded)</div>
+    <p class="detail">ERGO[submit · render on the home box · artifact returns] — Maya submitted a render to the home box (loopback runner): the job ran and the finished out.mp4 came back, sha-verified</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">journey · sam</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Shell from anywhere (phone)</h2><p class="cap">Sam pairs his home server's terminal from his phone, opens it, runs a real command, and sees the output stream back over the data channel — no SSH server, no port-forward.</p>
+    <video controls preload="metadata" src="reel-sam-phone-shell.mp4"></video>
+    <p class="detail">ERGO[paired once · open · type · output] — opened the home server shell from a phone and ran a real command; output streamed back over the data channel (no SSH server, no port-forward)</p>
+  </section>
+  <section class="card">
+    <div class="hd"><span class="tag">journey · sam</span><span class="badge" style="background:#7CF6C8">PASS</span></div>
+    <h2>Drag a build onto the box</h2><p class="cap">Sam drags a build artifact straight onto his home server's tile and it lands byte-correct — ship-to-the-box in one drag.</p>
+    <video controls preload="metadata" src="reel-sam-drag-build.mp4"></video>
+    <p class="detail">ERGO[1 drag · it's on the box] — Sam dragged a 2.2MB build artifact onto his home server; it landed BYTE-CORRECT (sam-drag-build-app.tar)</p>
   </section></div>
 </body></html>

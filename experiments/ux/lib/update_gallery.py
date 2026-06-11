@@ -29,8 +29,22 @@ META = {
         "Open the real command palette, filter, and run the open-terminal action against a paired shell device."),
     "pwa-update": ("pwa", "PWA update — two builds",
         "Build A is serving; build B is deployed (a fresh /sw.js). The running service worker discovers the update — the 'New version available' nudge or a controllerchange takes over."),
+    # ---- usecases "journey" suite (persona → journey → reel) ----
+    "maya-send-big-file": ("journey · maya", "Hero: drag a big file home — survives café wifi",
+        "Maya pairs her home desktop once, then DRAGS a multi-MB export onto its tile — byte-correct. Mid-transfer, a café-wifi stall is injected (the data-path-freeze) and it AUTO-HEALS byte-exact with zero user action. Paired once · 1 drag · auto-healed 1 blip."),
+    "maya-phone-to-laptop": ("journey · maya", "Phone → laptop, one tap",
+        "A paired phone peer sends a clip; Maya's laptop shows the offer, she taps once, and it's there. No code to retype."),
+    "maya-gpu-render": ("journey · maya", "Render on the home box",
+        "Maya submits a small render to the home box (loopback runner) and the finished artifact returns, sha-verified."),
+    "sam-phone-shell": ("journey · sam", "Shell from anywhere (phone)",
+        "Sam pairs his home server's terminal from his phone, opens it, runs a real command, and sees the output stream back over the data channel — no SSH server, no port-forward."),
+    "sam-drag-build": ("journey · sam", "Drag a build onto the box",
+        "Sam drags a build artifact straight onto his home server's tile and it lands byte-correct — ship-to-the-box in one drag."),
 }
 ORDER = list(META.keys())
+# the journey ids, in persona order, for any consumer that wants just the suite.
+JOURNEY_IDS = ["maya-send-big-file", "maya-phone-to-laptop", "maya-gpu-render",
+               "sam-phone-shell", "sam-drag-build"]
 
 
 def load_results(path):
