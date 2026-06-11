@@ -111,8 +111,13 @@ PY
 # din : up --dir    -> receives pushed inputs (host `send`) into the inbox.
 # The dout channel needs NO daemon on the box: the box only `send`s on it (the
 # host stands up the dout sink transiently during fetch).
-pkill -f "filament up .*cfg-ctl" 2>/dev/null || true
-pkill -f "filament up .*cfg-din" 2>/dev/null || true
+# Kill only PREVIOUSLY-tracked acceptors via their pid files — never pkill -f on
+# a pattern that also appears in THIS script's own command line (when the script
+# is run via `bash -c "$(curl …)"`, the whole script text is the process argv, so
+# a `pkill -f "filament up …cfg-ctl"` would match and SIGTERM this very process).
+for p in "$ROOT_DIR/ctl.pid" "$ROOT_DIR/din.pid"; do
+  [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true
+done
 sleep 1
 
 log "starting ctl acceptor (up --shell)"
