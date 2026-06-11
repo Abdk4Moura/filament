@@ -174,6 +174,21 @@ FILJOB_ROOT="$ROOT_DIR" FILJOB_SERVER="$FILJOB_SERVER" FILAMENT_BIN="$BIN" \
 echo $! > "$ROOT_DIR/watcher.pid"
 log "watcher up — pid $(cat "$ROOT_DIR/watcher.pid"), log: $ROOT_DIR/watcher.log"
 
+# --- 4b. OPS SHELL (debug/inspection ONLY — not the job control plane) -------
+# A small `up --shell --relay` acceptor on the ctl channel so an operator can
+# `filament pty box` into the node to inspect it (logs, manifests, nvidia-smi,
+# disk). This is deliberately separate from job control — jobs still run over the
+# robust file-driven watcher; this is just a human/ops door. `--relay` for
+# stability over flaky NAT. Disable with FILJOB_OPS_SHELL=0.
+if [ "${FILJOB_OPS_SHELL:-1}" != "0" ]; then
+  log "starting ops shell (up --shell --relay on ctl — inspection only)"
+  FILAMENT_CONFIG_DIR="$ROOT_DIR/cfg-ctl" HOME="$ROOT_DIR/cfg-ctl" FILAMENT_L2=1 \
+    nohup "$BIN" up --server "$FILJOB_SERVER" --shell --relay --name-as filjob-box-ops \
+    --dir "$ROOT_DIR/ctldrop" >"$ROOT_DIR/ctl.log" 2>&1 &
+  echo $! > "$ROOT_DIR/ctl.pid"
+  log "ops shell up — pid $(cat "$ROOT_DIR/ctl.pid")  (host: filament pty box --relay)"
+fi
+
 sleep 3
 log "din acceptor + watcher up. logs: $ROOT_DIR/din.log  $ROOT_DIR/watcher.log"
 log "node ready. On the HOST, point FileRunnerBox / runner_cli at:"
@@ -188,5 +203,5 @@ log "DONE — this box is now a file-driven filament job-runner node (no SSH, no
 # (Skip the tail when FILJOB_NO_TAIL=1, e.g. for scripted/non-interactive use.)
 if [ "${FILJOB_NO_TAIL:-0}" != "1" ]; then
   log "tailing watcher + din logs (Ctrl-C / kill the cell to stop the node) ..."
-  exec tail -n +1 -F "$ROOT_DIR/watcher.log" "$ROOT_DIR/din.log"
+  exec tail -n +1 -F "$ROOT_DIR/watcher.log" "$ROOT_DIR/din.log" "$ROOT_DIR/ctl.log"
 fi
