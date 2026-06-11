@@ -32,7 +32,7 @@ function xtermTheme(T, accent) {
 }
 const haptic = (ms = 8) => { try { navigator.vibrate && navigator.vibrate(ms) } catch (e) {} } // Android only
 
-export default function WebTerminal({ link, peerName, route, T, accent, font, onClose }) {
+export default function WebTerminal({ link, peerName, route, T, accent, font, onClose, onBackground, hidden, instanceId }) {
   const hostRef = useRef(null)
   const termRef = useRef(null)
   const fitRef = useRef(null)
@@ -117,6 +117,19 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   // live theme
   useEffect(() => { if (termRef.current) termRef.current.options.theme = xtermTheme(T, accent) }, [T, accent])
 
+  // Sessions dock: when this instance is un-hidden (reopened from the background)
+  // its host had display:none, so xterm couldn't measure — refit + refocus now
+  // that it's visible again. The terminal was NEVER unmounted, so scrollback and
+  // the live PTY are intact. requestAnimationFrame waits for the layout to apply.
+  useEffect(() => {
+    if (hidden) return
+    const raf = requestAnimationFrame(() => {
+      try { fitRef.current && fitRef.current.fit() } catch (e) {}
+      try { termRef.current && termRef.current.focus() } catch (e) {}
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [hidden])
+
   // visualViewport keyboard avoidance: lift the bar above the soft keyboard
   useEffect(() => {
     const vv = window.visualViewport
@@ -150,7 +163,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   ]
 
   return (
-    <div style={{ position: 'absolute', inset: 0, background: T.bg, color: T.text, fontFamily: font, display: 'flex', flexDirection: 'column' }}>
+    <div data-session-id={instanceId} style={{ position: 'absolute', inset: 0, background: T.bg, color: T.text, fontFamily: font, display: 'flex', flexDirection: 'column' }}>
       {/* header */}
       <div style={{ height: 40, flex: '0 0 auto', display: 'flex', alignItems: 'center', gap: 10, padding: '0 14px', borderBottom: `1px solid ${T.line}` }}>
         <span style={{ width: 8, height: 8, borderRadius: 8, background: dot, boxShadow: `0 0 8px ${dot}` }} />
@@ -158,8 +171,14 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
         <span style={{ fontSize: 10.5, color: accent, border: `1px solid ${accent}55`, padding: '2px 6px', background: accent + '14' }}>
           {route || 'direct'}{status === 'connecting' ? ' · connecting…' : ''}
         </span>
-        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 14, color: T.dim, fontSize: 15 }}>
-          <span title="close" onClick={onClose} style={{ cursor: 'pointer' }}>✕</span>
+        <span style={{ marginLeft: 'auto', display: 'inline-flex', gap: 14, color: T.dim, fontSize: 13 }}>
+          {/* Background: hide the overlay WITHOUT tearing down the PTY (the
+              instance stays mounted, reachable from the SESSIONS strip). */}
+          {onBackground && (
+            <span title="background (keep running)" onClick={onBackground}
+              style={{ cursor: 'pointer', fontSize: 12, letterSpacing: '.04em' }}>— hide</span>
+          )}
+          <span title="close (end session)" onClick={onClose} style={{ cursor: 'pointer', fontSize: 15 }}>✕</span>
         </span>
       </div>
       {/* terminal */}

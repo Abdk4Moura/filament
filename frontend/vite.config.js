@@ -51,12 +51,42 @@ const stubFirebaseDev = {
   },
 }
 
+// Build-only: stamp a unique build id into the emitted service worker so its
+// cache name is versioned per deploy. public/sw.js is copied verbatim by Vite,
+// so we rewrite dist/sw.js after the bundle is written, replacing the
+// `__BUILD_ID__` placeholder. The id is derived from the emitted entry bundle's
+// content-hashed filename when available (so it changes exactly when the app
+// changes), with a timestamp fallback. A versioned cache name lets the SW's
+// `activate` purge every non-current cache — the deploy-stale-cache fix.
+const swVersion = {
+  name: 'sw-version',
+  apply: 'build',
+  writeBundle(_opts, bundle) {
+    const entry = Object.keys(bundle).find(
+      (f) => bundle[f] && bundle[f].isEntry && f.endsWith('.js'),
+    )
+    const hashFromEntry = entry && (entry.match(/-([A-Za-z0-9_-]{6,})\.js$/) || [])[1]
+    const buildId = hashFromEntry || Date.now().toString(36)
+    const swPath = path.resolve(process.cwd(), 'dist', 'sw.js')
+    try {
+      let src = fs.readFileSync(swPath, 'utf8')
+      src = src.replace(/__BUILD_ID__/g, buildId)
+      fs.writeFileSync(swPath, src)
+      // eslint-disable-next-line no-console
+      console.log(`[sw-version] stamped dist/sw.js cache -> filament-${buildId}`)
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('[sw-version] could not stamp dist/sw.js:', String(e))
+    }
+  },
+}
+
 // In dev: Vite serves the UI on :5173 with hot reload and proxies the API +
 // websocket to Flask on :5000, so the app behaves as a single origin.
 // In build: emits the default ./dist (frontend/dist) — Cloudflare serves it via
 // wrangler.jsonc, and Flask serves it for local single-service runs.
 export default defineConfig({
-  plugins: [stubFirebaseDev, annotatorSink, react()],
+  plugins: [stubFirebaseDev, annotatorSink, swVersion, react()],
   build: {
     emptyOutDir: true,
     rollupOptions: {

@@ -512,6 +512,68 @@ function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, D, accent }
   )
 }
 
+// Shell-surfacing Phase 2 — the SESSIONS strip (idea E). A slim bar that only
+// renders when ≥1 terminal session is open or backgrounded (free to the 90% who
+// never open a shell). One chip per session: click to switch/reopen, ✕ to close
+// (which tears down its PTY). Desktop: a thin bar atop the peers column; mobile:
+// a pill row under the tab strip. `narrow` picks the spacing/size.
+function SessionsStrip({ sessions, activeId, onSwitch, onClose, narrow, T, accent }) {
+  if (!sessions.length) return null
+  return (
+    <div
+      data-testid="sessions-strip"
+      style={{
+        flexShrink: 0, display: 'flex', alignItems: 'center', gap: narrow ? 6 : 8,
+        padding: narrow ? '8px 0 2px' : '0 0 12px', overflowX: 'auto',
+        WebkitOverflowScrolling: 'touch',
+      }}
+    >
+      <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim, whiteSpace: 'nowrap', flexShrink: 0 }}>
+        SESSIONS
+      </span>
+      {sessions.map((s) => {
+        const active = s.id === activeId
+        const name = s.peer.known || s.peer.verified || s.peer.name
+        return (
+          <span
+            key={s.id}
+            data-testid="session-chip"
+            data-session-active={active ? '1' : '0'}
+            onClick={() => onSwitch(s.id)}
+            title={active ? `${name} (showing)` : `switch to ${name}`}
+            style={{
+              flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 7,
+              cursor: 'pointer', whiteSpace: 'nowrap', userSelect: 'none',
+              padding: '5px 7px 5px 9px', fontSize: 11.5,
+              border: '1px solid ' + (active ? accent : T.line),
+              background: active ? (T.mode === 'light' ? 'rgba(12,138,96,.10)' : 'rgba(124,246,200,.10)') : T.panel,
+              color: active ? accent : T.sub,
+              transition: 'border-color .12s, color .12s, background .12s',
+            }}
+          >
+            <span style={{ width: 7, height: 7, background: active ? accent : T.dim, display: 'block', flexShrink: 0, boxShadow: active ? '0 0 7px ' + accent : 'none' }} />
+            <span style={{ maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis' }}>{name}</span>
+            <button
+              data-testid="session-close"
+              onClick={(e) => { e.stopPropagation(); onClose(s.id) }}
+              title={`close terminal on ${name}`}
+              aria-label={`close terminal on ${name}`}
+              style={{
+                flexShrink: 0, width: 18, height: 18, lineHeight: '16px', padding: 0,
+                cursor: 'pointer', font: 'inherit', fontSize: 13,
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                border: '1px solid transparent', background: 'transparent', color: T.dim,
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = T.bad; e.currentTarget.style.borderColor = T.bad }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = T.dim; e.currentTarget.style.borderColor = 'transparent' }}
+            >✕</button>
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
@@ -533,8 +595,33 @@ export default function Filament(props) {
   const rootRef = useRef(null)
   const [narrow, setNarrow] = useState(!!ui.forceMobile)
   const [tab, setTab] = useState('peers')
-  const [shellPeer, setShellPeer] = useState(null) // web-shell: the peer whose terminal is open
-  const shellLink = shellPeer && state.getLink ? state.getLink(shellPeer.id) : null
+  // Shell-surfacing Phase 2: a LIST of open terminal sessions (was a single
+  // shellPeer). Each session's WebTerminal stays MOUNTED for its lifetime —
+  // backgrounding only hides the overlay (activeSessionId = null), it does NOT
+  // unmount (unmount → link.closePty() kills the PTY). Only an explicit close
+  // unmounts a session, tearing down its PTY. Scrollback survives backgrounding
+  // because the instance is never remounted.
+  const [sessions, setSessions] = useState([]) // [{ id, peer }]
+  const [activeSessionId, setActiveSessionId] = useState(null)
+  const sessionSeq = useRef(0)
+
+  const openSession = useCallback((peer) => {
+    setSessions((prev) => {
+      // One session per peer: re-focus an existing one instead of duplicating.
+      const existing = prev.find((s) => s.peer.id === peer.id)
+      if (existing) { setActiveSessionId(existing.id); return prev }
+      const id = 'sess-' + (++sessionSeq.current)
+      setActiveSessionId(id)
+      return [...prev, { id, peer }]
+    })
+  }, [])
+  const backgroundSession = useCallback(() => setActiveSessionId(null), [])
+  const switchSession = useCallback((id) => setActiveSessionId(id), [])
+  const closeSession = useCallback((id) => {
+    setSessions((prev) => prev.filter((s) => s.id !== id))
+    setActiveSessionId((cur) => (cur === id ? null : cur))
+  }, [])
+  const activeSession = sessions.find((s) => s.id === activeSessionId) || null
   // model H: the per-device actions sheet. { peer, rect } — rect anchors the
   // desktop popover near the invoking tile (null = a sensible default position).
   const [sheet, setSheet] = useState(null)
@@ -637,27 +724,69 @@ export default function Filament(props) {
     backgroundSize: '34px 34px',
   }
 
-  // web-shell: the terminal renders as a full-window overlay (portal to body) so
-  // it works in both the desktop and mobile layouts from one place. Disclosure
-  // stays intact — it only exists once a shell button is clicked.
-  const terminalOverlay = shellPeer
+  // web-shell: terminals render as a full-window overlay (portal to body) so it
+  // works in both the desktop and mobile layouts from one place. Disclosure
+  // stays intact — a session only exists once a shell button is clicked.
+  //
+  // Shell-surfacing Phase 2: EVERY open session's WebTerminal is mounted here at
+  // once; only the active one is visible (the rest are display:none). This is
+  // load-bearing — keeping a backgrounded session mounted preserves its live PTY
+  // (unmount calls link.closePty()) and its scrollback. The whole portal only
+  // exists while ≥1 session is open; when none is active the overlay is hidden
+  // (pointerEvents:none) but the sessions stay mounted underneath.
+  const terminalOverlay = sessions.length
     ? createPortal(
-        <div style={{ position: 'fixed', inset: 0, zIndex: 4000, background: T.bg }}>
-          {shellLink
-            ? <WebTerminal link={shellLink} peerName={shellPeer.name} route={shellPeer.route}
-                T={T} accent={accent} font={font} onClose={() => setShellPeer(null)} />
-            : (
-              <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: T.dim, fontFamily: font }}>
-                <div style={{ textAlign: 'center' }}>
-                  <div>not connected to {shellPeer.name}</div>
-                  <button onClick={() => setShellPeer(null)} style={{ marginTop: 12, padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>close</button>
-                </div>
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 4000, background: T.bg,
+          display: activeSession ? 'block' : 'none',
+        }}>
+          {sessions.map((s) => {
+            const visible = s.id === activeSessionId
+            // Keep peer metadata (name/route) fresh as the roster updates.
+            const peer = state.peers.find((p) => p.id === s.peer.id) || s.peer
+            const link = state.getLink ? state.getLink(peer.id) : null
+            return (
+              <div key={s.id} data-testid="session-pane" data-session-pane-id={s.id}
+                style={{ position: 'absolute', inset: 0, display: visible ? 'block' : 'none' }}>
+                {link
+                  ? <WebTerminal link={link} peerName={peer.name} route={peer.route}
+                      T={T} accent={accent} font={font} instanceId={s.id} hidden={!visible}
+                      onBackground={backgroundSession} onClose={() => closeSession(s.id)} />
+                  : (
+                    <div style={{ position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', color: T.dim, fontFamily: font }}>
+                      <div style={{ textAlign: 'center' }}>
+                        <div>not connected to {peer.name}</div>
+                        <div style={{ marginTop: 12, display: 'flex', gap: 8, justifyContent: 'center' }}>
+                          <button onClick={backgroundSession} style={{ padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>hide</button>
+                          <button onClick={() => closeSession(s.id)} style={{ padding: '7px 14px', cursor: 'pointer', font: 'inherit', background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>close</button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
               </div>
-            )}
+            )
+          })}
         </div>,
         document.body,
       )
     : null
+
+  // Live peer metadata for the chips (status/name updates as the roster changes).
+  const sessionChips = sessions.map((s) => ({
+    id: s.id,
+    peer: state.peers.find((p) => p.id === s.peer.id) || s.peer,
+  }))
+  const sessionsStrip = (
+    <SessionsStrip
+      sessions={sessionChips}
+      activeId={activeSessionId}
+      onSwitch={switchSession}
+      onClose={closeSession}
+      narrow={narrow}
+      T={T}
+      accent={accent}
+    />
+  )
 
   // model H: the per-device actions sheet — a bottom sheet on mobile, an anchored
   // popover on desktop. `Open terminal` here closes the sheet and opens the same
@@ -672,7 +801,7 @@ export default function Filament(props) {
       D={D}
       accent={accent}
       font={font}
-      onOpenShell={setShellPeer}
+      onOpenShell={openSession}
       onSendFiles={onSendFiles}
       onForget={onForgetDevice}
       onClose={closeSheet}
@@ -724,6 +853,7 @@ export default function Filament(props) {
             {tabBtn('peers', state.peers.length)}
             {tabBtn('transfers', state.transfers.length)}
           </div>
+          <div style={{ padding: '0 16px', background: T.bg }}>{sessionsStrip}</div>
           <div style={{ padding: 16 }}>
             {tab === 'peers' ? (
               <>
@@ -773,6 +903,7 @@ export default function Filament(props) {
       <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
         {/* peers */}
         <div style={{ flex: '1 1 62%', padding: D.pad, borderRight: '1px solid ' + T.line, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+          {sessionsStrip}
           {discovery}
           <div style={{ fontSize: 11, color: T.dim, marginBottom: 14, display: 'flex', justifyContent: 'space-between', flexShrink: 0 }}>
             <span style={{ letterSpacing: '.06em' }}>PEERS · {state.peers.length}</span>
