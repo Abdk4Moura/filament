@@ -58,7 +58,17 @@ function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger }) {
   )
 }
 
-export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, font, onOpenShell, onSendFiles, onForget, onClose }) {
+// A compact read-only info line: dim label on the left, value on the right.
+function InfoLine({ label, value, color, T }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, lineHeight: 1.5, minWidth: 0 }}>
+      <span style={{ color: T.faint, letterSpacing: '.04em', flexShrink: 0 }}>{label}</span>
+      <span style={{ marginLeft: 'auto', color: color || T.sub, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textAlign: 'right' }}>{value}</span>
+    </div>
+  )
+}
+
+export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, font, onOpenShell, onSendFiles, onForget, onRename, onClose }) {
   const panelRef = useRef(null)
   const inp = useRef(null)
   const [dragY, setDragY] = useState(0) // mobile swipe-down offset
@@ -69,6 +79,18 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
   const displayName = peer.known || peer.verified || peer.name
   const showShell = ready && known && peer.shell && onOpenShell
   const canForget = !!peer.known && !!onForget // forget is keyed by the stored petname
+  // Rename edits the stored petname — keyed by peer.known (the current label),
+  // so it's offered only for a remembered device with a rename handler wired.
+  const canRename = !!peer.known && !!onRename
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(displayName)
+  const nameInp = useRef(null)
+  useEffect(() => { if (editing && nameInp.current) { nameInp.current.focus(); nameInp.current.select() } }, [editing])
+  const commitRename = () => {
+    const next = draft.trim()
+    if (next && next !== peer.known) onRename(peer.known, next)
+    setEditing(false)
+  }
   const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
   const rm = routeMeta(peer.route, T)
 
@@ -102,6 +124,19 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
     </div>
   )
 
+  // Read-only "Info": the same facts the tile derives, gathered in one place.
+  // Compact, on-theme; only shows fields the peer actually carries.
+  const info = (
+    <div style={{ padding: '10px 13px', borderTop: '1px solid ' + T.lineSoft, display: 'flex', flexDirection: 'column', gap: 5 }}>
+      <div style={{ fontSize: 9, letterSpacing: '.14em', color: T.faint, marginBottom: 3 }}>INFO</div>
+      {rm && <InfoLine label="route" value={rm.label} color={rm.color} T={T} />}
+      <InfoLine label="status" value={PEER_STATUS_LABEL[peer.status] || peer.status} color={sc} T={T} />
+      <InfoLine label="shell" value={peer.shell ? 'capable' : 'no'} color={peer.shell ? accent : T.sub} T={T} />
+      {known && <InfoLine label="paired" value="remembered" color={accent} T={T} />}
+      {peer.lastSeen && <InfoLine label="last seen" value={peer.lastSeen} T={T} />}
+    </div>
+  )
+
   const rows = (
     <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 9 }}>
       <input ref={inp} type="file" multiple style={{ display: 'none' }}
@@ -112,6 +147,37 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
       )}
       <ActionRow glyph="⇪" label="Send files" hint="pick files to send" accent={accent} T={T}
         onClick={openPicker} />
+      {canRename && (
+        editing ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 4px' }}>
+            <input
+              ref={nameInp}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); commitRename() }
+                // swallow Esc so the sheet's document-level listener doesn't close
+                // the whole sheet — Esc just cancels the rename.
+                if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setDraft(displayName); setEditing(false) }
+              }}
+              placeholder="device name"
+              style={{
+                flex: 1, minWidth: 0, font: 'inherit', fontSize: 13, padding: '9px 10px',
+                background: T.bg, color: T.text, border: '1px solid ' + accent, outline: 'none',
+              }}
+            />
+            <button onClick={commitRename} title="save name" style={{
+              flexShrink: 0, font: 'inherit', fontSize: 12, padding: '9px 12px', cursor: 'pointer',
+              background: accent, color: T.onAccent, border: '1px solid ' + accent }}>save</button>
+            <button onClick={() => { setDraft(displayName); setEditing(false) }} title="cancel" style={{
+              flexShrink: 0, font: 'inherit', fontSize: 12, padding: '9px 11px', cursor: 'pointer',
+              background: 'transparent', color: T.dim, border: '1px solid ' + T.line }}>✕</button>
+          </div>
+        ) : (
+          <ActionRow glyph="✎" label="Rename" hint="edit this device's name" accent={accent} T={T}
+            onClick={() => { setDraft(displayName); setEditing(true) }} />
+        )
+      )}
       {canForget && (
         <ActionRow glyph="⊘" label="Forget device" hint="stop auto-reconnecting" danger accent={accent} T={T}
           onClick={() => { onForget(peer.known); onClose() }} />
@@ -150,6 +216,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
           </div>
           {header}
           {rows}
+          {info}
         </div>
       </div>,
       document.body,
@@ -165,7 +232,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
   let top = anchorRect ? anchorRect.bottom + 6 : 80
   if (left + W > vw - 12) left = Math.max(12, (anchorRect ? anchorRect.right : vw) - W)
   // Rough height guess for flip-up when near the bottom edge.
-  const estH = 92 + (showShell ? 68 : 0) + 68 + (canForget ? 68 : 0)
+  const estH = 92 + (showShell ? 68 : 0) + 68 + (canRename ? 68 : 0) + (canForget ? 68 : 0) + 120 /* info block */
   if (top + estH > vh - 12 && anchorRect) top = Math.max(12, anchorRect.top - estH - 6)
 
   return createPortal(
@@ -182,6 +249,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
       >
         {header}
         {rows}
+        {info}
       </div>
     </div>,
     document.body,

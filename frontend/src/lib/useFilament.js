@@ -12,7 +12,7 @@ import { createSession } from './session.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
-import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, channelOf, proofFor } from './devices.js'
+import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintNameplate } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, PAIR_V2_CAPS } from './pairing.js'
 
@@ -193,6 +193,29 @@ export function useFilament() {
   const forgetDevice = useCallback((name) => {
     setKnownDevices(devicesForget(name))
   }, [])
+
+  // Rename a remembered device's LOCAL petname (no backend, no wire). The secret
+  // is unchanged, so the meeting-point channel and every proof stay byte-stable —
+  // this is purely the human-facing label. We (1) persist via devicesRename,
+  // (2) re-derive channels so channelMapRef/expectedSecretRef carry the new name
+  // (their `dev.name` is what lights up a tile's `known`), and (3) patch any live
+  // tile whose `known`/`verified` still shows the old label so it updates at once.
+  const renameDevice = useCallback((oldName, newName) => {
+    const next = String(newName || '').trim()
+    if (!next || next === oldName) return
+    setKnownDevices(devicesRename(oldName, next))
+    for (const [pid, dev] of expectedSecretRef.current) {
+      if (dev?.name === oldName) expectedSecretRef.current.set(pid, { ...dev, name: next })
+    }
+    subscribeKnown() // re-key channelMapRef → new dev.name
+    setPeers((prev) =>
+      prev.map((p) => ({
+        ...p,
+        ...(p.known === oldName ? { known: next } : null),
+        ...(p.verified === oldName ? { verified: next } : null),
+      })),
+    )
+  }, [subscribeKnown])
 
   // C27: remembering is a TRUST GRANT (the holder can find and auto-connect
   // to this browser forever) — so the human decides, never the protocol.
@@ -1032,6 +1055,7 @@ export function useFilament() {
     useAutoRoom, // go back to the 'people near you' auto room
     knownDevices, // C12: [{name, secret, addedAt}] — remembered devices
     forgetDevice, // C12: drop a remembered device by name
+    renameDevice, // edit a remembered device's local petname (no backend)
     pendingKeeps, // C27: [{peerId, name}] — peers asking to be remembered
     acceptKeep, // C27: store the secret + ack; auto-connect from now on
     declineKeep, // C27: refuse; the sender discards its half too

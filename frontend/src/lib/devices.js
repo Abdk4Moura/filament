@@ -67,6 +67,23 @@ export function deviceAllows(name, capability) {
   return !!caps && caps.includes(capability)
 }
 
+/// Rename a device's LOCAL petname — pure client-side relabel. The `secret`
+/// (and thus the meeting-point channel + every proof) is untouched, so the
+/// reconnect identity is byte-stable; only the human-facing label changes.
+/// Renames the FIRST record matching `oldName`; a no-op if it isn't found or
+/// the new name is blank/unchanged. Returns the fresh list.
+export function devicesRename(oldName, newName) {
+  const next = String(newName || '').trim()
+  if (!next || next === oldName) return devicesLoad()
+  const list = devicesLoad().map((d) => (d.name === oldName ? { ...d, name: next } : d))
+  try {
+    localStorage.setItem(KEY, JSON.stringify(list))
+  } catch (e) {
+    console.warn('filament: could not persist device rename (private browsing?)', e)
+  }
+  return list
+}
+
 export function devicesForget(name) {
   const list = devicesLoad().filter((d) => d.name !== name)
   try {

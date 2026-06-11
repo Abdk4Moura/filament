@@ -8,6 +8,7 @@ import { useState, useRef, useCallback, useEffect, useLayoutEffect } from 'react
 import { createPortal } from 'react-dom'
 import WebTerminal from './WebTerminal.jsx'
 import DeviceSheet from './DeviceSheet.jsx'
+import CommandPalette from './CommandPalette.jsx'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
@@ -354,11 +355,15 @@ function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, pla
   )
 }
 
-function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, T, D, accent }) {
+function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, openEntryNonce, T, D, accent }) {
   const scope = state.roomScope || 'link'
   const [copied, fireCopy] = useCopied()
   const [entering, setEntering] = useState(false)
   const [code, setCode] = useState('')
+
+  // The command palette's "Pair with code" raises this nonce; open our code
+  // input in response (skip the initial 0 so we don't auto-open on mount).
+  useEffect(() => { if (openEntryNonce) setEntering(true) }, [openEntryNonce])
 
   const ghostBtn = (label, fn, primary) => (
     <button onClick={fn} style={{
@@ -577,7 +582,7 @@ function SessionsStrip({ sessions, activeId, onSwitch, onClose, narrow, T, accen
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
     onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
-    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, ui = {} } = props
+    onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, ui = {} } = props
   const mode = ui.theme === 'light' ? 'light' : 'dark'
   const accentSet = ACCENTS[ui.accent] || ACCENTS.green
   const accent = accentSet[mode === 'light' ? 'l' : 'd']
@@ -627,6 +632,27 @@ export default function Filament(props) {
   const [sheet, setSheet] = useState(null)
   const openSheet = useCallback((peer, rect) => setSheet({ peer, rect }), [])
   const closeSheet = useCallback(() => setSheet(null), [])
+  // Idea C — the ⌘K / Ctrl+K command palette. A global hotkey toggles it; the
+  // overlay itself owns navigation/close. Opening the palette dismisses the
+  // sheet so the two surfaces never stack.
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const openPalette = useCallback(() => { setSheet(null); setPaletteOpen(true) }, [])
+  const closePalette = useCallback(() => setPaletteOpen(false), [])
+  // The palette's "Pair with code" has no inline field — it asks the always-
+  // visible DiscoveryBar to open ITS code input (which owns the cursor-safe
+  // entry). A monotonic nonce is the signal; the bar opens on each new value.
+  const [pairEntryNonce, setPairEntryNonce] = useState(0)
+  const requestPairEntry = useCallback(() => { closePalette(); setPairEntryNonce((n) => n + 1) }, [closePalette])
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault()
+        setPaletteOpen((v) => { if (!v) setSheet(null); return !v })
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
   // Keep the open sheet's peer fresh as the roster updates (status/route/shell).
   const sheetPeer = sheet ? (state.peers.find((p) => p.id === sheet.peer.id) || sheet.peer) : null
   useEffect(() => {
@@ -643,6 +669,24 @@ export default function Filament(props) {
     ro.observe(el)
     return () => ro.disconnect()
   }, [ui.forceMobile])
+
+  // ⌘K affordance — discoverable on mobile (no hardware shortcut) and a hint on
+  // desktop. Opens the same palette the hotkey toggles.
+  const paletteBtn = (
+    <button
+      onClick={openPalette}
+      data-testid="cmd-open"
+      title="Quick launcher (⌘K)"
+      aria-label="Open command palette"
+      style={{
+        font: 'inherit', fontSize: 11, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
+        display: 'flex', alignItems: 'center', gap: 5,
+        background: 'transparent', color: T.sub, border: '1px solid ' + T.line,
+      }}
+    >
+      <span style={{ color: accent, fontWeight: 700 }}>⌘K</span>
+    </button>
+  )
 
   const themeBtn = onToggleTheme && (
     <button onClick={onToggleTheme} title="Toggle theme" style={{ font: 'inherit', fontSize: 11, padding: '6px 10px', cursor: 'pointer', whiteSpace: 'nowrap',
@@ -713,7 +757,7 @@ export default function Filament(props) {
       {keepBanners}
       {pakeKeepBanners}
       <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
-        onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} T={T} D={D} accent={accent} />
+        onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} openEntryNonce={pairEntryNonce} T={T} D={D} accent={accent} />
     </>
   )
 
@@ -804,9 +848,31 @@ export default function Filament(props) {
       onOpenShell={openSession}
       onSendFiles={onSendFiles}
       onForget={onForgetDevice}
+      onRename={onRenameDevice}
       onClose={closeSheet}
     />
   ) : null
+
+  // Idea C — the command palette overlay. Reuses the very handlers the tiles and
+  // discovery bar drive: a device row routes through openSheet/openSession; the
+  // globals call the pairing actions. It portals to body, so render once.
+  const commandPalette = (
+    <CommandPalette
+      open={paletteOpen}
+      onClose={closePalette}
+      peers={state.peers}
+      T={T}
+      D={D}
+      accent={accent}
+      font={font}
+      narrow={narrow}
+      onOpenShell={openSession}
+      onSendFiles={onSendFiles}
+      onOpenSheet={openSheet}
+      onPairWithCode={onPairWithCode ? requestPairEntry : null}
+      onGenerateCode={onGenerateCode || null}
+    />
+  )
 
   // ── Mobile layout ──────────────────────────────────────────────
   if (narrow) {
@@ -822,6 +888,7 @@ export default function Filament(props) {
       <div ref={rootRef} style={rootStyle}>
         {terminalOverlay}
         {deviceSheet}
+        {commandPalette}
         {/* stacked top bar */}
         <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -831,6 +898,7 @@ export default function Filament(props) {
             </span>
             <Pill T={T}>{state.roomId}</Pill>
             <span style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+              {paletteBtn}
               <StatusDot color={state.connected ? T.ok : T.bad} glow={state.connected} />
               {themeBtn}
             </span>
@@ -874,6 +942,7 @@ export default function Filament(props) {
     <div ref={rootRef} style={rootStyle}>
       {terminalOverlay}
       {deviceSheet}
+      {commandPalette}
       {/* top bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
         borderBottom: '1px solid ' + T.line, background: T.bg }}>
@@ -894,6 +963,7 @@ export default function Filament(props) {
               <Pill T={T}>{state.signalingKind}</Pill>
             </div>
           )}
+          {paletteBtn}
           {copyBtn('copy room link')}
           {themeBtn}
         </div>

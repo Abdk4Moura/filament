@@ -54,6 +54,7 @@ export default function App() {
       onAcceptPakeKeep={qs.acceptPakeKeep}
       onDeclinePakeKeep={qs.declinePakeKeep}
       onForgetDevice={qs.forgetDevice}
+      onRenameDevice={qs.renameDevice}
     />
   )
 }
