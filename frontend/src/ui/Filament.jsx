@@ -118,11 +118,10 @@ function RouteBadge({ route, T }) {
   )
 }
 
-function PeerTile({ peer, onSendFiles, onOpenSheet, T, D, accent }) {
+function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D, accent }) {
   const ready = peer.status === 'ready'
   const [over, setOver] = useState(false)
   const [hov, setHov] = useState(false)
-  const [moreHov, setMoreHov] = useState(false)
   const inp = useRef(null)
   const tileRef = useRef(null)
   // 'away' (C21): the peer announced a benign absence (e.g. it is choosing a
@@ -140,17 +139,38 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, T, D, accent }) {
   // "this device is a machine" visible at rest. The actual Open-terminal action
   // lives in the DeviceSheet, gated server-side on top of this hint.
   const isMachine = !!peer.shell
-  // Model H: the tap/click on a tile STILL sends (opens the picker). The `⋯`
-  // button and desktop right-click open the per-device DeviceSheet instead, so
-  // the send affordance is never in conflict with the secondary actions.
-  const showMore = ready && known && onOpenSheet
+  // tile-interaction-v2: the trigger DIVERGES per form factor; the substance
+  // (DeviceSheet, action set, sessions) stays shared.
+  //   - DESKTOP: single-click STILL sends (zero regression); double-click sends
+  //     too (reinforcement); right-click + a hover action bar open the sheet.
+  //   - MOBILE: tapping a KNOWN tile opens the sheet (the whole tile is the
+  //     trigger, no 24px ⋯); a STRANGER tile taps straight to the picker since
+  //     the sheet would offer nothing but Send.
+  // canSheet gates the sheet trigger (right-click / ⋯ / mobile tap) to remembered
+  // devices, exactly as model H did with showMore.
+  const canSheet = ready && known && onOpenSheet
+  // The hovered `›_` open-terminal chip — only when the device advertises a shell.
+  const canTerminal = ready && known && isMachine && onOpenTerminal
+  // The model-H top-right ⋯ flex-item is gone on BOTH form factors: on mobile the
+  // whole tile opens the sheet; on desktop the hover action bar's `⋯ more` chip
+  // (plus right-click) carries it. Matches the v2 mocks (no static ⋯ on a tile).
   const openSheet = () => onOpenSheet && onOpenSheet(peer, tileRef.current ? tileRef.current.getBoundingClientRect() : null)
+  const openTerminal = () => onOpenTerminal && onOpenTerminal(peer)
+  // Mobile: known → sheet; stranger → picker. Desktop: always send (picker).
+  const onTileClick = () => {
+    if (!ready) return
+    if (narrow && canSheet) { openSheet(); return }
+    if (inp.current) inp.current.click()
+  }
+  // Desktop hover bar replaces the hint line (swap, never stack) — see below.
+  const showHoverBar = !narrow && hov && ready && (canTerminal || canSheet)
   return (
     <div
       ref={tileRef}
       onMouseEnter={() => setHov(true)} onMouseLeave={() => setHov(false)}
-      onClick={() => ready && inp.current && inp.current.click()}
-      onContextMenu={(e) => { if (showMore) { e.preventDefault(); openSheet() } }}
+      onClick={onTileClick}
+      onDoubleClick={() => { if (!narrow && ready && inp.current) inp.current.click() }}
+      onContextMenu={(e) => { if (canSheet) { e.preventDefault(); openSheet() } }}
       onDragOver={(e) => { if (ready) { e.preventDefault(); setOver(true) } }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); setOver(false); if (ready && e.dataTransfer.files.length) onSendFiles(peer.id, e.dataTransfer.files) }}
@@ -191,29 +211,10 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, T, D, accent }) {
           {peer.route && !(known && isMachine) && <RouteBadge route={peer.route} T={T} />}
         </div>
         {/* status dot stays OUTSIDE the badge group so it's always visible;
-            marginLeft:auto floats it + the ⋯ to the right edge. */}
+            marginLeft:auto floats it to the right edge. The model-H top-right ⋯
+            trigger is gone (v2): mobile opens the sheet from the whole tile,
+            desktop from the hover action bar / right-click. */}
         <span style={{ flexShrink: 0, display: 'flex', marginLeft: 'auto' }}><StatusDot color={sc} glow={ready} /></span>
-        {/* ⋯ device-actions trigger (model H): touch-discoverable, opens the
-            sheet. A real flex item (not absolute) so it reserves its own space
-            and never overlaps the badges. stopPropagation so it never trips the
-            tile's own click-to-send. */}
-        {showMore && (
-          <button
-            onClick={(e) => { e.stopPropagation(); openSheet() }}
-            onMouseEnter={() => setMoreHov(true)} onMouseLeave={() => setMoreHov(false)}
-            title={`device actions for ${displayName}`}
-            aria-label={`device actions for ${displayName}`}
-            style={{
-              flexShrink: 0, marginTop: -4, marginRight: -4, zIndex: 2,
-              width: 24, height: 22, lineHeight: '20px', padding: 0, cursor: 'pointer',
-              font: 'inherit', fontSize: 15, fontWeight: 700, letterSpacing: '.04em',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              border: '1px solid ' + (moreHov ? accent : 'transparent'),
-              color: moreHov ? accent : T.dim, background: moreHov ? T.panel : 'transparent',
-              transition: 'color .12s, border-color .12s',
-            }}
-          >⋯</button>
-        )}
       </div>
       <div>
         <div style={{ fontSize: D.name, color: T.text, letterSpacing: '-.01em', marginBottom: 5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayName}</div>
@@ -221,11 +222,46 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, T, D, accent }) {
           <span style={{ color: sc }}>{PEER_STATUS_LABEL[peer.status]}</span>
           <span>{peer.lastSeen}</span>
         </div>
-        <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .12s' }}>
-          {ready
-            ? (over ? 'release to send' : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
-            : known ? 'remembered · reaches you in any room' : '—'}
-        </div>
+        {/* Hint line OR (desktop hover) the inline action bar — a SWAP, never a
+            stack: exactly one of the two renders in this slot, so the bar
+            occupies the hint's space and there is no overlap (the historical
+            layout bug came from stacking a second element over the hint). */}
+        {showHoverBar ? (
+          <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6, minHeight: 15 }}>
+            {canTerminal && (
+              <button
+                onClick={(e) => { e.stopPropagation(); openTerminal() }}
+                onDoubleClick={(e) => e.stopPropagation()}
+                title={`open a terminal on ${displayName}`}
+                aria-label={`open a terminal on ${displayName}`}
+                style={{
+                  font: 'inherit', fontSize: 10.5, fontWeight: 700, letterSpacing: '.04em',
+                  padding: '3px 8px', cursor: 'pointer', whiteSpace: 'nowrap',
+                  color: accent, background: 'transparent', border: '1px solid ' + accent,
+                }}
+              >›_</button>
+            )}
+            {canSheet && (
+              <button
+                onClick={(e) => { e.stopPropagation(); openSheet() }}
+                onDoubleClick={(e) => e.stopPropagation()}
+                title={`device actions for ${displayName}`}
+                aria-label={`device actions for ${displayName}`}
+                style={{
+                  font: 'inherit', fontSize: 10.5, letterSpacing: '.04em',
+                  padding: '3px 8px', cursor: 'pointer', whiteSpace: 'nowrap',
+                  color: T.sub, background: 'transparent', border: '1px solid ' + T.line,
+                }}
+              >⋯ more</button>
+            )}
+          </div>
+        ) : (
+          <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .12s', minHeight: 15 }}>
+            {ready
+              ? (over ? 'release to send' : narrow ? (known ? 'tap → actions' : 'tap · drop to send') : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
+              : known ? 'remembered · reaches you in any room' : '—'}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -716,7 +752,7 @@ export default function Filament(props) {
   const peerGrid = (gridCols) =>
     hasPeers ? (
       <div style={{ display: 'grid', gridTemplateColumns: gridCols, gap: D.gap }}>
-        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenSheet={openSheet} T={T} D={D} accent={accent} />)}
+        {state.peers.map((p) => <PeerTile key={p.id} peer={p} onSendFiles={onSendFiles} onOpenSheet={openSheet} onOpenTerminal={openSession} narrow={narrow} T={T} D={D} accent={accent} />)}
       </div>
     ) : (
       emptyPeers
@@ -841,6 +877,7 @@ export default function Filament(props) {
       peer={sheetPeer}
       anchorRect={sheet.rect}
       narrow={narrow}
+      sendFirst={narrow}
       T={T}
       D={D}
       accent={accent}
@@ -925,7 +962,7 @@ export default function Filament(props) {
           <div style={{ padding: 16 }}>
             {tab === 'peers' ? (
               <>
-                <div style={{ fontSize: 11, color: T.faint, marginBottom: 12 }}>tap a tile to send a file</div>
+                <div style={{ fontSize: 11, color: T.faint, marginBottom: 12 }}>tap a tile for actions</div>
                 {peerGrid('repeat(2,minmax(0,1fr))')}
               </>
             ) : (

@@ -29,12 +29,13 @@ function routeMeta(route, T) {
 const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away — be right back' }
 
 // A single tappable action row. ≥44px tall for touch; accent only when primary.
-function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger }) {
+function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger, autoFocus }) {
   const [hov, setHov] = useState(false)
   const color = danger ? T.bad : tone === 'primary' ? accent : T.text
   const border = tone === 'primary' ? accent : T.line
   return (
     <button
+      autoFocus={autoFocus}
       onClick={onClick}
       onMouseEnter={() => setHov(true)}
       onMouseLeave={() => setHov(false)}
@@ -68,7 +69,7 @@ function InfoLine({ label, value, color, T }) {
   )
 }
 
-export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, font, onOpenShell, onSendFiles, onForget, onRename, onClose }) {
+export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D, accent, font, onOpenShell, onSendFiles, onForget, onRename, onClose }) {
   const panelRef = useRef(null)
   const inp = useRef(null)
   const [dragY, setDragY] = useState(0) // mobile swipe-down offset
@@ -141,12 +142,29 @@ export default function DeviceSheet({ peer, anchorRect, narrow, T, D, accent, fo
     <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 9 }}>
       <input ref={inp} type="file" multiple style={{ display: 'none' }}
         onChange={(e) => { if (e.target.files.length) { onSendFiles(peer.id, e.target.files); onClose() } e.target.value = '' }} />
-      {showShell && (
-        <ActionRow glyph="›_" label="Open terminal" hint={`a shell on ${displayName}`} tone="primary"
-          accent={accent} T={T} onClick={() => { onClose(); onOpenShell(peer) }} />
+      {/* Row order is context-driven (tile-interaction-v2 §5): when the sheet is
+          the PRIMARY surface (mobile, sendFirst) Send must lead — first, accent,
+          auto-focused so the second tap is immediate. Otherwise (desktop, where a
+          tile click already sends) keep terminal-first, the action you came for. */}
+      {sendFirst ? (
+        <>
+          <ActionRow glyph="⇪" label="Send files" hint="pick files to send" tone="primary" autoFocus
+            accent={accent} T={T} onClick={openPicker} />
+          {showShell && (
+            <ActionRow glyph="›_" label="Open terminal" hint={`a shell on ${displayName}`}
+              accent={accent} T={T} onClick={() => { onClose(); onOpenShell(peer) }} />
+          )}
+        </>
+      ) : (
+        <>
+          {showShell && (
+            <ActionRow glyph="›_" label="Open terminal" hint={`a shell on ${displayName}`} tone="primary"
+              accent={accent} T={T} onClick={() => { onClose(); onOpenShell(peer) }} />
+          )}
+          <ActionRow glyph="⇪" label="Send files" hint="pick files to send" accent={accent} T={T}
+            onClick={openPicker} />
+        </>
       )}
-      <ActionRow glyph="⇪" label="Send files" hint="pick files to send" accent={accent} T={T}
-        onClick={openPicker} />
       {canRename && (
         editing ? (
           <div style={{ display: 'flex', alignItems: 'center', gap: 7, padding: '6px 4px' }}>
