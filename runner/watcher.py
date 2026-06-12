@@ -28,6 +28,37 @@ so per-GPU parallel dispatch can be added later (see _claim_next / DISPATCH HOOK
 
 Stdlib-only. Targets the T4 stack (glibc 2.35 / python3). Logs plainly to stdout
 (the bring-up tails it).
+
+----------------------------------------------------------------------------
+P4 RETIREMENT NOTE (transport-resilience §P4 / GAP-5) — the app-level integrity
++ ACK loop below is now REDUNDANT with a CORE guarantee.
+
+  This watcher carries its OWN whole-file reliability layer on top of filament:
+    - per-output sha256 verification (box_executor manifest + the host re-hashes
+      every declared output against the manifest before accepting), and
+    - the `ack-<job_id>` ACK loop (_ack_seen / _consume_acks below + the host's
+      ack push), which re-ships each round until the host confirms the FULL,
+      sha256-verified result set has landed.
+  It was built this way because the CORE `send`/`recv` had no whole-file integrity
+  check and was fire-and-forget (a transfer could "complete" truncated/corrupt and
+  the sender never learned it landed) — see docs/runner/jobrunner-challenges.md.
+
+  As of P4 the CORE now provides exactly this for EVERY transfer: the sender puts
+  the file's whole-file sha256 in the offer (`full`), the receiver verifies its
+  received bytes on completion and resumes/re-fetches on a mismatch (never accepts
+  a corrupt/truncated file), and on a match returns a `delivery-ack` control frame
+  that gates the sender's success. So a single `filament send` of the outputs is
+  now itself verified-and-acknowledged at the transport layer.
+
+  TODO(runner-retirement): once the core P4 path has soaked on the real T4 WAN
+  link, collapse this duplicate — drop the `ack-<job_id>` round-trip + the host's
+  ack push and rely on `send` returning success (it now means "delivered intact")
+  plus a single manifest-vs-disk sha256 cross-check for defense in depth. Do NOT
+  rip it out preemptively: the runner's green e2e (run_local_test.sh / test_e2e.py)
+  depends on this loop today, and core P4 must prove itself on the WAN link first.
+  This is a clean follow-on, intentionally deferred so the working runner stays
+  green. (The duplication is now belt-and-suspenders, not load-bearing-unique.)
+----------------------------------------------------------------------------
 """
 import json
 import os

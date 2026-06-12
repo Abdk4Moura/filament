@@ -51,6 +51,16 @@ API
     manifest = rb.manifest(job)                             # the recorded manifest dict
 
 Stdlib-only on the host side too (uses subprocess to drive the `filament` CLI).
+
+P4 RETIREMENT NOTE (transport-resilience §P4 / GAP-5): the host-side whole-file
+sha256 cross-check + the `ack-<job_id>` push that pairs with watcher.py's re-ship
+loop are now REDUNDANT with a CORE guarantee — core `send`/`recv` verifies the
+whole-file sha256 on completion (resume/re-fetch on mismatch, never accept a
+corrupt/truncated file) and returns a `delivery-ack` that gates `send` success.
+See the fuller note in watcher.py's header and the TODO(runner-retirement) there.
+This duplicate is intentionally LEFT IN PLACE (belt-and-suspenders) so the
+runner's green e2e is not destabilized; collapsing it is a clean follow-on once
+core P4 has soaked on the real T4 WAN link. Do NOT rip it out preemptively.
 """
 import json
 import os

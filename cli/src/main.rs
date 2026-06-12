@@ -99,6 +99,13 @@ fn relay_banner() -> String {
 /// a re-dial is cheap, so a few extra are worth a deterministic recovery.
 const STALL_MAX_REPAIRS: u32 = 5;
 
+/// P4 (GAP-5): how many times the receiver re-requests a transfer whose
+/// whole-file sha256 didn't match on completion (truncated/corrupt) before it
+/// gives up and fails CLEARLY (kept partial, no silent bad file). A transient
+/// truncation recovers on the first resume; this bound only catches a payload
+/// that is genuinely, repeatedly corrupt — never a hang, never a silent accept.
+const MAX_VERIFY_FAILS: u32 = 3;
+
 /// Gate-18 Mode B: the single predicate that decides whether a stuck/lost link
 /// should be DROPPED (transfer is complete; nothing left to fetch) rather than
 /// reconnected. Pulled out as a pure function so the gate-2 / gate-11c fence
@@ -498,11 +505,35 @@ fn head_hash(path: &Path) -> Option<String> {
     Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// P4 (GAP-5): sha256 over the WHOLE file — the end-to-end content digest the
+/// receiver compares against on completion so a truncated/corrupt transfer can
+/// never be declared "done" (the runner had to bolt this above the transport;
+/// P4 makes it a core guarantee). Streamed in 1 MiB reads so a large payload
+/// doesn't have to be slurped into RAM. `None` if the file can't be read — the
+/// offer then omits `full` and the receiver degrades to the legacy size-only
+/// check (backward-compat; bounded, never a hang).
+fn full_hash(path: &Path) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.update(&buf[..n]),
+            Err(_) => return None,
+        }
+    }
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Sidecar metadata for a partial receive (`<name>.part.meta`).
-/// JSON {"size":N,"head":"hex"}; legacy files hold a bare size string.
+/// JSON {"size":N,"head":"hex","full":"hex"}; legacy files hold a bare size string.
+/// `full` is the whole-file sha256 the sender offered (P4) — persisted so a
+/// resume after a process restart can still verify-on-completion.
 struct PartMeta {
     size: u64,
     head: Option<String>,
+    full: Option<String>,
 }
 
 impl PartMeta {
@@ -510,13 +541,17 @@ impl PartMeta {
         let raw = std::fs::read_to_string(path).ok()?;
         if let Ok(v) = serde_json::from_str::<Value>(&raw) {
             if let Some(size) = v["size"].as_u64() {
-                return Some(PartMeta { size, head: v["head"].as_str().map(|s| s.to_string()) });
+                return Some(PartMeta {
+                    size,
+                    head: v["head"].as_str().map(|s| s.to_string()),
+                    full: v["full"].as_str().map(|s| s.to_string()),
+                });
             }
         }
-        raw.trim().parse::<u64>().ok().map(|size| PartMeta { size, head: None })
+        raw.trim().parse::<u64>().ok().map(|size| PartMeta { size, head: None, full: None })
     }
     fn store(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, json!({ "size": self.size, "head": self.head }).to_string())
+        std::fs::write(path, json!({ "size": self.size, "head": self.head, "full": self.full }).to_string())
     }
 }
 
@@ -3352,9 +3387,24 @@ struct Outgoing {
     name: String,
     size: u64,
     head: Option<String>,
+    /// P4 (GAP-5): sha256 of the WHOLE file, carried in file-offer as `full`. The
+    /// receiver compares its received bytes against this on completion and only
+    /// accepts (and acks) on a match — so no transfer can "complete" truncated or
+    /// corrupt. `None` only when the digest couldn't be computed (degrades to the
+    /// legacy size-only check on the receiver — bounded, never a hang).
+    full: Option<String>,
     path: PathBuf,
     temp: bool,          // delete after sending (tar spools, stdin spools)
     accepted_once: bool, // re-offers carry resume:true after first accept
+    /// P4: the bytes left this side (stream finished / file-end sent). NOT the
+    /// same as `done` anymore: a transfer is `sent` once but is only `done` after
+    /// the receiver's whole-file-verified `delivery-ack` lands (or the bounded
+    /// fallback fires for a peer too old to ack).
+    sent: bool,
+    /// P4: the receiver returned a verified `delivery-ack` for this id. This is
+    /// the deterministic "it landed intact" signal — `send` completes only when
+    /// every transfer is acked (or the bounded no-ack fallback declared it done).
+    acked: bool,
     done: bool,
 }
 
@@ -3391,8 +3441,9 @@ async fn send_cmd(
             let n = std::io::copy(&mut std::io::stdin().lock(), &mut f)?;
             drop(f);
             let head = head_hash(&spool);
+            let full = full_hash(&spool);
             let offered = name.clone().filter(|_| single).unwrap_or_else(|| "stdin.bin".into());
-            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, path: spool, temp: true, accepted_once: false, done: false });
+            outgoing.push(Outgoing { id, sid, name: offered, size: n, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false });
         } else {
             let path = PathBuf::from(p);
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
@@ -3411,7 +3462,8 @@ async fn send_cmd(
                 }
                 let size = std::fs::metadata(&spool)?.len();
                 let head = head_hash(&spool);
-                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, path: spool, temp: true, accepted_once: false, done: false });
+                let full = full_hash(&spool);
+                outgoing.push(Outgoing { id, sid, name: format!("{dirname}.tar"), size, head, full, path: spool, temp: true, accepted_once: false, sent: false, acked: false, done: false });
             } else {
                 // A single regular file with --name uses the override; otherwise
                 // the basename. With multiple files --name was already warned off.
@@ -3419,7 +3471,8 @@ async fn send_cmd(
                     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone())
                 });
                 let head = head_hash(&path);
-                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, path, temp: false, accepted_once: false, done: false });
+                let full = full_hash(&path);
+                outgoing.push(Outgoing { id, sid, name: offered, size: meta.len(), head, full, path, temp: false, accepted_once: false, sent: false, acked: false, done: false });
             }
         }
     }
@@ -3528,6 +3581,20 @@ async fn send_cmd(
     // Bug 5: count stuck-while-connecting events to hint at the mDNS wedge once.
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
+    // P4 (delivery-ack BOUNDED FALLBACK): when every transfer's bytes have been
+    // `sent` but the whole-file `delivery-ack` hasn't landed, we wait — but only
+    // up to this bound, then declare done anyway so an OLD receiver (one that
+    // verifies-on-size but never learned to send the ack) can never make `send`
+    // hang forever. The link's data path drained (`drain_finish`) before we even
+    // start waiting, so the bytes are on the wire; this only bounds the
+    // KNOW-it-landed confirmation, never the delivery itself. Overridable via
+    // FILAMENT_ACK_TIMEOUT (seconds; 0 disables the wait = legacy fire-and-forget).
+    let ack_wait = std::env::var("FILAMENT_ACK_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(15));
+    let mut sent_all_at: Option<Instant> = None;
 
     loop {
         // Bug 6: no data channel has come up within the establishment window —
@@ -3783,6 +3850,9 @@ async fn send_cmd(
                         if let Some(h) = &o.head {
                             offer["head"] = json!(h);
                         }
+                        if let Some(f) = &o.full {
+                            offer["full"] = json!(f);
+                        }
                         if o.accepted_once {
                             offer["resume"] = json!(true);
                         }
@@ -3835,6 +3905,9 @@ async fn send_cmd(
                                         });
                                         if let Some(h) = &o.head {
                                             offer["head"] = json!(h);
+                                        }
+                                        if let Some(f) = &o.full {
+                                            offer["full"] = json!(f);
                                         }
                                         let _ = t.send_control(&offer).await;
                                     }
@@ -3922,6 +3995,23 @@ async fn send_cmd(
                         o.done = true;
                     }
                 }
+                // P4 (delivery-ack): the receiver computed the whole-file sha256
+                // of every byte it received and it MATCHED our offered digest —
+                // the bytes landed INTACT. Only now is the transfer truly `done`
+                // (vs the old fire-and-forget where `file-end` alone "completed"
+                // it). This closes the loop the runner had to fake above the
+                // transport: the sender deterministically KNOWS it landed whole.
+                Some("delivery-ack") => {
+                    let id = v["id"].as_str().unwrap_or_default();
+                    let mut out = outgoing.lock().await;
+                    if let Some(o) = out.iter_mut().find(|o| o.id == id) {
+                        if !o.acked {
+                            o.acked = true;
+                            o.done = true;
+                            ui::say(&ui::paint(ui::Tone::Dim, &format!("    {} delivered + verified (whole-file sha256 matched)", o.name)));
+                        }
+                    }
+                }
                 _ => {}
             },
             Ev::TransferFailed { id, err } => {
@@ -3957,6 +4047,9 @@ async fn send_cmd(
                                 if let Some(h) = &o.head {
                                     offer["head"] = json!(h);
                                 }
+                                if let Some(f) = &o.full {
+                                    offer["full"] = json!(f);
+                                }
                                 let _ = t.send_control(&offer).await;
                             }
                         }
@@ -3979,7 +4072,13 @@ async fn send_cmd(
                     // — the hard direct-only promise is "fail clean, fast", never a
                     // hang. The receiver kept its `.part`, so re-running resumes.
                     Rung::Exhausted => {
-                        let _ = sio.disconnect().await;
+                        // The hard direct-only promise is "fail clean AND FAST" — never
+                        // a hang. A signaling socket wedged by the same frozen path can
+                        // make `disconnect()` itself block, so BOUND it: a 2s cap keeps
+                        // the exit prompt (we're tearing down anyway; the OS reaps the
+                        // socket). This only affects the already-failing path — it can
+                        // never delay or alter a successful send.
+                        let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
                         if relay_forbidden() {
                             bail!("couldn't establish a direct path and relay is disabled (--no-relay) — partial kept; re-run to resume, or drop --no-relay");
                         }
@@ -4027,7 +4126,53 @@ async fn send_cmd(
             }
             _ => {}
         }
-        // Exit when every transfer reached a terminal state.
+        // P4: every transfer's BYTES have left this side (`sent`), but a transfer
+        // is only truly `done` once the receiver returns a whole-file-verified
+        // `delivery-ack`. Drain the wire first (so the bytes are actually on it,
+        // not parked in a send buffer), then WAIT — bounded by `ack_wait` — for
+        // the ack. A modern receiver acks within a round-trip of finishing its
+        // verify; an OLD receiver (verifies-on-size, never learned the ack) never
+        // sends one, so after the bound we declare it done anyway rather than hang
+        // (graceful backward-compat). The wait is on the KNOW-it-landed signal,
+        // never on delivery — the drain already put the bytes on the wire.
+        {
+            let mut out = outgoing.lock().await;
+            let all_sent = !out.is_empty() && out.iter().all(|o| o.sent);
+            let all_acked = !out.is_empty() && out.iter().all(|o| o.done);
+            if all_sent && !all_acked {
+                if sent_all_at.is_none() {
+                    sent_all_at = Some(Instant::now());
+                    // Flush (NOT drain_finish) on first reaching the all-sent point:
+                    // push the wire so the receiver can finish + verify + ack. We do
+                    // NOT call drain_finish here because on direct-QUIC that ends the
+                    // send half (`finish()`) — which would block a corrupt-case
+                    // RE-FETCH that needs to stream more bytes. The final exit block
+                    // does the authoritative drain_finish once the ack lands (no more
+                    // re-fetch possible by then). On a DataChannel both are just
+                    // flush(); on QUIC this keeps the stream open for a resume.
+                    if let Some(t) = conn.transport() {
+                        let _ = t.flush().await;
+                    }
+                }
+                // Bounded fallback: ack never came (old/ack-less peer) — accept on
+                // size, note it honestly, stop waiting. ack_wait==0 disables the
+                // wait entirely (explicit legacy fire-and-forget).
+                if sent_all_at.map(|t| t.elapsed() >= ack_wait).unwrap_or(false) {
+                    for o in out.iter_mut().filter(|o| !o.done) {
+                        eprintln!(
+                            "{}",
+                            ui::paint(ui::Tone::Warn, &format!(
+                                "  {}: no delivery-ack within {}s — peer may be too old to confirm; accepting on size (bytes were delivered + drained)",
+                                o.name, ack_wait.as_secs()
+                            ))
+                        );
+                        o.done = true;
+                    }
+                }
+            }
+        }
+        // Exit when every transfer reached a terminal state (`done` = acked, or the
+        // bounded-fallback / un-hashable cases above).
         {
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
@@ -4106,7 +4251,19 @@ async fn stream_one(
     bar.done(sent - offset);
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-        o.done = true;
+        // P4: the bytes + file-end left this side — but the transfer is NOT
+        // `done` yet. It is `done` only once the receiver returns a whole-file-
+        // verified `delivery-ack` (or the bounded no-ack fallback fires). A peer
+        // that has nothing more to send for THIS file is `sent`; the all-done
+        // exit waits on `acked`. If this file carries no `full` digest (we
+        // couldn't hash it), there's nothing for the receiver to verify-and-ack,
+        // so it's done on send — the legacy fire-and-forget behaviour, scoped to
+        // exactly the un-hashable case.
+        o.sent = true;
+        if o.full.is_none() {
+            o.acked = true;
+            o.done = true;
+        }
     }
     Ok(())
 }
@@ -4114,13 +4271,18 @@ async fn stream_one(
 // ------------------------------------------------------------------- recv --
 
 struct IncomingFile {
-    #[allow(dead_code)] // transfer id; will key decline/cancel when added
     id: String,
     name: String,
     size: u64,
     received: u64,
     file: tokio::io::BufWriter<tokio::fs::File>,
     part_path: PathBuf,
+    /// P4 (GAP-5): the whole-file sha256 the SENDER offered (`full`). On
+    /// completion we hash the received `.part` and compare — only a match
+    /// finalizes + acks. `None` = the sender offered no digest (old peer / an
+    /// un-hashable source); we fall back to the legacy size-only acceptance and
+    /// do NOT ack (nothing to verify), which the sender's bounded fallback covers.
+    full: Option<String>,
     bar: ui::Progress,
 }
 
@@ -4339,6 +4501,12 @@ async fn recv_cmd(
         });
     }
     let mut by_sid: HashMap<(String, u32), IncomingFile> = HashMap::new();
+    // P4 (GAP-5): per-transfer count of whole-file-verify FAILURES (the digest
+    // didn't match on completion). Each failure re-requests a resume (truncated)
+    // or a from-zero re-fetch (corrupt body); bounded so a genuinely
+    // unrecoverable corruption fails CLEARLY after a few rounds rather than
+    // looping forever. Keyed by transfer id.
+    let mut verify_fails: HashMap<String, u32> = HashMap::new();
     // C22: offers awaiting consent — exactly ONE stdin owner (the reader
     // task); answers arrive as StdinLine events, never via a competing
     // blocking read racing for the user's "y".
@@ -5303,6 +5471,9 @@ async fn recv_cmd(
                         .unwrap_or_else(|| "file.bin".into());
                     let size = v["size"].as_u64().unwrap_or(0);
                     let offer_head = v["head"].as_str().map(|s| s.to_string());
+                    // P4 (GAP-5): the sender's whole-file sha256 (absent for an old
+                    // peer). Used to verify-on-completion + drive the delivery-ack.
+                    let offer_full = v["full"].as_str().map(|s| s.to_string());
                     let is_resume = v["resume"].as_bool().unwrap_or(false);
 
                     let part_path = dir.join(format!("{name}.part"));
@@ -5310,6 +5481,10 @@ async fn recv_cmd(
                     // C7: a partial counts only if size matches AND the
                     // content head matches (when both sides have one).
                     let mut offset = 0u64;
+                    // P4: the whole-file digest persisted with the partial, so a
+                    // resume after a process restart can still verify-on-completion
+                    // even if this particular re-offer omits `full`.
+                    let mut prior_full: Option<String> = None;
                     if part_path.is_file() {
                         let prior = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
                         match PartMeta::load(&meta_path) {
@@ -5320,6 +5495,7 @@ async fn recv_cmd(
                                 };
                                 if head_ok {
                                     offset = prior;
+                                    prior_full = m.full;
                                 } else {
                                     eprintln!("{name}: same name+size but different content — restarting from 0");
                                 }
@@ -5432,18 +5608,24 @@ async fn recv_cmd(
                                 received: 0,
                                 file: tokio::io::BufWriter::with_capacity(1 << 20, out),
                                 part_path: PathBuf::new(),
-
+                                // Pipe mode streams to a fd we can't re-read, so we
+                                // can't recompute the digest — no verify, no ack
+                                // (the sender's bounded fallback covers it).
+                                full: None,
                                 bar: ui::Progress::new("(stdout)", size),
                             });
                             t.send_control(&json!({ "type": "file-accept", "id": id, "offset": 0 })).await?;
                             continue;
                         }
                     }
+                    // P4: the digest to verify against on completion — the current
+                    // offer's, else the one persisted with the partial (resume).
+                    let effective_full = offer_full.clone().or(prior_full);
                     let file = if offset > 0 {
                         eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
                         tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
                     } else {
-                        PartMeta { size, head: offer_head }.store(&meta_path)?;
+                        PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)?;
                         tokio::fs::File::create(&part_path).await?
                     };
                     let bar = ui::Progress::new(&name, size);
@@ -5454,7 +5636,7 @@ async fn recv_cmd(
                         received: offset,
                         file: tokio::io::BufWriter::with_capacity(1 << 20, file),
                         part_path,
-
+                        full: effective_full,
                         bar,
                     });
                     t.send_control(&json!({ "type": "file-accept", "id": id, "offset": offset })).await?;
@@ -5475,10 +5657,104 @@ async fn recv_cmd(
                             completed += 1;
                             continue;
                         }
-                        let rename_to = if completed == 0 { output.clone() } else { None };
-                        let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
-                            completed += 1;
+                        // P4 (GAP-5): WHOLE-FILE INTEGRITY. The sender offered the
+                        // file's full sha256 (`inc.full`). Before declaring "done",
+                        // recompute it over the received `.part` and COMPARE. A
+                        // truncated or corrupt receive (the 7 KB stub class) must
+                        // NOT be accepted — instead keep the partial and re-request
+                        // until the bytes are whole and the hash matches, or fail
+                        // CLEARLY after a bound. Only on a MATCH do we finalize +
+                        // send the delivery-ack. An old peer that offered no digest
+                        // (`inc.full == None`) degrades to the legacy size check —
+                        // no verify, no ack (the sender's bounded fallback covers
+                        // it), so this never hangs against an ack-less peer.
+                        let id = inc.id.clone();
+                        if inc.full.is_some() {
+                            let verdict = verify_incoming(&mut inc).await;
+                            match verdict {
+                                VerifyResult::Match => {
+                                    // INTACT — finalize, then tell the sender it
+                                    // landed whole (the deterministic delivery-ack).
+                                    verify_fails.remove(&id);
+                                    let rename_to = if completed == 0 { output.clone() } else { None };
+                                    let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                                    let nm = inc.name.clone();
+                                    if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                                        completed += 1;
+                                        if let Some(t) = conn.transport_of(&pid) {
+                                            let _ = t.send_control(&json!({
+                                                "type": "delivery-ack", "id": id, "sid": sid, "v": 1,
+                                            })).await;
+                                            ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched) — acked", )));
+                                        }
+                                    }
+                                }
+                                VerifyResult::Mismatch { restart_from_zero } => {
+                                    // TRUNCATED or CORRUPT — do NOT accept. Bound the
+                                    // re-request so a genuinely-unrecoverable payload
+                                    // fails clearly instead of looping forever.
+                                    let fails = verify_fails.entry(id.clone()).or_insert(0);
+                                    *fails += 1;
+                                    if *fails > MAX_VERIFY_FAILS {
+                                        // Give up CLEANLY: keep the partial, surface
+                                        // the cause, do not finalize, do not ack. No
+                                        // silent bad file; re-running can still retry.
+                                        ui::say(&ui::paint(ui::Tone::Err, &format!(
+                                            "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches — refusing to accept a corrupt file (partial kept)",
+                                            inc.name
+                                        )));
+                                        verify_fails.remove(&id);
+                                        // Leave the .part on disk; the stream is dropped
+                                        // (by_sid already removed). The sender's transfer
+                                        // stays un-acked; its bounded ack-wait then reports
+                                        // honestly rather than declaring success.
+                                        continue;
+                                    }
+                                    // Re-request: a truncated tail resumes from the
+                                    // current `.part` offset; a corrupt body (full
+                                    // size, wrong hash) restarts from 0 (the .part is
+                                    // poisoned — truncate it and re-fetch whole).
+                                    let mut req_offset = inc.received;
+                                    if restart_from_zero {
+                                        let _ = tokio::fs::File::create(&inc.part_path).await; // truncate to 0
+                                        inc.received = 0;
+                                        req_offset = 0;
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                                            "  {}: received all bytes but whole-file checksum FAILED (corrupt) — re-fetching from 0 (attempt {})",
+                                            inc.name, *fails
+                                        )));
+                                    } else {
+                                        ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                                            "  {}: TRUNCATED ({}/{}) — checksum can't match yet; re-requesting the rest (attempt {})",
+                                            inc.name, human(inc.received), human(inc.size), *fails
+                                        )));
+                                    }
+                                    // Park the stream back in by_sid so resumed chunks
+                                    // land in the same writer, and ask the sender to
+                                    // (re)stream from req_offset.
+                                    let _ = inc.file.flush().await;
+                                    if req_offset == 0 {
+                                        // Reopen the freshly-truncated file for append.
+                                        if let Ok(f) = tokio::fs::OpenOptions::new().append(true).open(&inc.part_path).await {
+                                            inc.file = tokio::io::BufWriter::with_capacity(1 << 20, f);
+                                        }
+                                    }
+                                    by_sid.insert((pid.clone(), sid), inc);
+                                    if let Some(t) = conn.transport_of(&pid) {
+                                        let _ = t.send_control(&json!({
+                                            "type": "file-accept", "id": id, "offset": req_offset,
+                                        })).await;
+                                    }
+                                }
+                            }
+                        } else {
+                            // No digest offered (old peer / pipe source): legacy
+                            // size-only acceptance, no ack.
+                            let rename_to = if completed == 0 { output.clone() } else { None };
+                            let from = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                            if finalize_incoming(inc, &dir, rename_to.as_deref(), daemon, &from).await? {
+                                completed += 1;
+                            }
                         }
                     }
                 }
@@ -5707,6 +5983,61 @@ async fn recv_cmd(
             }
             _ => {}
         }
+    }
+}
+
+/// P4 (GAP-5): outcome of the whole-file integrity check on completion.
+enum VerifyResult {
+    /// Received bytes hash to the sender's offered digest — accept + ack.
+    Match,
+    /// Hash didn't match. `restart_from_zero` distinguishes the two cases:
+    /// a SHORT file (received < size) is merely TRUNCATED — resume the tail;
+    /// a FULL-SIZE file with the wrong hash has a CORRUPT BODY — the partial is
+    /// poisoned, so re-fetch from 0.
+    Mismatch { restart_from_zero: bool },
+}
+
+/// P4 (GAP-5): recompute the whole-file sha256 of the received `.part` and
+/// compare against the digest the sender offered (`inc.full`, guaranteed Some by
+/// the caller). Flushes first so every buffered byte is on disk. This is the
+/// CORE whole-file integrity guarantee the runner used to bolt on above the
+/// transport — now every `recv` gets it.
+///
+/// Test hook (the truncation/ack gate): `FILAMENT_TEST_CORRUPT_RECV=<id>` flips
+/// a byte of the on-disk `.part` for the matching transfer id right before the
+/// hash is computed, deterministically inducing the corrupt-receive case so the
+/// gate can prove reject + recover. `FILAMENT_TEST_CORRUPT_ONCE=1` makes it fire
+/// exactly once (the re-fetch then succeeds), proving auto-recovery.
+async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
+    let want = match &inc.full { Some(w) => w.clone(), None => return VerifyResult::Match };
+    let _ = inc.file.flush().await;
+
+    // Test-only corruption injection (deterministic; gate proof).
+    if let Ok(target) = std::env::var("FILAMENT_TEST_CORRUPT_RECV") {
+        let once = std::env::var("FILAMENT_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false);
+        let already = std::env::var("FILAMENT_TEST_CORRUPT_FIRED").is_ok();
+        if target == inc.id && inc.received == inc.size && !(once && already) {
+            if let Ok(mut bytes) = std::fs::read(&inc.part_path) {
+                if let Some(b) = bytes.last_mut() {
+                    *b ^= 0xFF; // flip the final byte — same size, wrong hash
+                    let _ = std::fs::write(&inc.part_path, &bytes);
+                    eprintln!("[test] CORRUPT-RECV: flipped the last byte of {} (id {})", inc.name, inc.id);
+                    if once { unsafe { std::env::set_var("FILAMENT_TEST_CORRUPT_FIRED", "1"); } }
+                }
+            }
+        }
+    }
+
+    // A short file can't possibly match — it's truncated; resume the tail.
+    if inc.received < inc.size {
+        return VerifyResult::Mismatch { restart_from_zero: false };
+    }
+    let path = inc.part_path.clone();
+    let got = tokio::task::spawn_blocking(move || full_hash(&path)).await.ok().flatten();
+    match got {
+        Some(g) if g == want => VerifyResult::Match,
+        // Full size but wrong hash → corrupt body, re-fetch whole.
+        _ => VerifyResult::Mismatch { restart_from_zero: true },
     }
 }
 
@@ -6022,15 +6353,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("filament-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("x.part.meta");
-        PartMeta { size: 42, head: Some("abc".into()) }.store(&p).unwrap();
+        PartMeta { size: 42, head: Some("abc".into()), full: Some("deadbeef".into()) }.store(&p).unwrap();
         let m = PartMeta::load(&p).unwrap();
         assert_eq!(m.size, 42);
         assert_eq!(m.head.as_deref(), Some("abc"));
+        // P4: the whole-file digest survives the round-trip too.
+        assert_eq!(m.full.as_deref(), Some("deadbeef"));
         // legacy plain-size format still parses
         std::fs::write(&p, "1234").unwrap();
         let m = PartMeta::load(&p).unwrap();
         assert_eq!(m.size, 1234);
         assert!(m.head.is_none());
+        assert!(m.full.is_none());
         // garbage does not
         std::fs::write(&p, "{not json").unwrap();
         assert!(PartMeta::load(&p).is_none());
@@ -6058,6 +6392,31 @@ mod tests {
         std::fs::write(&a, b"tiny").unwrap();
         std::fs::write(&b, b"tinY").unwrap();
         assert_ne!(head_hash(&a), head_hash(&b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_hash_whole_file_integrity() {
+        // P4 (GAP-5): full_hash digests the WHOLE file (not just the 256 KiB
+        // head), so a difference PAST the head — exactly the truncation/corrupt
+        // case the head-hash can't see — produces a different digest.
+        let dir = std::env::temp_dir().join(format!("filament-test-fh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        let mut base = vec![3u8; (HEAD_BYTES + 4096) as usize];
+        std::fs::write(&a, &base).unwrap();
+        // identical head, byte flipped well PAST the head: head_hash agrees but
+        // full_hash MUST differ (this is the whole-file guarantee).
+        base[(HEAD_BYTES + 2048) as usize] = 4;
+        std::fs::write(&b, &base).unwrap();
+        assert_eq!(head_hash(&a), head_hash(&b), "tails past the head don't change the head hash");
+        assert_ne!(full_hash(&a), full_hash(&b), "full_hash sees the whole file");
+        // a truncated file (same prefix, shorter) also differs.
+        std::fs::write(&b, &base[..base.len() - 100]).unwrap();
+        assert_ne!(full_hash(&a), full_hash(&b), "truncation changes the full hash");
+        // full_hash matches a one-shot sha256 of the bytes.
+        assert_eq!(full_hash(&a), Some(sha256_hex(&vec![3u8; (HEAD_BYTES + 4096) as usize])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
