@@ -83,6 +83,32 @@ pub fn signaling_silence_ms() -> u64 {
         .unwrap_or(SIGNALING_SILENCE_MS_DEFAULT)
 }
 
+/// P3 (GAP-3): is the WARM redundant transport opt-in override set?
+///
+/// Warm redundancy keeps one alternate transport READY so a detected stall cuts
+/// over INSTANTLY (rung b) instead of paying the cold re-establish latency of
+/// the direct-repair rungs (a)/(c). It costs a second live path, so it is
+/// SELECTIVE: ON only for long-lived / interactive sessions (PTY, L2 tunnels,
+/// `up --shell` acceptors), OFF for one-shot file `send` (the P0/P1 ladder is
+/// already fine there — the on-disk partial + resume make a cold repair correct
+/// and bounded, and a warm standby isn't worth a second socket for a single
+/// transfer).
+///
+/// The session kind decides the default (set on `Conn::warm_standby` at
+/// construction). This knob is the explicit override:
+///   `FILAMENT_WARM_STANDBY=1` forces it ON  (e.g. a sustained transfer standing
+///                                            in for an interactive session in a
+///                                            test / power-user case),
+///   `FILAMENT_WARM_STANDBY=0` forces it OFF (kill switch / A-B baseline).
+/// Returns `None` when unset, so the session-kind default stands.
+pub fn warm_standby_override() -> Option<bool> {
+    match std::env::var("FILAMENT_WARM_STANDBY").ok().as_deref() {
+        Some("1") | Some("true") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("off") => Some(false),
+        _ => None,
+    }
+}
+
 // ------------------------------------------------------------------ events --
 
 #[derive(Debug)]

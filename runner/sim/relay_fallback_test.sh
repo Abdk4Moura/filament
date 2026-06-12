@@ -135,18 +135,24 @@ fi
 # FILAMENT_DIRECT_LOOPBACK_ONLY pins the QUIC race to 127.0.0.1 (multi-homed box).
 # FILAMENT_TEST_FREEZE_PERSIST=1 makes EVERY direct transport freeze -> the direct
 # ladder exhausts -> rung-d escalation to relay is the ONLY way to complete.
+# FILAMENT_WARM_STANDBY=0: P1 tests the SYMMETRIC cold-ladder -> rung-d escalation
+# (both ends grind direct then escalate together). P3 (GAP-3) made the long-lived
+# `up` receiver default to a WARM relay standby (instant cutover on stall #1); left
+# on, the receiver would relay-commit early while the one-shot SEND end still grinds
+# its cold ladder, an asymmetry that breaks the symmetric escalation this gate
+# asserts. The warm-standby path has its own gate (warm_standby_test.sh).
 one_relay_attempt() {
   local tag="$1"
   local DG="$WORK/$tag-drop"; rm -rf "$DG"; mkdir -p "$DG"
   local UPLOG="$WORK/$tag-up.log"; local SENDLOG="$WORK/$tag-send.log"
   FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
+    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
     FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 120 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP); sleep 3
   R_RC=0
   FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
+    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
     FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 120 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || R_RC=1
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null
@@ -158,7 +164,10 @@ one_relay_attempt() {
 run_relay() {
   local tag="$1"; local try GOT
   GOT="$WORK/$tag-drop/big.bin"
-  for try in 1 2 3 4 5 6; do
+  # Re-seat budget: the initial direct establishment + the symmetric cold re-dial
+  # under a persistent freeze is independently flaky on a multi-homed loopback box
+  # (orthogonal to the fallback under test). 10 re-seats keep the gate deterministic.
+  for try in $(seq 1 "${RELAY_RETRIES:-10}"); do
     one_relay_attempt "$tag"
     if [ "${R_FROZE:-0}" != "1" ]; then
       echo "    (setup attempt $try: initial direct establishment didn't carry the offer — retrying)" >&2
@@ -244,13 +253,13 @@ one_norelay_attempt() {
   local DGN="$WORK/norelay-drop"; rm -rf "$DGN"; mkdir -p "$DGN"
   UPLOGN="$WORK/norelay-up.log"; SENDLOGN="$WORK/norelay-send.log"
   FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
+    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
     FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 150 "$BIN" --no-relay up --dir "$DGN" --server "$SERVER" >"$UPLOGN" 2>&1 &
   local UPN=$!; pids+=($UPN); sleep 3
   local T0; T0=$(date +%s); RCN=0
   FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 \
-    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
+    FILAMENT_STALL_MS="$STALL_MS" FILAMENT_WARM_STANDBY=0 FILAMENT_TEST_FREEZE_PERSIST=1 FILAMENT_TEST_WEBRTC_RELAY_ONLY=1 \
     FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout "$NORELAY_BUDGET" "$BIN" --no-relay send "$BIG" --to boxB --server "$SERVER" >"$SENDLOGN" 2>&1 || RCN=$?
   local T1; T1=$(date +%s); ELAPSED=$((T1 - T0))

@@ -102,11 +102,21 @@ one_attempt() {
   local tag="$1"; local stall_ms="$2"
   local DG="$WORK/$tag-drop"; rm -rf "$DG"; mkdir -p "$DG"
   local UPLOG="$WORK/$tag-up.log"; local SENDLOG="$WORK/$tag-send.log"
+  # P0 tests the COLD direct-repair ladder (rung a resume -> rung c in-place
+  # re-dial) with NO relay configured on this backend. P3 (GAP-3) made the
+  # long-lived `up` daemon default to a WARM relay standby (instant cutover), which
+  # would here escalate the receiver to relay-only ICE — and with no TURN server it
+  # can't connect. So this gate explicitly opts OUT of warm standby
+  # (FILAMENT_WARM_STANDBY=0) to exercise the cold ladder it was written for; the
+  # warm-standby behaviour has its own gate (warm_standby_test.sh, which runs a real
+  # coturn). Not masking anything: P0's property is the cold-ladder recovery.
   FILAMENT_CONFIG_DIR="$DB" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 FILAMENT_STALL_MS="$stall_ms" \
+    FILAMENT_WARM_STANDBY=0 \
     timeout 90 "$BIN" up --dir "$DG" --server "$SERVER" >"$UPLOG" 2>&1 &
   local UP=$!; pids+=($UP); sleep 3
   R_RC=0
   FILAMENT_CONFIG_DIR="$DA" FILAMENT_DIRECT=1 FILAMENT_DIRECT_LOOPBACK_ONLY=1 FILAMENT_STALL_MS="$stall_ms" \
+    FILAMENT_WARM_STANDBY=0 \
     FILAMENT_TEST_FREEZE_AFTER_BYTES="$FREEZE_AT" \
     timeout 90 "$BIN" send "$BIG" --to boxB --server "$SERVER" >"$SENDLOG" 2>&1 || R_RC=1
   sleep 1; kill $UP 2>/dev/null; wait $UP 2>/dev/null

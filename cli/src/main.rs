@@ -1057,6 +1057,11 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
     relay_committed: std::collections::HashSet::new(),
+    // P3 (GAP-3): warm redundancy is selective — OFF for one-shot / non-session
+    // flows; the long-lived `up` acceptor turns it ON below. The override knob
+    // (`FILAMENT_WARM_STANDBY`) can force it either way.
+    warm_standby: net::warm_standby_override().unwrap_or(false),
+    warm_cutover: std::collections::HashSet::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1292,6 +1297,11 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
     relay_committed: std::collections::HashSet::new(),
+    // P3 (GAP-3): warm redundancy is selective — OFF for one-shot / non-session
+    // flows; the long-lived `up` acceptor turns it ON below. The override knob
+    // (`FILAMENT_WARM_STANDBY`) can force it either way.
+    warm_standby: net::warm_standby_override().unwrap_or(false),
+    warm_cutover: std::collections::HashSet::new(),
     };
     {
         let tx = tx.clone();
@@ -1748,6 +1758,26 @@ struct Conn {
     /// over relay-only WebRTC. Survives link drops (keyed by pid, not stored on the
     /// Link), so a re-establish never bounces back to the known-bad direct path.
     relay_committed: std::collections::HashSet<String>,
+    /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
+    /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
+    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel)
+    /// — the sessions §2.4 says a mid-session drop is intolerable for. When set,
+    /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
+    /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
+    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials — so the
+    /// failover is near-instant rather than a perceptible gap. FALSE for one-shot
+    /// file `send` (the 90% case): the on-disk partial + C7 resume make the cold
+    /// repair ladder correct and bounded, and a warm standby isn't worth a second
+    /// socket / NAT mapping / keepalive for a single transfer (the honest cost
+    /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
+    /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
+    warm_standby: bool,
+    /// P3: per-peer warm-standby bookkeeping — peers whose relay standby has
+    /// already been cut over to in the current stall episode, so a flapping relay
+    /// path can't re-fire the instant cutover every tick (it falls through to the
+    /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
+    /// `note_progress` once bytes move again.
+    warm_cutover: std::collections::HashSet<String>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -2473,6 +2503,9 @@ impl Conn {
     /// again (the link recovered) or nothing is in flight.
     fn note_progress(&mut self, pid: &str) {
         self.stall_repairs.remove(pid);
+        // P3: a fresh byte means the (warm-cut-over) path is healthy again — let a
+        // FUTURE episode warm-cut-over once more if it too stalls.
+        self.warm_cutover.remove(pid);
     }
 
     /// P0 liveness cross-check: is the link's CONTROL path still answering? A
@@ -2502,17 +2535,84 @@ impl Conn {
     ///   `Rung::Repaired`— rung (c): the transport was repaired in place
     ///                     (direct: fresh QUIC dial of the known device;
     ///                     WebRTC: restart_ice) — caller re-offers once it's back.
-    ///   `Rung::Exhausted`— rungs a→c spent (MAX_ATTEMPTS) — P1 would escalate to
-    ///                     relay here (clean hook, not built in P0).
+    ///   `Rung::Relayed` — rung (b)/(d): re-established over the TURN relay. P3
+    ///                     reaches this on the FIRST stall for a warm-standby
+    ///                     (interactive) session — instant failover to the
+    ///                     pre-designated warm alternate; P1 reaches it at the
+    ///                     ladder ceiling for a one-shot transfer.
+    ///   `Rung::Exhausted`— rungs a→c spent (MAX_ATTEMPTS) AND relay unavailable
+    ///                     (forbidden / already on relay) — fail clean, kept partial.
     /// Bounds the episode by MAX_ATTEMPTS, reusing the same ceiling as on_stuck.
     async fn correct_stall(&mut self, pid: &str) -> Rung {
+        // P3 (GAP-3): once this episode has CUT OVER to the warm relay standby, a
+        // SECOND Ev::TransferStalled that was already QUEUED before the cutover ran
+        // (the loops emit one per tick while the stall holds) must NOT re-enter the
+        // ladder and run a COLD in-place repair on top of the converging cutover —
+        // that tore the fresh relay link down ("ICE Agent can not be restarted when
+        // gathering"). Swallow it as a no-op (`Repaired` is the benign "in flight,
+        // nothing to do" for both handlers). This guard is keyed on `warm_cutover`,
+        // which is ONLY ever set on the warm path — so the COLD ladder (P0/P1) is
+        // byte-for-byte unchanged and still climbs rung a→c→d normally. Cleared by
+        // `note_progress` when the relay path moves a byte.
+        if self.warm_cutover.contains(pid) {
+            return Rung::Repaired;
+        }
         let st = self.stall_repairs.entry(pid.to_string()).or_default();
         st.pending = true;
         let attempt = st.attempts;
         st.attempts += 1;
+
+        // P3 (GAP-3): WARM-REDUNDANCY instant failover (rung b). For a long-lived
+        // / interactive session (`warm_standby`), the relay is a PRE-DESIGNATED
+        // WARM standby kept ready alongside the primary direct path. On the FIRST
+        // detected stall we CUT OVER to it IMMEDIATELY rather than grinding through
+        // the slow direct-repair rungs — rung (a)'s resume-and-wait-another-stall,
+        // then rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, each of which costs a
+        // full stall threshold before it gives up. Those rungs are correct for a
+        // one-shot file (the on-disk partial makes a cold repair fine), but for an
+        // interactive session every one of those windows is a visible, intolerable
+        // gap. Cutting straight to the warm relay collapses N×stall_ms of cold
+        // re-establish into a single relay cutover (rung d's machinery, but reached
+        // on stall #1 instead of stall #~6), preserving the on-disk partial / PTY
+        // stream / tunnel state via the same C7 resume seam.
+        //
+        // Gated tightly so we never pay this on the wrong session:
+        //   - `warm_standby` (session-kind selectivity) must be on;
+        //   - relay must be PERMITTED (`--no-relay` keeps the hard direct-only
+        //     promise → fall through to the normal ladder, which fails clean);
+        //   - we must not be ON relay already (`relay_only`) — then relay is the
+        //     PRIMARY that stalled, so there's no warmer alternate; fall through to
+        //     the ladder, which lands on the honest "still stalled on relay" exit;
+        //   - we cut over at most ONCE per episode (`warm_cutover`) — a flapping
+        //     relay can't re-fire instant cutover every tick; the second stall on
+        //     the relay path falls through to the bounded relay-stalled honesty.
+        let warm_eligible = self.warm_standby
+            && !relay_forbidden()
+            && !self.relay_only
+            && !self.warm_cutover.contains(pid);
+        if attempt == 0 && warm_eligible {
+            ui::say(&ui::paint(
+                ui::Tone::Warn,
+                "  transfer stalled — cutting over to the warm relay standby (instant failover)",
+            ));
+            self.warm_cutover.insert(pid.to_string());
+            // Latch the episode as relaying so detect_stall waits for the fresh
+            // relay path to move a byte (clearing the whole episode) instead of
+            // re-firing the ladder while the cutover converges (P1's convergence
+            // signal, reused).
+            if let Some(st) = self.stall_repairs.get_mut(pid) {
+                st.relayed = true;
+            }
+            self.escalate_to_relay(pid).await;
+            return Rung::Relayed;
+        }
+
         if attempt == 0 {
             // Rung (a): cheapest — re-issue on the same transport. The caller
             // owns `outgoing`, so it does the actual re-offer; we just classify.
+            // (Reached when warm redundancy is OFF — the one-shot `send` default —
+            // or relay is forbidden / already in use; the P0/P1 ladder is correct
+            // and bounded there.)
             ui::say(&ui::paint(ui::Tone::Warn, "  transfer stalled — resuming on the same link"));
             return Rung::Resume;
         }
@@ -3390,6 +3490,11 @@ async fn send_cmd(
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
     relay_committed: std::collections::HashSet::new(),
+    // P3 (GAP-3): warm redundancy is selective — OFF for one-shot / non-session
+    // flows; the long-lived `up` acceptor turns it ON below. The override knob
+    // (`FILAMENT_WARM_STANDBY`) can force it either way.
+    warm_standby: net::warm_standby_override().unwrap_or(false),
+    warm_cutover: std::collections::HashSet::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -4164,6 +4269,11 @@ async fn recv_cmd(
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
     relay_committed: std::collections::HashSet::new(),
+    // P3 (GAP-3): the `up`/`up --shell` daemon acceptor is the canonical
+    // long-lived / interactive session, so warm redundancy defaults ON for it
+    // (a one-shot `recv` keeps daemon=false -> OFF). Override knob can force either.
+    warm_standby: net::warm_standby_override().unwrap_or(daemon),
+    warm_cutover: std::collections::HashSet::new(),
     };
     {
         let tx = tx.clone();
