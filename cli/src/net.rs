@@ -109,6 +109,80 @@ pub fn warm_standby_override() -> Option<bool> {
     }
 }
 
+// --- P5 (GAP-6): relay->direct auto-upgrade prober knobs ---------------------
+//
+// P1 makes a peer FALL to relay when direct stalls; `relay_committed` then stops
+// the known-bad direct path from re-winning the race during cutover. But that
+// makes relay a ONE-WAY TRAPDOOR: once on relay the peer STAYS there even after
+// the network heals and direct would work again. P5 fixes that: a background
+// prober keeps probing for a direct path while serving on relay and SEAMLESSLY
+// upgrades back when one is confirmed STABLE (verify-before-upgrade). Relay
+// becomes a way-station, not a destination.
+
+/// Is the relay->direct upgrade prober ENABLED? (`FILAMENT_UPGRADE_PROBE=0`
+/// disables it — the kill switch the resilience plan calls for. Default ON.)
+/// A no-op under `--no-relay` (that path never reaches relay) regardless of
+/// this knob — the caller also gates on `relay_forbidden()`.
+pub fn upgrade_prober_enabled() -> bool {
+    match std::env::var("FILAMENT_UPGRADE_PROBE").ok().as_deref() {
+        Some("0") | Some("false") | Some("off") => false,
+        _ => true,
+    }
+}
+
+/// FIRST direct re-probe delay after a peer falls to relay (ms). Soon, because
+/// the cause is often transient (a momentary NAT/path hiccup that heals in
+/// seconds). `FILAMENT_UPGRADE_FIRST_MS`, default ~5 s.
+pub const UPGRADE_FIRST_MS_DEFAULT: u64 = 5_000;
+pub fn upgrade_first_ms() -> u64 {
+    std::env::var("FILAMENT_UPGRADE_FIRST_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(UPGRADE_FIRST_MS_DEFAULT)
+}
+
+/// STEADY re-probe cadence once direct keeps failing (ms). Backs off from the
+/// eager first probe to a calm cadence so a symmetric-NAT peer that will NEVER
+/// get direct doesn't get hammered (CPU/battery). `FILAMENT_UPGRADE_STEADY_MS`,
+/// default ~25 s. The schedule is: first probe at `first_ms`, then each failed
+/// probe doubles the interval toward this cap.
+pub const UPGRADE_STEADY_MS_DEFAULT: u64 = 25_000;
+pub fn upgrade_steady_ms() -> u64 {
+    std::env::var("FILAMENT_UPGRADE_STEADY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(UPGRADE_STEADY_MS_DEFAULT)
+}
+
+/// VERIFY-before-upgrade window (ms): once a direct standby CONNECTS alongside
+/// the live relay link, it must move real data CONTINUOUSLY for at least this
+/// long before we cut over. Prevents thrash on a flaky direct path that
+/// connects then immediately re-stalls. `FILAMENT_UPGRADE_VERIFY_MS`, default
+/// ~2.5 s of sustained progress.
+pub const UPGRADE_VERIFY_MS_DEFAULT: u64 = 2_500;
+pub fn upgrade_verify_ms() -> u64 {
+    std::env::var("FILAMENT_UPGRADE_VERIFY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(UPGRADE_VERIFY_MS_DEFAULT)
+}
+
+/// VERIFY-before-upgrade idle guard (ms): during the verify window, if the
+/// direct standby goes idle for this long it is judged regressed and DISCARDED
+/// (we stay on relay). Tighter than `stall_ms` so a flaky standby fails fast.
+/// `FILAMENT_UPGRADE_VERIFY_IDLE_MS`, default ~1.2 s.
+pub const UPGRADE_VERIFY_IDLE_MS_DEFAULT: u64 = 1_200;
+pub fn upgrade_verify_idle_ms() -> u64 {
+    std::env::var("FILAMENT_UPGRADE_VERIFY_IDLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(UPGRADE_VERIFY_IDLE_MS_DEFAULT)
+}
+
 // ------------------------------------------------------------------ events --
 
 #[derive(Debug)]
@@ -143,6 +217,14 @@ pub enum Ev {
     /// (rung-1) or `holepunched` (rung-2) — a direct link has no WebRTC
     /// `route()` to query, so the winning rung tells us which path it used.
     DirectReady(String, Arc<dyn Transport>, &'static str),
+    /// P5 (GAP-6): a relay->direct UPGRADE probe's fresh authenticated direct
+    /// transport CONNECTED alongside the live relay link (peer sid, transport,
+    /// route label). Unlike `DirectReady` this MUST NOT clobber the serving relay
+    /// link: the handler stashes it as a warm DIRECT standby and runs the
+    /// verify-before-upgrade dance, only cutting over once it is confirmed moving
+    /// data. Distinct event so the normal `adopt_direct` path is never reached for
+    /// a probe.
+    DirectUpgradeReady(String, Arc<dyn Transport>, &'static str),
     Control(String, Value),
     Chunk(String, u32, Bytes),
     PcState(String, String),

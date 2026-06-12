@@ -93,6 +93,41 @@ fn freeze_persist() -> bool {
     std::env::var("FILAMENT_TEST_FREEZE_PERSIST").map(|v| v == "1").unwrap_or(false)
 }
 
+/// P5 (GAP-6) relay->direct UPGRADE PROOF hook (test-only):
+/// `FILAMENT_TEST_DIRECT_UNBLOCK_MS=N` LIFTS the persistent direct freeze for any
+/// transport born after N ms of process uptime. So the timeline is: early direct
+/// transports freeze (the peer falls to relay, rung d), then — once the prober
+/// dials a FRESH direct standby after the unblock moment — that late transport is
+/// NOT frozen and carries data, letting the prober VERIFY + UPGRADE back to
+/// direct. Unset ⇒ no lift (the freeze persists forever, as P1's gate needs).
+/// Compiled in ONLY under `--features test-hooks` — stripped from release.
+#[cfg(feature = "test-hooks")]
+fn direct_unblock_after_ms() -> Option<u64> {
+    std::env::var("FILAMENT_TEST_DIRECT_UNBLOCK_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
+/// P5 (GAP-6) NO-FLAP PROOF hook (test-only): `FILAMENT_TEST_DIRECT_FLAKY=1`
+/// makes a post-unblock direct standby CONNECT and move a little data, then
+/// RE-FREEZE almost immediately — modelling a flaky direct path that comes up but
+/// won't hold. The verify-before-upgrade guard must catch this and DISCARD the
+/// standby (stay on relay), never flapping relayed<->direct. With this set, the
+/// unblock lift is GRANTED for connection (so the standby forms) but the transport
+/// re-freezes after a tiny byte threshold. Compiled in ONLY under
+/// `--features test-hooks` — stripped from release.
+#[cfg(feature = "test-hooks")]
+fn direct_flaky_upgrade() -> bool {
+    std::env::var("FILAMENT_TEST_DIRECT_FLAKY").map(|v| v == "1").unwrap_or(false)
+}
+
+/// P5 (GAP-6): tiny byte threshold after which a FLAKY post-unblock standby
+/// re-freezes (enough to connect + look alive for a beat, far less than the
+/// verify window needs to confirm sustained progress).
+#[cfg(feature = "test-hooks")]
+const FLAKY_REFREEZE_BYTES: u64 = 4_096;
+
 /// Process-global "a transport has already frozen once" latch (see
 /// `freeze_after_bytes`). `false` until the first transport freezes; once `true`
 /// every later transport streams normally, so rung-c's fresh dial recovers.
@@ -199,6 +234,23 @@ fn local_ips() -> Vec<IpAddr> {
     let lo: IpAddr = "127.0.0.1".parse().unwrap();
     out.push(lo);
     out
+}
+
+/// P5 (GAP-6): a stable, sorted snapshot of the local ROUTABLE source addresses
+/// (loopback excluded — it never changes and would mask a real handoff). The
+/// relay->direct prober polls this each tick: a change (new/removed interface,
+/// wifi<->cellular handoff, default-route move) is the strongest portable "a new
+/// direct path may exist NOW" signal, and triggers an immediate re-probe. Cheap
+/// (two UDP `connect`s, no packets) and dependency-free — no platform netlink.
+pub fn local_ip_snapshot() -> Vec<String> {
+    let mut v: Vec<String> = local_ips()
+        .into_iter()
+        .filter(|ip| !ip.is_loopback())
+        .map(|ip| ip.to_string())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Public IP for cross-NAT reachability: `FILAMENT_PUBLIC_IP` override wins,
@@ -467,6 +519,14 @@ pub struct DirectTransport {
     /// Compiled out entirely unless `--features test-hooks` is set.
     #[cfg(feature = "test-hooks")]
     frozen: std::sync::atomic::AtomicBool,
+    /// P5 (GAP-6) PROOF hook: process-uptime (ms) at which THIS transport was
+    /// born. The relay->direct upgrade gate uses `FILAMENT_TEST_DIRECT_UNBLOCK_MS`
+    /// to LIFT the persistent freeze for transports born AFTER that moment — so the
+    /// peer first falls to relay (early transports freeze) and then the prober's
+    /// DIRECT standby (a late transport) actually carries data, proving the
+    /// detect->verify->UPGRADE path. Compiled out unless `--features test-hooks`.
+    #[cfg(feature = "test-hooks")]
+    born_ms: u64,
 }
 
 const KIND_CONTROL: u8 = 0;
@@ -512,6 +572,49 @@ impl Transport for DirectTransport {
     }
 
     async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+        // P5 (GAP-6): the relay->direct UPGRADE lift. A transport born AFTER the
+        // unblock moment is the prober's DIRECT standby — let it carry data so the
+        // verify-before-upgrade can confirm + cut over. In FLAKY mode the lift is
+        // granted only for the first few KB (it connects + looks alive for a beat),
+        // then it re-freezes — exercising the no-flap guard (verify must DISCARD it).
+        #[cfg(feature = "test-hooks")]
+        let unblocked = match direct_unblock_after_ms() {
+            Some(after) => self.born_ms >= after,
+            None => false,
+        };
+        #[cfg(feature = "test-hooks")]
+        if unblocked && !self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
+            // Healthy upgrade standby: stream normally (no freeze ever).
+            if !direct_flaky_upgrade() {
+                let mut framed = Vec::with_capacity(4 + payload.len());
+                framed.extend_from_slice(&sid.to_be_bytes());
+                framed.extend_from_slice(payload);
+                self.write_framed(KIND_DATA, &framed).await?;
+                self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            // Flaky standby: carry a few KB (so it connects and looks alive for a
+            // beat), then re-freeze so the verify window can never confirm.
+            let prior = self
+                .sent_data
+                .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if prior + (payload.len() as u64) >= FLAKY_REFREEZE_BYTES {
+                self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[test] FLAKY direct standby re-froze at {prior} bytes — verify must discard it");
+                loop {
+                    if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err(anyhow!("direct connection closed (flaky standby discarded)"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            let mut framed = Vec::with_capacity(4 + payload.len());
+            framed.extend_from_slice(&sid.to_be_bytes());
+            framed.extend_from_slice(payload);
+            self.write_framed(KIND_DATA, &framed).await?;
+            self.last_activity.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
         // P0 PROOF hook: black-hole the data path after N bytes on the FIRST
         // transport. We DON'T write and DON'T stamp last_activity — so this
         // transport's idle_ms() climbs while the connection stays up and control
@@ -701,6 +804,8 @@ fn make_transport(
         sent_data: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "test-hooks")]
         frozen: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(feature = "test-hooks")]
+        born_ms: now_ms(),
     })
 }
 

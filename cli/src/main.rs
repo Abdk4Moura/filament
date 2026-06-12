@@ -184,6 +184,15 @@ fn relay_banner() -> String {
 /// a re-dial is cheap, so a few extra are worth a deterministic recovery.
 const STALL_MAX_REPAIRS: u32 = 5;
 
+/// P5 (GAP-6): reserved sid for the relay->direct upgrade VERIFY heartbeat. A
+/// real DATA frame on this sid lets the prober confirm the new direct path is
+/// actually MOVING data (not just connected) before cutting over. It lives in the
+/// non-L2 sid space and far above any file-transfer counter, so it never collides;
+/// the receiver has no `by_sid` entry for it, so the inbound chunk is dropped
+/// harmlessly (after stamping inbound activity — which is the point: symmetric
+/// verify). See `Conn::judge_upgrade_standby`.
+const VERIFY_PROBE_SID: u32 = 0x7FFF_FFFF;
+
 /// P4 (GAP-5): how many times the receiver re-requests a transfer whose
 /// whole-file sha256 didn't match on completion (truncated/corrupt) before it
 /// gives up and fails CLEARLY (kept partial, no silent bad file). A transient
@@ -1182,6 +1191,8 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     // (`FILAMENT_WARM_STANDBY`) can force it either way.
     warm_standby: net::warm_standby_override().unwrap_or(false),
     warm_cutover: std::collections::HashSet::new(),
+    upgrade_probe: HashMap::new(),
+    iface_snapshot: Vec::new(),
     };
     // sid -> which device (false = a, true = b)
     let mut who: HashMap<String, bool> = HashMap::new();
@@ -1422,6 +1433,8 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     // (`FILAMENT_WARM_STANDBY`) can force it either way.
     warm_standby: net::warm_standby_override().unwrap_or(false),
     warm_cutover: std::collections::HashSet::new(),
+    upgrade_probe: HashMap::new(),
+    iface_snapshot: Vec::new(),
     };
     {
         let tx = tx.clone();
@@ -1898,6 +1911,19 @@ struct Conn {
     /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
     /// `note_progress` once bytes move again.
     warm_cutover: std::collections::HashSet<String>,
+    /// P5 (GAP-6): per-peer relay->direct UPGRADE-PROBE bookkeeping. Present only
+    /// for peers currently committed to relay (`relay_committed`) on a session
+    /// where the prober is eligible (warm_standby/daemon, relay permitted). Drives
+    /// the backoff schedule (probe soon, then steady cadence) and the
+    /// verify-before-upgrade window for a connected direct standby. Removed on a
+    /// successful upgrade (cutover) or when the peer leaves.
+    upgrade_probe: HashMap<String, UpgradeProbe>,
+    /// P5: a snapshot of the local interface set (sorted IP strings) at the last
+    /// probe schedule. A change (new/removed interface, wifi<->cellular,
+    /// default-route move surfacing a new local IP) is the "walked home onto wifi"
+    /// signal — we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
+    /// netlink dependency); the portable best-effort trigger the plan asks for.
+    iface_snapshot: Vec<String>,
 }
 
 /// P0: one peer's stall-repair episode state.
@@ -1915,6 +1941,47 @@ struct StallState {
     /// into a premature `Exhausted` before relay even connects. Cleared by
     /// `note_progress` on the first byte over the relay path.
     relayed: bool,
+}
+
+/// P5 (GAP-6): one peer's relay->direct UPGRADE-PROBE state. Lifecycle:
+///   IDLE   — armed (relay-committed); `next_at` is when the next probe fires,
+///            `attempt` drives the exponential backoff (first_ms → steady_ms).
+///   PROBING— a direct dial is in flight (a `DirectPending{probe:true}` exists);
+///            we don't re-fire until it resolves (win → VERIFYING, or expiry →
+///            back to IDLE with a longer backoff).
+///   VERIFYING — a direct standby CONNECTED (`standby` set). It must move data
+///            CONTINUOUSLY for `verify_ms` before we cut over; `verify_started`
+///            marks when it connected. If it goes idle past `verify_idle_ms` or
+///            never reaches `verify_ms` of sustained progress, it is DISCARDED
+///            and we go back to IDLE (stay on relay — the no-flap guard).
+struct UpgradeProbe {
+    /// failed-probe count; each failure backs the cadence off toward steady_ms.
+    attempt: u32,
+    /// when the next probe may fire (None ⇒ probe ASAP, e.g. just armed or a
+    /// network-change re-probe).
+    next_at: Option<Instant>,
+    /// the connected-but-unverified direct standby transport (VERIFYING state).
+    standby: Option<Arc<dyn Transport>>,
+    /// the route label of the standby (`direct-quic` / `holepunched`).
+    standby_route: &'static str,
+    /// when the standby connected — the start of the verify window.
+    verify_started: Option<Instant>,
+    /// the standby's `idle_ms()` floor observed so far in the verify window, used
+    /// to require SUSTAINED progress (it must keep moving, not just connect).
+    verify_last_idle: u64,
+}
+
+impl UpgradeProbe {
+    fn armed() -> Self {
+        UpgradeProbe {
+            attempt: 0,
+            next_at: None, // first probe is scheduled by the prober tick
+            standby: None,
+            standby_route: "direct-quic",
+            verify_started: None,
+            verify_last_idle: u64::MAX,
+        }
+    }
 }
 
 /// P0: which correction rung the stall ladder took (see `Conn::correct_stall`).
@@ -1954,6 +2021,14 @@ struct DirectPending {
     /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
     #[allow(dead_code)]
     my_srflx: Option<std::net::SocketAddr>,
+    /// P5 (GAP-6): this is a relay->direct UPGRADE probe — a direct dial run
+    /// ALONGSIDE a live relay link (not the cold establishment path). When the
+    /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
+    /// before-upgrade) instead of `Ev::DirectReady` (which would clobber the
+    /// serving relay link). When the budget expires with no winner, `expired_direct`
+    /// just DROPS the pending (no WebRTC fallback — the relay link is still serving)
+    /// and the prober schedules the next backoff.
+    probe: bool,
 }
 
 impl Conn {
@@ -2219,10 +2294,29 @@ impl Conn {
     /// peer (a second call while pending is a no-op). The peer's own
     /// transport-offer (Ev::TransportOffer) drives the race.
     async fn start_direct(&mut self, pid: &str, name: &str, secret: &str) {
+        self.start_direct_inner(pid, name, secret, false).await
+    }
+
+    /// P5 (GAP-6): arm a relay->direct UPGRADE probe — a direct dial run
+    /// ALONGSIDE the live relay link. Bypasses the `relay_committed` /
+    /// already-linked early-returns of `start_direct` (the whole POINT is to dial
+    /// direct while a relay link serves), and marks the `DirectPending` as a
+    /// probe so the winner posts `Ev::DirectUpgradeReady` (verify-before-upgrade)
+    /// rather than clobbering the serving relay link. A no-op if a probe is
+    /// already in flight for this peer.
+    async fn start_upgrade_probe(&mut self, pid: &str, name: &str, secret: &str) {
+        // A probe already in flight (its own DirectPending) — don't double-dial.
+        if self.direct_pending.contains_key(pid) {
+            return;
+        }
+        self.start_direct_inner(pid, name, secret, true).await
+    }
+
+    async fn start_direct_inner(&mut self, pid: &str, name: &str, secret: &str, probe: bool) {
         if !direct::direct_enabled() {
             return;
         }
-        if self.relay_committed.contains(pid) {
+        if !probe && self.relay_committed.contains(pid) {
             // P1: this peer escalated to relay — never re-dial direct (it would
             // only re-freeze and race the relay link). If a link already exists
             // (the relay link that escalate_to_relay built, possibly still
@@ -2230,13 +2324,18 @@ impl Conn {
             // would otherwise tear it down and re-establish mid-handshake, so it
             // never connects ("stuck while connecting"). Only (re)establish over
             // relay when there is no link at all to carry the session.
+            // P5 (GAP-6): a `probe` deliberately bypasses this guard — it dials
+            // direct ALONGSIDE the serving relay link (warm direct standby) and
+            // never touches `links`, so it cannot disturb the relay path.
             if !self.links.contains_key(pid) {
                 let info = json!({ "id": pid, "name": name });
                 let _ = self.establish(info).await;
             }
             return;
         }
-        if self.direct_pending.contains_key(pid) || self.links.contains_key(pid) {
+        // A probe expects a relay link to be present (it's the one we'd upgrade
+        // AWAY from); only the cold path bails when a link already exists.
+        if self.direct_pending.contains_key(pid) || (!probe && self.links.contains_key(pid)) {
             return; // already trying, or already linked (WebRTC or direct)
         }
         let (ep, port) = match direct::bind_endpoint() {
@@ -2268,12 +2367,21 @@ impl Conn {
         if let Some(s) = my_srflx {
             offer["srflx"] = json!(s.to_string());
         }
+        // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
+        // too — its winning side then posts Ev::DirectUpgradeReady (verify-before-
+        // upgrade) instead of clobbering ITS serving relay link. Both ends must
+        // treat the new direct path as a standby until verified, or one end would
+        // tear down its relay link unilaterally.
+        if probe {
+            offer["probe"] = json!(true);
+        }
         let _ = self
             .sio
             .emit("signal", json!({ "to": pid, "data": offer.clone() }))
             .await;
         eprintln!(
-            "filament: DIRECT-OFFER sent to {name} ({pid}) — port {} srflx {}",
+            "filament: {} sent to {name} ({pid}) — port {} srflx {}",
+            if probe { "UPGRADE-PROBE-OFFER" } else { "DIRECT-OFFER" },
             port,
             my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
         );
@@ -2316,6 +2424,7 @@ impl Conn {
                 endpoint: Some(ep),
                 punch_sock,
                 my_srflx,
+                probe,
             },
         );
     }
@@ -2342,7 +2451,8 @@ impl Conn {
 
     /// The peer advertised its candidates. If we have a matching pending attempt
     /// and haven't started the race yet, consume the endpoint and spawn the
-    /// simultaneous-open + auth race; the winner posts Ev::DirectReady.
+    /// simultaneous-open + auth race; the winner posts Ev::DirectReady (or, for an
+    /// upgrade probe, Ev::DirectUpgradeReady — verify-before-upgrade).
     fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
         let Some(p) = self.direct_pending.get_mut(pid) else { return };
         if p.racing {
@@ -2351,6 +2461,10 @@ impl Conn {
         let Some(ep) = p.endpoint.take() else { return };
         p.racing = true;
         let secret = p.secret.1.clone();
+        // P5 (GAP-6): is THIS the upgrade-probe pending? Then the winner posts
+        // DirectUpgradeReady (verify-before-upgrade) so the serving relay link is
+        // never clobbered. A cold pending posts DirectReady as before.
+        let is_probe = p.probe;
         // rung-2: hand the punch socket + peer's srflx to the chained ladder.
         let punch_sock = p.punch_sock.take();
         let peer_srflx_addr = peer_srflx
@@ -2358,12 +2472,19 @@ impl Conn {
             .and_then(|s| s.parse::<std::net::SocketAddr>().ok());
         let tx = self.tx.clone();
         let pid_s = pid.to_string();
+        let mk = move |pid: String, t: Arc<dyn Transport>, route: &'static str| {
+            if is_probe {
+                Ev::DirectUpgradeReady(pid, t, route)
+            } else {
+                Ev::DirectReady(pid, t, route)
+            }
+        };
         tokio::spawn(async move {
             // rung-1: direct-dial QUIC over host candidates (UNCHANGED).
             if let Some(t) =
                 direct::race_connect(ep, peer_cands, &secret, pid_s.clone(), tx.clone()).await
             {
-                let _ = tx.send(Ev::DirectReady(pid_s, t, "direct-quic"));
+                let _ = tx.send(mk(pid_s, t, "direct-quic"));
                 return;
             }
             // rung-2: UDP hole-punch, then rung-1's QUIC race over the punched
@@ -2384,13 +2505,36 @@ impl Conn {
                     )
                     .await
                     {
-                        let _ = tx.send(Ev::DirectReady(pid_s, t, "holepunched"));
+                        let _ = tx.send(mk(pid_s, t, "holepunched"));
                         return;
                     }
                 }
             }
             // On None the per-tick reaper handles the WebRTC fallback at deadline.
         });
+    }
+
+    /// P5 (GAP-6): a relay-committed peer received an UPGRADE-PROBE transport-
+    /// offer (`probe:true`) from the other end while we have no probe pending of
+    /// our own yet. ARM a matching upgrade probe so the symmetric direct dial can
+    /// complete (both ends must offer their candidates for the QUIC simultaneous-
+    /// open race). Only fires for a peer we are actually serving on relay
+    /// (`relay_committed` + a live link) and only when the prober is enabled and
+    /// relay isn't forbidden — otherwise the probe offer is ignored.
+    async fn answer_upgrade_probe(&mut self, pid: &str) {
+        if !net::upgrade_prober_enabled() || relay_forbidden() {
+            return;
+        }
+        if !self.relay_committed.contains(pid) || !self.links.contains_key(pid) {
+            return;
+        }
+        if self.direct_pending.contains_key(pid) {
+            return; // our own probe is already in flight — its race will consume the offer
+        }
+        let known = self.links.get(pid).and_then(|l| l.expected_secret.clone());
+        if let Some((name, secret)) = known {
+            self.start_upgrade_probe(pid, &name, &secret).await;
+        }
     }
 
     /// Create the Link for a direct connection that won the race. `peer: None`
@@ -2444,10 +2588,26 @@ impl Conn {
     fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
         let mut fell_back = Vec::new();
+        // P5 (GAP-6): an UPGRADE-PROBE pending whose budget expired with no winner
+        // must NOT fall back to WebRTC — the relay link is still serving and the
+        // whole point of the probe was to find a DIRECT path. Just DROP it and let
+        // the prober's backoff schedule the next attempt (mark_probe_failed). The
+        // cold (non-probe) pendings keep their existing WebRTC-fallback behavior.
+        let expired_probes: Vec<String> = self
+            .direct_pending
+            .iter()
+            .filter(|(_, p)| p.probe && now >= p.deadline)
+            .map(|(pid, _)| pid.clone())
+            .collect();
+        for pid in expired_probes {
+            self.direct_pending.remove(&pid);
+            eprintln!("filament: UPGRADE-PROBE for {pid} found no direct path in budget — staying on relay");
+            self.mark_probe_failed(&pid);
+        }
         let expired: Vec<String> = self
             .direct_pending
             .iter()
-            .filter(|(pid, p)| now >= p.deadline && !self.links.contains_key(*pid))
+            .filter(|(pid, p)| !p.probe && now >= p.deadline && !self.links.contains_key(*pid))
             .map(|(pid, _)| pid.clone())
             .collect();
         for pid in expired {
@@ -2464,12 +2624,16 @@ impl Conn {
                 fell_back.push((pid, info, p.secret));
             }
         }
-        // Drop pendings whose link landed by another route (cleanup).
+        // Drop pendings whose link landed by another route (cleanup). P5 (GAP-6):
+        // EXCLUDE upgrade probes — a probe pending ALWAYS coexists with the serving
+        // relay link (that's the point), so this cleanup must not reap it before its
+        // race runs; a probe is reaped only by its own deadline (above) or by the
+        // upgrade cutover consuming it.
         let linked: Vec<String> = self
             .direct_pending
-            .keys()
-            .filter(|pid| self.links.contains_key(*pid))
-            .cloned()
+            .iter()
+            .filter(|(pid, p)| !p.probe && self.links.contains_key(*pid))
+            .map(|(pid, _)| pid.clone())
             .collect();
         for pid in linked {
             self.direct_pending.remove(&pid);
@@ -2876,6 +3040,326 @@ impl Conn {
         }
         // Honest, loud: the user must know this session is now on a relay.
         ui::say(&format!("  {}", relay_banner()));
+        // P5 (GAP-6): ARM the relay->direct upgrade prober for this peer. Relay is
+        // a way-station, not a destination: while we serve on relay we keep probing
+        // for a direct path and upgrade back the moment one is confirmed stable.
+        // Eligibility mirrors warm redundancy (long-lived/interactive sessions +
+        // the daemon — a one-shot send that already completed doesn't need it) and
+        // requires relay to be PERMITTED. The kill switch (`FILAMENT_UPGRADE_PROBE=0`)
+        // and `--no-relay` both make this a no-op.
+        if self.upgrade_eligible() {
+            self.upgrade_probe
+                .entry(pid.to_string())
+                .or_insert_with(UpgradeProbe::armed);
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                "  on relay — will keep trying for a direct path and upgrade automatically",
+            ));
+        }
+    }
+
+    /// P5 (GAP-6): is this session eligible to run the relay->direct prober?
+    /// Selective like P3's warm redundancy: ON for long-lived / interactive
+    /// sessions (the `up`/`up --shell` daemon acceptor; a transfer flagged
+    /// interactive via `FILAMENT_WARM_STANDBY=1`). Gated off by the kill switch
+    /// and by `--no-relay` (which never reaches relay anyway).
+    fn upgrade_eligible(&self) -> bool {
+        self.warm_standby && net::upgrade_prober_enabled() && !relay_forbidden()
+    }
+
+    /// P5 (GAP-6): a portable network-change-ish event fired (a signaling
+    /// reconnect / fresh welcome). Re-probe every relay-committed peer IMMEDIATELY
+    /// (reset its backoff to fire now), unless it's already mid-verify on a standby.
+    /// Cheap and idempotent — the prober tick does the actual dialing.
+    fn reprobe_on_network_event(&mut self) {
+        if !net::upgrade_prober_enabled() || relay_forbidden() {
+            return;
+        }
+        for up in self.upgrade_probe.values_mut() {
+            if up.standby.is_none() {
+                up.next_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// P5 (GAP-6): record a failed/expired probe and back the cadence off toward
+    /// the steady cadence (exponential, capped at steady_ms). Also clears any
+    /// stale standby/verify state so the next probe starts clean.
+    fn mark_probe_failed(&mut self, pid: &str) {
+        let Some(up) = self.upgrade_probe.get_mut(pid) else { return };
+        up.attempt = up.attempt.saturating_add(1);
+        up.standby = None;
+        up.verify_started = None;
+        up.verify_last_idle = u64::MAX;
+        // Backoff: first failure → first_ms; then double toward steady_ms (cap).
+        let first = net::upgrade_first_ms();
+        let steady = net::upgrade_steady_ms();
+        let backoff = first.saturating_mul(1u64 << up.attempt.min(8)).min(steady);
+        up.next_at = Some(Instant::now() + Duration::from_millis(backoff));
+    }
+
+    /// P5 (GAP-6): the per-tick prober. Run from each live-session event loop's
+    /// tick (no new concurrency, F8). For every peer currently committed to relay
+    /// with an armed `UpgradeProbe`: (1) if a direct standby is mid-VERIFY, judge
+    /// it (cut over if it has sustained progress for verify_ms; discard + back off
+    /// if it regressed); (2) else if a probe is due (`next_at`), fire a fresh
+    /// direct dial ALONGSIDE the relay link (warm direct standby) without
+    /// disturbing it. Also detects a local interface change (`iface_snapshot`) and
+    /// re-probes IMMEDIATELY — the "walked home onto wifi" trigger.
+    async fn tick_upgrade_prober(&mut self) {
+        if !net::upgrade_prober_enabled() || relay_forbidden() {
+            return;
+        }
+        if self.upgrade_probe.is_empty() {
+            return;
+        }
+        // Network-change trigger: a change to the local interface set is the
+        // strongest "a new direct path may exist NOW" signal we can read without a
+        // platform netlink dependency. On change, reset every armed probe's
+        // backoff to fire immediately (catches the wifi/cellular handoff instantly).
+        let snap = direct::local_ip_snapshot();
+        if snap != self.iface_snapshot {
+            if !self.iface_snapshot.is_empty() {
+                ui::say(&ui::paint(
+                    ui::Tone::Dim,
+                    "  network changed — re-probing for a direct path now",
+                ));
+                for up in self.upgrade_probe.values_mut() {
+                    if up.standby.is_none() {
+                        up.next_at = Some(Instant::now()); // fire ASAP
+                    }
+                }
+            }
+            self.iface_snapshot = snap;
+        }
+
+        let now = Instant::now();
+        let pids: Vec<String> = self.upgrade_probe.keys().cloned().collect();
+        for pid in pids {
+            // A peer that is no longer relay-committed (already upgraded or gone)
+            // shouldn't be probed; drop its entry.
+            if !self.relay_committed.contains(&pid) || !self.links.contains_key(&pid) {
+                self.upgrade_probe.remove(&pid);
+                self.direct_pending.remove(&pid);
+                continue;
+            }
+            // VERIFYING: a standby connected — judge it before scheduling anything.
+            let verifying = self
+                .upgrade_probe
+                .get(&pid)
+                .map(|u| u.standby.is_some())
+                .unwrap_or(false);
+            if verifying {
+                self.judge_upgrade_standby(&pid).await;
+                continue;
+            }
+            // PROBING: a direct dial is in flight (its DirectPending) — wait for it
+            // to win (→ DirectUpgradeReady) or expire (→ expired_direct backoff).
+            if self.direct_pending.contains_key(&pid) {
+                continue;
+            }
+            // IDLE: schedule / fire the next probe per the backoff.
+            let due = match self.upgrade_probe.get(&pid).and_then(|u| u.next_at) {
+                None => true,            // armed but unscheduled → schedule first probe
+                Some(at) => now >= at,   // due
+            };
+            if let Some(up) = self.upgrade_probe.get_mut(&pid) {
+                if up.next_at.is_none() {
+                    // First scheduling after arming: probe after first_ms.
+                    up.next_at = Some(now + Duration::from_millis(net::upgrade_first_ms()));
+                    continue;
+                }
+            }
+            if !due {
+                continue;
+            }
+            // Fire a probe: dial direct ALONGSIDE the relay link.
+            let known = self.links.get(&pid).and_then(|l| l.expected_secret.clone());
+            let Some((name, secret)) = known else {
+                // No stored secret to authenticate a direct dial — can't probe;
+                // disarm so we don't spin.
+                self.upgrade_probe.remove(&pid);
+                continue;
+            };
+            ui::say(&ui::paint(
+                ui::Tone::Dim,
+                "  probing for a direct path (alongside the relay)…",
+            ));
+            // Pre-set the NEXT backoff deadline so a probe that silently makes no
+            // progress still re-schedules (expired_direct also calls
+            // mark_probe_failed on budget expiry; whichever fires first wins).
+            self.start_upgrade_probe(&pid, &name, &secret).await;
+        }
+    }
+
+    /// P5 (GAP-6): VERIFY-before-upgrade. A direct standby has connected for
+    /// `pid`. Decide whether it is STABLE enough to cut over to:
+    ///   - if it has been moving data (idle_ms stays low) CONTINUOUSLY for
+    ///     `verify_ms`, perform the upgrade (clear relay_committed/relay_only, cut
+    ///     over to the direct transport, tear down relay, re-offer transfers);
+    ///   - if it goes idle past `verify_idle_ms` before that, DISCARD it and stay
+    ///     on relay (back off) — the mandatory no-flap guard against a flaky direct
+    ///     path that connects then immediately re-stalls.
+    /// We drive a tiny VERIFY heartbeat over the standby (a control ping) so a
+    /// healthy path keeps stamping its `idle_ms()` low even before the session's
+    /// real transfer bytes are re-routed onto it.
+    async fn judge_upgrade_standby(&mut self, pid: &str) {
+        let verify_ms = net::upgrade_verify_ms();
+        let verify_idle_ms = net::upgrade_verify_idle_ms();
+        // Heartbeat the standby with a real DATA frame (reserved verify sid) so a
+        // healthy path advances its activity clock (`idle_ms()` stays low) while a
+        // stalled/flaky standby — which black-holes the DATA path, not the control
+        // path — either errors here or lets idle climb. A control ping would wrongly
+        // pass on a flaky standby (whose control path stays alive), so we MUST probe
+        // the data path. The peer drops the unknown-sid chunk harmlessly but stamps
+        // its inbound activity, so its side's idle drops too (symmetric verify).
+        let standby = self.upgrade_probe.get(pid).and_then(|u| u.standby.clone());
+        let Some(standby) = standby else { return };
+        // BOUND the heartbeat (F8: never block the event loop on something a remote
+        // / a wedged path controls). A flaky standby's data path black-holes — the
+        // send_frame would park forever — so a timeout reads as "didn't hold".
+        let beat_ok = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                standby.send_frame(VERIFY_PROBE_SID, b"upgrade-verify"),
+            )
+            .await,
+            Ok(Ok(()))
+        );
+        let idle = standby.idle_ms();
+        let Some(up) = self.upgrade_probe.get_mut(pid) else { return };
+        let started = match up.verify_started {
+            Some(t) => t,
+            None => {
+                up.verify_started = Some(Instant::now());
+                up.verify_last_idle = idle;
+                return;
+            }
+        };
+        // Regressed: control send failed OR the path went idle past the guard.
+        // Discard the standby, stay on relay, back off (the no-flap guard).
+        if !beat_ok || idle >= verify_idle_ms {
+            ui::say(&ui::paint(
+                ui::Tone::Warn,
+                "  direct path connected but didn't hold — staying on relay (no flap)",
+            ));
+            self.direct_pending.remove(pid);
+            self.mark_probe_failed(pid);
+            return;
+        }
+        up.verify_last_idle = up.verify_last_idle.min(idle);
+        // Sustained: moved data continuously for the whole verify window → upgrade.
+        if started.elapsed() >= Duration::from_millis(verify_ms) {
+            let t = standby;
+            let route = self.upgrade_probe.get(pid).map(|u| u.standby_route).unwrap_or("direct-quic");
+            self.perform_upgrade(pid, t, route).await;
+        }
+    }
+
+    /// P5 (GAP-6): the upgrade cutover. The direct standby is CONFIRMED stable —
+    /// commit it as the session's transport, preserving the session (the same
+    /// cutover seam P1/P3 use): clear `relay_committed` + `relay_only` so direct
+    /// may win again, swap the verified direct transport into the link (the relay
+    /// link/transport is dropped), and re-offer any unfinished transfers
+    /// (resume:true) on the new direct path. Honest + loud, mirroring the relay
+    /// banner: the user is told they're back on a direct path.
+    async fn perform_upgrade(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        let was_active = self.is_active(pid);
+        let known = self.links.get(pid).and_then(|l| l.expected_secret.clone());
+        // Clear the relay commitment FIRST so the new direct link isn't treated as
+        // a known-bad path and so a future stall can escalate cleanly again.
+        self.relay_committed.remove(pid);
+        self.relay_only = false;
+        self.upgrade_probe.remove(pid);
+        self.direct_pending.remove(pid);
+        // Swap the verified direct transport into the link, dropping the relay
+        // link/transport (drop_link tears down the WebRTC peer). adopt the new
+        // transport via the same direct-link shape adopt_direct builds, but reusing
+        // the existing identity so the session is preserved across the swap.
+        self.drop_link(pid);
+        self.adopt_direct_transport(pid, t.clone(), route, known);
+        if was_active {
+            self.active = Some(pid.to_string());
+        }
+        ui::say(&ui::paint(
+            ui::Tone::Ok,
+            &format!("  upgraded back to a direct path (route: {route}) — relay released"),
+        ));
+        // Re-offer unfinished transfers on the new direct transport (resume:true);
+        // the ChannelReady re-emit drives the same path for the send loop.
+        let _ = self.tx.send(Ev::ChannelReady(pid.to_string(), t));
+    }
+
+    /// P5 (GAP-6): build the post-upgrade DIRECT link from a verified standby
+    /// transport, reusing the known identity (so the session/petname is stable
+    /// across the relay->direct swap — only the wire path changes). Mirrors
+    /// `adopt_direct` but takes an already-connected transport and a carried
+    /// (name,secret) instead of consuming a `DirectPending`.
+    fn adopt_direct_transport(
+        &mut self,
+        pid: &str,
+        t: Arc<dyn Transport>,
+        route: &'static str,
+        known: Option<(String, String)>,
+    ) {
+        let info = self
+            .roster
+            .get(pid)
+            .cloned()
+            .unwrap_or_else(|| json!({ "id": pid, "name": known.as_ref().map(|(n, _)| n.clone()).unwrap_or_else(|| "peer".into()) }));
+        let name = known
+            .as_ref()
+            .map(|(n, _)| n.clone())
+            .or_else(|| info["name"].as_str().map(String::from))
+            .unwrap_or_else(|| "peer".into());
+        let uid = info["uid"].as_str().map(|s| s.to_string());
+        self.next_gen += 1;
+        let generation = self.next_gen;
+        self.links.insert(
+            pid.to_string(),
+            Link {
+                peer: None,
+                info,
+                name,
+                uid,
+                transport: Some(t),
+                generation,
+                attempts: 0,
+                trusted: true,
+                verified_name: known.as_ref().map(|(n, _)| n.clone()),
+                expected_secret: known,
+                presence: Presence::Ready,
+                direct: true,
+                direct_route: route,
+            },
+        );
+    }
+
+    /// P5 (GAP-6): a relay->direct upgrade probe's direct standby CONNECTED. Stash
+    /// it on the peer's `UpgradeProbe` and START the verify window. Crucially, do
+    /// NOT touch `links` — the relay link keeps serving until the standby is proven
+    /// stable. If we have no armed probe for this peer (it upgraded/left while the
+    /// race was in flight), just drop the transport (it closes on drop). Idempotent:
+    /// a second DirectUpgradeReady for an already-stashed standby is ignored.
+    fn stash_upgrade_standby(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
+        // Consume any probe DirectPending so expired_direct doesn't reap/backoff it
+        // out from under the verify (the race already won).
+        self.direct_pending.remove(pid);
+        let Some(up) = self.upgrade_probe.get_mut(pid) else {
+            // No armed probe — the transport is unowned; dropping it tears it down.
+            return;
+        };
+        if up.standby.is_some() {
+            return; // already verifying a standby; ignore the duplicate.
+        }
+        up.standby = Some(t);
+        up.standby_route = route;
+        up.verify_started = None; // judge_upgrade_standby stamps it on first look
+        up.verify_last_idle = u64::MAX;
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            "  direct path connected — verifying it holds before upgrading…",
+        ));
     }
 
     /// C4: transient `disconnected` — nudge ICE from the impolite side and
@@ -3632,6 +4116,8 @@ async fn send_cmd(
     // (`FILAMENT_WARM_STANDBY`) can force it either way.
     warm_standby: net::warm_standby_override().unwrap_or(false),
     warm_cutover: std::collections::HashSet::new(),
+    upgrade_probe: HashMap::new(),
+    iface_snapshot: Vec::new(),
     };
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
@@ -3768,11 +4254,20 @@ async fn send_cmd(
                 }
             }
         }
+        // P5 (GAP-6): relay->direct upgrade prober (send side). Probe for a direct
+        // path while serving on relay; verify-before-upgrade cuts over only when a
+        // direct standby is confirmed stable. No-op unless a peer is relay-committed
+        // on an eligible session.
+        conn.tick_upgrade_prober().await;
         let Some(ev) = ev else { continue };
 
         match ev {
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                // P5 (GAP-6): a fresh signaling welcome (reconnect) is a moment a
+                // new direct path may have appeared — re-probe immediately for any
+                // relay-committed peer rather than waiting out the backoff.
+                conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, code_used).await?;
@@ -3841,6 +4336,16 @@ async fn send_cmd(
                         .unwrap_or_default();
                     // rung-2: optional server-reflexive candidate for hole-punch.
                     let srflx = data["srflx"].as_str().map(String::from);
+                    // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
+                    // probe from the other end. If we're serving this peer on relay
+                    // and have no probe of our own yet, ARM one so the symmetric
+                    // direct dial can complete (a later re-send of the offer — the
+                    // peer re-emits 6x — is consumed by our now-armed pending). The
+                    // winner posts DirectUpgradeReady (verify-before-upgrade), never
+                    // clobbering the serving relay link.
+                    if data["probe"].as_bool() == Some(true) {
+                        conn.answer_upgrade_probe(&from).await;
+                    }
                     conn.on_transport_offer(&from, cands, srflx);
                     continue;
                 }
@@ -3856,6 +4361,14 @@ async fn send_cmd(
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
                 let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            // P5 (GAP-6): a relay->direct upgrade probe's direct standby connected
+            // ALONGSIDE the live relay link. Do NOT adopt it (that would clobber the
+            // serving relay link); stash it as a warm standby and enter VERIFY. The
+            // per-tick prober (judge_upgrade_standby) decides whether to cut over
+            // (sustained progress) or discard (no flap).
+            Ev::DirectUpgradeReady(pid, t, route) => {
+                conn.stash_upgrade_standby(&pid, t, route);
             }
             Ev::ChannelReady(pid, t) => {
                 if let Some(l) = conn.link_mut(&pid) {
@@ -4518,6 +5031,8 @@ async fn recv_cmd(
     // (a one-shot `recv` keeps daemon=false -> OFF). Override knob can force either.
     warm_standby: net::warm_standby_override().unwrap_or(daemon),
     warm_cutover: std::collections::HashSet::new(),
+    upgrade_probe: HashMap::new(),
+    iface_snapshot: Vec::new(),
     };
     {
         let tx = tx.clone();
@@ -4882,6 +5397,12 @@ async fn recv_cmd(
             }
         }
 
+        // P5 (GAP-6): relay->direct upgrade prober (receive side). The `up` daemon
+        // acceptor is the canonical long-lived session, so the prober defaults ON
+        // here. Probe for a direct path while serving on relay; verify-before-
+        // upgrade cuts over only on a confirmed-stable direct standby.
+        conn.tick_upgrade_prober().await;
+
         // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
         // FLAP that contention triggers in the wild (the sender's departure puts
         // the receiver's link into the C4 reconnect loop). Once everything is on
@@ -5092,6 +5613,10 @@ async fn recv_cmd(
             }
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
+                // P5 (GAP-6): a fresh welcome (signaling reconnect) may mean the
+                // network just changed under us — re-probe relay-committed peers for
+                // a direct path immediately instead of waiting out the backoff.
+                conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
                     for p in peers {
                         conn.maybe_adopt(p, true).await?;
@@ -5138,6 +5663,16 @@ async fn recv_cmd(
                         .unwrap_or_default();
                     // rung-2: optional server-reflexive candidate for hole-punch.
                     let srflx = data["srflx"].as_str().map(String::from);
+                    // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
+                    // probe from the other end. If we're serving this peer on relay
+                    // and have no probe of our own yet, ARM one so the symmetric
+                    // direct dial can complete (a later re-send of the offer — the
+                    // peer re-emits 6x — is consumed by our now-armed pending). The
+                    // winner posts DirectUpgradeReady (verify-before-upgrade), never
+                    // clobbering the serving relay link.
+                    if data["probe"].as_bool() == Some(true) {
+                        conn.answer_upgrade_probe(&from).await;
+                    }
                     conn.on_transport_offer(&from, cands, srflx);
                     continue;
                 }
@@ -5151,6 +5686,11 @@ async fn recv_cmd(
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
                 let _ = tx.send(Ev::ChannelReady(pid, t));
+            }
+            // P5 (GAP-6): relay->direct upgrade standby connected (receiver side).
+            // Stash + VERIFY rather than adopt — see the send-loop twin.
+            Ev::DirectUpgradeReady(pid, t, route) => {
+                conn.stash_upgrade_standby(&pid, t, route);
             }
             Ev::ChannelReady(pid, t) => {
                 // web-shell discovery: tell the peer whether this receiver offers a
