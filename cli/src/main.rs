@@ -64,6 +64,91 @@ fn quiet_exit_window() -> Duration {
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
+/// Test/injection hooks — env-gated fault injectors used ONLY by the resilience
+/// gates (runner/sim/*) to drive deterministic failure modes. They are compiled
+/// in ONLY under `--features test-hooks`; a default/release build strips them
+/// entirely (no env reads, no injection logic in the shipped binary). Each hook
+/// has a `not(feature = "test-hooks")` twin that returns the production value
+/// (the no-hook path), so the surrounding real logic compiles and behaves
+/// EXACTLY as if the hook were absent. See cli/Cargo.toml [features].test-hooks.
+#[cfg(feature = "test-hooks")]
+mod test_hooks {
+    /// gate 17b: connect but never send our SPAKE2 element so the ceremony budget fires.
+    pub fn pair_stall() -> bool {
+        std::env::var("FILAMENT_TEST_PAIR_STALL").is_ok()
+    }
+    /// P1: force every WebRTC link relay-only (models a hard-NAT peer).
+    pub fn webrtc_relay_only() -> bool {
+        std::env::var("FILAMENT_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false)
+    }
+    /// gate 18b: revert the mode-B post-completion drop to reconnect-always.
+    pub fn disable_modeb_drop() -> bool {
+        std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_ok()
+    }
+    /// #28: revert the deferred peer-left drop to unconditional-drop.
+    pub fn no_defer() -> bool {
+        std::env::var("FILAMENT_TEST_NO_DEFER").is_ok()
+    }
+    /// #28: synthesize a peer-left for the active sid once N file-data bytes are sent.
+    pub fn inject_peer_left_at() -> Option<u64> {
+        std::env::var("FILAMENT_TEST_INJECT_PEER_LEFT").ok().and_then(|v| v.parse::<u64>().ok())
+    }
+    /// signaling-drop gate: revert the daemon acceptor to the no-outer-loop path.
+    pub fn no_signaling_reconnect() -> bool {
+        std::env::var("FILAMENT_TEST_NO_SIGNALING_RECONNECT").is_ok()
+    }
+    /// warm-standby gate: churn surviving links after completion to force the C4 flap.
+    pub fn churn_after_complete() -> bool {
+        std::env::var("FILAMENT_TEST_CHURN_AFTER_COMPLETE").is_ok()
+    }
+    /// gate 18: drop the file-end control frame so the completion sweep must finalize.
+    pub fn drop_file_end() -> bool {
+        std::env::var("FILAMENT_TEST_DROP_FILE_END").is_ok()
+    }
+    /// gate 18: drop a peer-left event so the quiet-exit fallback is exercised.
+    pub fn drop_peer_left() -> bool {
+        std::env::var("FILAMENT_TEST_DROP_PEER_LEFT").is_ok()
+    }
+
+    /// truncation/ack gate corruption injector. `FILAMENT_TEST_CORRUPT_RECV=<id>`
+    /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
+    /// fires exactly once (proving auto-recovery). The "already fired" latch is a
+    /// process-global AtomicBool — no env mutation (the old code did an unsafe
+    /// `set_var` of `FILAMENT_TEST_CORRUPT_FIRED` inside the async runtime).
+    static CORRUPT_FIRED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// The configured corrupt-recv target id, if any.
+    pub fn corrupt_recv_target() -> Option<String> {
+        std::env::var("FILAMENT_TEST_CORRUPT_RECV").ok()
+    }
+    pub fn corrupt_recv_once() -> bool {
+        std::env::var("FILAMENT_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false)
+    }
+    pub fn corrupt_already_fired() -> bool {
+        CORRUPT_FIRED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn corrupt_mark_fired() {
+        CORRUPT_FIRED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Production twins of the test hooks: each returns the no-hook value so the real
+/// logic is byte-for-byte the shipped behavior when `test-hooks` is off.
+#[cfg(not(feature = "test-hooks"))]
+mod test_hooks {
+    #[inline] pub fn pair_stall() -> bool { false }
+    #[inline] pub fn webrtc_relay_only() -> bool { false }
+    #[inline] pub fn disable_modeb_drop() -> bool { false }
+    #[inline] pub fn no_defer() -> bool { false }
+    #[inline] pub fn inject_peer_left_at() -> Option<u64> { None }
+    #[inline] pub fn no_signaling_reconnect() -> bool { false }
+    #[inline] pub fn churn_after_complete() -> bool { false }
+    #[inline] pub fn drop_file_end() -> bool { false }
+    #[inline] pub fn drop_peer_left() -> bool { false }
+    #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
+}
+
 /// P1 (GAP-4): process-global "the user forbade relay" flag, set once from the
 /// `--no-relay` CLI flag at startup. Read by `Conn::relay_forbidden` so the
 /// stall ladder knows, at `Rung::Exhausted`, whether it MAY auto-escalate to a
@@ -1389,7 +1474,7 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     let mut ceremony_deadline: Option<Instant> = None;
     // Gate 17b hook: connect but never complete, so the ceremony budget fires
     // deterministically (same-machine pairs otherwise finish in ~1s).
-    let stall = std::env::var("FILAMENT_TEST_PAIR_STALL").is_ok();
+    let stall = test_hooks::pair_stall();
 
     loop {
         // Done when the petname is settled AND the PAKE agreed a secret (key
@@ -2078,8 +2163,7 @@ impl Conn {
         // "direct can't, relay can" condition the auto-fallback exists for; never a
         // product knob. OR'd with the real relay_only (set by --relay or by an
         // auto escalate_to_relay).
-        let relay_ice = self.relay_only
-            || std::env::var("FILAMENT_TEST_WEBRTC_RELAY_ONLY").map(|v| v == "1").unwrap_or(false);
+        let relay_ice = self.relay_only || test_hooks::webrtc_relay_only();
         // P1 (GAP-4): --no-relay is a HARD direct-only promise — never traverse a
         // relay. Strip TURN servers from the ICE config so no relay candidate can
         // ever be gathered. A peer reachable ONLY via relay then simply fails to
@@ -2422,7 +2506,7 @@ impl Conn {
         // FILAMENT_TEST_DISABLE_MODEB_DROP reverts to the old reconnect-always
         // behaviour so the gate proves A/B with ONE binary: baseline (toggle set)
         // hangs to RC=124 under the churn hook; fix (toggle unset) exits cleanly.
-        if self.recv_done && std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_err() {
+        if self.recv_done && !test_hooks::disable_modeb_drop() {
             let was_active = self.is_active(pid);
             eprintln!(
                 "{}",
@@ -2873,7 +2957,7 @@ impl Conn {
         // the old unconditional-drop behaviour so an A/B repro can prove the
         // deferral is what saves the live transfer (baseline must FAIL).
         let forced = v["__fil_force_drop"].as_bool() == Some(true);
-        let defer_disabled = std::env::var("FILAMENT_TEST_NO_DEFER").is_ok();
+        let defer_disabled = test_hooks::no_defer();
         if !forced && !defer_disabled && self.link_flowing(&pid) {
             // Idempotent: first peer-left for this sid records the original
             // payload; a duplicate is swallowed (no double-defer, no drop).
@@ -4221,9 +4305,7 @@ async fn stream_one(
     // deferred-drop path must keep the link and let the transfer finish on it.
     // Injecting the active sid is critical: a wrong id makes on_peer_left
     // return early (link-not-found) and the test would falsely pass.
-    let inject_at: Option<u64> = std::env::var("FILAMENT_TEST_INJECT_PEER_LEFT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok());
+    let inject_at: Option<u64> = test_hooks::inject_peer_left_at();
     let mut injected = false;
     let mut f = std::fs::File::open(&path)?;
     f.seek(SeekFrom::Start(offset))?;
@@ -4570,8 +4652,7 @@ async fn recv_cmd(
     // FILAMENT_TEST_NO_SIGNALING_RECONNECT reverts to the OLD no-outer-loop path
     // so the signaling-drop gate's A/B baseline can prove the acceptor ZOMBIES
     // without the fix (the detector/loop is load-bearing, not incidental).
-    let signaling_self_heal =
-        daemon && std::env::var("FILAMENT_TEST_NO_SIGNALING_RECONNECT").is_err();
+    let signaling_self_heal = daemon && !test_hooks::no_signaling_reconnect();
     let mut last_signaling = Instant::now();
     let mut signaling_down_since: Option<Instant> = None;
     let mut reconnect_attempt: u32 = 0;
@@ -4812,7 +4893,7 @@ async fn recv_cmd(
         // links empties → no link to churn next tick → quiet-exit fires. Driven
         // at LOOP level (not inside on_stuck) so the A/B tests the fix, not
         // itself.
-        if conn.recv_done && std::env::var("FILAMENT_TEST_CHURN_AFTER_COMPLETE").is_ok() {
+        if conn.recv_done && test_hooks::churn_after_complete() {
             let churn: Vec<(String, u32)> = conn
                 .links
                 .iter()
@@ -4884,7 +4965,7 @@ async fn recv_cmd(
         // restores the old links-gated behaviour so gate 18b proves the A/B
         // (baseline hangs, fix exits) with one binary.
         let no_healthy_link = conn.links.values().all(|l| !matches!(l.presence, Presence::Ready));
-        let links_clear = if std::env::var("FILAMENT_TEST_DISABLE_MODEB_DROP").is_err() {
+        let links_clear = if !test_hooks::disable_modeb_drop() {
             no_healthy_link
         } else {
             conn.links.is_empty() || digest_says_alone
@@ -5647,7 +5728,7 @@ async fn recv_cmd(
                     // by_sid — mirrors a sender whose PC tears down before the
                     // best-effort file-end is delivered. The G-k completion
                     // sweep must then finalize it on size and quiet-exit.
-                    if std::env::var("FILAMENT_TEST_DROP_FILE_END").is_ok() {
+                    if test_hooks::drop_file_end() {
                         continue;
                     }
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
@@ -5949,7 +6030,7 @@ async fn recv_cmd(
                 // quiet-exit fallback (G-k) can be exercised. SIGSTOP can't do
                 // it — engine.io's ping timeout reaps a frozen client in ~30s
                 // and the legit peer-left wins the race.
-                if std::env::var("FILAMENT_TEST_DROP_PEER_LEFT").is_ok() {
+                if test_hooks::drop_peer_left() {
                     continue;
                 }
                 let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
@@ -6012,20 +6093,28 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
     let want = match &inc.full { Some(w) => w.clone(), None => return VerifyResult::Match };
     let _ = inc.file.flush().await;
 
-    // Test-only corruption injection (deterministic; gate proof).
-    if let Ok(target) = std::env::var("FILAMENT_TEST_CORRUPT_RECV") {
-        let once = std::env::var("FILAMENT_TEST_CORRUPT_ONCE").map(|v| v == "1").unwrap_or(false);
-        let already = std::env::var("FILAMENT_TEST_CORRUPT_FIRED").is_ok();
-        if target == inc.id && inc.received == inc.size && !(once && already) {
-            if let Ok(mut bytes) = std::fs::read(&inc.part_path) {
-                if let Some(b) = bytes.last_mut() {
-                    *b ^= 0xFF; // flip the final byte — same size, wrong hash
-                    let _ = std::fs::write(&inc.part_path, &bytes);
-                    eprintln!("[test] CORRUPT-RECV: flipped the last byte of {} (id {})", inc.name, inc.id);
-                    if once { unsafe { std::env::set_var("FILAMENT_TEST_CORRUPT_FIRED", "1"); } }
+    // Test-only corruption injection (deterministic; gate proof). Compiled out
+    // entirely on default/release builds — the `corrupt_recv_target` twin returns
+    // None there, so this whole block strips to nothing. The "fired once" latch is
+    // an AtomicBool inside test_hooks (no unsafe env mutation).
+    if let Some(target) = test_hooks::corrupt_recv_target() {
+        #[cfg(feature = "test-hooks")]
+        {
+            let once = test_hooks::corrupt_recv_once();
+            let already = test_hooks::corrupt_already_fired();
+            if target == inc.id && inc.received == inc.size && !(once && already) {
+                if let Ok(mut bytes) = std::fs::read(&inc.part_path) {
+                    if let Some(b) = bytes.last_mut() {
+                        *b ^= 0xFF; // flip the final byte — same size, wrong hash
+                        let _ = std::fs::write(&inc.part_path, &bytes);
+                        eprintln!("[test] CORRUPT-RECV: flipped the last byte of {} (id {})", inc.name, inc.id);
+                        if once { test_hooks::corrupt_mark_fired(); }
+                    }
                 }
             }
         }
+        // Silence the unused binding on default builds (this arm never runs there).
+        let _ = &target;
     }
 
     // A short file can't possibly match — it's truncated; resume the tail.

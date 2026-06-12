@@ -22,6 +22,9 @@ UX_ROOT="$(cd "$PEERS_LIB_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$UX_ROOT/../.." && pwd)"
 
 # The LOCALLY-BUILT binary (never the installed one). Override with FILAMENT_BIN.
+# When provided externally it is trusted as-is (FILAMENT_BIN_EXPLICIT); otherwise
+# pipe_ensure_binary rebuilds it WITH the test-hooks feature.
+FILAMENT_BIN_EXPLICIT="${FILAMENT_BIN:+1}"
 FILAMENT_BIN="${FILAMENT_BIN:-$REPO_ROOT/cli/target/release/filament}"
 
 # A python that can run the signaling backend (flask-socketio + eventlet). Prefer
@@ -86,10 +89,14 @@ pipe_reap_backends() {
 }
 
 # ---- ensure the built binary exists ----------------------------------------
+# The UX journeys drive env-gated test hooks (FILAMENT_TEST_FREEZE_AFTER_BYTES,
+# FILAMENT_DIRECT_LOOPBACK_ONLY), which now ship ONLY in a `--features test-hooks`
+# build (stripped from default/release). Build WITH the feature; if an explicit
+# FILAMENT_BIN was provided, trust it as-is.
 pipe_ensure_binary() {
-  if [ -x "$FILAMENT_BIN" ]; then return 0; fi
-  echo "[peers] locally-built binary missing — building (cargo build --release)…" >&2
-  ( cd "$REPO_ROOT/cli" && cargo build --release >"$PIPE_WORK/cargo-build.log" 2>&1 ) || {
+  if [ -n "${FILAMENT_BIN_EXPLICIT:-}" ] && [ -x "$FILAMENT_BIN" ]; then return 0; fi
+  echo "[peers] building filament (cargo build --release --features test-hooks)…" >&2
+  ( cd "$REPO_ROOT/cli" && cargo build --release --features test-hooks >"$PIPE_WORK/cargo-build.log" 2>&1 ) || {
     echo "[peers] cargo build FAILED — see $PIPE_WORK/cargo-build.log" >&2; return 1; }
   [ -x "$FILAMENT_BIN" ]
 }

@@ -60,7 +60,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[ -x "$BIN" ] || { echo "build first: (cd cli && cargo build --release)"; exit 2; }
+# Resilience gates drive the env-gated test hooks (FILAMENT_TEST_*), which now
+# ship ONLY in a `--features test-hooks` build (stripped from default/release).
+# Auto-build that binary unless an explicit FILJOB_BIN was provided.
+if [ -z "${FILJOB_BIN:-}" ]; then
+  ( cd "$CLI_DIR" && cargo build --release --features test-hooks ) || { echo "build failed"; exit 2; }
+fi
+[ -x "$BIN" ] || { echo "build first: (cd cli && cargo build --release --features test-hooks)"; exit 2; }
 
 # ---- own fixture backend ----------------------------------------------------
 for pid in $(ss -tlnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+' | sort -u); do kill "$pid" 2>/dev/null; done

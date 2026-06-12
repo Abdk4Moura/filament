@@ -70,7 +70,13 @@ trap cleanup EXIT
 
 echo "[test] binary:  $BIN"
 echo "[test] work:    $WORK"
-[ -x "$BIN" ] || { echo "ERROR: filament binary not found at $BIN (build: cargo build --release -p filament-cli)"; exit 1; }
+# The local test drives env-gated test hooks (FILAMENT_TEST_*), which now ship
+# ONLY in a `--features test-hooks` build (stripped from default/release).
+# Auto-build that binary unless an explicit FILJOB_BIN was provided.
+if [ -z "${FILJOB_BIN:-}" ]; then
+  ( cd "$ROOT/cli" && cargo build --release --features test-hooks ) || { echo "ERROR: build failed"; exit 1; }
+fi
+[ -x "$BIN" ] || { echo "ERROR: filament binary not found at $BIN (build: cd cli && cargo build --release --features test-hooks)"; exit 1; }
 
 # --- devices.json on each side -------------------------------------------------
 # host: din->"box-in" (send target). host-dout: dout->"box-out" (sink peer).

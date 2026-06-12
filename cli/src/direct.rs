@@ -69,7 +69,9 @@ fn test_block() -> bool {
 /// transport has frozen, a *fresh* transport built by the correction ladder's
 /// in-place repair (rung c) is NOT frozen — so the test proves the stall is
 /// both DETECTED and AUTO-RECOVERED on the re-dialled path, not merely detected.
-/// Never a product knob; only the data-path-freeze sim sets it.
+/// Never a product knob; only the data-path-freeze sim sets it. Compiled in ONLY
+/// under `--features test-hooks` — stripped from default/release builds.
+#[cfg(feature = "test-hooks")]
 fn freeze_after_bytes() -> Option<u64> {
     std::env::var("FILAMENT_TEST_FREEZE_AFTER_BYTES")
         .ok()
@@ -84,7 +86,9 @@ fn freeze_after_bytes() -> Option<u64> {
 /// EXHAUSTS, and the only way the transfer completes is the rung-(d) escalation
 /// to the TURN relay (a WebRTC path that doesn't ride this direct-QUIC freeze).
 /// This is how the relay-fallback gate forces the exact "direct can't, relay can"
-/// condition deterministically. Only that sim sets it.
+/// condition deterministically. Only that sim sets it. Compiled in ONLY under
+/// `--features test-hooks` — stripped from default/release builds.
+#[cfg(feature = "test-hooks")]
 fn freeze_persist() -> bool {
     std::env::var("FILAMENT_TEST_FREEZE_PERSIST").map(|v| v == "1").unwrap_or(false)
 }
@@ -92,6 +96,8 @@ fn freeze_persist() -> bool {
 /// Process-global "a transport has already frozen once" latch (see
 /// `freeze_after_bytes`). `false` until the first transport freezes; once `true`
 /// every later transport streams normally, so rung-c's fresh dial recovers.
+/// Test-only — stripped from default/release builds.
+#[cfg(feature = "test-hooks")]
 static FROZE_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Total budget for the whole direct attempt before falling back to WebRTC.
@@ -241,8 +247,17 @@ fn suppress_public() -> bool {
 /// actually carry data, so even a CLEAN same-host transfer is flaky. This knob
 /// makes same-host gates deterministic by advertising ONLY loopback. NOT a
 /// product knob — only the local sim gates set it.
+/// Test-only — compiled in ONLY under `--features test-hooks`; the production
+/// twin returns `false` so a default/release build never reads the env and
+/// advertises the real candidate set.
+#[cfg(feature = "test-hooks")]
 fn loopback_only() -> bool {
     std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").map(|v| v == "1").unwrap_or(false)
+}
+#[cfg(not(feature = "test-hooks"))]
+#[inline]
+fn loopback_only() -> bool {
+    false
 }
 
 /// Gather all advertisable candidates for our bound endpoint port.
@@ -441,13 +456,16 @@ pub struct DirectTransport {
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
     /// Running count of file-data bytes this transport has written. Only read by
-    /// the data-path-freeze PROOF hook (`freeze_after_bytes`); zero overhead when
-    /// the hook is off (a single relaxed add per frame).
+    /// the data-path-freeze PROOF hook (`freeze_after_bytes`); compiled out
+    /// entirely unless `--features test-hooks` is set.
+    #[cfg(feature = "test-hooks")]
     sent_data: std::sync::atomic::AtomicU64,
     /// PROOF hook: set once THIS transport's data path has gone dark, so EVERY
     /// subsequent `send_frame` on it parks too (a black-holed path stays dark,
     /// not just the one stream that tripped it) — faithful to a NAT-rebind that
     /// strands the data 5-tuple. A fresh transport (rung c) has this clear.
+    /// Compiled out entirely unless `--features test-hooks` is set.
+    #[cfg(feature = "test-hooks")]
     frozen: std::sync::atomic::AtomicBool,
 }
 
@@ -501,6 +519,7 @@ impl Transport for DirectTransport {
         // catch. Parking here (not erroring) mimics a wire that silently drops
         // data: the sender just stops making progress. One-shot via FROZE_ONCE,
         // so the ladder's fresh re-dial (rung c) streams normally and recovers.
+        #[cfg(feature = "test-hooks")]
         if let Some(limit) = freeze_after_bytes() {
             // Engage the freeze the first time THIS transport crosses the byte
             // threshold AND no transport has frozen yet (one episode per process).
@@ -678,7 +697,9 @@ fn make_transport(
         send: Arc::new(Mutex::new(send)),
         last_activity,
         dead,
+        #[cfg(feature = "test-hooks")]
         sent_data: std::sync::atomic::AtomicU64::new(0),
+        #[cfg(feature = "test-hooks")]
         frozen: std::sync::atomic::AtomicBool::new(false),
     })
 }

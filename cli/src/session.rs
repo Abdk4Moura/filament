@@ -34,17 +34,33 @@ pub struct Session {
     loss: f64,
 }
 
+/// gate L (`FILAMENT_TEST_EMIT_LOSS` + `_SEED`): the loss-shim parameters. These
+/// are env-gated test injectors compiled in ONLY under `--features test-hooks`.
+/// The `not` twin returns the production no-loss defaults (loss 0.0, fixed seed),
+/// so the shipped binary never reads the env and `emit` never drops.
+#[cfg(feature = "test-hooks")]
+fn emit_loss_params() -> (f64, u64) {
+    let loss = std::env::var("FILAMENT_TEST_EMIT_LOSS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|l| (0.0..1.0).contains(l))
+        .unwrap_or(0.0);
+    let seed = std::env::var("FILAMENT_TEST_EMIT_SEED")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0xF11A_C30D);
+    (loss, seed)
+}
+
+#[cfg(not(feature = "test-hooks"))]
+#[inline]
+fn emit_loss_params() -> (f64, u64) {
+    (0.0, 0xF11A_C30D)
+}
+
 impl Session {
     pub fn new(name: &str, uid: &str) -> Self {
-        let loss = std::env::var("FILAMENT_TEST_EMIT_LOSS")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|l| (0.0..1.0).contains(l))
-            .unwrap_or(0.0);
-        let seed = std::env::var("FILAMENT_TEST_EMIT_SEED")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0xF11A_C30D);
+        let (loss, seed) = emit_loss_params();
         Session {
             room: None,
             name: name.to_string(),

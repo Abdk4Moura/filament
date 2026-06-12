@@ -19,6 +19,12 @@ path = "src/main.rs"
 # the system one. rust_socketio hard-depends on native-tls, so a rustls-only
 # tree is not possible without forking it upstream (ledger C16).
 static = ["dep:openssl-sys"]
+# Env-gated fault/injection hooks used ONLY by the resilience gates
+# (runner/sim/*). NOT in `default` and NOT pulled by the release profile, so a
+# default `cargo build --release` (what users install) strips every test hook
+# from the binary — no `FILAMENT_TEST_*` env reads, no corruption/freeze/drop
+# injection logic. Build the gates' binary with `--features test-hooks`.
+test-hooks = []
 
 [dependencies]
 openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
