@@ -902,7 +902,7 @@ pub async fn race_connect_labeled(
                     // greppable. Dial failures (unreachable candidate) are noise.
                     let s = e.to_string();
                     if s.contains("DIRECT-AUTH-FAIL") {
-                        eprintln!("filament: {s}");
+                        crate::ui::trace(&format!("filament: {s}"));
                     }
                     continue;
                 }
@@ -920,12 +920,14 @@ pub async fn race_connect_labeled(
     };
 
     let (conn, send, recv) = winner;
-    eprintln!(
+    // DEBUG — direct-connect diagnostic (the user-facing route label is the
+    // `route:` line emitted in main.rs; this is the internal detail).
+    crate::ui::debug(&format!(
         "filament: DIRECT-CONNECT ok (route: {}) peer={} remote={}",
         route,
         peer_id,
         conn.remote_address()
-    );
+    ));
     // Keep the endpoint alive for the connection's lifetime by leaking it into
     // the transport's closure scope: hold it in a task that lives as long as the
     // connection. Simplest: stash it in a detached keepalive future.

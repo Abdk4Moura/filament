@@ -832,7 +832,7 @@ impl Peer {
                 };
                 for c in pending {
                     if let Err(e) = self.pc.add_ice_candidate(c).await {
-                        eprintln!("filament: queued candidate failed: {e}");
+                        crate::ui::trace(&format!("filament: queued candidate failed: {e}"));
                     }
                 }
                 if is_offer {
@@ -867,7 +867,7 @@ impl Peer {
                 };
                 if !buffered {
                     if let Err(e) = self.pc.add_ice_candidate(init).await {
-                        eprintln!("filament: addIceCandidate failed: {e}");
+                        crate::ui::trace(&format!("filament: addIceCandidate failed: {e}"));
                     }
                 }
             }
@@ -1005,7 +1005,7 @@ async fn wire_channel(
             let raw = match dc2.detach().await {
                 Ok(raw) => raw,
                 Err(e) => {
-                    eprintln!("filament: data channel detach failed: {e}");
+                    crate::ui::trace(&format!("filament: data channel detach failed: {e}"));
                     return;
                 }
             };

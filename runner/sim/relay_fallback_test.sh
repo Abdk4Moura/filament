@@ -37,6 +37,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 CLI_DIR="$ROOT/cli"
 BIN="${FILJOB_BIN:-$CLI_DIR/target/release/filament}"
+# Verbosity: the resilience PROOF lines this gate greps for (stall detected,
+# repairing in place, warm cutover, signaling reconnected, falling back to the
+# TURN relay, resuming at, parked for resume, …) emit at the CLI's `debug`
+# level. Export FILAMENT_LOG=debug so every $BIN child prints them; the
+# value-prop lines (route, relay banner, P5 upgrade) are `critical` and show
+# regardless. Respect an explicit override if the caller set one.
+export FILAMENT_LOG="${FILAMENT_LOG:-debug}"
 PORT="${FILAMENT_TEST_PORT:-8098}"
 SERVER="http://127.0.0.1:$PORT"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/relay-fallback.XXXXXX")"

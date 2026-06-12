@@ -680,7 +680,7 @@ async fn bring_up_to_known(
         });
     };
 
-    eprintln!("filament: waiting for known device '{peer_name}'...");
+    crate::ui::say(&format!("filament: waiting for known device '{peer_name}'..."));
 
     loop {
         // One candidate at a time: start the next attempt whenever idle.
@@ -709,12 +709,11 @@ async fn bring_up_to_known(
                                 direct_cands =
                                     Some(crate::direct::gather_candidates(server, port).await);
                                 endpoint = Some(ep);
-                                eprintln!(
-                                    "filament: DIRECT-OFFER sent to '{peer_name}' — port {port}"
-                                );
+                                // TRACE — direct-offer detail.
+                                crate::ui::trace(&format!("filament: DIRECT-OFFER sent to '{peer_name}' — port {port}"));
                             }
                             Err(e) => {
-                                eprintln!("filament: direct disabled (endpoint bind failed: {e}) — WebRTC only");
+                                crate::ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e}) — WebRTC only"));
                             }
                         }
                     }
@@ -793,10 +792,11 @@ async fn bring_up_to_known(
                             .as_array()
                             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                             .unwrap_or_default();
-                        eprintln!(
+                        // DEBUG — resilience/direct internal (racing a direct path).
+                        crate::ui::debug(&format!(
                             "filament: got transport-offer ({} cand) — racing direct-quic",
                             peer_cands.len()
-                        );
+                        ));
                         let secret = secret.clone();
                         let pid = v["from"].as_str().unwrap_or_default().to_string();
                         let tx = tx.clone();
@@ -838,11 +838,11 @@ async fn bring_up_to_known(
                         )
                         .await?;
                         if let Err(e) = p.handle_signal(offer).await {
-                            eprintln!("filament: signal: {e}");
+                            crate::ui::trace(&format!("filament: signal: {e}"));
                         }
                         peer = Some(p);
                     }
-                    Err(e) => eprintln!("filament: signal: {e}"),
+                    Err(e) => crate::ui::trace(&format!("filament: signal: {e}")),
                 }
             }
             Ev::DirectReady(_pid, t, route) => {
@@ -855,7 +855,8 @@ async fn bring_up_to_known(
                 // not have, and the acceptor's direct link (`peer: None`) has none
                 // to verify against. (design-l2-direct-ladder.md §NOTE: pre-trust
                 // OR pair-proof — we confirmed pre-trust holds for the L2 acceptor.)
-                eprintln!("filament: tunnel up to '{peer_name}' (route: {route})");
+                // INFO — tunnel established (with its route label).
+                crate::ui::say(&format!("filament: tunnel up to '{peer_name}' (route: {route})"));
                 // The WebRTC `peer` is now superfluous; the guard owns it (its
                 // teardown/forget semantics are unchanged — no extra teardown).
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
@@ -870,7 +871,7 @@ async fn bring_up_to_known(
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
-                    eprintln!("filament: candidate unresponsive — rotating");
+                    crate::ui::debug("filament: candidate unresponsive — rotating");
                     queue.push_back((pid, peer_uid.take()));
                 }
             }
@@ -889,7 +890,7 @@ async fn bring_up_to_known(
                 // Hand sio + peer to the caller via a guard: a long-lived tunnel
                 // `forget()`s it (keep alive); the bootstrap `close().await`s it
                 // (tear down before the second link).
-                eprintln!("filament: tunnel up to '{peer_name}'");
+                crate::ui::say(&format!("filament: tunnel up to '{peer_name}'"));
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
                 return Ok((t, rx, guard));
             }
@@ -900,7 +901,7 @@ async fn bring_up_to_known(
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
-                    eprintln!("filament: connection {s} — rotating");
+                    crate::ui::debug(&format!("filament: connection {s} — rotating"));
                     queue.push_back((pid, peer_uid.take()));
                 }
             }
@@ -930,7 +931,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                 mux.on_frame(sid, data).await;
             }
             Ev::PcState(_, s) if s == "failed" || s == "closed" || s == "disconnected" => {
-                eprintln!("filament: tunnel {s} — closing streams");
+                crate::ui::debug(&format!("filament: tunnel {s} — closing streams"));
                 mux.shutdown_all().await;
             }
             _ => {}
@@ -1074,7 +1075,7 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
     tokio::spawn(pump_initiator(rx, mux.clone()));
 
     let listener = TcpListener::bind(("127.0.0.1", lport)).await?;
-    eprintln!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}");
+    crate::ui::say(&format!("filament: forwarding 127.0.0.1:{lport} -> {peer}:127.0.0.1:{rport}"));
     // NOTE(scope): concurrent heavy forwards over one link need credit flow
     // control (design §4); single active stream is the supported case today.
     loop {

@@ -267,6 +267,17 @@ struct Cli {
     /// Display name shown to peers (default: config file, then user@host)
     #[arg(long, global = true)]
     name_as: Option<String>,
+    /// Verbose output: -v shows resilience internals (stalls, repairs,
+    /// reconnects, upgrade probes); -vv adds ICE/per-frame trace. The
+    /// value-prop lines (route, relay banner) always print. Overridden by
+    /// FILAMENT_LOG=<critical|info|debug|trace>.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Quiet: print only the must-see lines (route label, relay banner, P1/P5
+    /// path changes, fatal errors). Conflicts with -v. Overridden by
+    /// FILAMENT_LOG.
+    #[arg(short = 'q', long = "quiet", global = true, conflicts_with = "verbose")]
+    quiet: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -2117,10 +2128,10 @@ impl Conn {
             if self.link_flowing(&old_sid) {
                 // Observable so a gate can assert the keep happened (true
                 // positive), not merely that no supersede line appeared.
-                eprintln!("{name} reconnected — keeping active link");
+                ui::debug(&format!("{name} reconnected — keeping active link"));
                 return Ok(self.is_active(&old_sid));
             }
-            eprintln!("{name} reconnected — superseding old link");
+            ui::debug(&format!("{name} reconnected — superseding old link"));
             let was_active = self.is_active(&old_sid);
             let secret = self.links.get(&old_sid).and_then(|l| l.expected_secret.clone());
             self.drop_link(&old_sid);
@@ -2341,7 +2352,7 @@ impl Conn {
         let (ep, port) = match direct::bind_endpoint() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("filament: direct disabled (endpoint bind failed: {e})");
+                ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e})"));
                 return;
             }
         };
@@ -2379,12 +2390,13 @@ impl Conn {
             .sio
             .emit("signal", json!({ "to": pid, "data": offer.clone() }))
             .await;
-        eprintln!(
+        // TRACE — direct-offer / signaling detail.
+        ui::trace(&format!(
             "filament: {} sent to {name} ({pid}) — port {} srflx {}",
             if probe { "UPGRADE-PROBE-OFFER" } else { "DIRECT-OFFER" },
             port,
             my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
-        );
+        ));
         // Re-send the offer periodically. The L2 initiator (netcat/ssh) subscribes
         // to the channel AFTER us, so on a late join it can miss BOTH our single
         // fire-once offer AND its own KnownPeer for us (presence delivery is racy)
@@ -2493,9 +2505,8 @@ impl Conn {
             // through to the WebRTC step-down via the per-tick reaper.
             if holepunch::holepunch_enabled() {
                 if let (Some(sock), Some(peer_srflx)) = (punch_sock, peer_srflx_addr) {
-                    eprintln!(
-                        "filament: rung-1 failed — attempting hole-punch to {peer_srflx}"
-                    );
+                    // TRACE — direct/hole-punch detail.
+                    ui::trace(&format!("filament: rung-1 failed — attempting hole-punch to {peer_srflx}"));
                     if let Some(t) = holepunch::connect(
                         sock,
                         peer_srflx,
@@ -2601,7 +2612,8 @@ impl Conn {
             .collect();
         for pid in expired_probes {
             self.direct_pending.remove(&pid);
-            eprintln!("filament: UPGRADE-PROBE for {pid} found no direct path in budget — staying on relay");
+            // DEBUG — resilience internal (upgrade probe found no path).
+            ui::debug(&format!("filament: UPGRADE-PROBE for {pid} found no direct path in budget — staying on relay"));
             self.mark_probe_failed(&pid);
         }
         let expired: Vec<String> = self
@@ -2617,10 +2629,11 @@ impl Conn {
                     .get(&pid)
                     .cloned()
                     .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
-                eprintln!(
+                // DEBUG — resilience internal (direct→WebRTC fallback).
+                ui::debug(&format!(
                     "filament: DIRECT-FALLBACK for {} — no authenticated QUIC in budget, using WebRTC",
                     p.secret.0
-                );
+                ));
                 fell_back.push((pid, info, p.secret));
             }
         }
@@ -2672,24 +2685,19 @@ impl Conn {
         // hangs to RC=124 under the churn hook; fix (toggle unset) exits cleanly.
         if self.recv_done && !test_hooks::disable_modeb_drop() {
             let was_active = self.is_active(pid);
-            eprintln!(
-                "{}",
-                ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after completion — nothing left to fetch)"))
-            );
+            ui::debug(&ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after completion — nothing left to fetch)")));
             self.drop_link(pid);
             return Ok(was_active);
         }
         let attempts = l.attempts + 1;
         if attempts >= MAX_ATTEMPTS {
             let was_active = self.is_active(pid);
-            eprintln!(
-                "{}",
-                ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after {attempts} attempts)"))
-            );
+            ui::debug(&ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after {attempts} attempts)")));
             self.drop_link(pid);
             return Ok(was_active);
         }
-        eprintln!("connection {why} — retrying ({}/{})", attempts + 1, MAX_ATTEMPTS);
+        // DEBUG — resilience internal (link retry).
+        ui::debug(&format!("connection {why} — retrying ({}/{})", attempts + 1, MAX_ATTEMPTS));
         let info = l.info.clone();
         let secret = l.expected_secret.clone();
         // C26: a link that was ever up is *re*connecting; one that never
@@ -2874,7 +2882,9 @@ impl Conn {
             && !self.relay_only
             && !self.warm_cutover.contains(pid);
         if attempt == 0 && warm_eligible {
-            ui::say(&ui::paint(
+            // DEBUG — resilience internal (warm cutover). Visible at -v / the gates
+            // run with FILAMENT_LOG=debug.
+            ui::debug(&ui::paint(
                 ui::Tone::Warn,
                 "  transfer stalled — cutting over to the warm relay standby (instant failover)",
             ));
@@ -2896,7 +2906,8 @@ impl Conn {
             // (Reached when warm redundancy is OFF — the one-shot `send` default —
             // or relay is forbidden / already in use; the P0/P1 ladder is correct
             // and bounded there.)
-            ui::say(&ui::paint(ui::Tone::Warn, "  transfer stalled — resuming on the same link"));
+            // DEBUG — resilience internal (rung (a) resume on the same link).
+            ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled — resuming on the same link"));
             return Rung::Resume;
         }
         if attempt >= STALL_MAX_REPAIRS {
@@ -2907,7 +2918,8 @@ impl Conn {
             let already_relayed = self.relay_only;
             if relay_forbidden() {
                 // The hard direct-only promise: never silently fall to a relay.
-                ui::say(&ui::paint(
+                // CRITICAL — a clean fatal path-decision the user must see (-q too).
+                ui::critical(&ui::paint(
                     ui::Tone::Warn,
                     "  couldn't establish a direct path; relay disabled (--no-relay) \
                      — partial kept on disk. Re-run to resume, or drop --no-relay to \
@@ -2919,7 +2931,8 @@ impl Conn {
                 // We already re-established over relay and it ALSO stalled — there
                 // is no harder rung. Stop honestly with the partial preserved
                 // (this is the genuine out-of-scope case: no path exists).
-                ui::say(&ui::paint(
+                // CRITICAL — a terminal honesty line the user must see (-q too).
+                ui::critical(&ui::paint(
                     ui::Tone::Warn,
                     "  transfer still stalled on the relay route — partial kept on disk. \
                      Re-run to resume.",
@@ -2928,7 +2941,9 @@ impl Conn {
             }
             // Rung (d): re-establish this transfer over the TURN relay, preserving
             // the on-disk partial (C7 resume). Bounded: one escalation per episode.
-            ui::say(&ui::paint(
+            // CRITICAL — P1's value-prop: the never-flaky promise kicking in. The
+            // user must see the path change to relay even under -q.
+            ui::critical(&ui::paint(
                 ui::Tone::Warn,
                 "  direct paths exhausted — falling back to the TURN relay",
             ));
@@ -2943,7 +2958,8 @@ impl Conn {
             return Rung::Relayed;
         }
         // Rung (c): repair the transport IN PLACE under the live session.
-        ui::say(&ui::paint(
+        // DEBUG — resilience internal (in-place repair).
+        ui::debug(&ui::paint(
             ui::Tone::Warn,
             &format!("  transfer stalled — repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
         ));
@@ -3039,7 +3055,8 @@ impl Conn {
             self.active = Some(pid.to_string());
         }
         // Honest, loud: the user must know this session is now on a relay.
-        ui::say(&format!("  {}", relay_banner()));
+        // CRITICAL — the value-prop path label; shown even under -q.
+        ui::critical(&format!("  {}", relay_banner()));
         // P5 (GAP-6): ARM the relay->direct upgrade prober for this peer. Relay is
         // a way-station, not a destination: while we serve on relay we keep probing
         // for a direct path and upgrade back the moment one is confirmed stable.
@@ -3120,7 +3137,8 @@ impl Conn {
         let snap = direct::local_ip_snapshot();
         if snap != self.iface_snapshot {
             if !self.iface_snapshot.is_empty() {
-                ui::say(&ui::paint(
+                // DEBUG — resilience internal (upgrade-probe trigger).
+                ui::debug(&ui::paint(
                     ui::Tone::Dim,
                     "  network changed — re-probing for a direct path now",
                 ));
@@ -3181,7 +3199,8 @@ impl Conn {
                 self.upgrade_probe.remove(&pid);
                 continue;
             };
-            ui::say(&ui::paint(
+            // DEBUG — resilience internal (upgrade probe attempt).
+            ui::debug(&ui::paint(
                 ui::Tone::Dim,
                 "  probing for a direct path (alongside the relay)…",
             ));
@@ -3239,7 +3258,8 @@ impl Conn {
         // Regressed: control send failed OR the path went idle past the guard.
         // Discard the standby, stay on relay, back off (the no-flap guard).
         if !beat_ok || idle >= verify_idle_ms {
-            ui::say(&ui::paint(
+            // DEBUG — resilience internal (no-flap guard rejecting a standby).
+            ui::debug(&ui::paint(
                 ui::Tone::Warn,
                 "  direct path connected but didn't hold — staying on relay (no flap)",
             ));
@@ -3281,7 +3301,8 @@ impl Conn {
         if was_active {
             self.active = Some(pid.to_string());
         }
-        ui::say(&ui::paint(
+        // CRITICAL — P5's value-prop line: relay released, back on a direct path.
+        ui::critical(&ui::paint(
             ui::Tone::Ok,
             &format!("  upgraded back to a direct path (route: {route}) — relay released"),
         ));
@@ -3356,7 +3377,8 @@ impl Conn {
         up.standby_route = route;
         up.verify_started = None; // judge_upgrade_standby stamps it on first look
         up.verify_last_idle = u64::MAX;
-        ui::say(&ui::paint(
+        // DEBUG — resilience internal (upgrade verify window opening).
+        ui::debug(&ui::paint(
             ui::Tone::Dim,
             "  direct path connected — verifying it holds before upgrading…",
         ));
@@ -3447,7 +3469,8 @@ impl Conn {
             // payload; a duplicate is swallowed (no double-defer, no drop).
             self.deferred_left.entry(pid.clone()).or_insert_with(|| v.clone());
             let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "peer".into());
-            eprintln!("{name} signaling left — data channel still flowing, deferring drop");
+            // DEBUG — resilience internal (deferred drop while channel flowing).
+            ui::debug(&format!("{name} signaling left — data channel still flowing, deferring drop"));
             return false;
         }
         let was_active = self.is_active(&pid);
@@ -3499,7 +3522,8 @@ impl Conn {
                 obj.insert("__fil_force_drop".into(), Value::Bool(true));
             }
             let name = self.link(&sid).map(|l| l.name.clone()).unwrap_or_else(|| "peer".into());
-            eprintln!("{name} link went idle after deferred leave — dropping now");
+            // DEBUG — resilience internal (deferred-leave reap).
+            ui::debug(&format!("{name} link went idle after deferred leave — dropping now"));
             // Re-inject so the loop's own peer-left branch handles partials,
             // messaging and the rejoin window exactly as a fresh leave would.
             let _ = self.tx.send(Ev::PeerLeft(payload));
@@ -3576,16 +3600,16 @@ impl Conn {
             Ok(net::SignalOutcome::Glare(offer)) => {
                 self.drop_link(from);
                 if let Err(e) = self.ensure_responder(from, &offer).await {
-                    eprintln!("signal: glare rebuild failed: {e} (recovering)");
+                    ui::trace(&format!("signal: glare rebuild failed: {e} (recovering)"));
                     return;
                 }
                 if let Some(p) = self.link(from).and_then(|l| l.peer.clone()) {
                     if let Err(e) = p.handle_signal(offer).await {
-                        eprintln!("signal failed to apply: {e} (recovering)");
+                        ui::trace(&format!("signal failed to apply: {e} (recovering)"));
                     }
                 }
             }
-            Err(e) => eprintln!("signal failed to apply: {e} (recovering)"),
+            Err(e) => ui::trace(&format!("signal failed to apply: {e} (recovering)")),
         }
     }
 
@@ -3685,6 +3709,9 @@ async fn main() -> Result<()> {
         }
     }
     let cli = Cli::parse_from(argv);
+    // Resolve the global output verbosity ONCE, before any worker spawns:
+    // FILAMENT_LOG (if set) overrides the -v/-q flags. Default = info.
+    ui::init_verbosity(cli.verbose, cli.quiet);
     if let Some(n) = &cli.name_as {
         // single-threaded at this point (before the runtime spawns workers)
         unsafe { std::env::set_var("FILAMENT_NAME", n) };
@@ -3900,7 +3927,7 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     };
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
 
-    eprintln!("downloading {asset} ...");
+    ui::say(&format!("downloading {asset} ..."));
     let bytes = client.get(format!("{base}/{asset}")).send().await?.error_for_status()?.bytes().await?;
     let sums = client.get(format!("{base}/SHA256SUMS")).send().await?.error_for_status()?.text().await?;
     let got = sha256_hex(&bytes);
@@ -3912,7 +3939,7 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
     if got != expected {
         bail!("checksum mismatch for {asset}: got {got}, expected {expected}");
     }
-    eprintln!("checksum ok");
+    ui::say("checksum ok");
 
     // Unpack the single binary.
     let new_bin: Vec<u8> = if asset.ends_with(".tar.gz") {
@@ -3995,7 +4022,7 @@ async fn send_cmd(
     // payload (stdin, or one regular file). With multiple paths or a directory
     // there is no single name to override, so warn that it's ignored.
     if name.is_some() && paths.len() > 1 {
-        eprintln!("{}", ui::paint(ui::Tone::Warn, "--name is ignored when sending multiple paths"));
+        ui::say(&ui::paint(ui::Tone::Warn, "--name is ignored when sending multiple paths"));
     }
     let single = paths.len() == 1;
     let my_uid = mk_uid("s");
@@ -4017,11 +4044,11 @@ async fn send_cmd(
             let meta = std::fs::metadata(&path).with_context(|| format!("stat {p}"))?;
             if meta.is_dir() {
                 if name.is_some() && single {
-                    eprintln!("{}", ui::paint(ui::Tone::Warn, "--name is ignored for a directory (it's tarred under the directory name)"));
+                    ui::say(&ui::paint(ui::Tone::Warn, "--name is ignored for a directory (it's tarred under the directory name)"));
                 }
                 let dirname = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "dir".into());
                 let spool = std::env::temp_dir().join(format!("filament-tar-{}-{}.tar", std::process::id(), i));
-                eprintln!("packing {p} -> {dirname}.tar ...");
+                ui::say(&format!("packing {p} -> {dirname}.tar ..."));
                 {
                     let f = std::fs::File::create(&spool)?;
                     let mut b = tar::Builder::new(f);
@@ -4045,7 +4072,7 @@ async fn send_cmd(
         }
     }
     for o in &outgoing {
-        eprintln!("send: {} ({})", o.name, human(o.size));
+        ui::say(&format!("send: {} ({})", o.name, human(o.size)));
     }
 
     let room = match room {
@@ -4076,7 +4103,7 @@ async fn send_cmd(
         };
         sio.emit("pair-create", payload).await.ok();
     } else {
-        eprintln!("waiting for a peer in room {room} (same network auto-discovers; or use --code)");
+        ui::say(&format!("waiting for a peer in room {room} (same network auto-discovers; or use --code)"));
     }
     // Live spinner while nothing is connected yet (tty only; stops at adopt).
     let waiting = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -4297,7 +4324,7 @@ async fn send_cmd(
             }
             Ev::PairError(v) => bail!("pairing failed: {}", v["error"].as_str().unwrap_or("?")),
             Ev::PairUsed(_) => {
-                eprintln!("code claimed — connecting...");
+                ui::say("code claimed — connecting...");
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
@@ -4309,7 +4336,7 @@ async fn send_cmd(
                 }
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
-                        eprintln!("known device '{n}' is online — connecting");
+                        ui::say(&format!("known device '{n}' is online — connecting"));
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
                         // rung-1: both ends are CLIs (known device) — try direct
                         // QUIC FIRST. start_direct records the pending so the
@@ -4396,21 +4423,23 @@ async fn send_cmd(
                             for _ in 0..6 {
                                 tokio::time::sleep(Duration::from_millis(400)).await;
                                 if let Some(r) = p.route().await {
-                                    ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    // CRITICAL: the route label is the value-prop —
+                                    // direct vs relayed. Always shown, even under -q.
+                                    ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
-                                    // they're on a middleman path.
+                                    // they're on a middleman path. CRITICAL.
                                     if r == "relayed" {
-                                        ui::say(&format!("    {}", relay_banner()));
+                                        ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
                             }
                         });
                     } else if is_direct {
-                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
+                        ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                     // C12: prove identity to a known device (their daemon
                     // auto-accepts only after verifying); or hand over a new
@@ -4426,13 +4455,13 @@ async fn send_cmd(
                                 "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
                             })).await?;
                         } else {
-                            eprintln!("{}", ui::paint(ui::Tone::Warn, "no DTLS fingerprints available — skipping identity proof"));
+                            ui::say(&ui::paint(ui::Tone::Warn, "no DTLS fingerprints available — skipping identity proof"));
                         }
                     } else if let (Some(name), true) = (&remember, use_code) {
                         let sec = fresh_secret();
                         t.send_control(&json!({ "type": "pair-keep", "secret": sec })).await?;
                         devices_store(name, &sec)?;
-                        eprintln!("remembered this device as '{name}' (they must also pass --remember)");
+                        ui::say(&format!("remembered this device as '{name}' (they must also pass --remember)"));
                     }
                     // (Re-)offer everything unfinished; resume:true after a
                     // prior accept so receivers continue from their partial.
@@ -4490,10 +4519,8 @@ async fn send_cmd(
                             if let Some(b) = obj.get(&o.id).and_then(|x| x.as_u64()) {
                                 if o.done && b < o.size {
                                     o.done = false; // not actually done
-                                    eprintln!(
-                                        "{}",
-                                        ui::paint(ui::Tone::Warn, &format!("  state-diverged: {} — peer holds {b}/{}; re-offering", o.name, o.size))
-                                    );
+                                    // DEBUG — resilience internal (state-divergence re-offer).
+                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!("  state-diverged: {} — peer holds {b}/{}; re-offering", o.name, o.size)));
                                     if let Some(t) = conn.transport_of(&pid) {
                                         let mut offer = json!({
                                             "type": "file-offer", "id": o.id, "sid": o.sid,
@@ -4527,7 +4554,7 @@ async fn send_cmd(
                             if let Some(t) = conn.transport_of(&pid) {
                                 let _ = t.send_control(&json!({ "type": "pair-proof", "mac": mac })).await;
                                 reproved.insert(pid.clone());
-                                eprintln!("{}", ui::paint(ui::Tone::Dim, "  state-diverged: re-proving identity"));
+                                ui::debug(&ui::paint(ui::Tone::Dim, "  state-diverged: re-proving identity"));
                             }
                         }
                     }
@@ -4588,7 +4615,7 @@ async fn send_cmd(
                     let id = v["id"].as_str().unwrap_or_default();
                     let mut out = outgoing.lock().await;
                     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-                        eprintln!("declined: {}", o.name);
+                        ui::say(&format!("declined: {}", o.name));
                         o.done = true;
                     }
                 }
@@ -4614,7 +4641,8 @@ async fn send_cmd(
             Ev::TransferFailed { id, err } => {
                 let out = outgoing.lock().await;
                 let name = out.iter().find(|o| o.id == id).map(|o| o.name.as_str()).unwrap_or("?");
-                eprintln!("{name}: interrupted ({err}) — will resume on reconnect");
+                // DEBUG — resilience internal (transfer interrupted, will resume).
+                ui::debug(&format!("{name}: interrupted ({err}) — will resume on reconnect"));
             }
             // P0 (GAP-1): the bytes-moved watchdog declared this transfer stalled.
             // Drive the least-disruptive correction ladder, preserving the on-disk
@@ -4623,10 +4651,8 @@ async fn send_cmd(
                 if !conn.is_active(&pid) {
                     continue; // only the transfer-target peer's stall matters
                 }
-                eprintln!(
-                    "{}",
-                    ui::paint(ui::Tone::Warn, &format!("  stall detected: {idle_ms}ms with no data — correcting"))
-                );
+                // DEBUG — resilience internal (stall detection).
+                ui::debug(&ui::paint(ui::Tone::Warn, &format!("  stall detected: {idle_ms}ms with no data — correcting")));
                 match conn.correct_stall(&pid).await {
                     Rung::Resume => {
                         // Rung (a): re-issue every unfinished transfer with
@@ -4716,7 +4742,8 @@ async fn send_cmd(
                         let gid = v["id"].as_str().unwrap_or_default();
                         match gone {
                             Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, &format!("disconnected — waiting up to {secs}s"), &n)),
-                            None => eprintln!("peer disconnected — waiting up to {secs}s for them to come back"),
+                            // DEBUG — resilience internal (peer-disconnect wait).
+                            None => ui::debug(&format!("peer disconnected — waiting up to {secs}s for them to come back")),
                         }
                     }
                 }
@@ -4756,13 +4783,10 @@ async fn send_cmd(
                 // wait entirely (explicit legacy fire-and-forget).
                 if sent_all_at.map(|t| t.elapsed() >= ack_wait).unwrap_or(false) {
                     for o in out.iter_mut().filter(|o| !o.done) {
-                        eprintln!(
-                            "{}",
-                            ui::paint(ui::Tone::Warn, &format!(
-                                "  {}: no delivery-ack within {}s — peer may be too old to confirm; accepting on size (bytes were delivered + drained)",
-                                o.name, ack_wait.as_secs()
-                            ))
-                        );
+                        ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                            "  {}: no delivery-ack within {}s — peer may be too old to confirm; accepting on size (bytes were delivered + drained)",
+                            o.name, ack_wait.as_secs()
+                        )));
                         o.done = true;
                     }
                 }
@@ -4780,13 +4804,14 @@ async fn send_cmd(
                     // already drained in flush()). Surface a drain failure rather
                     // than silently reporting "done" on a partial transfer.
                     if let Err(e) = t.drain_finish().await {
-                        eprintln!("warning: transfer may be incomplete — {e}");
+                        // CRITICAL — a possibly-incomplete delivery; must-see even under -q.
+                        ui::critical(&ui::paint(ui::Tone::Warn, &format!("warning: transfer may be incomplete — {e}")));
                     }
                 }
                 for o in out.iter().filter(|o| o.temp) {
                     let _ = std::fs::remove_file(&o.path);
                 }
-                eprintln!("done.");
+                ui::say("done.");
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let _ = sio.disconnect().await;
                 return Ok(());
@@ -4810,7 +4835,8 @@ async fn stream_one(
         (o.sid, o.name.clone(), o.size, o.path.clone())
     };
     if offset > 0 {
-        eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
+        // DEBUG — resilience internal (transfer resuming from a saved offset).
+        ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
     }
     // #28 deterministic test hook: once we cross this byte offset, synthesize a
     // peer-left for the ACTIVE peer WITHOUT touching the data channel — exactly
@@ -4999,7 +5025,7 @@ async fn recv_cmd(
             // C12: announce on every known device's presence channel
             if !devices.is_empty() {
                 let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
-                eprintln!("watching for {} known device(s)", devices.len());
+                ui::say(&format!("watching for {} known device(s)", devices.len()));
                 sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
             }
         }
@@ -5224,7 +5250,8 @@ async fn recv_cmd(
                 if saw_down {
                     signaling_down_since = Some(Instant::now());
                     last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
-                    eprintln!("{}", ui::paint(ui::Tone::Warn, "  signaling link closed — reconnecting"));
+                    // DEBUG — resilience internal (signaling reconnect).
+                    ui::debug(&ui::paint(ui::Tone::Warn, "  signaling link closed — reconnecting"));
                 } else if silent_ms >= silence {
                     if !probed_silence {
                         // Heartbeat probe: force a sync NOW (bypassing the C30
@@ -5235,10 +5262,8 @@ async fn recv_cmd(
                     } else if silent_ms >= silence.saturating_mul(2) {
                         signaling_down_since = Some(Instant::now());
                         last_reconnect_try = Instant::now() - Duration::from_secs(60);
-                        eprintln!(
-                            "{}",
-                            ui::paint(ui::Tone::Warn, &format!("  signaling silent for {silent_ms}ms — reconnecting"))
-                        );
+                        // DEBUG — resilience internal (signaling reconnect).
+                        ui::debug(&ui::paint(ui::Tone::Warn, &format!("  signaling silent for {silent_ms}ms — reconnecting")));
                     }
                 }
             }
@@ -5278,16 +5303,12 @@ async fn recv_cmd(
                             last_signaling = Instant::now();
                             signaling_down_since = None;
                             probed_silence = false;
-                            eprintln!(
-                                "{}",
-                                ui::paint(ui::Tone::Ok, "  signaling reconnected — re-announcing presence")
-                            );
+                            // DEBUG — resilience internal (signaling reconnected).
+                            ui::debug(&ui::paint(ui::Tone::Ok, "  signaling reconnected — re-announcing presence"));
                         }
                         Err(e) => {
-                            eprintln!(
-                                "{}",
-                                ui::paint(ui::Tone::Dim, &format!("  signaling reconnect failed ({e}) — retrying with backoff"))
-                            );
+                            // DEBUG — resilience internal (signaling reconnect retry).
+                            ui::debug(&ui::paint(ui::Tone::Dim, &format!("  signaling reconnect failed ({e}) — retrying with backoff")));
                         }
                     }
                 }
@@ -5306,7 +5327,7 @@ async fn recv_cmd(
             for (n, s) in devices_load() {
                 let ch = channel_of(&s);
                 if known_channels.insert(ch.clone()) {
-                    eprintln!("new device '{n}' paired — now reachable");
+                    ui::say(&format!("new device '{n}' paired — now reachable"));
                     devices.push((n, s));
                     new_chans.push(ch);
                 }
@@ -5442,7 +5463,7 @@ async fn recv_cmd(
         if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
             && !conn.links.is_empty() && conn.only_deferred_links()
         {
-            eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+            ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
             let _ = sio.disconnect().await;
             return Ok(());
         }
@@ -5460,7 +5481,7 @@ async fn recv_cmd(
         {
             conn.waiting_rejoin = None;
             ui::clear_sticky();
-            eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+            ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
             let _ = sio.disconnect().await;
             return Ok(());
         }
@@ -5496,7 +5517,7 @@ async fn recv_cmd(
                 None => last_quiet = Some(Instant::now()),
                 Some(since) if since.elapsed() > quiet_window => {
                     ui::say(&ui::paint(ui::Tone::Dim, "  (peer-left never arrived — exiting on quiet)"));
-                    eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+                    ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
                     let _ = sio.disconnect().await;
                     return Ok(());
                 }
@@ -5552,7 +5573,7 @@ async fn recv_cmd(
                     for p in &peers {
                         let id = p["id"].as_str().unwrap_or_default();
                         if !id.is_empty() && !conn.links.contains_key(id) {
-                            eprintln!("{}", ui::paint(ui::Tone::Dim, "  (digest: adopting a peer we never heard join)"));
+                            ui::debug(&ui::paint(ui::Tone::Dim, "  (digest: adopting a peer we never heard join)"));
                             conn.maybe_adopt(p, true).await?;
                         }
                     }
@@ -5632,7 +5653,7 @@ async fn recv_cmd(
                     continue; // our own sender/daemon shares these channels
                 }
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
-                    eprintln!("known device '{n}' appeared — connecting");
+                    ui::say(&format!("known device '{n}' appeared — connecting"));
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
                     // rung-1: known device = both CLIs; try direct QUIC first.
                     let (n, sec) = (n.clone(), sec.clone());
@@ -5712,21 +5733,23 @@ async fn recv_cmd(
                             for _ in 0..6 {
                                 tokio::time::sleep(Duration::from_millis(400)).await;
                                 if let Some(r) = p.route().await {
-                                    ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
+                                    // CRITICAL: the route label is the value-prop —
+                                    // direct vs relayed. Always shown, even under -q.
+                                    ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                     // Relay honesty (§3.3): the quiet `route:` line
                                     // is legible but not loud. When the route is
                                     // actually the TURN relay, print the honest
                                     // one-line banner so the user is never unaware
-                                    // they're on a middleman path.
+                                    // they're on a middleman path. CRITICAL.
                                     if r == "relayed" {
-                                        ui::say(&format!("    {}", relay_banner()));
+                                        ui::critical(&format!("    {}", relay_banner()));
                                     }
                                     break;
                                 }
                             }
                         });
                     } else if is_direct {
-                        ui::say(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
+                        ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                 }
                 // C29: an in-session pairing — exactly one side hands over a
@@ -5775,7 +5798,8 @@ async fn recv_cmd(
                         l2::OpenVerdict::Deny { sid, err } => {
                             // Log refused dials (threat model: port-scan / SSRF
                             // visibility). The gate observes this line.
-                            eprintln!("l2: refused stream {sid:#x}: {err}");
+                            // DEBUG — l2 diagnostic (port-scan / SSRF visibility).
+                            ui::debug(&format!("l2: refused stream {sid:#x}: {err}"));
                             let _ = t
                                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
                                 .await;
@@ -5808,7 +5832,7 @@ async fn recv_cmd(
                             .unwrap_or(false);
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        eprintln!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)");
+                        ui::say(&format!("l2: shell bootstrap refused: {who} (no shell cap / untrusted)"));
                         let _ = t
                             .send_control(&json!({
                                 "type": "shell-bootstrap-deny",
@@ -5827,7 +5851,7 @@ async fn recv_cmd(
                     let pubkey = match sshkeys::validate_pubkey(&pubkey) {
                         Ok(k) => k,
                         Err(e) => {
-                            eprintln!("l2: shell bootstrap refused: malformed pubkey from '{device}': {e}");
+                            ui::say(&format!("l2: shell bootstrap refused: malformed pubkey from '{device}': {e}"));
                             let _ = t
                                 .send_control(&json!({
                                     "type": "shell-bootstrap-deny",
@@ -5841,9 +5865,7 @@ async fn recv_cmd(
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
                             let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
-                            eprintln!(
-                                "l2: shell granted to '{device}' — installed managed key (filament-managed block)"
-                            );
+                            ui::say(&format!("l2: shell granted to '{device}' — installed managed key (filament-managed block)"));
                             let _ = t
                                 .send_control(&json!({
                                     "type": "shell-bootstrap-ack",
@@ -5853,7 +5875,7 @@ async fn recv_cmd(
                                 .await;
                         }
                         Err(e) => {
-                            eprintln!("l2: shell bootstrap install failed for '{device}': {e}");
+                            ui::say(&format!("l2: shell bootstrap install failed for '{device}': {e}"));
                             let _ = t
                                 .send_control(&json!({
                                     "type": "shell-bootstrap-deny",
@@ -5882,7 +5904,7 @@ async fn recv_cmd(
                             .unwrap_or(false);
                     if !granted {
                         let who = dev.as_deref().unwrap_or("<unverified>");
-                        eprintln!("l2: pty refused: {who} (no shell cap / untrusted)");
+                        ui::say(&format!("l2: pty refused: {who} (no shell cap / untrusted)"));
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell capability not granted" }))
                             .await;
@@ -5898,12 +5920,12 @@ async fn recv_cmd(
                     // PTY cap BEFORE spawning a shell. A flaky/hostile paired
                     // device can otherwise flood `pty-open` and exhaust threads.
                     if mux.at_stream_cap().await {
-                        eprintln!("l2: pty refused: too many streams on this link");
+                        ui::say("l2: pty refused: too many streams on this link");
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
                         continue;
                     }
                     let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
-                        eprintln!("l2: pty refused: too many PTYs (global cap {})", l2::MAX_PTYS_GLOBAL);
+                        ui::say(&format!("l2: pty refused: too many PTYs (global cap {})", l2::MAX_PTYS_GLOBAL));
                         let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
                         continue;
                     };
@@ -5912,7 +5934,7 @@ async fn recv_cmd(
                     // Resizer is owned by the mux so it is freed on EVERY teardown
                     // path (inbound l2-close, serve_pty exit, link death) — H-1.
                     mux.register_resizer(sid, rtx).await;
-                    eprintln!("l2: pty granted to '{}' — {cols}x{rows}", dev.unwrap_or_default());
+                    ui::say(&format!("l2: pty granted to '{}' — {cols}x{rows}", dev.unwrap_or_default()));
                     let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
                     tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(shell_user.as_deref()), rx, rrx, pty_guard));
                 }
@@ -5955,7 +5977,7 @@ async fn recv_cmd(
                     if sec.len() == 64 {
                         let kept = if let Some(name) = &remember {
                             devices_store(name, &sec)?;
-                            eprintln!("remembered this device as '{name}' — future sends auto-accept after proof");
+                            ui::say(&format!("remembered this device as '{name}' — future sends auto-accept after proof"));
                             true
                         } else if ceremony == Some(false) {
                             // C29: we typed their code into this session — the
@@ -5974,7 +5996,7 @@ async fn recv_cmd(
                             ));
                             true
                         } else {
-                            eprintln!("(sender offered to be remembered; re-run with --remember <name> to keep it)");
+                            ui::say("(sender offered to be remembered; re-run with --remember <name> to keep it)");
                             false
                         };
                         // C27: answer either way — a declined sender discards
@@ -6025,14 +6047,14 @@ async fn recv_cmd(
                         None => None,
                     };
                     let Some((my_fp, their_fp)) = fps else {
-                        eprintln!("pair-proof received before fingerprints known — ignoring");
+                        ui::debug("pair-proof received before fingerprints known — ignoring");
                         continue;
                     };
                     // #9: pair secrets are symmetric — our own install holds
                     // every secret we do, so a same-host process could prove
                     // "pop2" and tunnel callers into the WRONG machine. Refuse.
                     let hit = if is_self_uid(&conn.my_uid, Some(peer_uid.as_str())) {
-                        eprintln!("pair-proof from our own install — refusing (self-connect)");
+                        ui::debug("pair-proof from our own install — refusing (self-connect)");
                         None
                     } else {
                         devices
@@ -6047,10 +6069,11 @@ async fn recv_cmd(
                             // under exactly this, not the presence display name).
                             l.verified_name = Some(n.clone());
                         }
-                        eprintln!("identity verified: '{n}' (auto-accepting)");
+                        ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
                         true
                     } else {
-                        eprintln!("pair-proof FAILED verification — treating peer as untrusted");
+                        // CRITICAL — a security verdict the user must see (-q too).
+                        ui::critical(&ui::paint(ui::Tone::Warn, "pair-proof FAILED verification — treating peer as untrusted"));
                         false
                     };
                     // C27: tell the prover the verdict — a rejected prover
@@ -6118,7 +6141,8 @@ async fn recv_cmd(
                                     offset = prior;
                                     prior_full = m.full;
                                 } else {
-                                    eprintln!("{name}: same name+size but different content — restarting from 0");
+                                    // DEBUG — resilience internal (resume mismatch, restart).
+                                    ui::debug(&format!("{name}: same name+size but different content — restarting from 0"));
                                 }
                             }
                             _ => {}
@@ -6243,7 +6267,8 @@ async fn recv_cmd(
                     // offer's, else the one persisted with the partial (resume).
                     let effective_full = offer_full.clone().or(prior_full);
                     let file = if offset > 0 {
-                        eprintln!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0);
+                        // DEBUG — resilience internal (receiver resuming from offset).
+                        ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
                         tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
                     } else {
                         PartMeta { size, head: offer_head, full: effective_full.clone() }.store(&meta_path)?;
@@ -6320,7 +6345,9 @@ async fn recv_cmd(
                                         // Give up CLEANLY: keep the partial, surface
                                         // the cause, do not finalize, do not ack. No
                                         // silent bad file; re-running can still retry.
-                                        ui::say(&ui::paint(ui::Tone::Err, &format!(
+                                        // CRITICAL — a clean terminal refusal (corrupt file
+                                        // rejected); the user must see it even under -q.
+                                        ui::critical(&ui::paint(ui::Tone::Err, &format!(
                                             "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches — refusing to accept a corrupt file (partial kept)",
                                             inc.name
                                         )));
@@ -6340,12 +6367,14 @@ async fn recv_cmd(
                                         let _ = tokio::fs::File::create(&inc.part_path).await; // truncate to 0
                                         inc.received = 0;
                                         req_offset = 0;
-                                        ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                                        // DEBUG — resilience internal (P4 whole-file re-fetch).
+                                        ui::debug(&ui::paint(ui::Tone::Warn, &format!(
                                             "  {}: received all bytes but whole-file checksum FAILED (corrupt) — re-fetching from 0 (attempt {})",
                                             inc.name, *fails
                                         )));
                                     } else {
-                                        ui::say(&ui::paint(ui::Tone::Warn, &format!(
+                                        // DEBUG — resilience internal (P4 truncation re-request).
+                                        ui::debug(&ui::paint(ui::Tone::Warn, &format!(
                                             "  {}: TRUNCATED ({}/{}) — checksum can't match yet; re-requesting the rest (attempt {})",
                                             inc.name, human(inc.received), human(inc.size), *fails
                                         )));
@@ -6491,10 +6520,8 @@ async fn recv_cmd(
             // saved offset (no restart-from-zero). For a WebRTC link the repair
             // is the impolite-side ICE-restart inside correct_stall.
             Ev::TransferStalled(pid, idle_ms) => {
-                eprintln!(
-                    "{}",
-                    ui::paint(ui::Tone::Warn, &format!("  inbound stall: {idle_ms}ms with no data from peer — repairing link"))
-                );
+                // DEBUG — resilience internal (inbound stall detection).
+                ui::debug(&ui::paint(ui::Tone::Warn, &format!("  inbound stall: {idle_ms}ms with no data from peer — repairing link")));
                 // P0 partial-preservation: flush THIS peer's in-flight partials
                 // to their `.part` on disk and release the in-memory handles, so
                 // the C23 "already receiving" guard doesn't reject the sender's
@@ -6507,7 +6534,7 @@ async fn recv_cmd(
                 for key in stale {
                     if let Some(mut inc) = by_sid.remove(&key) {
                         let _ = inc.file.flush().await;
-                        eprintln!("{}: parked at {} for resume", inc.name, human(inc.received));
+                        ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received)));
                     }
                 }
                 match conn.correct_stall(&pid).await {
@@ -6582,7 +6609,7 @@ async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, &format!("  sender disconnected mid-transfer — waiting up to {secs}s")));
                         flush_inflight(&mut by_sid).await;
                     } else if completed > 0 && !keep_open {
-                        eprintln!("done ({completed} file{}).", if completed == 1 { "" } else { "s" });
+                        ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
                         let _ = sio.disconnect().await;
                         return Ok(());
                     } else if paired && !keep_open {
@@ -6763,7 +6790,7 @@ async fn sweep_completed_streams(
 async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     for (_sid, mut inc) in by_sid.drain() {
         let _ = inc.file.flush().await;
-        eprintln!("{}: parked at {} for resume", inc.name, human(inc.received));
+        ui::debug(&format!("{}: parked at {} for resume", inc.name, human(inc.received)));
     }
 }
 

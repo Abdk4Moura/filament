@@ -282,15 +282,16 @@ pub async fn connect(
     .ok()?;
     let (r, punch_sock) = punch_result;
     if let Err(e) = r {
-        eprintln!("filament: {e}");
+        crate::ui::trace(&format!("filament: {e}"));
         return None; // step down to WebRTC
     }
-    eprintln!("filament: HOLEPUNCH ok — NAT open toward {peer_srflx}, starting QUIC");
+    // DEBUG — direct/hole-punch internal.
+    crate::ui::debug(&format!("filament: HOLEPUNCH ok — NAT open toward {peer_srflx}, starting QUIC"));
 
     let endpoint = match endpoint_from_socket(punch_sock) {
         Ok(ep) => ep,
         Err(e) => {
-            eprintln!("filament: holepunch endpoint build failed: {e}");
+            crate::ui::trace(&format!("filament: holepunch endpoint build failed: {e}"));
             return None;
         }
     };

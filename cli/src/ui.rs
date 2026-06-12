@@ -6,9 +6,80 @@
 // only, so logs and scripts stay clean. NO_COLOR and TERM=dumb are honored.
 
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
+
+// ------------------------------------------------------------- verbosity --
+// One global output LEVEL, resolved once at startup. The default is `info`:
+// the normal useful lines print, the resilience firehose (debug/trace) is
+// gated, and the value-prop lines (route label, relay banner, P1 fall-to-relay,
+// P5 upgrade, fatals) are `critical` so they survive even `-q`.
+//
+//   critical(0) — always shown, even under -q. The value-prop + must-see.
+//   info(1)     — DEFAULT. The normal useful lines (connection, ✓, transfer).
+//   debug(2)    — resilience internals (stall/repair/reconnect/cutover/probe).
+//   trace(3)    — ICE candidates, per-frame, signaling/direct-offer detail.
+
+/// Output verbosity levels. Lower = more important / always shown.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Level {
+    Critical = 0,
+    Info = 1,
+    Debug = 2,
+    Trace = 3,
+}
+
+// Stored as the configured ceiling: a line at `lvl` prints iff `lvl <= VERBOSITY`.
+// Default = Info (1).
+static VERBOSITY: AtomicU8 = AtomicU8::new(Level::Info as u8);
+
+/// Resolve and install the global verbosity ONCE, at startup. Precedence:
+///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env — OVERRIDES the flags.
+///   2. otherwise the clap flags: `-q/--quiet` → critical; repeated `-v` raises
+///      info → debug → trace (count saturates at trace).
+/// Call this from `main` right after parsing, before any worker spawns.
+pub fn init_verbosity(verbose: u8, quiet: bool) {
+    let level = if let Ok(s) = std::env::var("FILAMENT_LOG") {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "critical" | "crit" | "quiet" | "q" => Level::Critical,
+            "info" => Level::Info,
+            "debug" | "v" => Level::Debug,
+            "trace" | "vv" => Level::Trace,
+            _ => resolve_from_flags(verbose, quiet),
+        }
+    } else {
+        resolve_from_flags(verbose, quiet)
+    };
+    VERBOSITY.store(level as u8, Ordering::Relaxed);
+}
+
+fn resolve_from_flags(verbose: u8, quiet: bool) -> Level {
+    if quiet {
+        return Level::Critical;
+    }
+    match verbose {
+        0 => Level::Info,
+        1 => Level::Debug,
+        _ => Level::Trace,
+    }
+}
+
+/// The currently configured verbosity ceiling.
+#[allow(dead_code)] // public accessor; callers use `enabled()` today
+pub fn verbosity() -> Level {
+    match VERBOSITY.load(Ordering::Relaxed) {
+        0 => Level::Critical,
+        1 => Level::Info,
+        2 => Level::Debug,
+        _ => Level::Trace,
+    }
+}
+
+/// True iff a line at `lvl` should print under the configured verbosity.
+pub fn enabled(lvl: Level) -> bool {
+    (lvl as u8) <= VERBOSITY.load(Ordering::Relaxed)
+}
 
 pub struct Caps {
     pub tty: bool,
@@ -140,7 +211,10 @@ fn paint_live(line: &str) {
 }
 
 /// Permanent line (survives in scrollback); repaints any sticky line below.
-pub fn say(line: &str) {
+/// The raw emitter — every leveled helper funnels through here once it has
+/// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
+/// `debug`/`trace`) at call sites so the verbosity gate is applied.
+fn emit(line: &str) {
     clear_live();
     eprintln!("{line}");
     if let Ok(s) = STICKY.lock() {
@@ -149,6 +223,41 @@ pub fn say(line: &str) {
                 paint_live(st);
             }
         }
+    }
+}
+
+/// INFO level (the default): the normal useful lines — connection established,
+/// ✓ peer / route, transfer started/complete, pairing success. Printed at the
+/// default verbosity and above; suppressed under `-q`.
+pub fn say(line: &str) {
+    if enabled(Level::Info) {
+        emit(line);
+    }
+}
+
+/// CRITICAL level: the value-prop + must-see lines — the route label, the relay
+/// banner, P1's fall-to-relay, P5's upgrade/relay-released, and fatal errors.
+/// ALWAYS printed, even under `-q` (critical is level 0).
+pub fn critical(line: &str) {
+    if enabled(Level::Critical) {
+        emit(line);
+    }
+}
+
+/// DEBUG level (`-v`): resilience internals — stall detected, resuming, in-place
+/// repair, signaling reconnecting/reconnected, warm cutover, upgrade-probe
+/// attempts. No-op at the default level.
+pub fn debug(line: &str) {
+    if enabled(Level::Debug) {
+        emit(line);
+    }
+}
+
+/// TRACE level (`-vv` / `FILAMENT_LOG=trace`): ICE candidates, per-frame,
+/// signaling / direct-offer detail. No-op below trace.
+pub fn trace(line: &str) {
+    if enabled(Level::Trace) {
+        emit(line);
     }
 }
 
@@ -317,4 +426,46 @@ pub fn qr(url: &str) -> String {
         y += 2;
     }
     out
+}
+
+#[cfg(test)]
+mod verbosity_tests {
+    use super::*;
+
+    #[test]
+    fn flags_map_to_levels() {
+        // -q wins → critical; no flags → info; -v → debug; -vv (and up) → trace.
+        assert_eq!(resolve_from_flags(0, true), Level::Critical);
+        assert_eq!(resolve_from_flags(2, true), Level::Critical); // quiet beats -v count
+        assert_eq!(resolve_from_flags(0, false), Level::Info);
+        assert_eq!(resolve_from_flags(1, false), Level::Debug);
+        assert_eq!(resolve_from_flags(2, false), Level::Trace);
+        assert_eq!(resolve_from_flags(9, false), Level::Trace); // saturates
+    }
+
+    #[test]
+    fn enabled_respects_ceiling() {
+        // At the default (info) ceiling, critical+info print; debug+trace gated.
+        VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
+        assert!(enabled(Level::Critical));
+        assert!(enabled(Level::Info));
+        assert!(!enabled(Level::Debug));
+        assert!(!enabled(Level::Trace));
+
+        // Under -q (critical), only critical prints.
+        VERBOSITY.store(Level::Critical as u8, Ordering::Relaxed);
+        assert!(enabled(Level::Critical));
+        assert!(!enabled(Level::Info));
+        assert!(!enabled(Level::Debug));
+
+        // Under -v (debug), critical+info+debug print, trace still gated.
+        VERBOSITY.store(Level::Debug as u8, Ordering::Relaxed);
+        assert!(enabled(Level::Critical));
+        assert!(enabled(Level::Info));
+        assert!(enabled(Level::Debug));
+        assert!(!enabled(Level::Trace));
+
+        // restore default for any later same-process readers.
+        VERBOSITY.store(Level::Info as u8, Ordering::Relaxed);
+    }
 }
