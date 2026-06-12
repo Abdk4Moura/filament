@@ -11,7 +11,9 @@
 // This mirrors the CLI exactly (cli/src/main.rs channel_of / proof_for) — the
 // strings MUST stay byte-identical or browsers and CLIs stop recognizing
 // each other.
+import { log } from './log.js'
 
+const dlog = log.scope('dev')
 const KEY = 'filament-known-devices'
 
 export function devicesLoad() {
@@ -31,7 +33,7 @@ export function devicesStore(name, secret) {
   } catch (e) {
     // Private Browsing / storage blocked: the device won't be remembered and
     // auto-reconnect won't work — say so where a debugger will look.
-    console.warn('filament: could not persist known device (private browsing?)', e)
+    dlog.warn('could not persist known device (private browsing?)', e)
   }
   return list
 }
@@ -46,7 +48,7 @@ export function devicesStoreV2(name, secret, caps) {
   try {
     localStorage.setItem(KEY, JSON.stringify(list))
   } catch (e) {
-    console.warn('filament: could not persist known device (private browsing?)', e)
+    dlog.warn('could not persist known device (private browsing?)', e)
   }
   return list
 }
@@ -79,7 +81,7 @@ export function devicesRename(oldName, newName) {
   try {
     localStorage.setItem(KEY, JSON.stringify(list))
   } catch (e) {
-    console.warn('filament: could not persist device rename (private browsing?)', e)
+    dlog.warn('could not persist device rename (private browsing?)', e)
   }
   return list
 }

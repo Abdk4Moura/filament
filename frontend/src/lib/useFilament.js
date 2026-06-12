@@ -12,6 +12,7 @@ import { createSession } from './session.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
+import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintNameplate } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, PAIR_V2_CAPS } from './pairing.js'
@@ -132,8 +133,19 @@ export function useFilament() {
   // Update an EXISTING peer only — never re-adds (#3). A late callback from a
   // closed PeerLink must not resurrect a tile we already removed.
   const updatePeer = useCallback((id, patch) => {
-    if (patch.status) telPeer(id, patch.status)
-    if (patch.route) tel('peer-route', { peer: id.slice(-6), route: patch.route })
+    if (patch.status) {
+      telPeer(id, patch.status)
+      // info = the value-prop moment a peer becomes usable; failures are warn.
+      if (patch.status === 'ready') log.info('peer ready', id.slice(-6))
+      else if (patch.status === 'failed') log.warn('peer failed', id.slice(-6))
+      else log.debug('peer status', id.slice(-6), patch.status)
+    }
+    if (patch.route) {
+      tel('peer-route', { peer: id.slice(-6), route: patch.route })
+      // route change direct<->relay is the firehose's debug tier; the value
+      // proposition itself stays in the UI (route badge / amber relay chip).
+      log.debug('route', id.slice(-6), patch.route)
+    }
     setPeers((prev) => {
       const i = prev.findIndex((x) => x.id === id)
       if (i === -1) return prev
@@ -149,6 +161,13 @@ export function useFilament() {
 
   const upsertTransfer = useCallback((t) => {
     transferOwner.current.set(t.id, t.peerId)
+    if (t.status && transferStatusRef.current.get(t.id) !== t.status) {
+      // info = transfer reached a terminal/usable state; transferring chatter
+      // and progress are trace.
+      if (t.status === 'complete') log.info('transfer complete', t.id, t.name || '')
+      else if (t.status === 'failed' || t.status === 'declined') log.debug('transfer ' + t.status, t.id)
+      else log.trace('transfer', t.id, t.status)
+    }
     if (t.status) transferStatusRef.current.set(t.id, t.status)
     setTransfers((prev) => {
       const i = prev.findIndex((x) => x.id === t.id)
@@ -627,6 +646,7 @@ export function useFilament() {
       // One-time pairing (#11): the server matched us with the code's other
       // party — the code is burned; move both into the private room.
       sig.on('pair-matched', ({ room }) => {
+        log.debug('pair matched — joining room')
         setRoomCode(null)
         rejoinRef.current?.(room, 'pair')
       })
@@ -637,7 +657,7 @@ export function useFilament() {
         setRoomScope((s) => (s === 'code' ? prevScopeRef.current || 'auto' : s))
       })
       sig.on('pair-error', ({ error, why }) => {
-        console.warn('pairing failed:', error, why || '')
+        log.warn('pairing failed:', error, why || '')
         // Only translate CLAIM failures (we typed a code) into user-facing
         // status. A create-side collision ('taken') is handled by generateCode's
         // own retry and must not flash an error here.
@@ -661,6 +681,10 @@ export function useFilament() {
       // and refresh ICE config on reconnect — TURN creds are time-limited (#9).
       sig.on('status', ({ connected: up }) => {
         tel(up ? 'socket-up' : 'socket-down', {})
+        // info = socket connected (a lifecycle landmark); a drop is debug —
+        // the rejoin is automatic, so it's not a user-actionable warning.
+        if (up) log.info('socket connected')
+        else log.debug('socket disconnected (auto-reconnecting)')
         if (!up) telFlush()
         setConnected(up)
         connectedRef.current = up
@@ -919,6 +943,7 @@ export function useFilament() {
         clearTimeout(watchdog)
         const full = pendingPakeRef.current?.full
         tel('pair-create-ok', { rttMs: Date.now() - t0, retried, v: 2 })
+        log.debug('pair code ready', { rttMs: Date.now() - t0, retried })
         setRoomCode(full)
         setPairStatus('pairing')
         setRoomScope((s) => {

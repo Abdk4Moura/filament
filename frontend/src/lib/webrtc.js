@@ -10,6 +10,9 @@
 //   complete     -> done; a receive transfer also carries { url, blob }
 //   declined     -> receiver said no
 //   failed       -> connection/transfer error
+import { log } from './log.js'
+
+const rlog = log.scope('rtc')
 
 const CTRL = {
   OFFER: 'file-offer',
@@ -113,7 +116,10 @@ export class PeerLink {
 
     this.pc = new RTCPeerConnection({ iceServers })
     this.pc.onicecandidate = (e) => {
-      if (e.candidate) this.sendSignal({ type: 'candidate', candidate: e.candidate })
+      if (e.candidate) {
+        rlog.trace('ice candidate', this.id.slice(-6), e.candidate.candidate)
+        this.sendSignal({ type: 'candidate', candidate: e.candidate })
+      }
     }
     // All (re)negotiation funnels through here — we never hand-roll offers.
     // Explicit createOffer (not the no-arg setLocalDescription()) for older
@@ -125,7 +131,7 @@ export class PeerLink {
         await this.pc.setLocalDescription(offer)
         this.sendSignal({ type: 'description', description: this.pc.localDescription })
       } catch (err) {
-        console.error('negotiation failed', err)
+        rlog.error('negotiation failed', this.id.slice(-6), err)
       } finally {
         this._makingOffer = false
       }
@@ -133,18 +139,21 @@ export class PeerLink {
     this.pc.ondatachannel = (e) => this._setChannel(e.channel)
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState
+      rlog.trace('connectionState', this.id.slice(-6), s)
       if (s === 'connected') {
         clearTimeout(this._dcTimer)
         clearTimeout(this._watchdog) // established — watchdog stands down (#8)
         this.onStatus('ready')
         this._detectRoute() // which physical path did ICE actually pick?
       } else if (s === 'disconnected') {
+        rlog.debug('peer disconnected — attempting recovery', this.id.slice(-6))
         // Usually a transient blip (#6): show 'connecting' (or keep 'away' if
         // they announced the absence), nudge an ICE restart from the impolite
         // side, and only fail if it doesn't recover in time.
         this.onStatus((this._awayUntil || 0) > Date.now() ? 'away' : 'connecting')
         if (!this.polite) {
           try {
+            rlog.debug('restarting ICE (repair)', this.id.slice(-6))
             this.pc.restartIce()
           } catch {}
         }
@@ -191,7 +200,7 @@ export class PeerLink {
   enqueueSignal(data) {
     this._signalQ = this._signalQ
       .then(() => this._handleSignal(data))
-      .catch((err) => console.error('signal handling failed', err))
+      .catch((err) => rlog.error('signal handling failed', this.id.slice(-6), err))
     return this._signalQ
   }
 
@@ -218,7 +227,7 @@ export class PeerLink {
       try {
         await this.pc.addIceCandidate(data.candidate)
       } catch (err) {
-        if (!this._ignoreOffer) console.error('addIceCandidate failed', err)
+        if (!this._ignoreOffer) rlog.warn('addIceCandidate failed', this.id.slice(-6), err)
       }
     }
   }
@@ -230,7 +239,7 @@ export class PeerLink {
       try {
         await this.pc.addIceCandidate(c)
       } catch (err) {
-        console.error('queued candidate failed', err)
+        rlog.warn('queued candidate failed', this.id.slice(-6), err)
       }
     }
   }
