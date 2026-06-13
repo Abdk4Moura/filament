@@ -44,6 +44,13 @@ const ACK_FALLBACK_MS = 30000
 //   ?test=trunconce  -> on the RECEIVER, drop the final chunk before file-end
 //                       exactly once, inducing a truncated receive so the
 //                       whole-file verify + re-request path is exercised live.
+//   ?test=freeze     -> P0: after FREEZE_AFTER_BYTES on a transfer, make
+//                       _streamFile's channel.send a no-op for THAT transfer
+//                       once (one-shot) while the channel stays open — a
+//                       faithful NAT-rebind black-hole that drives the in-flight
+//                       stall watchdog + correction ladder. Mirrors the Rust
+//                       client's FILAMENT_TEST_FREEZE_AFTER_BYTES. Inert for
+//                       real users (TEST.freeze is false).
 function _testFlags() {
   try {
     const q = new URLSearchParams(window.location.search).get('test')
@@ -55,8 +62,42 @@ function _testFlags() {
 }
 const TEST = (() => {
   const f = _testFlags()
-  return { fixedId: f.includes('fixedid'), truncOnce: f.includes('trunconce') }
+  return { fixedId: f.includes('fixedid'), truncOnce: f.includes('trunconce'), freeze: f.includes('freeze') }
 })()
+
+// P0 test knob: bytes a frozen transfer is allowed to send before the data path
+// goes dark (mirrors FILAMENT_TEST_FREEZE_AFTER_BYTES). Overridable via
+// ?freezeafter=<bytes>; defaults to a value a multi-chunk file crosses quickly.
+const FREEZE_AFTER_BYTES = (() => {
+  try {
+    const v = parseInt(new URLSearchParams(window.location.search).get('freezeafter') || '', 10)
+    return Number.isFinite(v) && v > 0 ? v : 700000
+  } catch {
+    return 700000
+  }
+})()
+
+// P0 (GAP-1): the in-flight STALL watchdog. We tick every STALL_TICK_MS and, if
+// a transfer is `transferring` over an OPEN channel yet no bytes have moved (and
+// the SCTP send buffer isn't draining) for >= STALL_MS, the data path has gone
+// dark (NAT-rebind black-hole / path death) even though the channel reports
+// `open` and the pc stays `connected`. Mirrors the Rust client's idle_ms()
+// watchdog (STALL_MS_DEFAULT=6000, cli/src/net.rs:55). The threshold is on TIME
+// SINCE THE LAST BYTE, never throughput, so a slow-but-moving link never trips.
+const STALL_TICK_MS = 2000
+// Override STALL_MS via ?stallms=<ms> for the A/B baseline (huge => the watchdog
+// is effectively off and a freeze must HANG), mirroring FILAMENT_STALL_MS.
+const STALL_MS = (() => {
+  try {
+    const v = parseInt(new URLSearchParams(window.location.search).get('stallms') || '', 10)
+    return Number.isFinite(v) && v > 0 ? v : 6000
+  } catch {
+    return 6000
+  }
+})()
+// Ladder ceiling (mirror Rust STALL_MAX_REPAIRS' intent): rungs a→c, then fail
+// clean through _failActive (paused/resumable — never silently dead).
+const MAX_STALL_ATTEMPTS = 3
 
 let _tid = 0
 const nextTransferId = () =>
@@ -150,7 +191,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
+  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -159,6 +200,11 @@ export class PeerLink {
     this.onTransfer = onTransfer || (() => {})
     this.onRoute = onRoute || (() => {})
     this.onChannelOpen = onChannelOpen || (() => {})
+    // P0: escalation hook fired at rung (c) when an in-flight stall persists past
+    // the in-place repair ladder. P1 wires this to the relay-preferred rebuild +
+    // the amber UI; until then it's a no-op (the ladder still fails clean via
+    // _failActive on exhaustion — partials preserved).
+    this.onStall = onStall || (() => {})
     this.onPairKeep = onPairKeep || (() => {}) // C12: peer handed us a pair secret
     this.onPairKeepAck = onPairKeepAck || (() => {}) // C27: peer answered our remember offer
     this.onPairProof = onPairProof || (() => {}) // C20: peer claims to be a known device
@@ -194,6 +240,18 @@ export class PeerLink {
     this._drainWaiters = [] // backpressure waiters fed by one shared onbufferedamountlow
     this._closed = false // guards late callbacks after teardown (#3)
     this._dcTimer = null // grace timer for transient 'disconnected' (#6)
+
+    // P0 (GAP-1): in-flight bytes-moved liveness. `_bytesMoved` counts FILE
+    // bytes sent + received on this link (PTY bytes excluded — file-transfer
+    // liveness only). The watchdog compares it (and the SCTP send buffer level)
+    // against the last tick's snapshot to tell "data wedged, link alive" (→ the
+    // correction ladder) from a slow-but-moving link (→ no action).
+    this._bytesMoved = 0
+    this._lastMovedSnapshot = 0
+    this._lastBuffered = 0
+    this._stallIdleMs = 0 // accumulated no-progress time across ticks
+    this._stallEpisode = null // {rung, at} latch: prevents re-entering a rung mid-convergence (mirrors Rust repair_in_flight)
+    this._stallTimer = null // the watchdog interval (armed on channel open)
 
     this.pc = new RTCPeerConnection({ iceServers })
     this.pc.onicecandidate = (e) => {
@@ -378,6 +436,17 @@ export class PeerLink {
       // beliefs (lost END, lost proof, stale away) self-correct.
       clearInterval(this._stateTimer)
       this._stateTimer = setInterval(() => this._sendState(), 10000)
+      // P0: arm the in-flight stall watchdog alongside the state ticker. It is
+      // disjoint from the establishment _watchdog (which only runs pre-connected)
+      // and from C4's _dcTimer (which only arms on 'disconnected'): during a
+      // black-hole the pc stays 'connected' and the channel 'open', so only this
+      // detector runs. Reset the baseline so the first tick starts clean.
+      this._lastMovedSnapshot = this._bytesMoved
+      this._lastBuffered = this.channel?.bufferedAmount || 0
+      this._stallIdleMs = 0
+      this._stallEpisode = null
+      clearInterval(this._stallTimer)
+      this._stallTimer = setInterval(() => this._checkStall(), STALL_TICK_MS)
     }
     channel.onmessage = (e) => this._onMessage(e.data)
     // One persistent drain handler feeds ALL concurrent senders — never
@@ -407,6 +476,7 @@ export class PeerLink {
     const payload = data.slice(4)
     entry.buffers.push(payload)
     entry.received += payload.byteLength
+    this._bytesMoved += payload.byteLength // P0: inbound file bytes = data path alive (PTY excluded — handled above)
     this._update(this.transfers.get(id), { progress: entry.size ? entry.received / entry.size : 0 })
   }
 
@@ -750,6 +820,7 @@ export class PeerLink {
     const { file, sid } = entry
     this._update(t, { status: 'transferring', progress: file.size ? startOffset / file.size : 0 })
     let offset = Math.max(0, Math.min(startOffset, file.size))
+    let sentThisRun = 0 // P0 freeze shim: bytes pushed since this _streamFile call began
     while (offset < file.size) {
       if (this._closed || this.channel?.readyState !== 'open') return // dropped mid-transfer
       const buf = await file.slice(offset, offset + this.chunkSize).arrayBuffer()
@@ -762,8 +833,20 @@ export class PeerLink {
       const framed = new Uint8Array(4 + buf.byteLength)
       new DataView(framed.buffer).setUint32(0, sid)
       framed.set(new Uint8Array(buf), 4)
+      // P0 test shim (?test=freeze): after FREEZE_AFTER_BYTES on THIS transfer,
+      // make the data-path send a no-op ONCE (one-shot per transfer) while the
+      // channel stays open — a faithful NAT-rebind black-hole. The control path
+      // keeps flowing, the channel stays 'open', the pc stays 'connected'; only
+      // the bytes-moved watchdog can catch this. Inert in production.
+      if (TEST.freeze && !this._frozenIds?.has(id) && sentThisRun + buf.byteLength > FREEZE_AFTER_BYTES) {
+        ;(this._frozenIds ||= new Set()).add(id) // one-shot: rung (a)/(b)'s re-stream sends normally
+        rlog.debug('[test] data-path FREEZE engaged — dropping chunks (channel stays open)', id, 'after', sentThisRun)
+        return // park the sender loop without advancing offset; the partial is preserved
+      }
       this.channel.send(framed)
       offset += buf.byteLength
+      sentThisRun += buf.byteLength
+      this._bytesMoved += buf.byteLength // P0: outbound file bytes handed to SCTP = progress
       this._update(t, { progress: Math.min(offset / file.size, 1) })
     }
     this._control({ type: CTRL.END, id, sid })
@@ -812,6 +895,13 @@ export class PeerLink {
   // (we still hold the File / the partial bytes — kept in the hook-owned stores,
   // which deliberately survive this link), else 'failed' (#5 + resume).
   _failActive() {
+    // P0: the in-flight watchdog is meaningless once we've torn the link's
+    // transfers down — disarm it and clear the episode so a fresh link starts
+    // clean (close() also clears it; this covers a mid-life link drop).
+    clearInterval(this._stallTimer)
+    this._stallTimer = null
+    this._stallEpisode = null
+    this._stallIdleMs = 0
     for (const t of this.transfers.values()) {
       if (t.status !== 'transferring' && t.status !== 'offered') continue
       const resumable =
@@ -846,8 +936,155 @@ export class PeerLink {
     })
   }
 
+  // -------------------------------------------------------------- P0 stall (GAP-1)
+  // Application-layer "no bytes moved in N seconds while the channel is OPEN"
+  // detector. Mirrors the Rust client's idle_ms() watchdog: the threshold is on
+  // TIME SINCE THE LAST BYTE, never throughput, so a slow-but-moving link never
+  // trips. Runs every STALL_TICK_MS from channel.onopen; disarmed in close() /
+  // _failActive(). Composition is deliberate (none double-fires):
+  //   - establishment _watchdog: disjoint (it only runs pre-'connected'; this
+  //     requires the channel 'open');
+  //   - C4 _dcTimer: only arms on 'disconnected'. During a black-hole the state
+  //     stays 'connected', so only this runs; rung (a)'s connectionState guard
+  //     prevents colliding restartIce calls if a real 'disconnected' happens.
+  _checkStall() {
+    // A genuine drop is C4's job — this detector is for an OPEN-but-dark channel.
+    if (this._closed || this.channel?.readyState !== 'open') return
+    // An idle link must never trip: nothing with bytes STILL TO MOVE -> reset the
+    // baseline. A transfer at progress 1 has handed every byte off and is in its
+    // legitimate no-wire-bytes tail (SCTP drain + whole-file verify + delivery-ack,
+    // P4) — counting it would false-trip on a clean transfer, so we require
+    // progress < 1 (an outstanding byte) to treat the link as stall-eligible.
+    const transferring = [...this.transfers.values()].some(
+      (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
+    )
+    if (!transferring) {
+      this._lastMovedSnapshot = this._bytesMoved
+      this._lastBuffered = this.channel.bufferedAmount
+      this._stallIdleMs = 0
+      this._stallEpisode = null
+      return
+    }
+    // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
+    // gets its window — don't trip while they're legitimately away.
+    if ((this._awayUntil || 0) > Date.now()) {
+      this._lastMovedSnapshot = this._bytesMoved
+      this._lastBuffered = this.channel.bufferedAmount
+      this._stallIdleMs = 0
+      return
+    }
+    // PROGRESS check. Either application-level bytes advanced, OR the SCTP send
+    // buffer drained (bytes left for the wire) — the latter prevents a false
+    // positive on a slow-but-moving link whose chunks sit briefly buffered.
+    const buffered = this.channel.bufferedAmount
+    if (this._bytesMoved !== this._lastMovedSnapshot || buffered < this._lastBuffered) {
+      this._lastMovedSnapshot = this._bytesMoved
+      this._lastBuffered = buffered
+      this._stallIdleMs = 0
+      // A moved byte clears any open episode (the link recovered) — mirrors the
+      // Rust note_progress(): a future stall may climb the ladder fresh.
+      if (this._stallEpisode) {
+        rlog.info('stall corrected — bytes moving again', this.id.slice(-6), 'rung', this._stallEpisode.rung)
+        this._stallEpisode = null
+      }
+      return
+    }
+    // No progress this tick — accumulate idle time.
+    this._lastBuffered = buffered
+    this._stallIdleMs += STALL_TICK_MS
+    if (this._stallIdleMs < STALL_MS) return
+    // The _stallEpisode latch gates re-entry: while a rung is mid-convergence
+    // (we gave it ~one STALL_MS grace) we wait rather than re-firing the ladder.
+    const now = Date.now()
+    if (this._stallEpisode && now - this._stallEpisode.at < STALL_MS) return
+    rlog.debug('stall detected', this.id.slice(-6), 'idleMs', this._stallIdleMs)
+    this._correctStall()
+  }
+
+  // Least-disruptive-first correction ladder (mirrors Rust correct_stall):
+  //   (a) liveness ping + (impolite, connected) restartIce — cheapest in-place;
+  //   (b) re-offer/resume unfinished transfers (receiver auto-resumes; the
+  //       receiver instead re-acks at its current offset to nudge the sender);
+  //   (c) escalate to onStall (P1: relay-preferred rebuild) — callback may be a
+  //       no-op for now.
+  // Bounded at MAX_STALL_ATTEMPTS; on exhaustion -> onStatus('failed') +
+  // _failActive (transfers become paused/resumable — NEVER silently dead).
+  _correctStall() {
+    const now = Date.now()
+    const rung = this._stallEpisode?.rung
+    // RUNG (a): liveness probe + in-place ICE repair.
+    if (!rung) {
+      try {
+        // A control send over the reliable channel: success ⇒ the transport
+        // itself is up (data path dark, link alive). A throw ⇒ truly dead — let
+        // C4 / _failActive own it.
+        this.channel.send(JSON.stringify({ type: 'ping', v: 1, reason: 'stall-probe' }))
+      } catch {
+        rlog.debug('stall: control send threw — link is dead, deferring to C4', this.id.slice(-6))
+        return
+      }
+      // Only nudge ICE while CONNECTED and from the IMPOLITE side: C4 owns the
+      // ICE-restart while 'disconnected', and restarting from both sides at once
+      // glares. The guard also stops a double-fire if a real 'disconnected' lands
+      // mid-stall (C4 then takes over).
+      if (this.pc.connectionState === 'connected' && !this.polite) {
+        try {
+          this.pc.restartIce()
+          rlog.info('stall corrected attempt (rung a) — liveness ping + restartIce', this.id.slice(-6))
+        } catch {}
+      } else {
+        rlog.info('stall corrected attempt (rung a) — liveness ping (no ICE restart: polite/not-connected)', this.id.slice(-6))
+      }
+      this._stallEpisode = { rung: 'a', at: now }
+      return
+    }
+    // RUNG (b): still stalled after rung (a)'s grace — re-issue every unfinished
+    // transfer so the data path re-flows from the partial.
+    if (rung === 'a') {
+      let nudged = 0
+      for (const t of this.transfers.values()) {
+        if (t.status !== 'transferring') continue
+        if (t.direction === 'send') {
+          // Re-offer with resume:true; the receiver auto-resumes from its partial.
+          // Clear the per-link send state so resumeSend re-arms a fresh stream.
+          this._outgoingFiles.delete(t.id)
+          this.resumeSend(t.id)
+          nudged++
+        } else if (t.direction === 'receive') {
+          // Receiver side: re-send a resume accept at the current offset to nudge
+          // the sender to (re)stream from where we are — never restart from 0.
+          const partial = this.stores.partials.get(t.id)
+          this._control({ type: CTRL.ACCEPT, id: t.id, offset: partial ? partial.received : 0 })
+          nudged++
+        }
+      }
+      rlog.info('stall correction (rung b) — re-offered/resumed unfinished transfers', this.id.slice(-6), 'count', nudged)
+      this._stallEpisode = { rung: 'b', at: now }
+      return
+    }
+    // RUNG (c): still stalled — escalate to the hook (P1 implements the
+    // relay-preferred rebuild). The callback may be a no-op for now.
+    if (rung === 'b') {
+      rlog.info('stall correction (rung c) — escalating to onStall', this.id.slice(-6))
+      try {
+        this.onStall?.({ reason: 'persistent', route: this.route })
+      } catch (err) {
+        rlog.warn('onStall hook threw', this.id.slice(-6), err)
+      }
+      this._stallEpisode = { rung: 'c', at: now }
+      return
+    }
+    // EXHAUSTED (rungs a→c spent, MAX_STALL_ATTEMPTS): no rung recovered. Fail
+    // CLEAN — transfers become paused/resumable via _failActive, never silently
+    // dead; the partials are preserved for the next link.
+    rlog.warn('stall correction exhausted — failing clean (partials preserved)', this.id.slice(-6))
+    this.onStatus('failed')
+    this._failActive()
+  }
+
   close() {
     clearInterval(this._stateTimer)
+    clearInterval(this._stallTimer) // P0: disarm the in-flight stall watchdog
     if (this._closed) return
     this._closed = true
     clearTimeout(this._dcTimer)
