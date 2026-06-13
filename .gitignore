@@ -19,6 +19,7 @@ frontend/tests/.relay-honesty-bundle.js
 frontend/tests/.relay-honesty-bundle.css
 frontend/tests/.relay-shots/
 frontend/tests/.p1-relay-bundle.js
+frontend/tests/.p5-upgrade-bundle.js
 
 # Build / coverage
 build

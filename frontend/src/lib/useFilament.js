@@ -1016,11 +1016,20 @@ export function useFilament() {
   // tells every connected peer we'll be right back, so they hold the line for
   // the declared window instead of guessing; coming back says so.
   useEffect(() => {
+    // P5: a network change is the strongest "a new direct path may exist NOW"
+    // signal we can read in a browser (the analog of the Rust client's iface-
+    // change re-probe). Nudge every relayed link to re-probe immediately so a
+    // wifi/cellular handoff upgrades off relay at once instead of waiting out the
+    // backed-off cadence. Covers refocus, `online`, and Network Information API.
+    const nudgeUpgradeProbes = () => {
+      for (const link of linksRef.current.values()) link.probeUpgradeNow?.()
+    }
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
         sigRef.current?.reconnect?.()
         sessionRef.current?.kick() // C30: re-ensure room + channels the freeze may have eaten
         subscribeKnown() // re-derive channels in case a secret was stored while hidden
+        nudgeUpgradeProbes() // P5: refocus may follow a network change — re-probe relayed links
         for (const link of linksRef.current.values()) link.sendBack?.()
         // #13 (measured live): two mobile tabs rarely negotiate while both
         // awake — links that failed while WE were frozen stay failed forever.
@@ -1043,9 +1052,16 @@ export function useFilament() {
     }
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onVisibility)
+    // P5: re-probe relayed links the instant connectivity returns or the active
+    // network interface changes — both mean a fresh direct path may now exist.
+    window.addEventListener('online', nudgeUpgradeProbes)
+    const conn = typeof navigator !== 'undefined' && navigator.connection
+    conn?.addEventListener?.('change', nudgeUpgradeProbes)
     return () => {
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onVisibility)
+      window.removeEventListener('online', nudgeUpgradeProbes)
+      conn?.removeEventListener?.('change', nudgeUpgradeProbes)
     }
   }, [subscribeKnown])
 

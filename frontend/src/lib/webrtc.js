@@ -51,6 +51,16 @@ const ACK_FALLBACK_MS = 30000
 //                       stall watchdog + correction ladder. Mirrors the Rust
 //                       client's FILAMENT_TEST_FREEZE_AFTER_BYTES. Inert for
 //                       real users (TEST.freeze is false).
+//   ?test=freezepersist -> P5: like ?test=freeze but PERSISTENT — EVERY
+//                       _streamFile run (not just the first) black-holes after
+//                       FREEZE_AFTER_BYTES, so a relayOnly link rebuilt on stall
+//                       (P1) STAYS the carrying path: the relay is a one-way
+//                       trapdoor we then escape. Lifted for any send begun after
+//                       `?healafter=<ms>` (the network "heals") so the P5 upgrade
+//                       prober's re-probe can re-detect a direct route and the
+//                       verify-before-commit path runs live. Mirrors the Rust
+//                       FILAMENT_TEST_FREEZE_PERSIST + FILAMENT_TEST_DIRECT_UNBLOCK_MS.
+//                       Inert for real users.
 function _testFlags() {
   try {
     const q = new URLSearchParams(window.location.search).get('test')
@@ -62,7 +72,30 @@ function _testFlags() {
 }
 const TEST = (() => {
   const f = _testFlags()
-  return { fixedId: f.includes('fixedid'), truncOnce: f.includes('trunconce'), freeze: f.includes('freeze') }
+  return {
+    fixedId: f.includes('fixedid'),
+    truncOnce: f.includes('trunconce'),
+    freeze: f.includes('freeze'),
+    freezePersist: f.includes('freezepersist'),
+  }
+})()
+// P5 test knob: ms after page load before the persistent freeze "heals" (the
+// network recovers and a direct path becomes possible). Mirrors the Rust
+// FILAMENT_TEST_DIRECT_UNBLOCK_MS. Only meaningful with ?test=freezepersist.
+const HEAL_AFTER_MS = (() => {
+  try {
+    const v = parseInt(new URLSearchParams(window.location.search).get('healafter') || '', 10)
+    return Number.isFinite(v) && v >= 0 ? v : Infinity
+  } catch {
+    return Infinity
+  }
+})()
+const _bootAt = (() => {
+  try {
+    return performance.now()
+  } catch {
+    return Date.now()
+  }
 })()
 
 // P0 test knob: bytes a frozen transfer is allowed to send before the data path
@@ -98,6 +131,47 @@ const STALL_MS = (() => {
 // Ladder ceiling (mirror Rust STALL_MAX_REPAIRS' intent): rungs a→c, then fail
 // clean through _failActive (paused/resumable — never silently dead).
 const MAX_STALL_ATTEMPTS = 3
+
+// P5 (GAP-6): the relay→direct UPGRADE prober. P1 makes a stalled direct path
+// fall to the TURN relay — but that's a ONE-WAY TRAPDOOR: once on relay the link
+// STAYS on relay even after the network heals and direct would work again. P5
+// fixes that: while serving on relay, periodically restartIce() on the SAME PC
+// (the data channel SURVIVES an ICE restart — non-disruptive) and re-detect the
+// route; if a direct candidate-pair wins re-nomination AND holds (verify-before-
+// commit), commit to direct and release the relay. "Relay is a way-station, not
+// a destination." Mirrors the Rust upgrade prober (cli/src/net.rs).
+//
+// Cadence: eager FIRST probe (the cause is often a transient hiccup that heals in
+// seconds), then each failed probe backs off toward a calm STEADY cap so a
+// symmetric-NAT peer that will NEVER get direct isn't hammered (CPU/battery).
+const UPGRADE_FIRST_MS = (() => {
+  try {
+    const v = parseInt(new URLSearchParams(window.location.search).get('upgradefirstms') || '', 10)
+    return Number.isFinite(v) && v > 0 ? v : 5000
+  } catch {
+    return 5000
+  }
+})()
+const UPGRADE_STEADY_MS = (() => {
+  try {
+    const v = parseInt(new URLSearchParams(window.location.search).get('upgradesteadyms') || '', 10)
+    return Number.isFinite(v) && v > 0 ? v : 25000
+  } catch {
+    return 25000
+  }
+})()
+// VERIFY-before-commit window: once re-detection reports a non-relay route, it
+// must READ non-relay AND keep moving bytes continuously for this long before we
+// cut over. Prevents thrash on a flaky direct path that wins re-nomination then
+// immediately re-stalls (the mandatory no-flap guard).
+const UPGRADE_VERIFY_MS = (() => {
+  try {
+    const v = parseInt(new URLSearchParams(window.location.search).get('upgradeverifyms') || '', 10)
+    return Number.isFinite(v) && v > 0 ? v : 2500
+  } catch {
+    return 2500
+  }
+})()
 
 let _tid = 0
 const nextTransferId = () =>
@@ -253,6 +327,15 @@ export class PeerLink {
     this._stallEpisode = null // {rung, at} latch: prevents re-entering a rung mid-convergence (mirrors Rust repair_in_flight)
     this._stallTimer = null // the watchdog interval (armed on channel open)
 
+    // P5 (GAP-6): the relay→direct upgrade prober. Armed when the route becomes
+    // 'relayed', disarmed when it's 'direct'/'local'. `_upgradeTimer` is the
+    // backoff timer; `_upgradeDelay` is the current (doubling) cadence;
+    // `_upgradeVerify` is the in-progress verify latch {since, bytesAt}.
+    this._upgradeTimer = null
+    this._upgradeDelay = UPGRADE_FIRST_MS
+    this._upgradeVerify = null
+    this._upgrading = false // re-entrancy guard while a probe/verify is mid-flight
+
     // P1 (GAP-4): when this link is rebuilt relay-preferred after a chronically
     // stalled direct/STUN path, force EVERY ICE candidate through the TURN relay
     // (`iceTransportPolicy:'relay'`) — the same auto-relay the Rust client takes
@@ -397,8 +480,13 @@ export class PeerLink {
   //   direct  — peer-to-peer over the internet (NAT-traversed, no relay)
   //   relayed — falling back through a TURN relay
   // ICE renominates occasionally, so we poll a few times after connecting.
-  async _detectRoute(attempt = 0) {
-    if (this._closed) return
+  // PURE read of the currently-selected candidate-pair route (no commit, no UI,
+  // no prober side-effects). Returns 'local'|'direct'|'relayed', or null when no
+  // pair is selected yet / getStats is unsupported. Shared by _detectRoute (the
+  // committing path) and the P5 prober's verify (which must NOT commit until the
+  // path is verified — see _beginUpgradeVerify).
+  async _measureRoute() {
+    if (this._closed) return null
     try {
       const stats = await this.pc.getStats()
       const cands = {}
@@ -413,22 +501,194 @@ export class PeerLink {
         if (r.id === transportSelectedId || (!transportSelectedId && r.state === 'succeeded' && (r.nominated || r.selected)))
           selected = r
       })
-      if (!selected) {
-        if (attempt < 5) setTimeout(() => this._detectRoute(attempt + 1), 400)
-        return
-      }
+      if (!selected) return null
       const lt = cands[selected.localCandidateId]?.candidateType
       const rt = cands[selected.remoteCandidateId]?.candidateType
-      let route = 'direct'
-      if (lt === 'relay' || rt === 'relay') route = 'relayed'
-      else if (lt === 'host' && rt === 'host') route = 'local'
-      if (route !== this.route) {
-        this.route = route
-        this.onRoute(route)
-      }
+      if (lt === 'relay' || rt === 'relay') return 'relayed'
+      if (lt === 'host' && rt === 'host') return 'local'
+      return 'direct'
     } catch {
-      /* getStats unsupported — leave route null */
+      return null // getStats unsupported
     }
+  }
+
+  async _detectRoute(attempt = 0) {
+    if (this._closed) return null
+    const route = await this._measureRoute()
+    if (this._closed) return null
+    if (!route) {
+      if (attempt < 5) setTimeout(() => this._detectRoute(attempt + 1), 400)
+      return null
+    }
+    if (route !== this.route) {
+      this.route = route
+      this.onRoute(route)
+    }
+    // P5: arm the upgrade prober whenever we're serving on relay; disarm it the
+    // moment we're on a direct/local path (nothing to upgrade away from). This
+    // runs on the initial connect detection AND every prober re-poll, so a route
+    // that drops back to relay re-arms automatically.
+    if (route === 'relayed') this._armUpgradeProber()
+    else this._disarmUpgradeProber()
+    return route
+  }
+
+  // ---------------------------------------------------- P5 relay→direct upgrade
+  // Begin probing for a direct path while serving on relay. Idempotent. The
+  // schedule is: first probe at UPGRADE_FIRST_MS (eager — the cause is often a
+  // transient hiccup), then each failed probe doubles toward UPGRADE_STEADY_MS.
+  _armUpgradeProber() {
+    if (this._closed || this._upgradeTimer) return
+    rlog.debug('upgrade prober armed (on relay — probing for a direct path)', this.id.slice(-6))
+    this._upgradeDelay = UPGRADE_FIRST_MS
+    this._scheduleUpgradeProbe(this._upgradeDelay)
+  }
+
+  _disarmUpgradeProber() {
+    if (this._upgradeTimer) {
+      clearTimeout(this._upgradeTimer)
+      this._upgradeTimer = null
+    }
+    this._upgradeVerify = null
+    this._upgrading = false
+    this._upgradeDelay = UPGRADE_FIRST_MS
+  }
+
+  _scheduleUpgradeProbe(delay) {
+    if (this._closed) return
+    clearTimeout(this._upgradeTimer)
+    this._upgradeTimer = setTimeout(() => this._upgradeProbe(), delay)
+  }
+
+  // Re-probe NOW: collapse the backoff so the next probe fires immediately. The
+  // hook calls this from its visibility/online effect on a network change — the
+  // browser analog of the Rust client's iface-change re-probe trigger.
+  probeUpgradeNow() {
+    if (this._closed || this.route !== 'relayed') return
+    this._upgradeDelay = UPGRADE_FIRST_MS // a fresh path may exist — reset the cadence
+    if (this._upgrading) return // a probe is already in flight; let it run
+    rlog.debug('upgrade re-probe now (network change)', this.id.slice(-6))
+    this._scheduleUpgradeProbe(0)
+  }
+
+  // One upgrade attempt: restartIce() on the live PC (the data channel survives,
+  // so this is non-disruptive), let ICE re-nominate, then re-detect the route. A
+  // non-relay re-detection enters the verify-before-commit window; anything else
+  // backs off and re-schedules.
+  async _upgradeProbe() {
+    this._upgradeTimer = null
+    if (this._closed || this.route !== 'relayed') return this._disarmUpgradeProber()
+    // Kill-switch (browser analog of FILAMENT_UPGRADE_PROBE=0): the user opted out
+    // of the prober entirely. Leave the link on relay; never re-schedule.
+    try {
+      if (localStorage.getItem('filamentUpgradeProbe') === '0') {
+        rlog.debug('upgrade prober disabled (filamentUpgradeProbe=0) — staying on relay', this.id.slice(-6))
+        return
+      }
+    } catch {}
+    // Shared-ICE-restart guard: the P0 stall ladder also drives restartIce. They
+    // must never both fire at once (glare / churn). If a stall episode is open or
+    // we're not cleanly connected, skip this probe and back off.
+    if (this.pc.connectionState !== 'connected' || this._stallEpisode) {
+      rlog.debug('upgrade probe skipped (not connected or stall episode open)', this.id.slice(-6))
+      return this._backoffUpgrade()
+    }
+    // Only the IMPOLITE side drives restartIce (consistent with C4 + the P0
+    // ladder rung a) — restarting from both sides glares.
+    this._upgrading = true
+    if (!this.polite) {
+      try {
+        rlog.debug('upgrade probe — restartIce to find a direct path', this.id.slice(-6))
+        this.pc.restartIce()
+      } catch {}
+    } else {
+      rlog.debug('upgrade probe — re-detecting route (polite: no restartIce)', this.id.slice(-6))
+    }
+    // Give ICE a moment to re-nominate, then MEASURE (not commit) the route. We
+    // deliberately use _measureRoute, not _detectRoute: a relay→direct flip must
+    // pass verify-before-commit first, so we must NOT fire onRoute / clear the
+    // amber UI here. Only _commitUpgrade does that, after the path holds.
+    await new Promise((r) => setTimeout(r, 1200))
+    this._upgrading = false
+    if (this._closed || this.route !== 'relayed') return
+    const route = await this._measureRoute()
+    if (this._closed || this.route !== 'relayed') return
+    // A non-relay measurement enters the verify window; anything else backs off.
+    if (route && route !== 'relayed') {
+      this._beginUpgradeVerify(route)
+    } else {
+      this._upgradeVerify = null
+      this._backoffUpgrade()
+    }
+  }
+
+  // Verify-before-commit (mirrors Rust judge_upgrade_standby): a direct path that
+  // wins re-nomination must keep moving data for UPGRADE_VERIFY_MS before we cut
+  // over. Reuses the P0 _bytesMoved counter as the "data path holds" signal. We
+  // sample on a short heartbeat; if the route reverts to relay OR bytes stop
+  // before the window closes, DISCARD and back off — no flap.
+  _beginUpgradeVerify(route) {
+    rlog.debug('direct path detected — verifying it holds before committing', this.id.slice(-6))
+    const start = Date.now()
+    const verify = { route, bytesAt: this._bytesMoved, lastBytes: this._bytesMoved, lastSeen: start }
+    this._upgradeVerify = verify
+    const VERIFY_TICK = 500
+    // During the verify window we want some traffic to move so a flaky path
+    // reveals itself. _checkStall already nudges real transfers; if the link is
+    // otherwise idle we can't distinguish hold-vs-flaky, so an idle link that
+    // simply READS non-relay across the whole window is accepted (a connected
+    // direct candidate-pair is itself evidence; the no-flap risk is only when a
+    // transfer is in flight, and then _bytesMoved advances).
+    const tick = async () => {
+      if (this._closed || this._upgradeVerify !== verify) return
+      if (this.route !== 'relayed') return // someone else committed; stop
+      const re = await this._measureRoute() // MEASURE only — commit happens below
+      if (this._closed || this._upgradeVerify !== verify) return
+      const hasInflight = [...this.transfers.values()].some(
+        (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
+      )
+      const moved = this._bytesMoved !== verify.lastBytes
+      if (moved) {
+        verify.lastBytes = this._bytesMoved
+        verify.lastSeen = Date.now()
+      }
+      // REGRESSED: route fell back to relay, OR a transfer is in flight yet bytes
+      // have stalled past a tick-of-grace → discard, stay on relay, back off.
+      const idleTooLong = hasInflight && Date.now() - verify.lastSeen >= UPGRADE_VERIFY_MS
+      if ((re && re === 'relayed') || idleTooLong) {
+        rlog.debug('direct path connected but did not hold — staying on relay (no flap)', this.id.slice(-6))
+        this._upgradeVerify = null
+        this._backoffUpgrade()
+        return
+      }
+      // HELD long enough → commit.
+      if (Date.now() - start >= UPGRADE_VERIFY_MS) {
+        this._commitUpgrade(verify.route)
+        return
+      }
+      this._upgradeTimer = setTimeout(tick, VERIFY_TICK)
+    }
+    this._upgradeTimer = setTimeout(tick, VERIFY_TICK)
+  }
+
+  // Commit the upgrade: the direct path held. Set the route, fire onRoute (which
+  // AUTO-CLEARS the amber RELAY UI — no new UI needed), log the one value-prop
+  // line, and disarm the prober (we're a destination now, not a way-station).
+  _commitUpgrade(route) {
+    if (this._closed) return
+    this.route = route
+    this.onRoute(route)
+    rlog.info('upgraded to direct — relay released', this.id.slice(-6), route)
+    this._disarmUpgradeProber()
+  }
+
+  // A probe (or a failed verify) didn't yield a held direct path: double the
+  // cadence toward the steady cap and re-schedule, so a peer that will never get
+  // direct isn't hammered.
+  _backoffUpgrade() {
+    this._upgrading = false
+    this._upgradeDelay = Math.min(this._upgradeDelay * 2, UPGRADE_STEADY_MS)
+    if (this.route === 'relayed' && !this._closed) this._scheduleUpgradeProbe(this._upgradeDelay)
   }
 
   // ------------------------------------------------------------- data channel
@@ -852,6 +1112,25 @@ export class PeerLink {
         rlog.debug('[test] data-path FREEZE engaged — dropping chunks (channel stays open)', id, 'after', sentThisRun)
         return // park the sender loop without advancing offset; the partial is preserved
       }
+      // P5 test shim (?test=freezepersist): a PERSISTENT freeze — EVERY run of
+      // this loop black-holes after FREEZE_AFTER_BYTES (not just the first), so a
+      // direct path can never carry the transfer and the link stays trapped on the
+      // relay P1 rebuilds it onto. It LIFTS once HEAL_AFTER_MS has elapsed since
+      // boot ("the network heals"), letting the P5 upgrade prober's re-probe
+      // re-detect a usable direct route. relayOnly links are exempt (the relay
+      // path must keep carrying bytes — only DIRECT is frozen). Inert in prod.
+      if (TEST.freezePersist && !this.relayOnly && sentThisRun + buf.byteLength > FREEZE_AFTER_BYTES) {
+        const now = (() => { try { return performance.now() } catch { return Date.now() } })()
+        if (now - _bootAt < HEAL_AFTER_MS) {
+          rlog.debug('[test] PERSISTENT data-path FREEZE engaged (direct dark, not yet healed)', id, 'after', sentThisRun)
+          // Re-arm the sender shortly so it resumes (and re-freezes) — this keeps
+          // the transferring transfer "in flight" so the stall watchdog + the P5
+          // verify both have live signal once the heal lifts.
+          setTimeout(() => { if (!this._closed && this.channel?.readyState === 'open') this._streamFile(id, offset) }, 500)
+          return
+        }
+        // Healed — fall through and send normally.
+      }
       this.channel.send(framed)
       offset += buf.byteLength
       sentThisRun += buf.byteLength
@@ -911,6 +1190,7 @@ export class PeerLink {
     this._stallTimer = null
     this._stallEpisode = null
     this._stallIdleMs = 0
+    this._disarmUpgradeProber() // P5: the upgrade prober dies with the link's transfers
     for (const t of this.transfers.values()) {
       if (t.status !== 'transferring' && t.status !== 'offered') continue
       const resumable =
@@ -1094,6 +1374,7 @@ export class PeerLink {
   close() {
     clearInterval(this._stateTimer)
     clearInterval(this._stallTimer) // P0: disarm the in-flight stall watchdog
+    this._disarmUpgradeProber() // P5: disarm the relay→direct upgrade prober
     if (this._closed) return
     this._closed = true
     clearTimeout(this._dcTimer)
