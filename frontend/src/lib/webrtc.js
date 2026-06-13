@@ -26,10 +26,41 @@ const CTRL = {
   PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
   PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict — a rejected prover stops claiming acquaintance
   STATE: 'state', // C30 ph3: periodic link truth {transfers, trusted, away} — divergence repair
+  DELIVERY_ACK: 'delivery-ack', // P4: receiver verified the WHOLE file (sha256 matched) — sender marks done only on this
 }
 
+// P4: bound the whole-file re-fetch so a genuinely-corrupt payload fails CLEANLY
+// instead of looping forever; the partial is kept, the transfer stays resumable.
+const MAX_VERIFY_FAILS = 2
+// P4: if a CLI peer is too old to send a delivery-ack, accept on size+drain after
+// this window so a send never hangs against an ack-less receiver (interop).
+const ACK_FALLBACK_MS = 30000
+
+// P4 test shims — INERT unless a `?test=` query flag (persisted to localStorage)
+// is set, so they ship in the bundle with zero effect on real users. They exist
+// only to drive the deterministic browser↔CLI integrity e2e:
+//   ?test=fixedid    -> mint a deterministic transfer id so the CLI's
+//                       FILAMENT_TEST_CORRUPT_RECV=<id> hook can target it.
+//   ?test=trunconce  -> on the RECEIVER, drop the final chunk before file-end
+//                       exactly once, inducing a truncated receive so the
+//                       whole-file verify + re-request path is exercised live.
+function _testFlags() {
+  try {
+    const q = new URLSearchParams(window.location.search).get('test')
+    if (q != null) localStorage.setItem('filamentTest', q)
+    return (q ?? localStorage.getItem('filamentTest') ?? '').split(',').filter(Boolean)
+  } catch {
+    return []
+  }
+}
+const TEST = (() => {
+  const f = _testFlags()
+  return { fixedId: f.includes('fixedid'), truncOnce: f.includes('trunconce') }
+})()
+
 let _tid = 0
-const nextTransferId = () => `t${++_tid}_${Math.random().toString(36).slice(2, 7)}`
+const nextTransferId = () =>
+  TEST.fixedId ? `webtest-${++_tid}` : `t${++_tid}_${Math.random().toString(36).slice(2, 7)}`
 
 // Content identity for resume (docs/cli-resilience.md C7): sha256 over the
 // first 256 KiB, carried in file-offer. Disk-based receivers (the CLI) use it
@@ -41,6 +72,56 @@ async function headHash(file) {
   try {
     const buf = await file.slice(0, Math.min(HEAD_BYTES, file.size)).arrayBuffer()
     const digest = await crypto.subtle.digest('SHA-256', buf)
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
+}
+
+// P4 (whole-file integrity): hex sha256 over the WHOLE file, carried in the
+// file-offer alongside `head`. The receiver recomputes it over every byte it
+// received and only declares the transfer done — and acks it — on a match, so a
+// silently-truncated/corrupt receive (the 7 KB stub class) is caught. Wire-
+// compatible with the Rust client's offer `full` field. Web Crypto has no
+// incremental digest, so we hash the whole buffer for the common case and fall
+// back to slice-accumulation above a threshold to bound peak memory. Returns
+// null where crypto.subtle is unavailable (insecure origin) — receivers then
+// degrade to size-only acceptance, exactly like headHash.
+const FULL_DIRECT_MAX = 64 * 1024 * 1024 // hash in one shot below this
+const FULL_SLICE = 8 * 1024 * 1024 // slice size above it
+async function fullHash(file) {
+  try {
+    if (!crypto?.subtle) return null
+    let bytes
+    if (file.size <= FULL_DIRECT_MAX) {
+      bytes = new Uint8Array(await file.arrayBuffer())
+    } else {
+      // Web Crypto can't update incrementally; concatenate slices into one
+      // buffer (bounded read pressure — we never hold two full copies of a
+      // slice). Peak is the file size in one contiguous buffer, which the
+      // single-shot path would also need, so this only caps per-read memory.
+      bytes = new Uint8Array(file.size)
+      let off = 0
+      while (off < file.size) {
+        const end = Math.min(off + FULL_SLICE, file.size)
+        const part = new Uint8Array(await file.slice(off, end).arrayBuffer())
+        bytes.set(part, off)
+        off = end
+      }
+    }
+    const digest = await crypto.subtle.digest('SHA-256', bytes)
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
+}
+
+// P4: hex sha256 over an assembled Blob (the received bytes), to compare against
+// the offered `full`. Same null-on-insecure-origin degradation as fullHash.
+async function blobHash(blob) {
+  try {
+    if (!crypto?.subtle) return null
+    const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer())
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
   } catch {
     return null
@@ -424,11 +505,17 @@ export class PeerLink {
           name: msg.name, size: msg.size, mime: msg.mime, progress: 0, status: 'offered',
         })
         t._sid = msg.sid
+        // P4: stash the offered whole-file digest on the transfer so accept can
+        // copy it onto the partial; verified at file-end.
+        t._full = msg.full || null
         // Resume: if we already hold partial bytes for this transfer (the link
         // dropped mid-receive), accept automatically from where we left off —
         // the user already said yes once.
         const partial = msg.resume && this.stores.partials.get(msg.id)
         if (partial) {
+          // P4: a re-offer may carry the digest the first offer did (or update
+          // it); keep the partial verifiable across a resume.
+          if (msg.full) partial.full = msg.full
           this._incomingBySid.set(msg.sid, msg.id)
           this._update(t, { status: 'transferring', progress: t.size ? partial.received / t.size : 0 })
           this._control({ type: CTRL.ACCEPT, id: msg.id, offset: partial.received })
@@ -451,12 +538,11 @@ export class PeerLink {
         const id = this._incomingBySid.get(msg.sid)
         const entry = id && this.stores.partials.get(id)
         if (!entry) return
-        this._incomingBySid.delete(msg.sid)
-        this.stores.partials.delete(id)
-        const blob = new Blob(entry.buffers, { type: entry.mime || 'application/octet-stream' })
-        this._update(this.transfers.get(id), {
-          status: 'complete', progress: 1, blob, url: URL.createObjectURL(blob),
-        })
+        // P4: whole-file verify happens here. If the offer carried `full`,
+        // recompute sha256 over the received bytes and only finalize + ack on a
+        // match; on a mismatch keep the partial and re-request, bounded by
+        // MAX_VERIFY_FAILS. No digest (old/insecure peer) -> legacy accept.
+        this._finishReceive(id, entry, msg.sid)
         break
       }
       case CTRL.PAIR_KEEP:
@@ -497,7 +583,99 @@ export class PeerLink {
         }
         break
       }
+      case CTRL.DELIVERY_ACK: {
+        // P4: the receiver verified the WHOLE file (sha256 matched). Only NOW is
+        // an outgoing send truly done (vs the old fire-and-forget on file-end).
+        const t = this.transfers.get(msg.id)
+        if (!t || t.direction !== 'send') break
+        if (this._ackTimers?.has(msg.id)) {
+          clearTimeout(this._ackTimers.get(msg.id))
+          this._ackTimers.delete(msg.id)
+        }
+        if (t.status === 'complete') break // already accepted (e.g. via fallback)
+        this._outgoingFiles.delete(msg.id)
+        this.stores.outgoing.delete(msg.id)
+        this._update(t, { status: 'complete', progress: 1 })
+        rlog.info('delivery-ack received — send verified + complete', msg.id)
+        break
+      }
     }
+  }
+
+  // P4 (whole-file integrity + delivery-ack, RECEIVER side). Called at file-end.
+  // - no offered digest -> finalize as before (interop with old/insecure peers).
+  // - digest present + MATCH -> finalize AND send delivery-ack.
+  // - digest present + MISMATCH -> keep the partial, log a checksum-fail, and
+  //   re-request: a short receive (buffered < size) resumes from where we are;
+  //   a full-size-but-wrong-hash receive (corrupt body) restarts from 0 (the
+  //   buffers are poisoned). Bounded by MAX_VERIFY_FAILS, then fail CLEAN
+  //   (paused/resumable, partial kept) — never an infinite loop.
+  async _finishReceive(id, entry, sid) {
+    const t = this.transfers.get(id)
+    const finalize = (blob) => {
+      this._incomingBySid.delete(sid)
+      this.stores.partials.delete(id)
+      this._update(t, { status: 'complete', progress: 1, blob, url: URL.createObjectURL(blob) })
+    }
+    if (!entry.full) {
+      // Legacy: no whole-file digest offered — accept on size, no ack.
+      finalize(new Blob(entry.buffers, { type: entry.mime || 'application/octet-stream' }))
+      return
+    }
+    // Test shim (?test=trunconce): drop the tail ONCE to simulate a lost final
+    // chunk, so the whole-file mismatch + re-request path runs against a CLI
+    // sender. Inert in production (TEST.truncOnce is false).
+    if (TEST.truncOnce && !entry._truncated && entry.buffers.length > 1) {
+      entry._truncated = true
+      const dropped = entry.buffers.pop()
+      entry.received -= dropped.byteLength
+      rlog.debug('[test] dropped final chunk to simulate truncation', id)
+    }
+    const blob = new Blob(entry.buffers, { type: entry.mime || 'application/octet-stream' })
+    const got = await blobHash(blob)
+    // Insecure origin on our side (can't hash): degrade to size-only acceptance
+    // rather than rejecting forever — matches headHash's null-degrade contract.
+    if (got == null) {
+      rlog.debug('no crypto.subtle — accepting received file on size (no whole-file verify)', id)
+      finalize(blob)
+      return
+    }
+    if (got === entry.full) {
+      // INTACT — finalize, then tell the sender it landed whole (delivery-ack).
+      entry.verifyFails = 0
+      finalize(blob)
+      rlog.info('whole-file sha256 matched — finalizing + acking', id)
+      this._control({ type: CTRL.DELIVERY_ACK, id, sid, v: 1 })
+      return
+    }
+    // MISMATCH — do NOT finalize. Keep the partial, bound the re-request.
+    entry.verifyFails = (entry.verifyFails || 0) + 1
+    const truncated = entry.received < (entry.size || 0)
+    rlog.debug(
+      `whole-file checksum FAILED (${truncated ? 'truncated ' + entry.received + '/' + entry.size : 'corrupt'}) — attempt ${entry.verifyFails}`,
+      id,
+    )
+    if (entry.verifyFails > MAX_VERIFY_FAILS) {
+      // Give up CLEANLY: keep the partial on the store (resumable), mark paused,
+      // do not finalize, do not ack. No silent bad file, no hang.
+      rlog.warn(`whole-file checksum still wrong after ${MAX_VERIFY_FAILS} re-fetches — refusing corrupt file (partial kept)`, id)
+      this._incomingBySid.delete(sid)
+      this._update(t, { status: 'paused' })
+      return
+    }
+    // Re-request: truncated -> resume from current offset; corrupt (full size,
+    // wrong hash) -> the buffers are poisoned, restart from 0.
+    let offset = entry.received
+    if (!truncated) {
+      entry.buffers = []
+      entry.received = 0
+      offset = 0
+    }
+    // Keep the stream routable so resumed chunks land in the same partial, and
+    // ask the sender to (re)stream from offset.
+    this._incomingBySid.set(sid, id)
+    this._update(t, { status: 'transferring', progress: entry.size ? offset / entry.size : 0 })
+    this._control({ type: CTRL.ACCEPT, id, offset })
   }
 
   // ------------------------------------------------------------- send / accept
@@ -519,10 +697,11 @@ export class PeerLink {
       })
       t._sid = sid
       this.onTransfer(t)
-      // The offer ships once the head hash resolves (C7); order across
-      // concurrent offers doesn't matter — ids are independent.
-      headHash(file).then((head) =>
-        this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}) })
+      // The offer ships once the hashes resolve: head (C7 resume) AND the
+      // whole-file digest (P4 integrity). Order across concurrent offers
+      // doesn't matter — ids are independent.
+      Promise.all([headHash(file), fullHash(file)]).then(([head, full]) =>
+        this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}), ...(full ? { full } : {}) })
       )
       ids.push(id)
     }
@@ -541,8 +720,8 @@ export class PeerLink {
     })
     t._sid = sid
     this.onTransfer(t)
-    headHash(entry.file).then((head) =>
-      this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, ...(head ? { head } : {}) })
+    Promise.all([headHash(entry.file), fullHash(entry.file)]).then(([head, full]) =>
+      this._control({ type: CTRL.OFFER, id, sid, name: entry.name, size: entry.size, mime: entry.mime, resume: true, ...(head ? { head } : {}), ...(full ? { full } : {}) })
     )
   }
 
@@ -550,7 +729,7 @@ export class PeerLink {
   acceptTransfer(id) {
     const t = this.transfers.get(id)
     if (!t || t.direction !== 'receive') return
-    this.stores.partials.set(id, { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name })
+    this.stores.partials.set(id, { received: 0, buffers: [], size: t.size, mime: t.mime, name: t.name, full: t._full || null })
     this._incomingBySid.set(t._sid, id)
     this._update(t, { status: 'transferring' })
     this._control({ type: CTRL.ACCEPT, id, offset: 0 })
@@ -594,9 +773,23 @@ export class PeerLink {
     while (!this._closed && this.channel?.readyState === 'open' && this.channel.bufferedAmount > 0) {
       await new Promise((res) => setTimeout(res, 50))
     }
-    this._outgoingFiles.delete(id)
-    this.stores.outgoing.delete(id)
-    this._update(t, { status: 'complete', progress: 1 })
+    if (this._closed) return
+    // P4: do NOT declare complete here anymore. A send is "done" only when the
+    // receiver delivery-acks the whole-file sha256 (see CTRL.DELIVERY_ACK).
+    // Bounded fallback for interop with a peer too old to ack (or one that
+    // offered no digest): after the buffer drains, accept on size+drain in
+    // ACK_FALLBACK_MS if no ack arrives — preserves the never-hangs property.
+    this._ackTimers ||= new Map()
+    if (this._ackTimers.has(id)) clearTimeout(this._ackTimers.get(id))
+    this._ackTimers.set(id, setTimeout(() => {
+      this._ackTimers.delete(id)
+      const cur = this.transfers.get(id)
+      if (!cur || cur.status === 'complete') return
+      rlog.debug('no delivery-ack — accepting on drain', id)
+      this._outgoingFiles.delete(id)
+      this.stores.outgoing.delete(id)
+      this._update(cur, { status: 'complete', progress: 1 })
+    }, ACK_FALLBACK_MS))
   }
 
   // ------------------------------------------------------------------ helpers
@@ -628,6 +821,12 @@ export class PeerLink {
     }
     this._incomingBySid.clear() // sid routing dies with the link; partials survive
     this._outgoingFiles.clear() // per-link send state; the Files survive in stores
+    // P4: drop pending ack-fallback timers — the send is no longer 'complete' on
+    // this link (it becomes 'paused' above and re-offers on the next link).
+    if (this._ackTimers) {
+      for (const tm of this._ackTimers.values()) clearTimeout(tm)
+      this._ackTimers.clear()
+    }
     const waiters = this._drainWaiters
     this._drainWaiters = []
     waiters.forEach((r) => r()) // unblock parked sender loops so they exit
