@@ -18,6 +18,7 @@ frontend/tests/.pakekeep-bundle.js
 frontend/tests/.relay-honesty-bundle.js
 frontend/tests/.relay-honesty-bundle.css
 frontend/tests/.relay-shots/
+frontend/tests/.p1-relay-bundle.js
 
 # Build / coverage
 build

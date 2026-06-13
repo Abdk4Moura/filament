@@ -122,6 +122,7 @@ export function useFilament() {
   const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
   const transferStatusRef = useRef(new Map()) // transferId -> latest status
   const attemptsRef = useRef(new Map()) // peerId -> watchdog retry count (#8)
+  const relayedRef = useRef(new Map()) // peerId -> relay-preferred rebuild count (P1: at-most-once escalation)
   const makeLinkRef = useRef(null) // lets onStuck re-create a link without closure cycles
   const prevScopeRef = useRef('auto') // restore the discovery bar after a code is used
 
@@ -310,7 +311,7 @@ export function useFilament() {
 
   // ---- create a PeerLink for one remote peer -------------------------------
   const makeLink = useCallback(
-    ({ id, name, uid }) => {
+    ({ id, name, uid, relayOnly }) => {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
       // Supersede (#10): a tab has exactly ONE live connection. If we already
       // show a tile for this uid under an older sid (zombie registry entry, or
@@ -323,6 +324,7 @@ export function useFilament() {
             oldLink.close()
             removePeer(oldId)
             attemptsRef.current.delete(oldId)
+            relayedRef.current.delete(oldId)
           }
         }
       }
@@ -335,6 +337,9 @@ export function useFilament() {
         id,
         name,
         iceServers: cfgRef.current.iceServers,
+        // P1 (GAP-4): force this link's ICE through the TURN relay when we're
+        // rebuilding after a persistent stall — see onStall below.
+        relayOnly: !!relayOnly,
         chunkSize: cfgRef.current.chunkSize,
         polite,
         peerUid: uid || null,
@@ -455,6 +460,35 @@ export function useFilament() {
         // lost (dead-sid relay, suspended peer, swallowed SDP error). Tear down
         // and retry with a fresh link + fresh ICE config; then fail honestly.
         watchdogMs: 15000,
+        // P1 (GAP-4): the in-flight stall ladder (P0 rungs a+b) is exhausted on
+        // this link — a chronically stalled direct/STUN path. Rebuild the link
+        // RELAY-PREFERRED (iceTransportPolicy:'relay'), mirroring the Rust
+        // client's auto-relay at ladder exhaustion. The amber RELAY UI lights
+        // itself via the normal _detectRoute()→onRoute('relayed') path; the
+        // hook-owned partials/outgoing stores outlive the link, so the re-offer
+        // -on-channel-open path RESUMES the in-flight transfer (not restart).
+        // Bounded: a peer is escalated to relay at most ONCE — a relay link that
+        // itself stalls falls through to P0's terminal _failActive, never an
+        // infinite relay-rebuild loop.
+        onStall: ({ reason }) => {
+          if (reason !== 'persistent') return
+          if (relayOnly) {
+            // We're already on the relay and it stalled too — don't re-escalate.
+            // Let P0's terminal _failActive own it (partials preserved).
+            log.debug('rtc: relay link still stalled — leaving terminal failure to P0', id.slice(-6))
+            return
+          }
+          const r = relayedRef.current.get(id) || 0
+          if (r >= 1) {
+            log.debug('rtc: persistent stall but relay-preferred already spent — not re-escalating', id.slice(-6))
+            return
+          }
+          relayedRef.current.set(id, r + 1)
+          log.info('rtc: persistent stall — rebuilding relay-preferred (auto-relay fallback)', id.slice(-6))
+          linksRef.current.delete(id)
+          link.close()
+          makeLinkRef.current?.({ id, name, uid, relayOnly: true })
+        },
         onStuck: () => {
           linksRef.current.delete(id)
           link.close()

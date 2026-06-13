@@ -191,7 +191,7 @@ export class PeerLink {
    * @param {(status:string)=>void} o.onStatus    'connecting'|'ready'|'failed'
    * @param {(t:object)=>void}      o.onTransfer  transfer state changed
    */
-  constructor({ id, name, iceServers, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
+  constructor({ id, name, iceServers, relayOnly, chunkSize, polite, peerUid, stores, sendSignal, onStatus, onTransfer, onRoute, onChannelOpen, onStuck, onStall, watchdogMs, onPairKeep, onPairKeepAck, onPairProof, onPairProofAck, onPeerStateDiverged, onPtyData, onPtyClose, onPtyReady, onCaps }) {
     this.id = id
     this.name = name
     this.chunkSize = chunkSize || 64 * 1024
@@ -253,7 +253,16 @@ export class PeerLink {
     this._stallEpisode = null // {rung, at} latch: prevents re-entering a rung mid-convergence (mirrors Rust repair_in_flight)
     this._stallTimer = null // the watchdog interval (armed on channel open)
 
-    this.pc = new RTCPeerConnection({ iceServers })
+    // P1 (GAP-4): when this link is rebuilt relay-preferred after a chronically
+    // stalled direct/STUN path, force EVERY ICE candidate through the TURN relay
+    // (`iceTransportPolicy:'relay'`) — the same auto-relay the Rust client takes
+    // at ladder exhaustion. The amber RELAY UI then lights itself off the normal
+    // `_detectRoute()`→onRoute('relayed') path; P5 later upgrades back to direct.
+    this.relayOnly = !!relayOnly
+    this.pc = new RTCPeerConnection({
+      iceServers,
+      ...(this.relayOnly ? { iceTransportPolicy: 'relay' } : {}),
+    })
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
         rlog.trace('ice candidate', this.id.slice(-6), e.candidate.candidate)
