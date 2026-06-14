@@ -15,6 +15,7 @@
 // Failure-mode ledger: ../docs/cli-resilience.md — every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
+mod codeentry;
 mod direct;
 mod holepunch;
 mod l2;
@@ -164,6 +165,24 @@ fn relay_forbidden() -> bool {
     NO_RELAY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Set once in `run`, before any worker spawns, from the global `--no-interactive`
+/// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
+static NO_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// THE interactivity GATE — scripts/automation are safe BY DEFAULT. Three layers:
+///   1. stdin is not a TTY  -> never interactive (pipes, CI, `< /dev/null`).
+///   2. TTY but opted out    -> never interactive: `--no-interactive` OR the env
+///                              var `FILAMENT_NONINTERACTIVE` (any value).
+///   3. TTY and not opted out -> interactive (the guided entry may open).
+/// When this returns false, callers MUST keep exactly today's behavior (a clear
+/// parse error + expected format and non-zero exit for a malformed arg, or the
+/// existing non-interactive default for a missing-but-optional code). NEVER block.
+fn interactive_allowed() -> bool {
+    std::io::stdin().is_terminal()
+        && !NO_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+        && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none()
+}
+
 /// The one honest CLI line shown whenever a transfer/connection is actually on
 /// the TURN relay route (rung d). Relay is still end-to-end encrypted, but it is
 /// NOT a direct link — the "no middleman on the wire" property is gone, so we say
@@ -278,13 +297,23 @@ struct Cli {
     /// FILAMENT_LOG.
     #[arg(short = 'q', long = "quiet", global = true, conflicts_with = "verbose")]
     quiet: bool,
+    /// Never drop into the guided interactive code entry — fail fast instead.
+    /// Use in scripts/automation. A non-TTY stdin is ALWAYS non-interactive even
+    /// without this; the env var FILAMENT_NONINTERACTIVE=1 does the same thing.
+    #[arg(long, global = true)]
+    no_interactive: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Send files or directories to a peer (browser or CLI)
+    /// Send files or directories to a peer (browser or CLI).
+    ///
+    /// In a terminal with no --code/--word this offers to mint a shareable code
+    /// (or press enter for the local network). Scripts are safe by default: a
+    /// non-TTY uses the local network; under a TTY set FILAMENT_NONINTERACTIVE=1
+    /// or pass --no-interactive to skip the prompt.
     Send {
         /// Files or directories to send; '-' reads stdin
         paths: Vec<String>,
@@ -307,7 +336,12 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Receive files from a peer (browser or CLI)
+    /// Receive files from a peer (browser or CLI).
+    ///
+    /// In a terminal with no code this opens a guided code entry (or press enter
+    /// for the local-network auto room). Scripts are safe by default: a non-TTY
+    /// uses the auto room; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass
+    /// --no-interactive to skip the prompt.
     Recv {
         /// One-time code spoken by the sender (omit to use the auto room)
         code: Option<String>,
@@ -334,7 +368,12 @@ enum Cmd {
         output: Option<String>,
     },
     /// Remember a device — a pairing ceremony, no file needed. Mints a code
-    /// (or claims one) and exchanges the pair secret with consent on both ends
+    /// (or claims one) and exchanges the pair secret with consent on both ends.
+    ///
+    /// In a terminal with no code (or a malformed one) this opens a guided,
+    /// color-coded code entry. Scripts are safe by default: a non-TTY never
+    /// prompts; under a TTY set FILAMENT_NONINTERACTIVE=1 or pass --no-interactive
+    /// to fail fast instead of prompting.
     Pair {
         /// A code from the other device; omit to mint one for them
         code: Option<String>,
@@ -509,7 +548,7 @@ fn looks_like_pake_code(s: &str) -> bool {
 /// guessing is bounded by claim-burn + the 5/min rate-limit (≈1 guess per code,
 /// no offline attack); a single word like `cat` falls below that floor. Digits
 /// and 1-letter fragments don't count.
-fn password_word_tokens(normalized_password: &str) -> usize {
+pub(crate) fn password_word_tokens(normalized_password: &str) -> usize {
     let mut tokens = 0;
     let mut run = 0;
     for c in normalized_password.chars() {
@@ -1405,7 +1444,64 @@ fn pair_v2_caps() -> Vec<String> {
     vec!["transfer".to_string()]
 }
 
-async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, word: Option<String>, relay: bool) -> Result<()> {
+/// The one-line dim banner shown right before we open the guided entry on a
+/// MALFORMED arg — so the user knows WHY the prompt appeared and how to make it
+/// fail fast in scripts.
+fn malformed_entry_banner(arg: &str) {
+    ui::say(&ui::paint(
+        ui::Tone::Dim,
+        &format!(
+            "couldn't parse '{arg}' — opening guided entry · set FILAMENT_NONINTERACTIVE=1 to fail fast in scripts"
+        ),
+    ));
+}
+
+/// Map a codeentry Outcome::Cancelled into a clean error (used by the wired
+/// commands so a cancel exits non-zero without a stack-y message).
+fn cancelled() -> anyhow::Error {
+    anyhow!("cancelled")
+}
+
+async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
+    // INTERACTIVE GATE (scripts safe by default — see `interactive_allowed`).
+    //   * `pair` with no code AND no --word -> guided CREATE entry. Empty submit
+    //     falls back to today's auto-mint; typed words become the chosen password.
+    //   * `pair <malformed>` (a positional that isn't a valid claim shape) ->
+    //     banner, then guided CLAIM entry PRE-FILLED with the normalized input.
+    // When the gate is closed we keep EXACTLY today's behavior below.
+    if word.is_none() && interactive_allowed() {
+        let malformed = code.as_deref().filter(|c| {
+            // A "valid claim shape" is words + a trailing dash-group; anything that
+            // split_code can't peel into (nameplate, non-empty words) is malformed.
+            let normalized = filament_pake::norm_code(c);
+            let (np, pw) = filament_pake::split_code(&normalized);
+            pw.is_empty() || np.is_empty()
+        });
+        match (&code, malformed) {
+            // No code at all -> CREATE entry.
+            (None, _) => {
+                let auto_np = filament_pake::words::mint_nameplate();
+                match codeentry::run("  pair · choose words  ", codeentry::Mode::Create, "", &auto_np)? {
+                    codeentry::Outcome::Submitted(words) => word = Some(words),
+                    codeentry::Outcome::Empty => { /* fall through to auto-mint */ }
+                    codeentry::Outcome::Cancelled => return Err(cancelled()),
+                }
+            }
+            // Malformed positional -> banner + prefilled CLAIM entry.
+            (Some(raw), Some(_)) => {
+                malformed_entry_banner(raw);
+                let prefill = filament_pake::norm_code(raw);
+                match codeentry::run("  pair · code  ", codeentry::Mode::Claim, &prefill, "")? {
+                    codeentry::Outcome::Submitted(c) => code = Some(c),
+                    // Empty submit on a claim-fix means "give up on this code".
+                    codeentry::Outcome::Empty => return Err(cancelled()),
+                    codeentry::Outcome::Cancelled => return Err(cancelled()),
+                }
+            }
+            // A well-formed positional -> no prompt, proceed as today.
+            (Some(_), None) => {}
+        }
+    }
     // STEERING: --word lets the creator choose the SPAKE2 password. The positional
     // `code` arg still means "claim", so --word + a code is contradictory.
     if word.is_some() && code.is_some() {
@@ -3828,6 +3924,11 @@ async fn main() -> Result<()> {
     if cli.no_relay {
         NO_RELAY.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    // Record the global --no-interactive opt-out before any command runs (the
+    // gate also honors FILAMENT_NONINTERACTIVE and a non-TTY stdin).
+    if cli.no_interactive {
+        NO_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let server = if cli.server == DEFAULT_SERVER {
         config_get("server").unwrap_or(cli.server.clone())
     } else {
@@ -4115,8 +4216,8 @@ struct Outgoing {
 async fn send_cmd(
     server: &str,
     paths: Vec<String>,
-    use_code: bool,
-    word: Option<String>,
+    mut use_code: bool,
+    mut word: Option<String>,
     room: Option<String>,
     to: Option<String>,
     name: Option<String>,
@@ -4125,6 +4226,26 @@ async fn send_cmd(
 ) -> Result<()> {
     if paths.is_empty() {
         bail!("nothing to send — pass files, directories, or '-' for stdin");
+    }
+    // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
+    // from stdin -> offer to mint a shareable code. Enter = local network
+    // (today's default); typing words drops into the CREATE entry. Kept minimal:
+    // a one-key choice gates the create-entry, nothing else about send changes.
+    // Skipped when reading payload from stdin ('-') so we never fight for stdin.
+    if !use_code && to.is_none() && !paths.iter().any(|p| p == "-") && interactive_allowed() {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            "  press enter to send over the local network, or type words to create a shareable code",
+        ));
+        let auto_np = filament_pake::words::mint_nameplate();
+        match codeentry::run("  send · code  ", codeentry::Mode::Create, "", &auto_np)? {
+            codeentry::Outcome::Submitted(words) => {
+                use_code = true;
+                word = Some(words);
+            }
+            codeentry::Outcome::Empty => { /* fall through to local-network send */ }
+            codeentry::Outcome::Cancelled => return Err(cancelled()),
+        }
     }
     // --name overrides the offered name, but only makes sense for a SINGLE
     // payload (stdin, or one regular file). With multiple paths or a directory
@@ -4998,7 +5119,7 @@ struct IncomingFile {
 #[allow(clippy::too_many_arguments)]
 async fn recv_cmd(
     server: &str,
-    code: Option<String>,
+    mut code: Option<String>,
     dir: PathBuf,
     yes: bool,
     room: Option<String>,
@@ -5014,6 +5135,21 @@ async fn recv_cmd(
     shell_user: Option<String>,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
+    // INTERACTIVE GATE (CLI `recv` only — never the daemon/`up`). With no code,
+    // offer: type a code to connect to a specific person, or press Enter on an
+    // empty buffer to use the local network (today's default). When the gate is
+    // closed we fall straight through to the auto-room default below.
+    if !daemon && code.is_none() && interactive_allowed() {
+        ui::say(&ui::paint(
+            ui::Tone::Dim,
+            "  enter a code to connect to a specific person, or press enter to use the local network",
+        ));
+        match codeentry::run("  recv · code  ", codeentry::Mode::Claim, "", "")? {
+            codeentry::Outcome::Submitted(c) => code = Some(c),
+            codeentry::Outcome::Empty => { /* fall through to the local-network auto room */ }
+            codeentry::Outcome::Cancelled => return Err(cancelled()),
+        }
+    }
     // A code that looks like a PAIRING code (word-word-NNNN, 4-digit trailing,
     // from `filament pair`) typed into `recv`, which claims one-time transfer
     // codes — fail with a clear redirect instead of a silent never-connect.

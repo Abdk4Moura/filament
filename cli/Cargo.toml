@@ -55,6 +55,10 @@ filament-pake = { path = "../pake" }
 # no process-default crypto provider is required.
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = { version = "=0.13.2", default-features = false, features = ["ring", "pem"] }
+# Interactive guided code entry (raw mode + key events + styled output;
+# cross-platform incl. Windows). Used ONLY behind the interactivity gate; a
+# non-TTY / scripted run never enters its event loop.
+crossterm = "0.29"
 
 [profile.release]
 lto = true
