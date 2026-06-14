@@ -6967,6 +6967,8 @@ mod tests {
         // with `printf 'filament-proof2:u1|u1|u2|FPA|FPB' | openssl dgst
         // -sha256 -hmac s3cret`). If either implementation drifts, browsers
         // and CLIs silently stop recognizing each other as known devices.
+        // The JS half of this byte-identity proof asserts the IDENTICAL vectors:
+        // cli/tests/l1a/gate8_byte_identity.mjs (channelOf/proofFor).
         let want = "f98c3b6b7a70ebdf4b200680e83383881bdb1a11476283507359c55ef03a8474";
         // deliberately unsorted inputs — proof_for must normalize
         assert_eq!(proof_for("s3cret", "u1", "u2", "u1", "FPB", "FPA"), want);
