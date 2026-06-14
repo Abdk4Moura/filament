@@ -25,7 +25,13 @@ const KEYS = {
   Home: '\x1b[H', End: '\x1b[F', PgUp: '\x1b[5~', PgDn: '\x1b[6~',
   Del: '\x1b[3~', '|': '|', '/': '/', '~': '~', '-': '-',
 }
-const isTouch = typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(pointer: coarse)').matches
+// Coarse pointer => treat as touch (mobile). The ?preview=...&touch=1 query is a
+// dev-only override so the touch input/scroll path can be exercised on a desktop
+// browser in the harness; it is inert in the real app (no preview query).
+const forceTouch = (() => {
+  try { const q = new URLSearchParams(window.location.search); return !!q.get('preview') && q.get('touch') === '1' } catch (e) { return false }
+})()
+const isTouch = forceTouch || (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
 
 function xtermTheme(T, accent) {
   return {
@@ -58,7 +64,18 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const [status, setStatus] = useState('connecting')
   const [kbInset, setKbInset] = useState(0) // visualViewport keyboard height
   const [atBottom, setAtBottom] = useState(true) // false => show scroll-to-bottom
+  const [toast, setToast] = useState('') // brief copy/paste feedback
+  const toastTimer = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
+
+  // brief, self-clearing status note (copy/paste feedback so a silent clipboard
+  // rejection on mobile is visible).
+  const showToast = useCallback((msg) => {
+    setToast(msg)
+    if (toastTimer.current) clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast(''), 1400)
+  }, [])
+  useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current) }, [])
 
   const write = useCallback((s) => link && link.sendPtyInput(enc.encode(s)), [link])
 
@@ -183,9 +200,67 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     // draws into the wrong region (issue #1).
     try { fit.fit() } catch (e) {}
 
-    // harden the hidden textarea for mobile (no autocorrect/autocap/spellcheck)
+    // harden the hidden textarea for mobile. The Android soft keyboard (Gboard)
+    // does TWO destructive things to a terminal:
+    //   1. predictive text / autocomplete: it COMPOSES a word in the textarea and
+    //      replaces it on accept, so a single typed word arrives garbled.
+    //   2. xterm's IME path re-reads the textarea value and, when composition
+    //      never cleanly finalizes (Gboard's keyCode 229 stream), it re-emits the
+    //      whole growing buffer on every keystroke ("I cant say... I cant say t
+    //      ... I cant say th..." repeating). See xterm CompositionHelper.
+    // The fix has two parts. (a) Tell the IME to stop predicting/correcting and
+    // mark the field non-autofillable so Gboard sends discrete keys. (b) Strip
+    // composition-based input events ourselves and forward only the inserted
+    // delta to the PTY, so a replay of the accumulated value can never reach the
+    // shell. We also keep the textarea cleared so there is no buffer to replay.
     const ta = hostRef.current.querySelector('textarea')
-    if (ta) { ta.setAttribute('autocorrect', 'off'); ta.setAttribute('autocapitalize', 'off'); ta.setAttribute('autocomplete', 'off'); ta.setAttribute('spellcheck', 'false') }
+    if (ta) {
+      ta.setAttribute('autocorrect', 'off'); ta.setAttribute('autocapitalize', 'off')
+      ta.setAttribute('autocomplete', 'off'); ta.setAttribute('spellcheck', 'false')
+      // Hints that suppress Gboard predictive text / suggestions strip on many
+      // keyboards. inputmode stays 'text' (we still want the keyboard); the
+      // enterkeyhint keeps Enter sane. data-gramm disables Grammarly overlays.
+      ta.setAttribute('enterkeyhint', 'send'); ta.setAttribute('data-gramm', 'false')
+      ta.setAttribute('aria-autocomplete', 'none')
+      // (b) On touch keyboards, neutralize the IME composition path WITHOUT
+      // touching normal typing. Plain (non-composed) keys still flow through
+      // xterm's own input handler, which is correct. The corruption is purely
+      // the COMPOSITION path: xterm's CompositionHelper slices the textarea value
+      // on a delayed timer and, with Gboard's predictive stream, re-emits the
+      // whole growing buffer. We defang it by keeping the textarea EMPTY for the
+      // duration of a composition (so the slice yields nothing) and committing
+      // the resolved word ourselves, exactly once, on compositionend.
+      if (isTouch) {
+        let composing = false
+        const onCompStart = () => { composing = true; ta.value = '' }
+        const onCompUpdate = () => { ta.value = '' } // never let it accumulate
+        const onCompEnd = (e) => {
+          composing = false
+          // Commit the resolved/autocompleted word ONCE.
+          const data = e && e.data ? e.data : ''
+          if (data) write(applyMods(data))
+          // Blank on the next tick too: xterm's _finalizeComposition reads the
+          // value from a setTimeout, so clearing now AND async keeps it empty.
+          ta.value = ''
+          setTimeout(() => { ta.value = '' }, 0)
+        }
+        // During composition, swallow the IME's interim insert events so neither
+        // xterm nor the textarea accumulates a replayable buffer. Plain keys
+        // (no composition active) are left entirely to xterm.
+        const onBeforeInput = (e) => {
+          const it = e.inputType || ''
+          if (composing || it === 'insertCompositionText' || it === 'insertFromComposition') {
+            if (e.cancelable) e.preventDefault()
+            ta.value = ''
+          }
+        }
+        // Capture phase: run before xterm's (capture-registered) input handler.
+        ta.addEventListener('compositionstart', onCompStart, true)
+        ta.addEventListener('compositionupdate', onCompUpdate, true)
+        ta.addEventListener('compositionend', onCompEnd, true)
+        ta.addEventListener('beforeinput', onBeforeInput, true)
+      }
+    }
 
     // bridge: PTY -> xterm. Raw bytes, written through unmodified so alternate
     // screen / cursor-addressing escapes reach the parser intact (issue #1).
@@ -343,24 +418,61 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
 
   // --- copy / paste (issue #3) --------------------------------------------
   // Desktop: select-to-copy (auto-copies the current selection) + Ctrl/Cmd+V
-  // paste. Mobile: an explicit Paste accessory button, since selection + the OS
-  // clipboard are awkward on touch. Both write pasted text straight to the PTY.
+  // paste. Mobile: explicit Copy/Paste accessory buttons, since selection + the
+  // OS clipboard are awkward on touch. A tiny toast confirms success/failure so
+  // a silent clipboard rejection (common on Android) is no longer invisible.
+
+  // robust clipboard write: the async Clipboard API first, then a hidden
+  // textarea + execCommand('copy') fallback for browsers/contexts that block it.
+  const writeClipboard = useCallback(async (text) => {
+    if (!text) return false
+    try { await navigator.clipboard.writeText(text); return true } catch (e) {}
+    try {
+      const tmp = document.createElement('textarea')
+      tmp.value = text
+      tmp.style.position = 'fixed'; tmp.style.opacity = '0'; tmp.style.top = '0'
+      document.body.appendChild(tmp); tmp.focus(); tmp.select()
+      const ok = document.execCommand('copy')
+      document.body.removeChild(tmp)
+      return ok
+    } catch (e) { return false }
+  }, [])
+
+  // Copy: the current selection if there is one; on touch (where making a
+  // precise selection is hard) fall back to copying the VISIBLE viewport, so
+  // "grab that output" works with a single tap.
   const copySelection = useCallback(async () => {
     const term = termRef.current
     if (!term) return false
-    const sel = term.getSelection()
-    if (!sel) return false
-    try { await navigator.clipboard.writeText(sel); haptic(); return true } catch (e) { return false }
-  }, [])
+    let text = term.getSelection()
+    if ((!text || !text.length) && isTouch) {
+      try {
+        const b = term.buffer.active
+        const lines = []
+        for (let i = 0; i < term.rows; i++) {
+          const ln = b.getLine(b.viewportY + i)
+          if (ln) lines.push(ln.translateToString(true))
+        }
+        text = lines.join('\n').replace(/\n+$/, '')
+      } catch (e) {}
+    }
+    if (!text || !text.length) { showToast('nothing to copy'); return false }
+    const ok = await writeClipboard(text)
+    haptic(); showToast(ok ? 'copied' : 'copy blocked')
+    return ok
+  }, [writeClipboard, showToast])
+
   const pasteClipboard = useCallback(async () => {
     let text = ''
-    try { text = await navigator.clipboard.readText() } catch (e) { return false }
-    if (!text) return false
+    try { text = await navigator.clipboard.readText() } catch (e) {
+      showToast('paste blocked: allow clipboard'); return false
+    }
+    if (!text) { showToast('clipboard empty'); return false }
     write(text) // bracketed-paste-safe: the PTY/app decides how to treat it
-    haptic()
+    haptic(); showToast('pasted')
     termRef.current && termRef.current.focus()
     return true
-  }, [write])
+  }, [write, showToast])
 
   // Auto-copy on selection (desktop): mirrors a normal terminal's behavior and
   // gives mobile a no-op-safe path. Wired once per mounted terminal.
@@ -448,6 +560,16 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
               border: `1px solid ${accent}66`, color: T.onAccent, background: accent,
               boxShadow: '0 2px 10px rgba(0,0,0,.45)', opacity: 0.92,
             }}>↓</button>
+        )}
+        {/* copy/paste feedback toast: makes a silent clipboard rejection visible */}
+        {toast && (
+          <div data-testid="term-toast" style={{
+            position: 'absolute', left: '50%', bottom: 14, transform: 'translateX(-50%)',
+            zIndex: 6, pointerEvents: 'none', fontSize: 12, padding: '6px 12px',
+            borderRadius: 8, color: T.text, background: T.panel2,
+            border: `1px solid ${T.line}`, boxShadow: '0 2px 10px rgba(0,0,0,.45)',
+            whiteSpace: 'nowrap',
+          }}>{toast}</div>
         )}
       </div>
       {/* accessory key bar (always on touch; handy on desktop too) */}
