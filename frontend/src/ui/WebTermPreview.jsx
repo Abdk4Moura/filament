@@ -58,11 +58,19 @@ function makeMockLink() {
   }
   function run(cmd, l) {
     const c = cmd.trim()
-    if (c === 'help') l.onPtyData(enc.encode('commands: help, ls, whoami, echo <text>, date, tui\r\n'))
+    if (c === 'help') l.onPtyData(enc.encode('commands: help, ls, whoami, echo <text>, date, seq [n], tui\r\n'))
     else if (c === 'ls') l.onPtyData(enc.encode('\x1b[38;2;91;157;255mFilament\x1b[0m  docs  src  README.md\r\n'))
     else if (c === 'whoami') l.onPtyData(enc.encode('guest\r\n'))
     else if (c.startsWith('echo ')) l.onPtyData(enc.encode(c.slice(5) + '\r\n'))
     else if (c === 'date') l.onPtyData(enc.encode('Wed Jun 10 14:22:07 UTC 2026\r\n'))
+    else if (c === 'seq' || c.startsWith('seq ')) {
+      // Emit N numbered lines so scrollback (and the custom scrollbar) can be
+      // exercised in the harness. Default 200.
+      const n = Math.max(1, Math.min(5000, parseInt(c.split(' ')[1], 10) || 200))
+      let out = ''
+      for (let i = 1; i <= n; i++) out += 'line ' + i + '\r\n'
+      l.onPtyData(enc.encode(out))
+    }
     else if (c === 'tui') {
       // Issue #1 stand-in: enter the alternate screen and draw a full-screen
       // frame, exactly like vim/htop/opencode. If xterm passes our raw escapes

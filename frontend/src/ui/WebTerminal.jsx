@@ -67,6 +67,16 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
+  // --- custom scrollbar (the reliable mobile scroll, issue #5) -------------
+  // A plain DOM track+thumb pinned to the right edge. Unlike the swipe handler
+  // (which never fired reliably on real iPad/Android), a dragged DOM element
+  // behaves identically on touch, pen, and mouse via pointer events, so this is
+  // the dependable way to move through scrollback on a phone/tablet.
+  const trackRef = useRef(null)
+  // {visible, thumbTop, thumbH} as percentages of the track height. visible is
+  // false when everything fits (no scrollback) or a TUI owns the alt screen.
+  const [bar, setBar] = useState({ visible: false, top: 0, height: 100 })
+  const dragRef = useRef(null) // { startY, startTop } while dragging the thumb
 
   // brief, self-clearing status note (copy/paste feedback so a silent clipboard
   // rejection on mobile is visible).
@@ -124,6 +134,88 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     haptic()
   }, [])
 
+  // Recompute the thumb size + position from xterm's buffer geometry. The total
+  // scrollable height is (baseY + rows) lines: baseY is the topmost viewport
+  // line of the live tail, so the whole document is baseY + rows lines and the
+  // viewport shows `rows` of them starting at viewportY. The thumb height is the
+  // visible fraction (rows / total) and its top is viewportY / total. Hidden
+  // when everything fits (baseY === 0) or a TUI owns the alternate screen.
+  const syncBar = useCallback(() => {
+    const term = termRef.current
+    const b = term && term.buffer && term.buffer.active
+    if (!term || !b) { setBar((p) => (p.visible ? { ...p, visible: false } : p)); return }
+    if (b.type === 'alternate' || b.baseY <= 0) {
+      setBar((p) => (p.visible ? { ...p, visible: false } : p)); return
+    }
+    const rows = term.rows || 24
+    const total = b.baseY + rows
+    const h = Math.max(8, (rows / total) * 100) // % of track, floored so it stays grabbable
+    const maxTop = 100 - h
+    const top = total > rows ? (b.viewportY / b.baseY) * maxTop : 0
+    setBar({ visible: true, top: Math.max(0, Math.min(maxTop, top)), height: h })
+  }, [])
+
+  // Map a fractional position along the track (0 = top, 1 = bottom) to a buffer
+  // line and scroll there. Used by both the thumb drag and a track tap-to-page
+  // would use scrollLines instead; here we jump precisely.
+  const scrollToFraction = useCallback((frac) => {
+    const term = termRef.current
+    const b = term && term.buffer && term.buffer.active
+    if (!term || !b || b.type === 'alternate') return
+    const f = Math.max(0, Math.min(1, frac))
+    term.scrollToLine(Math.round(f * b.baseY))
+  }, [])
+
+  // Thumb drag: pointer events cover mouse + touch + pen identically, so a synth
+  // drag in the harness exercises the exact code a real finger does. We capture
+  // the pointer so the drag survives the finger sliding off the thin thumb, and
+  // map the thumb's center under the pointer to a scroll fraction.
+  const onThumbDown = useCallback((e) => {
+    const term = termRef.current
+    const track = trackRef.current
+    if (!term || !track) return
+    e.preventDefault(); e.stopPropagation() // never let it reach xterm (no typing/selection)
+    const rect = track.getBoundingClientRect()
+    // Measure the rendered thumb (its height can exceed bar.height% via minHeight)
+    // so the pixel<->line mapping is exact. grab is where within the thumb we
+    // grabbed, so the thumb does not snap its top to the pointer.
+    const thumbRect = e.currentTarget.getBoundingClientRect()
+    const thumbPx = thumbRect.height
+    const grab = e.clientY - thumbRect.top
+    dragRef.current = { rect, thumbPx, grab }
+    try { e.target.setPointerCapture(e.pointerId) } catch (err) {}
+  }, [])
+  const onThumbMove = useCallback((e) => {
+    const d = dragRef.current
+    if (!d) return
+    e.preventDefault()
+    const travel = d.rect.height - d.thumbPx // px of track the thumb top can span
+    if (travel <= 0) return
+    const topPx = (e.clientY - d.rect.top - d.grab)
+    scrollToFraction(topPx / travel)
+  }, [scrollToFraction])
+  const onThumbUp = useCallback((e) => {
+    if (!dragRef.current) return
+    dragRef.current = null
+    try { e.target.releasePointerCapture(e.pointerId) } catch (err) {}
+  }, [])
+
+  // Tap the track above/below the thumb: page toward the tap, like a native
+  // scrollbar gutter click. Ignore taps that land on the thumb (those start a
+  // drag instead). Direction: tap above the thumb scrolls up, below scrolls down.
+  const onTrackDown = useCallback((e) => {
+    const term = termRef.current
+    const track = trackRef.current
+    if (!term || !track) return
+    e.preventDefault()
+    const rect = track.getBoundingClientRect()
+    const y = e.clientY - rect.top
+    const thumbTop = (bar.top / 100) * rect.height
+    const thumbBot = thumbTop + (bar.height / 100) * rect.height
+    if (y < thumbTop) scrollPage(-1)
+    else if (y > thumbBot) scrollPage(1)
+  }, [bar, scrollPage])
+
   // --- resize hardening (issue #2) ----------------------------------------
   // The Android soft keyboard fires a burst of visualViewport resizes; the
   // ResizeObserver fires its own. ALL of them funnel through this one
@@ -165,8 +257,9 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
         }
       } catch (e) {}
       setAtBottom(computeAtBottom())
+      syncBar()
     })
-  }, [computeAtBottom])
+  }, [computeAtBottom, syncBar])
 
   // mount xterm + open the pty. Re-runs when `link` changes (a reconnect hands
   // us a fresh PeerLink); the SAME session id makes that a reattach, not a new
@@ -264,7 +357,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
 
     // bridge: PTY -> xterm. Raw bytes, written through unmodified so alternate
     // screen / cursor-addressing escapes reach the parser intact (issue #1).
-    link.onPtyData = (u8) => term.write(u8)
+    link.onPtyData = (u8) => term.write(u8, () => syncBar())
     link.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
     link.onPtyReady = () => {
       setStatus('ready')
@@ -280,7 +373,13 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     // Track scroll position so the scroll-to-bottom affordance shows only when
     // the reader has scrolled up off the live tail. Fires on wheel, touch swipe,
     // and programmatic scrolls alike.
-    const scrollSub = term.onScroll(() => setAtBottom(computeAtBottom()))
+    const scrollSub = term.onScroll(() => { setAtBottom(computeAtBottom()); syncBar() })
+    // Keep the thumb in sync as output arrives and as the alt screen toggles.
+    // onWriteParsed fires after each parsed chunk (covers TUI enter/exit and the
+    // alternate-screen flip); onLineFeed covers plain line growth.
+    const writeSub = term.onWriteParsed(() => syncBar())
+    const lineSub = term.onLineFeed(() => syncBar())
+    const resizeBarSub = term.onResize(() => syncBar())
 
     // --- touch scrolling (issue #5) -----------------------------------------
     // On mobile a one-finger swipe over the terminal must scroll the SCROLLBACK,
@@ -361,6 +460,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       if (poll) clearInterval(poll)
       if (fitRaf.current) { cancelAnimationFrame(fitRaf.current); fitRaf.current = 0 }
       dataSub.dispose(); sizeSub.dispose(); scrollSub.dispose(); ro.disconnect()
+      try { writeSub.dispose(); lineSub.dispose(); resizeBarSub.dispose() } catch (e) {}
       host.removeEventListener('touchstart', onTouchStart)
       host.removeEventListener('touchmove', onTouchMove)
       host.removeEventListener('touchend', onTouchEnd)
@@ -548,6 +648,35 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
             or zooming on a swipe over the terminal. */}
         <style>{`[data-testid="term-host"] .xterm-viewport{touch-action:pan-y}`}</style>
         <div ref={hostRef} data-testid="term-host" style={{ position: 'absolute', inset: 0, padding: '8px 10px', touchAction: 'none' }} />
+        {/* Custom scrollbar: a track + draggable thumb pinned to the right edge,
+            ABOVE the xterm canvas (zIndex 4, under the modal-level toast/button).
+            The track is a wide (28px) touch target so a finger can land it; the
+            visible rail inside is slimmer. Hidden when everything fits or a TUI
+            owns the alt screen. It does NOT use touch-action/swipe: a dragged DOM
+            element with pointer capture works the same on iPad, Android, desktop. */}
+        {bar.visible && (
+          <div ref={trackRef} data-testid="term-scrollbar" onPointerDown={onTrackDown}
+            style={{
+              position: 'absolute', top: 6, bottom: 6, right: 0, width: 28,
+              zIndex: 4, cursor: 'pointer', touchAction: 'none',
+              display: 'flex', justifyContent: 'center',
+            }}>
+            {/* rail (visual) */}
+            <div style={{ position: 'absolute', top: 0, bottom: 0, right: 9, width: 6, borderRadius: 3, background: T.lineSoft, opacity: 0.5 }} />
+            {/* thumb (the grab target). It is wider than the rail so it is easy to
+                hit; pointer events here scroll, never reach xterm. */}
+            <button data-testid="term-scrollbar-thumb" aria-label="scroll terminal"
+              onPointerDown={onThumbDown} onPointerMove={onThumbMove}
+              onPointerUp={onThumbUp} onPointerCancel={onThumbUp}
+              style={{
+                position: 'absolute', right: 5, width: 14, padding: 0, margin: 0,
+                top: `${bar.top}%`, height: `${bar.height}%`, minHeight: 28,
+                borderRadius: 7, border: `1px solid ${accent}66`, background: accent,
+                opacity: 0.9, cursor: 'grab', touchAction: 'none',
+                boxShadow: '0 1px 4px rgba(0,0,0,.4)',
+              }} />
+          </div>
+        )}
         {/* scroll-to-bottom: appears only when scrolled up off the live tail.
             Touch-sized (44px), unobtrusive, jumps back to the prompt. */}
         {!atBottom && (
