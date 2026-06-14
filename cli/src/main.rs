@@ -341,6 +341,11 @@ enum Cmd {
         /// What to call them (asked interactively if omitted)
         #[arg(long)]
         name: Option<String>,
+        /// Choose your own pairing words instead of minting (the SPAKE2
+        /// password; the connect number is still machine-assigned). Use at
+        /// least two words, e.g. --word "gigantic element".
+        #[arg(long)]
+        word: Option<String>,
     },
     /// List devices remembered via --remember (trusted for --to and auto-accept)
     Devices {
@@ -461,8 +466,12 @@ enum DevicesAction {
     Rename { old: String, new: String },
 }
 
-/// Looks like a legacy speakable TRANSFER code: word-word-digits (3 segments).
-/// This is what `send --code` mints and `recv` claims.
+/// Looks like a speakable CODE of the shape `word-word-DIGITS` (3 segments: two
+/// lowercase words then a numeric trailing group of >= 2 digits). BOTH a minted
+/// transfer code (`adj-animal-NNN`, 3-digit) and a minted pairing code
+/// (`adj-animal-NNNN`, 4-digit) now share this shape — the pairing-vs-transfer
+/// HINT is by trailing-number WIDTH (see `looks_like_pake_code`), not segment
+/// count. This is the claimable-code structural test (used by the `up` prompt).
 fn regex_lite_code(s: &str) -> bool {
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == 3
@@ -474,17 +483,46 @@ fn regex_lite_code(s: &str) -> bool {
         && parts[2].chars().all(|c| c.is_ascii_digit())
 }
 
-/// Bug 4: looks like a PAKE PAIRING code: adj-animal-extra-NNNN (4 segments,
-/// three lowercase words then a numeric nameplate). This is what `pair` mints
-/// and the browser's "pair with code" consumes — NOT interchangeable with the
-/// 3-segment transfer code above. Used only to give a helpful error/route, not
-/// to authenticate (the PAKE does that).
+/// The trailing numeric group's width (digit count), or 0 if the last segment
+/// isn't all digits. The pairing-vs-transfer hint keys off this: minted pairing
+/// nameplates are 4-digit; minted transfer codes are 3-digit.
+fn trailing_num_width(s: &str) -> usize {
+    match s.rsplit('-').next() {
+        Some(t) if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) => t.len(),
+        _ => 0,
+    }
+}
+
+/// ADVISORY hint that a typed code is a PAIRING code (vs a one-time transfer
+/// code). Both are now `word-word-DIGITS`; the only structural difference is the
+/// trailing-number WIDTH — a 4-digit nameplate is what `filament pair` / the
+/// browser "create code" mints, whereas a transfer code ends in 3 digits. This
+/// is UX-only — it NEVER authenticates (PAKE/SPAKE2 does) — so it's safe to be
+/// approximate; a mismatch still fails LOUDLY with the right next command.
 fn looks_like_pake_code(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('-').collect();
-    parts.len() == 4
-        && parts[..3].iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase()))
-        && parts[3].len() >= 2
-        && parts[3].chars().all(|c| c.is_ascii_digit())
+    regex_lite_code(s) && trailing_num_width(s) >= 4
+}
+
+/// STEERING (min-strength floor): count the WORD tokens in a normalized password
+/// — maximal runs of >= 2 ASCII letters. A user-chosen password must contain at
+/// least 2 such tokens. WHY: a minted 2-word code is ~12 bits and online
+/// guessing is bounded by claim-burn + the 5/min rate-limit (≈1 guess per code,
+/// no offline attack); a single word like `cat` falls below that floor. Digits
+/// and 1-letter fragments don't count.
+fn password_word_tokens(normalized_password: &str) -> usize {
+    let mut tokens = 0;
+    let mut run = 0;
+    for c in normalized_password.chars() {
+        if c.is_ascii_lowercase() {
+            run += 1;
+            if run == 2 {
+                tokens += 1; // crossed the >=2-letter threshold
+            }
+        } else {
+            run = 0;
+        }
+    }
+    tokens
 }
 
 // --------------------------------------------------------------- utilities --
@@ -1367,7 +1405,33 @@ fn pair_v2_caps() -> Vec<String> {
     vec!["transfer".to_string()]
 }
 
-async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, relay: bool) -> Result<()> {
+async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, word: Option<String>, relay: bool) -> Result<()> {
+    // STEERING: --word lets the creator choose the SPAKE2 password. The positional
+    // `code` arg still means "claim", so --word + a code is contradictory.
+    if word.is_some() && code.is_some() {
+        bail!("--word chooses your OWN pairing words (creator); it can't be combined with a code to claim. Drop one.");
+    }
+    // A custom phrase must clear the min-strength floor BEFORE we touch the
+    // network. Normalize with the SHARED norm_code so the echoed/created code is
+    // exactly what SPAKE2 will hash, then require >= 2 word tokens.
+    let custom_words: Option<String> = match &word {
+        Some(w) => {
+            let normalized = filament_pake::norm_code(w);
+            // Strip any trailing number the user typed into --word (the nameplate
+            // is ALWAYS machine-minted); keep only the words half.
+            let (_np, pw) = filament_pake::split_code(&normalized);
+            let words = if pw.is_empty() { normalized.clone() } else { pw };
+            if password_word_tokens(&words) < 2 {
+                bail!(
+                    "'{w}' is too weak — use at least two words, e.g. gigantic-element \
+                     (easier to say, harder to guess). A single word falls below the \
+                     strength floor the rate-limit relies on."
+                );
+            }
+            Some(words)
+        }
+        None => None,
+    };
     let my_uid = mk_uid("p");
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
@@ -1378,15 +1442,16 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.room = Some(solo.clone());
     sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
-    // Bug 4: a 3-segment legacy TRANSFER code (word-word-digits) typed into
-    // `pair`, which expects a 4-segment PAKE pairing code — redirect clearly
-    // before the PAKE handshake stalls forever against a peer that isn't pairing.
+    // A code that looks like a one-time TRANSFER code (word-word-NNN, 2-3 digit
+    // trailing) typed into `pair`, which runs the PAKE pairing ceremony —
+    // redirect clearly before the handshake stalls against a peer that isn't
+    // pairing. ADVISORY only (by trailing-number width); PAKE still authenticates.
     if let Some(c) = &code {
         if regex_lite_code(c) && !looks_like_pake_code(c) {
             bail!(
                 "'{c}' looks like a one-time TRANSFER code (from `filament send --code`), not a pairing code.\n  \
                  To receive that transfer: run `filament {c}` (or `filament recv {c}`)\n  \
-                 A pairing code looks like `brave-otter-ruby-3141` (one more word)."
+                 A pairing code ends in a 4-digit number, e.g. `brave-otter-3141`."
             );
         }
     }
@@ -1409,11 +1474,20 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
             sio.emit("pair-claim", json!({ "nameplate": np, "v": 2 })).await.ok();
         }
         None => {
-            // Creator: mint words + nameplate locally; ask the server to allocate
-            // ONLY the nameplate. The full code is displayed from our own mint
-            // when pair-ok arrives (the server never echoes any words).
-            my_words = filament_pake::words::mint_words();
+            // Creator: use the user's chosen words (--word) or mint them; the
+            // nameplate is ALWAYS machine-minted. Ask the server to allocate ONLY
+            // the nameplate. The full code is displayed from our own words when
+            // pair-ok arrives (the server never echoes any words).
+            my_words = custom_words.clone().unwrap_or_else(filament_pake::words::mint_words);
             my_nameplate = filament_pake::words::mint_nameplate();
+            // STEERING: echo the normalized code we're about to create so the
+            // creator sees EXACTLY what their peer must type (== what SPAKE2 hashes).
+            if custom_words.is_some() {
+                ui::say(&format!(
+                    "  using your words: {}",
+                    ui::paint(ui::Tone::Brand, &format!("{my_words}-{my_nameplate}"))
+                ));
+            }
             sio.emit("pair-create", json!({ "nameplate": my_nameplate, "v": 2 })).await.ok();
         }
     }
@@ -1597,7 +1671,11 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
                 // Creator nameplate collision: re-mint a FRESH nameplate (and
                 // fresh words) and retry — never reuse a burned code.
                 if creator && v["error"].as_str() == Some("taken") {
-                    my_words = filament_pake::words::mint_words();
+                    // Re-mint a FRESH nameplate; KEEP the creator's chosen words
+                    // (--word) — only mint fresh words when we minted them.
+                    if custom_words.is_none() {
+                        my_words = filament_pake::words::mint_words();
+                    }
                     my_nameplate = filament_pake::words::mint_nameplate();
                     let (st, msg) = filament_pake::start(my_words.as_bytes(), my_nameplate.as_bytes());
                     pake_state = Some(st);
@@ -3721,17 +3799,19 @@ async fn main() -> Result<()> {
     let mut argv: Vec<String> = std::env::args().collect();
     if let Some(first) = argv.get(1) {
         const CMDS: [&str; 17] = ["send", "recv", "devices", "update", "completions", "man", "config", "help", "up", "status", "down", "introduce", "netcat", "forward", "ssh", "grant", "revoke"];
-        let code_re = regex_lite_code(first);
         if !first.starts_with('-') && !CMDS.contains(&first.as_str()) {
             if std::path::Path::new(first).exists() {
                 argv.insert(1, "send".into());
                 argv.push("--code".into());
-            } else if code_re {
-                argv.insert(1, "recv".into());
             } else if looks_like_pake_code(first) {
-                // Bug 4: a 4-segment PAKE pairing code (from `filament pair`) —
-                // claim it via the pairing ceremony, not recv.
+                // A `word-word-NNNN` pairing code (4-digit nameplate, from
+                // `filament pair` / browser "create code") — claim it via the
+                // pairing ceremony. Checked FIRST: pairing and transfer codes are
+                // both 3-segment now, distinguished only by trailing-number width.
                 argv.insert(1, "pair".into());
+            } else if regex_lite_code(first) {
+                // A `word-word-NNN` transfer code (2-3 digit) — receive it.
+                argv.insert(1, "recv".into());
             }
         }
     }
@@ -3781,7 +3861,7 @@ async fn main() -> Result<()> {
         Cmd::Status => status_cmd(),
         Cmd::Down => down_cmd(),
         Cmd::Introduce { a, b } => introduce_cmd(&server, &a, &b, cli.relay).await,
-        Cmd::Pair { code, name } => pair_cmd(&server, code, name, cli.relay).await,
+        Cmd::Pair { code, name, word } => pair_cmd(&server, code, name, word, cli.relay).await,
         Cmd::Devices { action } => {
             match action {
                 None => {
@@ -4933,15 +5013,16 @@ async fn recv_cmd(
     shell_user: Option<String>,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
-    // Bug 4: a 4-segment PAKE pairing code (adj-animal-extra-NNNN) was typed
-    // into `recv`, which only claims 3-segment transfer codes — fail with a
-    // clear redirect instead of a silent never-connect.
+    // A code that looks like a PAIRING code (word-word-NNNN, 4-digit trailing,
+    // from `filament pair`) typed into `recv`, which claims one-time transfer
+    // codes — fail with a clear redirect instead of a silent never-connect.
+    // ADVISORY only (by trailing-number width); PAKE still authenticates.
     if let Some(c) = &code {
-        if looks_like_pake_code(c) && !regex_lite_code(c) {
+        if looks_like_pake_code(c) {
             bail!(
                 "'{c}' looks like a PAIRING code (from `filament pair`), not a transfer code.\n  \
                  To pair a device: run `filament pair {c}`\n  \
-                 A transfer code looks like `brave-otter-37` (one fewer word)."
+                 A transfer code ends in a 3-digit number, e.g. `brave-otter-371`."
             );
         }
     }
@@ -7152,24 +7233,53 @@ mod tests {
         assert_eq!(stdin(None, true), "stdin.bin");
     }
 
-    // Bug 4: the legacy 3-segment transfer code and the 4-segment PAKE pairing
-    // code are distinguishable, and never both match the same string.
+    // 3-seg codes: both transfer (word-word-NNN) and pairing (word-word-NNNN)
+    // share the shape now, so the pairing-vs-transfer HINT is by trailing-number
+    // WIDTH. `looks_like_pake_code` (4-digit) is a strict SUBSET of
+    // `regex_lite_code` (3-seg word-word-DIGITS) by design — the hint is
+    // advisory, never an authenticator.
     #[test]
     fn transfer_and_pairing_codes_are_distinguishable() {
-        // legacy transfer code: word-word-digits
-        assert!(regex_lite_code("brave-otter-37"));
+        // minted transfer code: word-word-NNN (3-digit) — claimable, NOT pairing.
+        assert!(regex_lite_code("brave-otter-371"));
+        assert!(!looks_like_pake_code("brave-otter-371"));
+        // minted pairing code: word-word-NNNN (4-digit) — claimable AND pairing.
+        assert!(regex_lite_code("brave-otter-3141"));
+        assert!(looks_like_pake_code("brave-otter-3141"));
+        // The redirect predicates the commands actually use:
+        //   `recv` bails on a pairing-looking code:        looks_like_pake_code
+        //   `pair` bails on a transfer-looking code: regex && !looks_like_pake
+        let transfer_hint = |s: &str| regex_lite_code(s) && !looks_like_pake_code(s);
+        assert!(transfer_hint("brave-otter-371"));   // -> "use recv"
+        assert!(!transfer_hint("brave-otter-3141")); // a pairing code, no bail
+        assert!(looks_like_pake_code("brave-otter-3141"));  // -> "use pair"
+        assert!(!looks_like_pake_code("brave-otter-37"));   // 2-digit transfer
+        // width boundary: 2-3 digits => transfer hint, >=4 => pairing hint.
+        assert!(trailing_num_width("brave-otter-37") == 2);
         assert!(!looks_like_pake_code("brave-otter-37"));
-        // PAKE pairing code: adj-animal-extra-NNNN
-        assert!(looks_like_pake_code("brave-otter-ruby-3141"));
-        assert!(!regex_lite_code("brave-otter-ruby-3141"));
-        // neither classifier ever claims the same string
-        for s in ["brave-otter-37", "brave-otter-ruby-3141", "calm-lynx-9", "swift-fox-teal-1000"] {
-            assert!(!(regex_lite_code(s) && looks_like_pake_code(s)), "{s} ambiguous");
-        }
-        // junk matches neither
+        assert!(looks_like_pake_code("calm-lynx-1000"));
+        // junk / malformed match neither.
         assert!(!regex_lite_code("hello"));
         assert!(!looks_like_pake_code("hello"));
-        assert!(!looks_like_pake_code("a-b-c-d")); // last seg not numeric
-        assert!(!looks_like_pake_code("Brave-otter-ruby-3141")); // uppercase
+        assert!(!regex_lite_code("a-b-c-d"));               // 4 segments
+        assert!(!regex_lite_code("brave-otter-ruby-3141")); // 4 segments (old shape)
+        assert!(!looks_like_pake_code("Brave-otter-3141")); // uppercase
+    }
+
+    // STEERING floor: --word must contain >= 2 word tokens (letter-runs >= 2).
+    #[test]
+    fn password_word_tokens_counts_real_words() {
+        // single word — too weak (refused).
+        assert_eq!(password_word_tokens("cat"), 1);
+        assert_eq!(password_word_tokens("gigantic"), 1);
+        // two+ words — ok.
+        assert_eq!(password_word_tokens("gigantic-element"), 2);
+        assert_eq!(password_word_tokens("brave-otter"), 2);
+        assert_eq!(password_word_tokens("brave-strong-otter"), 3);
+        // 1-letter fragments and digits don't count as words.
+        assert_eq!(password_word_tokens("a-b-c"), 0);
+        assert_eq!(password_word_tokens("ok1234"), 1);
+        // normalized spaces become dashes upstream; here we only see lowercase.
+        assert_eq!(password_word_tokens(""), 0);
     }
 }
