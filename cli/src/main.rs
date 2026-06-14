@@ -5274,13 +5274,50 @@ async fn recv_cmd(
     // code is split CLIENT-SIDE; only the numeric nameplate is sent (pair-claim
     // {nameplate, v:2}). The words feed SPAKE2 and never reach the server. After
     // mutual auth the agreed secret is DISCARDED (transfer never persists it).
-    let mut recv_cer: Option<Ceremony> = None;
+    //
+    // PER-PEER ceremonies (shared-auto-room fix): the receiver joins the sender's
+    // room, which (for a `send --code`) is the sender's AUTO room, shared with any
+    // other local peers sitting in it. We therefore CANNOT latch onto the first
+    // peer that appears: an unrelated decoy must not be allowed to consume our one
+    // ceremony, run it to the budget, and bail the whole receive. Instead we run
+    // an INDEPENDENT ephemeral ceremony per candidate peer, each built from the
+    // SAME claimed code (words + nameplate). The FIRST peer whose ceremony agrees
+    // K and verifies the confirm MAC becomes the authenticated sender; from then
+    // on we accept file-offers ONLY from that peer. A peer whose ceremony fails
+    // (wrong words) or whose per-peer budget expires is dropped INDIVIDUALLY and
+    // never bails the receive. Only an OVERALL deadline with NO peer authenticated
+    // fails the whole `recv` (so a genuinely absent/old sender still fails loudly
+    // rather than hanging). `recv_code_path` is the "this is a code claim" sentinel
+    // (was `recv_cer.is_some()`); `recv_pake_template` mints each per-peer ceremony.
+    let recv_code_path = code.is_some();
+    let recv_pake_template: Option<(String, String)>; // (words, nameplate)
+    // Each candidate peer's own ephemeral ceremony, keyed by peer id.
+    let mut recv_cers: HashMap<String, Ceremony> = HashMap::new();
+    // Each candidate peer's own bounded budget (armed when its channel comes up).
+    let mut recv_deadlines: HashMap<String, Instant> = HashMap::new();
+    // The peer that WON authentication (its ceremony confirmed). Once set, only
+    // this peer may offer files. `None` until someone authenticates.
     let mut recv_pake_peer: Option<String> = None;
+    // A file-offer can race ahead of auth: the sender offers as soon as IT has our
+    // confirm, which can land a tick BEFORE we finish verifying ITS confirm (the
+    // two confirms cross on the wire, and the shared-room mesh widens that gap). We
+    // must not silently drop that offer, the sender offers it only once. So we
+    // BUFFER the most recent pre-auth offer per candidate peer and REPLAY it the
+    // instant that peer authenticates. Bounded by RECV_MAX_CANDIDATES (same keys).
+    let mut recv_pending_offers: HashMap<String, Value> = HashMap::new();
     let mut recv_pake_done = code.is_none(); // only the code path runs the PAKE
     let recv_pake_budget = Duration::from_secs(
         std::env::var("FILAMENT_PAIR_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
     );
-    let mut recv_pake_deadline: Option<Instant> = None;
+    // Overall bound: once we are matched into the sender's room, SOMEONE must
+    // authenticate within this window or the whole `recv` fails loudly. Per-peer
+    // budgets only drop individual mis-latch candidates; this is the backstop for
+    // a genuinely absent / old sender. Armed on the first candidate channel.
+    let mut recv_pake_overall_deadline: Option<Instant> = None;
+    // Memory bound: a crowded room cannot blow us up. We mint at most this many
+    // concurrent candidate ceremonies; further candidates are ignored (the real
+    // sender is, in practice, among the first to share the room with the claimer).
+    const RECV_MAX_CANDIDATES: usize = 8;
     match &code {
         Some(c) => {
             // Split the typed code into (nameplate, words); send ONLY the
@@ -5290,10 +5327,13 @@ async fn recv_cmd(
             if pw.is_empty() || np.is_empty() {
                 bail!("that code doesn't look right, expected something like brave-otter-371");
             }
-            recv_cer = Some(Ceremony::new(&pw, &np, pair_v2_caps()));
+            // Held to mint a fresh per-peer ceremony for each candidate. The words
+            // live ONLY here and inside each Ceremony's SPAKE2 state; never sent.
+            recv_pake_template = Some((pw.clone(), np.clone()));
             sio.emit("pair-claim", json!({ "nameplate": np, "v": 2 })).await.ok();
         }
         None if daemon => {
+            recv_pake_template = None; // no code claim, no ephemeral PAKE
             // C19: the daemon joins NO room. Presence-channel subscriptions
             // only, strangers can't see it, probe it, or offer to it.
             // (We still `join` an unguessable solo room so the registry holds
@@ -5326,6 +5366,7 @@ async fn recv_cmd(
             }
         }
         None => {
+            recv_pake_template = None; // local-network listen, no ephemeral PAKE
             let room = match &room {
                 Some(r) => r.clone(),
                 None => net::fetch_auto_room(server).await?,
@@ -5518,28 +5559,63 @@ async fn recv_cmd(
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
         sess.tick(&sio).await;
 
-        // L1-a ephemeral PAKE progression (recv code path). Once the link to our
-        // PAKE counterpart is up: send our SPAKE2 element, then (once K + both
-        // DTLS fingerprints exist) the key-confirmation MAC. The secret is
-        // DISCARDED after auth (`recv_pake_done`), never stored.
-        if let (Some(cer), Some(pid)) = (recv_cer.as_mut(), recv_pake_peer.clone()) {
-            if let Some(data) = cer.take_msg_payload() {
-                sio.emit("signal", json!({ "to": pid, "data": data })).await.ok();
-            }
-            if cer.has_k() {
-                if let Some(l) = conn.link(&pid) {
-                    if let Some((my_fp, their_fp)) = match &l.peer { Some(p) => p.fingerprints().await, None => None } {
-                        if let Some(data) = cer.take_confirm_payload(&my_fp, &their_fp) {
+        // L1-a ephemeral PAKE progression (recv code path), PER CANDIDATE PEER.
+        // For each candidate's ceremony whose link is up: send our SPAKE2 element,
+        // then (once K + both DTLS fingerprints exist) the key-confirmation MAC.
+        // Each ceremony is independent, so a decoy peer that never replies just
+        // sits until ITS budget expires (dropped below), never blocking the real
+        // sender's ceremony. The agreed secret is DISCARDED after auth, never
+        // stored. Once one peer authenticates (`recv_pake_done`) we stop driving
+        // candidates: the sender is settled.
+        if recv_code_path && !recv_pake_done {
+            let pids: Vec<String> = recv_cers.keys().cloned().collect();
+            for pid in pids {
+                let send_msg = recv_cers.get_mut(&pid).and_then(|c| c.take_msg_payload());
+                if let Some(data) = send_msg {
+                    sio.emit("signal", json!({ "to": pid, "data": data })).await.ok();
+                }
+                let has_k = recv_cers.get(&pid).map(|c| c.has_k()).unwrap_or(false);
+                if has_k {
+                    let fps = match conn.link(&pid) {
+                        Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
+                        None => None,
+                    };
+                    if let Some((my_fp, their_fp)) = fps {
+                        let conf = recv_cers
+                            .get_mut(&pid)
+                            .and_then(|c| c.take_confirm_payload(&my_fp, &their_fp));
+                        if let Some(data) = conf {
                             sio.emit("signal", json!({ "to": pid, "data": data })).await.ok();
                         }
                     }
                 }
             }
         }
-        // Interop / downgrade: the ephemeral ceremony must confirm within budget
-        // once the channel is up, a sender that never runs it is an older build.
-        if !recv_pake_done {
-            if let Some(dl) = recv_pake_deadline {
+        // Per-peer budgets: a candidate whose ceremony never completes within its
+        // own budget is dropped INDIVIDUALLY (an unrelated decoy, or an old peer
+        // that won't run v2). Dropping it never bails the receive; the real sender
+        // keeps its own live budget. Only relevant before someone authenticates.
+        if recv_code_path && !recv_pake_done {
+            let now = Instant::now();
+            let expired: Vec<String> = recv_deadlines
+                .iter()
+                .filter(|(_, dl)| now > **dl)
+                .map(|(pid, _)| pid.clone())
+                .collect();
+            for pid in expired {
+                recv_deadlines.remove(&pid);
+                recv_cers.remove(&pid);
+                recv_pending_offers.remove(&pid);
+                ui::debug(&format!("recv: candidate {pid} did not authenticate in budget, dropped"));
+            }
+        }
+        // Overall deadline: the backstop. Once we are matched into the sender's
+        // room a candidate channel arms this; if NO peer authenticates within it,
+        // fail the whole `recv` loudly (a genuinely absent / old sender, mirroring
+        // the previous single-budget intent and FILAMENT_PAIR_GRACE_SECS) rather
+        // than hanging forever.
+        if recv_code_path && !recv_pake_done {
+            if let Some(dl) = recv_pake_overall_deadline {
                 if Instant::now() > dl {
                     bail!("the other device uses an older version and can't send securely over a code. Update it (or this CLI) so the transfer runs the encrypted handshake. Nothing was received.");
                 }
@@ -6030,31 +6106,75 @@ async fn recv_cmd(
                     continue;
                 }
                 // L1-a: PAKE messages ride the opaque `signal` relay. Route them
-                // into the ephemeral ceremony (recv code path). On confirm the
-                // secret is agreed; we record auth done and DISCARD the secret.
-                if matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm")) {
-                    if let Some(cer) = recv_cer.as_mut() {
-                        recv_pake_peer.get_or_insert(from.clone());
-                        let fps = match conn.link(&from) {
-                            Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
-                            None => None,
-                        };
-                        let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                // into THAT `from` peer's own ephemeral ceremony (recv code path).
+                // On confirm the secret is agreed; that peer becomes the
+                // authenticated sender and we DISCARD the secret. A failed/aborted
+                // ceremony drops ONLY that candidate (a decoy / wrong-words peer),
+                // it never bails the receive: the real sender's ceremony is
+                // independent and still live.
+                if recv_code_path
+                    && matches!(data["type"].as_str(), Some("pake-msg") | Some("pake-confirm"))
+                {
+                    // Already authenticated a sender? Ignore stray PAKE traffic
+                    // from anyone else, including a late decoy.
+                    if recv_pake_done {
+                        continue;
+                    }
+                    // Mint this peer's ceremony on first sight (bounded), or route
+                    // into its existing one. If the peer was already dropped (budget
+                    // expired) or we are at the candidate cap, ignore its traffic.
+                    if !recv_cers.contains_key(&from) {
+                        if recv_cers.len() >= RECV_MAX_CANDIDATES {
+                            ui::debug("recv: candidate cap reached, ignoring extra peer's PAKE");
+                            continue;
+                        }
+                        if let Some((pw, np)) = &recv_pake_template {
+                            recv_cers.insert(from.clone(), Ceremony::new(pw, np, pair_v2_caps()));
+                            recv_deadlines
+                                .entry(from.clone())
+                                .or_insert_with(|| Instant::now() + recv_pake_budget);
+                            recv_pake_overall_deadline
+                                .get_or_insert_with(|| Instant::now() + recv_pake_budget);
+                        }
+                    }
+                    let fps = match conn.link(&from) {
+                        Some(l) => match &l.peer { Some(p) => p.fingerprints().await, None => None },
+                        None => None,
+                    };
+                    let fp_ref = fps.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+                    if let Some(cer) = recv_cers.get_mut(&from) {
                         match cer.on_signal(&data, fp_ref) {
                             PakeInbound::Consumed => {
                                 if cer.secret().is_some() {
-                                    // Authenticated. DISCARD the secret (auth only).
+                                    // This peer authenticated. Record it as THE
+                                    // sender, DISCARD the secret (auth only), and
+                                    // forget the other candidates.
+                                    recv_pake_peer = Some(from.clone());
                                     recv_pake_done = true;
+                                    recv_cers.clear();
+                                    recv_deadlines.clear();
                                     ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
+                                    // Replay any offer this peer sent while we were
+                                    // still authenticating (the offer that raced the
+                                    // confirm), and drop the others' buffered offers.
+                                    let buffered = recv_pending_offers.remove(&from);
+                                    recv_pending_offers.clear();
+                                    if let Some(offer) = buffered {
+                                        let _ = tx.send(Ev::Control(from.clone(), offer));
+                                    }
                                 }
                             }
                             PakeInbound::Abort(why) => {
-                                bail!("transfer REFUSED: {why}. Nothing was received; ask for a FRESH code.");
+                                // Drop THIS candidate only; the receive lives on.
+                                recv_cers.remove(&from);
+                                recv_deadlines.remove(&from);
+                                recv_pending_offers.remove(&from);
+                                ui::debug(&format!("recv: candidate {from} refused ({why}), dropped"));
                             }
                             PakeInbound::Ignored => {}
                         }
-                        continue;
                     }
+                    continue;
                 }
                 // C18: an offer from an unlinked roster peer creates a polite
                 // responder link (browsers mesh-dial everyone, fix #7 rules).
@@ -6111,19 +6231,47 @@ async fn recv_cmd(
                         ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                 }
-                // L1-a: on the `recv <code>` path, mark this peer as our ephemeral
-                // PAKE counterpart and arm the bounded budget. The progression
-                // block (top of loop) runs the ceremony; file-offers are not
-                // accepted until it confirms (`recv_pake_done`). A direct link is
-                // already authenticated (QUIC keying MAC), so it skips the PAKE.
-                if recv_cer.is_some() && !recv_pake_done {
-                    let is_direct = conn.link(&pid).map(|l| l.direct).unwrap_or(false);
-                    if is_direct {
+                // L1-a: on the `recv <code>` path, this peer is a CANDIDATE sender.
+                // Mint its own ephemeral ceremony (bounded) and arm its per-peer
+                // budget plus the overall backstop. The progression block (top of
+                // loop) drives every candidate independently; file-offers are not
+                // accepted until ONE peer's ceremony confirms (`recv_pake_done`),
+                // and then only from that authenticated peer. A direct link is
+                // already authenticated (its pair-secret MAC bound the QUIC key,
+                // `trusted`), so it skips the PAKE.
+                if recv_code_path && !recv_pake_done {
+                    let (is_direct, is_trusted) = conn
+                        .link(&pid)
+                        .map(|l| (l.direct, l.trusted))
+                        .unwrap_or((false, false));
+                    if is_direct && is_trusted {
+                        // A secret-bound direct link is the sender (known device).
+                        recv_pake_peer = Some(pid.clone());
                         recv_pake_done = true; // pre-authenticated transport
-                    } else {
-                        recv_pake_peer.get_or_insert(pid.clone());
-                        recv_pake_deadline.get_or_insert_with(|| Instant::now() + recv_pake_budget);
-                        ui::say(&ui::paint(ui::Tone::Dim, "  authenticating…"));
+                        recv_cers.clear();
+                        recv_deadlines.clear();
+                        let buffered = recv_pending_offers.remove(&pid);
+                        recv_pending_offers.clear();
+                        if let Some(offer) = buffered {
+                            let _ = tx.send(Ev::Control(pid.clone(), offer));
+                        }
+                    } else if recv_cers.contains_key(&pid) {
+                        // Ceremony already minted (its PAKE traffic arrived first);
+                        // just make sure its budgets are armed.
+                        recv_deadlines
+                            .entry(pid.clone())
+                            .or_insert_with(|| Instant::now() + recv_pake_budget);
+                        recv_pake_overall_deadline
+                            .get_or_insert_with(|| Instant::now() + recv_pake_budget);
+                    } else if recv_cers.len() < RECV_MAX_CANDIDATES {
+                        if let Some((pw, np)) = &recv_pake_template {
+                            recv_cers.insert(pid.clone(), Ceremony::new(pw, np, pair_v2_caps()));
+                            recv_deadlines
+                                .insert(pid.clone(), Instant::now() + recv_pake_budget);
+                            recv_pake_overall_deadline
+                                .get_or_insert_with(|| Instant::now() + recv_pake_budget);
+                            ui::say(&ui::paint(ui::Tone::Dim, "  authenticating…"));
+                        }
                     }
                 }
                 // C29: an in-session pairing, exactly one side hands over a
@@ -6479,13 +6627,30 @@ async fn recv_cmd(
                 }
                 Some("file-offer") => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
-                    // L1-a: on the code path, NEVER accept bytes from a peer that
-                    // hasn't completed the ephemeral SPAKE2 ceremony with us. A
-                    // pre-PAKE file-offer means an unauthenticated (or older) sender
-                    // is trying to push before auth, ignore it; the budget watchdog
-                    // fails loudly if the ceremony never completes.
-                    if recv_cer.is_some() && !recv_pake_done && recv_pake_peer.as_deref() == Some(pid.as_str()) {
-                        ui::debug("ignoring file-offer before ephemeral PAKE confirmed");
+                    // L1-a (shared-room hardened): on the code path, accept bytes
+                    // ONLY from the peer whose ephemeral SPAKE2 ceremony confirmed
+                    // (the authenticated sender). Anything else, a pre-auth offer, a
+                    // decoy / unrelated room peer, or an offer from a DIFFERENT peer
+                    // than the one that authenticated, is refused. (Previously this
+                    // only gated the single latched peer, so a decoy could slip an
+                    // offer past while we were still authenticating; now it cannot.)
+                    // If no peer has authenticated yet, the overall watchdog still
+                    // fails loudly should the real sender never confirm.
+                    if recv_code_path
+                        && (!recv_pake_done || recv_pake_peer.as_deref() != Some(pid.as_str()))
+                    {
+                        // A pre-auth offer from a peer we are STILL authenticating
+                        // (it has a live ceremony) is buffered, not lost: the offer
+                        // and the sender's confirm crossed on the wire. If that peer
+                        // wins auth we replay it; if its ceremony is dropped, the
+                        // buffered offer dies with it. A confirmed-but-different peer
+                        // (a decoy that authenticated nothing) is simply ignored.
+                        if !recv_pake_done && recv_cers.contains_key(&pid) {
+                            recv_pending_offers.insert(pid.clone(), v.clone());
+                            ui::debug("buffering a pre-auth file-offer until its ceremony confirms");
+                        } else {
+                            ui::debug("ignoring file-offer from a peer that has not authenticated via ephemeral PAKE");
+                        }
                         continue;
                     }
                     let id = v["id"].as_str().unwrap_or_default().to_string();
