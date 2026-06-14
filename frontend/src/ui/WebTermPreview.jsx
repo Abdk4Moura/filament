@@ -58,12 +58,27 @@ function makeMockLink() {
   }
   function run(cmd, l) {
     const c = cmd.trim()
-    if (c === 'help') l.onPtyData(enc.encode('commands: help, ls, whoami, echo <text>, date\r\n'))
+    if (c === 'help') l.onPtyData(enc.encode('commands: help, ls, whoami, echo <text>, date, tui\r\n'))
     else if (c === 'ls') l.onPtyData(enc.encode('\x1b[38;2;91;157;255mFilament\x1b[0m  docs  src  README.md\r\n'))
     else if (c === 'whoami') l.onPtyData(enc.encode('guest\r\n'))
     else if (c.startsWith('echo ')) l.onPtyData(enc.encode(c.slice(5) + '\r\n'))
     else if (c === 'date') l.onPtyData(enc.encode('Wed Jun 10 14:22:07 UTC 2026\r\n'))
-    else if (c.length) l.onPtyData(enc.encode('\x1b[38;2;229;72;77m' + c.split(' ')[0] + ': command not found\x1b[0m\r\n'))
+    else if (c === 'tui') {
+      // Issue #1 stand-in: enter the alternate screen and draw a full-screen
+      // frame, exactly like vim/htop/opencode. If xterm passes our raw escapes
+      // through (the #1 fix), buffer.active.type flips to 'alternate' and the
+      // banner renders. Leaves the alt screen up so Playwright can assert it.
+      l.onPtyData(enc.encode(
+        '\x1b[?1049h' + // switch to alternate screen buffer
+        '\x1b[2J' +     // clear it
+        '\x1b[1;1H' +   // home
+        '\x1b[7m TUI-MODE-ACTIVE \x1b[0m\r\n' + // reverse-video banner
+        '\x1b[3;3Hopencode-style full-screen TUI is drawing here\r\n' +
+        '\x1b[5;3Hpress q (or run `exit-tui`) to leave',
+      ))
+    } else if (c === 'exit-tui') {
+      l.onPtyData(enc.encode('\x1b[?1049l')) // back to the normal screen buffer
+    } else if (c.length) l.onPtyData(enc.encode('\x1b[38;2;229;72;77m' + c.split(' ')[0] + ': command not found\x1b[0m\r\n'))
   }
   return link
 }

@@ -123,6 +123,13 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     term.loadAddon(fit)
     term.open(hostRef.current)
     termRef.current = term; fitRef.current = fit
+    // Dev-only: expose the live Terminal for the ?preview= harness so Playwright
+    // can assert alt-screen state / dimensions. Inert in the real app (no query).
+    try {
+      if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('preview')) {
+        window.__webterm = term
+      }
+    } catch (e) {}
     // Initial fit MUST land before we report a size to the PTY, otherwise the
     // shell allocates 80x24 while xterm shows a different geometry and a TUI
     // draws into the wrong region (issue #1).
