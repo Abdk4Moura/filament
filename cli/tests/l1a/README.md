@@ -31,6 +31,7 @@ paths at the top of each script for your environment.
 | 5 caps deny-default | `cargo test capability_deny_by_default` (in `cli/`) | empty caps refuse a gated action; "transfer" is the L0 baseline; not escalatable |
 | 6 downgrade-refused | `gate6_downgrade.sh`     | a v:2-stripping server (FIL_FORCE_V1) is refused; no v2 path stores a server-readable secret |
 | 7 no-regression     | `gate7_noregression.sh`  | vanilla send/recv still transfers; remembered v2 devices reconnect unchanged |
+| 9 transfer-pake     | `gate9_transfer_pake.sh` | `send --code` / `recv <code>` run the SHARED ephemeral SPAKE2 ceremony, transfer byte-exact, and persist NO secret (discarded after auth). Parameterized by `BIN`/`SERVER`. |
 
 Backend crypto + the relay-blind NEGATIVE assertion (words never reach the
 server): `python -m unittest backend.tests.test_pair_codes`.
