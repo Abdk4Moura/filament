@@ -1007,9 +1007,16 @@ export default function Filament(props) {
     : null
 
   // Live peer metadata for the chips (status/name updates as the roster changes).
+  // M5: prefer the STABLE uid. After a mobile reconnect the device's sid changes,
+  // so resolving by s.peer.id (the old sid) returns nothing and the chip freezes
+  // on stale info. Match by uid first (survives the reconnect), then fall back to
+  // the old sid, then to the captured peer snapshot.
   const sessionChips = sessions.map((s) => ({
     id: s.id,
-    peer: state.peers.find((p) => p.id === s.peer.id) || s.peer,
+    peer:
+      (s.peer.uid && state.peers.find((p) => p.uid && p.uid === s.peer.uid)) ||
+      state.peers.find((p) => p.id === s.peer.id) ||
+      s.peer,
   }))
   const sessionsStrip = (
     <SessionsStrip

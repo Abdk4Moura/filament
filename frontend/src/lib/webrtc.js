@@ -70,6 +70,18 @@ function _testFlags() {
     return []
   }
 }
+//   ?test=freezepty -> M1: black-hole the INTERACTIVE (PTY) data path while
+//                       keeping the channel open + the pc 'connected', a faithful
+//                       NAT-rebind on an idle shell link (no file transfer in
+//                       flight). sendPtyInput becomes a no-op once a PTY is open,
+//                       so no bytes leave AND, crucially, the selected candidate
+//                       pair stops receiving ICE consent responses are NOT
+//                       affected by app traffic, so to exercise M1 honestly the
+//                       seam ALSO stops counting consent progress via
+//                       `_testPtyFrozen` (see _checkPtyLiveness). This drives the
+//                       getStats-based interactive-link dead-detector (M1), the
+//                       fast shell grace (M2), and the fast relay escalation (M6)
+//                       with no file transfer present. Inert for real users.
 const TEST = (() => {
   const f = _testFlags()
   return {
@@ -77,6 +89,7 @@ const TEST = (() => {
     truncOnce: f.includes('trunconce'),
     freeze: f.includes('freeze'),
     freezePersist: f.includes('freezepersist'),
+    freezePty: f.includes('freezepty'),
   }
 })()
 // P5 test knob: ms after page load before the persistent freeze "heals" (the
@@ -131,6 +144,25 @@ const STALL_MS = (() => {
 // Ladder ceiling (mirror Rust STALL_MAX_REPAIRS' intent): rungs a→c, then fail
 // clean through _failActive (paused/resumable, never silently dead).
 const MAX_STALL_ATTEMPTS = 3
+
+// M1 (mobile): the IDLE INTERACTIVE-LINK dead-detector. P0's _checkStall is gated
+// on an active file transfer, so a SHELL link that gets black-holed (NAT rebind on
+// a cellular handoff) while idle is invisible to it, the only thing that finally
+// notices is the browser's native ICE consent timeout (~30s), which is far too
+// slow for an interactive terminal. M1 closes that gap WITHOUT needing a file
+// transfer and WITHOUT an app-layer pong: it polls pc.getStats() for the selected
+// candidate pair and watches a liveness signal that advances ONLY while the path
+// is alive. We use ICE CONSENT progress (`responsesReceived`, with
+// `lastPacketReceivedTimestamp` / `bytesReceived` as fallbacks) because the
+// browser sends STUN consent checks ~every 5s on a connected pair and the peer
+// answers them: that counter keeps climbing on a HEALTHY idle link (so we do NOT
+// false-positive on an idle-but-alive terminal) and FREEZES the instant the path
+// dies. App bytes would be the wrong signal (a genuinely idle shell sends none).
+// The window is generous enough to clear the ~5s consent cadence plus jitter.
+const PTY_LIVENESS_WINDOW_MS = 8000
+// Poll cadence is the existing 2s stall tick (we piggy-back on _stallTimer), so a
+// dead idle shell is caught in ~PTY_LIVENESS_WINDOW_MS + one tick (~8-10s) vs the
+// ~30s native consent timeout, fast enough for an interactive link to feel alive.
 
 // P5 (GAP-6): the relay→direct UPGRADE prober. P1 makes a stalled direct path
 // fall to the TURN relay, but that's a ONE-WAY TRAPDOOR: once on relay the link
@@ -328,6 +360,16 @@ export class PeerLink {
     this._stallEpisode = null // {rung, at} latch: prevents re-entering a rung mid-convergence (mirrors Rust repair_in_flight)
     this._stallTimer = null // the watchdog interval (armed on channel open)
 
+    // M1 (mobile): idle-interactive-link liveness. `_ptyLiveSignal` is the last
+    // ICE-consent liveness value we read from getStats (responsesReceived, or a
+    // packet/byte fallback); `_ptyDeadMs` accumulates the no-advance time. A dead
+    // idle shell trips once `_ptyDeadMs >= PTY_LIVENESS_WINDOW_MS`. `_ptyEpisode`
+    // latches an open recovery so we don't re-fire every tick mid-convergence.
+    this._ptyLiveSignal = null
+    this._ptyDeadMs = 0
+    this._ptyEpisode = null
+    this._testPtyFrozen = false // M1 test seam: set true by sendPtyInput under ?test=freezepty
+
     // P5 (GAP-6): the relay→direct upgrade prober. Armed when the route becomes
     // 'relayed', disarmed when it's 'direct'/'local'. `_upgradeTimer` is the
     // backoff timer; `_upgradeDelay` is the current (doubling) cadence;
@@ -393,9 +435,15 @@ export class PeerLink {
         // Dynamic grace (#12/C21): 6s mid-transfer (fail fast, resume covers
         // it); a peer that declared `brb` gets its announced window; 45s for
         // an unannounced idle drop (mobile pickers suspend the whole tab).
+        // M2: a SHELL link (_ptySid != null) is interactive, a 45s freeze on a
+        // dropped terminal feels broken, so treat it like the mid-transfer case
+        // and use the short 6s grace, failing over fast. The PTY reattaches on
+        // the next link via the stable sessionId, so a fast fail is recoverable.
+        // Genuinely idle NON-shell links keep the patient 45s grace.
         const midTransfer = [...this.transfers.values()].some((t) => t.status === 'transferring')
+        const shellLink = this._ptySid != null
         const awayMs = Math.max(0, (this._awayUntil || 0) - Date.now())
-        const grace = midTransfer ? 6000 : awayMs > 0 ? awayMs + 15000 : 45000
+        const grace = midTransfer || shellLink ? 6000 : awayMs > 0 ? awayMs + 15000 : 45000
         this._dcTimer = setTimeout(() => {
           if (this.pc.connectionState !== 'connected') {
             this.onStatus('failed')
@@ -715,8 +763,15 @@ export class PeerLink {
       this._lastBuffered = this.channel?.bufferedAmount || 0
       this._stallIdleMs = 0
       this._stallEpisode = null
+      // M1: reset the idle-interactive liveness baseline too (it shares this tick).
+      this._ptyLiveSignal = null
+      this._ptyDeadMs = 0
+      this._ptyEpisode = null
       clearInterval(this._stallTimer)
-      this._stallTimer = setInterval(() => this._checkStall(), STALL_TICK_MS)
+      this._stallTimer = setInterval(() => {
+        this._checkStall()
+        this._checkPtyLiveness() // M1: idle-shell black-hole detector
+      }, STALL_TICK_MS)
     }
     channel.onmessage = (e) => this._onMessage(e.data)
     // One persistent drain handler feeds ALL concurrent senders, never
@@ -805,6 +860,16 @@ export class PeerLink {
   }
   sendPtyInput(u8) {
     if (this._ptySid == null || this.channel?.readyState !== 'open') return
+    // M1 test seam (?test=freezepty): once a PTY is open, black-hole the
+    // interactive data path while leaving the channel 'open' and the pc
+    // 'connected', a faithful idle-shell NAT rebind. Marking `_testPtyFrozen`
+    // makes _checkPtyLiveness ignore real ICE-consent progress (the test peer is
+    // a local CLI whose path is genuinely alive), so the M1 detector fires as it
+    // would against a truly dead remote path. Inert in production.
+    if (TEST.freezePty) {
+      this._testPtyFrozen = true
+      return // drop input on the floor; nothing reaches the wire
+    }
     const framed = new Uint8Array(4 + u8.byteLength)
     new DataView(framed.buffer).setUint32(0, this._ptySid)
     framed.set(u8, 4)
@@ -1205,6 +1270,11 @@ export class PeerLink {
     this._stallTimer = null
     this._stallEpisode = null
     this._stallIdleMs = 0
+    // M1: the idle-interactive liveness watchdog rode the same timer; clear its
+    // latch too so a rebuilt link starts judging liveness fresh.
+    this._ptyEpisode = null
+    this._ptyDeadMs = 0
+    this._ptyLiveSignal = null
     this._disarmUpgradeProber() // P5: the upgrade prober dies with the link's transfers
     for (const t of this.transfers.values()) {
       if (t.status !== 'transferring' && t.status !== 'offered') continue
@@ -1384,6 +1454,140 @@ export class PeerLink {
     rlog.warn('stall correction exhausted, failing clean (partials preserved)', this.id.slice(-6))
     this.onStatus('failed')
     this._failActive()
+  }
+
+  // -------------------------------------------------- M1 idle-interactive liveness
+  // Read an ICE-CONSENT liveness value off the selected candidate pair. This
+  // counter advances ONLY while the remote answers the browser's STUN consent
+  // checks (~every 5s on a connected pair), so it keeps climbing on a healthy idle
+  // link (no false positive on an idle terminal) and freezes the instant the path
+  // is black-holed. Preference order: responsesReceived (the consent signal) >
+  // lastPacketReceivedTimestamp > bytesReceived (any inbound life). Returns a
+  // number that strictly increases while alive, or null when no pair / unsupported.
+  async _readConsentLiveness() {
+    if (this._closed) return null
+    try {
+      const stats = await this.pc.getStats()
+      let transportSelectedId = null
+      stats.forEach((r) => {
+        if (r.type === 'transport' && r.selectedCandidatePairId) transportSelectedId = r.selectedCandidatePairId
+      })
+      let pair = null
+      stats.forEach((r) => {
+        if (r.type !== 'candidate-pair') return
+        if (r.id === transportSelectedId || (!transportSelectedId && r.state === 'succeeded' && (r.nominated || r.selected)))
+          pair = r
+      })
+      if (!pair) return null
+      if (typeof pair.responsesReceived === 'number') return pair.responsesReceived
+      if (typeof pair.lastPacketReceivedTimestamp === 'number') return pair.lastPacketReceivedTimestamp
+      if (typeof pair.bytesReceived === 'number') return pair.bytesReceived
+      return null
+    } catch {
+      return null // getStats unsupported
+    }
+  }
+
+  // M1: detect a silently-dead INTERACTIVE link fast (the core mobile bug). Runs
+  // on the same 2s tick as _checkStall but is INDEPENDENT of any file transfer.
+  // Only active for a shell link (_ptySid != null) over an open+connected channel
+  // when NO file transfer is in flight (a transfer hands liveness to _checkStall,
+  // which owns the file-data ladder). If the consent-liveness signal has not
+  // advanced for PTY_LIVENESS_WINDOW_MS, the path is dead though the channel still
+  // claims open, trigger recovery via the SAME ladder P0 uses (no new ladder).
+  async _checkPtyLiveness() {
+    if (this._closed || this.channel?.readyState !== 'open') return
+    if (this._ptySid == null) { this._ptyLiveSignal = null; this._ptyDeadMs = 0; return }
+    if (this.pc.connectionState !== 'connected') { this._ptyDeadMs = 0; return }
+    // A file transfer in flight is _checkStall's job (it watches file bytes + the
+    // SCTP buffer). Don't double-detect, defer to it while a transfer moves.
+    const transferring = [...this.transfers.values()].some(
+      (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
+    )
+    if (transferring) { this._ptyDeadMs = 0; return }
+    // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
+    // is legitimately quiet, don't trip while they're away.
+    if ((this._awayUntil || 0) > Date.now()) { this._ptyDeadMs = 0; return }
+
+    const signal = await this._readConsentLiveness()
+    if (this._closed) return
+    // M1 test seam (?test=freezepty): the local CLI peer's path is genuinely
+    // alive, so consent KEEPS advancing even though we froze the app data path.
+    // Force the "no progress" branch so the detector fires as it would against a
+    // truly dead remote path. Inert in production (_testPtyFrozen stays false).
+    const frozenForTest = TEST.freezePty && this._testPtyFrozen
+    if (signal == null && !frozenForTest) { this._ptyDeadMs = 0; return } // can't read: don't guess
+
+    const advanced = !frozenForTest && this._ptyLiveSignal != null && signal > this._ptyLiveSignal
+    if (this._ptyLiveSignal == null && !frozenForTest) {
+      // First reading: seed the baseline, give it a tick before judging.
+      this._ptyLiveSignal = signal
+      this._ptyDeadMs = 0
+      return
+    }
+    if (advanced) {
+      this._ptyLiveSignal = signal
+      this._ptyDeadMs = 0
+      if (this._ptyEpisode) {
+        rlog.info('idle shell link recovered, consent advancing again', this.id.slice(-6))
+        this._ptyEpisode = null
+      }
+      return
+    }
+    // No advance this tick: accumulate dead time.
+    if (!frozenForTest) this._ptyLiveSignal = signal
+    this._ptyDeadMs += STALL_TICK_MS
+    if (this._ptyDeadMs < PTY_LIVENESS_WINDOW_MS) return
+    // Latch so we don't re-fire every tick while a correction converges.
+    const now = Date.now()
+    if (this._ptyEpisode && now - this._ptyEpisode.at < PTY_LIVENESS_WINDOW_MS) return
+    rlog.debug('idle shell link appears dead (consent not advancing)', this.id.slice(-6), 'deadMs', this._ptyDeadMs)
+    this._correctPtyDead()
+  }
+
+  // M1 + M6: recover a dead idle interactive link. Reuse the EXISTING correction
+  // ladder rather than inventing a new one. Rung 1: impolite-only restartIce (the
+  // cheapest in-place repair, identical to _correctStall rung a, the data channel
+  // survives an ICE restart). Rung 2+: escalate straight to onStall (the P1 relay-
+  // preferred rebuild). M6: because this is a shell link (_ptySid != null), skip
+  // the slower middle rungs, an interactive link should reach the relay fast, so
+  // one in-place ICE try then relay. File transfers are untouched (they go through
+  // _correctStall's full 3-rung ladder, gated above on `transferring`).
+  _correctPtyDead() {
+    const now = Date.now()
+    const stage = this._ptyEpisode?.stage
+    if (!stage) {
+      // Rung 1: in-place ICE repair (impolite + connected only, mirrors rung a).
+      if (this.pc.connectionState === 'connected' && !this.polite) {
+        try {
+          this.pc.restartIce()
+          rlog.info('idle shell dead (rung 1): restartIce', this.id.slice(-6))
+        } catch {}
+      } else {
+        rlog.info('idle shell dead (rung 1): no restartIce (polite/not-connected), waiting one window', this.id.slice(-6))
+      }
+      this._ptyEpisode = { stage: 'ice', at: now }
+      return
+    }
+    // M6: still dead after the in-place ICE try, escalate FAST to the relay
+    // rebuild (skip the file-transfer ladder's intermediate rungs). The hook's
+    // onStall does the bounded relay-preferred rebuild; the PTY reattaches on the
+    // new link via the stable sessionId, so the terminal recovers on the relay.
+    if (stage === 'ice') {
+      rlog.info('idle shell still dead (rung 2): escalating to relay rebuild (onStall)', this.id.slice(-6))
+      try {
+        this.onStall?.({ reason: 'persistent', route: this.route })
+      } catch (err) {
+        rlog.warn('onStall hook threw', this.id.slice(-6), err)
+      }
+      this._ptyEpisode = { stage: 'relay', at: now }
+      return
+    }
+    // Exhausted: the relay rebuild was requested and we're still here (the hook
+    // bounds relay escalation to at-most-once). Let the connection-state machine /
+    // M2 short shell grace carry it to a clean 'failed', the terminal reattaches
+    // on the next link. Re-latch so we keep deferring rather than thrashing.
+    this._ptyEpisode = { stage: 'relay', at: now }
   }
 
   close() {
