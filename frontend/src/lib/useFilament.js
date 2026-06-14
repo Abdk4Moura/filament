@@ -14,35 +14,16 @@ import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
-import { mintWords, mintNameplate } from './words.js'
+import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, PAIR_V2_CAPS } from './pairing.js'
 
-// Peer display names draw from the same 64x64 vocabulary as the server's
-// one-time codes (backend/signaling.py — keep in sync). 4,096 combinations
-// picked via crypto.getRandomValues, persisted per tab: a device KEEPS its
-// name on purpose (stable identity, like the uid below) — recurrence across
-// visits is sessionStorage, not a small or biased RNG. See the variance
-// analysis repo for the entropy/birthday math.
-const ADJ = [
-  'amber', 'bold', 'brave', 'brisk', 'calm', 'cheery', 'chill', 'civil',
-  'clever', 'cosy', 'crisp', 'daring', 'deft', 'dewy', 'eager', 'early',
-  'fancy', 'fiery', 'fleet', 'fond', 'frank', 'free', 'fresh', 'gentle',
-  'giddy', 'glad', 'golden', 'grand', 'happy', 'hardy', 'hasty', 'honest',
-  'humble', 'jolly', 'keen', 'kind', 'lively', 'loyal', 'lucky', 'lunar',
-  'mellow', 'merry', 'mighty', 'misty', 'neat', 'noble', 'perky', 'plucky',
-  'polar', 'proud', 'quick', 'quiet', 'rapid', 'rosy', 'royal', 'shiny',
-  'snappy', 'solid', 'spry', 'stout', 'sunny', 'swift', 'tidy', 'witty',
-]
-const ANIMALS = [
-  'otter', 'panda', 'falcon', 'lynx', 'koala', 'heron', 'fox', 'ibex',
-  'marten', 'tapir', 'badger', 'beaver', 'bison', 'bongo', 'camel', 'civet',
-  'condor', 'crane', 'dingo', 'dove', 'eland', 'ermine', 'ferret', 'finch',
-  'gecko', 'gibbon', 'hare', 'hawk', 'hyrax', 'jackal', 'kestrel', 'kiwi',
-  'lemur', 'llama', 'macaw', 'magpie', 'mole', 'moose', 'murre', 'newt',
-  'ocelot', 'okapi', 'oriole', 'osprey', 'owl', 'pika', 'plover', 'puffin',
-  'quokka', 'rabbit', 'raven', 'robin', 'seal', 'shrew', 'skink', 'sparrow',
-  'stoat', 'swan', 'tern', 'toucan', 'vole', 'wombat', 'wren', 'zebra',
-]
+// Peer display names draw from the same 64x64 vocabulary as the pairing
+// wordlists — imported from words.js (ADJ/ANIMAL) so there is a single source
+// of truth (was duplicated here). 4,096 combinations picked via
+// crypto.getRandomValues, persisted per tab: a device KEEPS its name on purpose
+// (stable identity, like the uid below) — recurrence across visits is
+// sessionStorage, not a small or biased RNG. See the variance analysis repo for
+// the entropy/birthday math.
 
 function cryptoPick(a) {
   const buf = new Uint32Array(1)
