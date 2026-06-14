@@ -923,7 +923,15 @@ export function useFilament() {
     // L1-a (PAKE v2): mint the WORDS locally; the server allocates ONLY the
     // numeric nameplate. The full code is assembled+displayed from our OWN mint
     // when pair-ok arrives (the server never echoes any words).
-    await pakeReady()
+    try {
+      await pakeReady()
+    } catch (e) {
+      // The secure-pairing WASM failed to load (e.g. the asset 404'd and the SPA
+      // fallback served HTML). Surface it instead of hanging on a click.
+      log.debug('pakeReady failed', { err: String(e) })
+      setPairStatus("couldn't load the secure-pairing module. Reload the page and try again.")
+      return null
+    }
     pakeReadyRef.current = true
     // STEERING: a custom string the user typed ("choose your own"). Parse it with
     // the SHARED split (normCode/splitCode via parseSpokenCode) so the words feed
@@ -938,6 +946,8 @@ export function useFilament() {
     let chosenNameplate = custom && /^[0-9]{3,5}$/.test(custom.nameplate) ? custom.nameplate : null
     return new Promise((resolve) => {
       let retried = false
+      let settled = false
+      let watchdog
       const mintAndCreate = () => {
         // Words: the user's chosen password, else a fresh mint. Nameplate: the
         // user's chosen one (first try) else a fresh mint; subsequent retries
@@ -950,6 +960,21 @@ export function useFilament() {
         pendingPakeRef.current = { nameplate, password: words, full, askedNameplate: custom?.nameplate || null }
         sig.pairCreateV2(nameplate)
         return full
+      }
+      // These handlers used to be added on EVERY click and never removed (the
+      // Emitter only had on()), so a later pair-error/-code fired every stale
+      // handler. off() + the `settled` guard keep each create attempt isolated.
+      const cleanup = () => {
+        clearTimeout(watchdog)
+        sig.off?.('pair-error', onError)
+        sig.off?.('pair-ok', onOk)
+        sig.off?.('pair-code', onDowngrade)
+      }
+      const finish = (val) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(val)
       }
       const arm = () =>
         setTimeout(() => {
@@ -964,13 +989,13 @@ export function useFilament() {
           } else {
             tel('pair-create-timeout', { afterMs: Date.now() - t0 })
             telFlush()
-            resolve(null)
+            setPairStatus("the server isn't responding. Check your connection and try again.")
+            finish(null)
           }
         }, 5000)
-      let watchdog = arm()
       // Collision: the server says our nameplate is taken — re-mint and retry.
       // If the user had CHOSEN that number, tell them which fresh one we used.
-      sig.on('pair-error', function onTaken({ error }) {
+      function onError({ error }) {
         if (error !== 'taken') return
         const asked = pendingPakeRef.current?.askedNameplate
         mintAndCreate()
@@ -978,9 +1003,18 @@ export function useFilament() {
         if (asked && used && asked !== used) {
           setPairStatus(`that number (${asked}) was busy — we used ${used}`)
         }
-      })
-      sig.on('pair-ok', function onOk() {
-        clearTimeout(watchdog)
+      }
+      // DOWNGRADE GUARD: a v1-only / out-of-date server answers our v2
+      // pair-create with `pair-code` (it minted the whole code) instead of
+      // `pair-ok`. We can't pair securely against it — say so loudly instead of
+      // waiting forever (this was the silent "create code does nothing" against
+      // a stale backend).
+      function onDowngrade() {
+        tel('pair-create-downgrade', { afterMs: Date.now() - t0 })
+        setPairStatus("this server is out of date. It can't create a secure code yet. Try again shortly.")
+        finish(null)
+      }
+      function onOk() {
         const full = pendingPakeRef.current?.full
         tel('pair-create-ok', { rttMs: Date.now() - t0, retried, v: 2 })
         log.debug('pair code ready', { rttMs: Date.now() - t0, retried })
@@ -990,8 +1024,12 @@ export function useFilament() {
           if (s !== 'code') prevScopeRef.current = s
           return 'code'
         })
-        resolve(full)
-      })
+        finish(full)
+      }
+      watchdog = arm()
+      sig.on('pair-error', onError)
+      sig.on('pair-ok', onOk)
+      sig.on('pair-code', onDowngrade)
       mintAndCreate()
     })
   }, [])

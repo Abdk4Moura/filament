@@ -25,6 +25,11 @@ class Emitter {
     ;(this.#handlers[event] ||= []).push(cb)
     return this
   }
+  off(event, cb) {
+    const a = this.#handlers[event]
+    if (a) this.#handlers[event] = a.filter((h) => h !== cb)
+    return this
+  }
   _emit(event, payload) {
     ;(this.#handlers[event] || []).forEach((cb) => cb(payload))
   }

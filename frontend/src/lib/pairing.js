@@ -114,7 +114,7 @@ export class PakePairing {
       // CONFIRMED. Derive the pinned secret from K — agreed, never transmitted.
       this.secret = this.session.secret()
     } else {
-      this.aborted = 'key confirmation failed — wrong code or tampering (a server cannot forge this)'
+      this.aborted = 'key confirmation failed: wrong code or tampering (a server cannot forge this)'
     }
   }
 }

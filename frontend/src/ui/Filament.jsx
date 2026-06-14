@@ -506,7 +506,7 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
       {/* Steering nudge: weak (single-word) input — typing stays allowed. */}
       {pv && typed.trim() && !pv.strongEnough && (
         <div data-testid="custom-nudge" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>
-          use at least two words, e.g. gigantic-element — easier to say, harder to guess
+          use at least two words, e.g. gigantic-element (easier to say, harder to guess)
         </div>
       )}
     </div>
