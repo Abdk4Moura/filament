@@ -1122,44 +1122,89 @@ export function useFilament() {
     const nudgeUpgradeProbes = () => {
       for (const link of linksRef.current.values()) link.probeUpgradeNow?.()
     }
+    // M3/M4: the shared RECOVERY body, extracted from the visibilitychange handler
+    // so the SAME repair runs on every "we may be on a new network now" trigger:
+    // refocus (visibility/focus), `online`, navigator.connection 'change' (a
+    // wifi<->cellular handoff), and a BFCache restore (pageshow persisted). It
+    // reconnects signaling, re-ensures room + channels, re-derives known-device
+    // channels, re-probes relayed links for a direct path, says we're back, then
+    // rebuilds every dead link. Debounced (M3) so a burst of network events (a
+    // single handoff often fires online + connection-change + visibility within
+    // a few hundred ms) does not thrash the reconnect/rebuild work.
+    let recoverTimer = null
+    const runRecovery = () => {
+      sigRef.current?.reconnect?.()
+      sessionRef.current?.kick() // C30: re-ensure room + channels the freeze may have eaten
+      subscribeKnown() // re-derive channels in case a secret was stored while hidden
+      nudgeUpgradeProbes() // P5: a network change may expose a direct path, re-probe relayed links
+      for (const link of linksRef.current.values()) link.sendBack?.()
+      // #13 (measured live): two mobile tabs rarely negotiate while both awake,
+      // links that failed while WE were frozen stay failed forever. Reset retry
+      // budgets (incl. second-wind markers, they share this map) and rebuild
+      // every dead link. M3: on a wifi<->cellular handoff the old ICE path is
+      // black-holed, so rebuilding 'disconnected'/'failed'/'closed' links is
+      // exactly the right response, not just a relay probe.
+      attemptsRef.current.clear()
+      for (const [id, link] of [...linksRef.current.entries()]) {
+        const st = link.pc?.connectionState
+        if (st === 'failed' || st === 'closed' || st === 'disconnected') {
+          tel('refocus-revive', { peer: id.slice(-6), was: st })
+          const { name, peerUid } = { name: link.name, peerUid: link.peerUid }
+          link.close()
+          linksRef.current.delete(id)
+          makeLinkRef.current?.({ id, name, uid: peerUid })
+        }
+      }
+    }
+    const recover = () => {
+      // Debounce: collapse a burst of triggers into one repair pass.
+      if (recoverTimer) return
+      recoverTimer = setTimeout(() => {
+        recoverTimer = null
+        runRecovery()
+      }, 250)
+    }
     const onVisibility = () => {
       if (document.visibilityState === 'visible') {
-        sigRef.current?.reconnect?.()
-        sessionRef.current?.kick() // C30: re-ensure room + channels the freeze may have eaten
-        subscribeKnown() // re-derive channels in case a secret was stored while hidden
-        nudgeUpgradeProbes() // P5: refocus may follow a network change, re-probe relayed links
-        for (const link of linksRef.current.values()) link.sendBack?.()
-        // #13 (measured live): two mobile tabs rarely negotiate while both
-        // awake, links that failed while WE were frozen stay failed forever.
-        // On refocus: reset retry budgets (incl. second-wind markers, they
-        // share this map) and rebuild every dead link.
-        attemptsRef.current.clear()
-        for (const [id, link] of [...linksRef.current.entries()]) {
-          const st = link.pc?.connectionState
-          if (st === 'failed' || st === 'closed' || st === 'disconnected') {
-            tel('refocus-revive', { peer: id.slice(-6), was: st })
-            const { name, peerUid } = { name: link.name, peerUid: link.peerUid }
-            link.close()
-            linksRef.current.delete(id)
-            makeLinkRef.current?.({ id, name, uid: peerUid })
-          }
-        }
+        recover()
       } else {
         for (const link of linksRef.current.values()) link.sendBrb?.(120)
       }
     }
+    // M3: a network change is a full recovery trigger, not just a relay probe. On
+    // wifi<->cellular the active interface (and our public IP) changes, so the old
+    // ICE path is dead; recover() reconnects signaling AND rebuilds dead links.
+    // (recover() already calls nudgeUpgradeProbes, so the P5 relay probe still
+    // runs too.) These also fire `online` immediately on a handoff.
+    const onNetworkChange = () => recover()
+    // M4: BFCache / iOS Safari. iOS can freeze a tab into BFCache firing ONLY
+    // pagehide (not visibilitychange); restore via pageshow with persisted:true.
+    // pagehide -> tell peers brb (mirrors the hidden branch). pageshow (persisted)
+    // -> run the shared recovery. Both share the debounce with visibility so a
+    // pageshow that also fires visibilitychange does not double-repair.
+    const onPageHide = () => {
+      for (const link of linksRef.current.values()) link.sendBrb?.(120)
+    }
+    const onPageShow = (e) => {
+      if (e && e.persisted) recover()
+    }
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onVisibility)
-    // P5: re-probe relayed links the instant connectivity returns or the active
-    // network interface changes, both mean a fresh direct path may now exist.
-    window.addEventListener('online', nudgeUpgradeProbes)
+    window.addEventListener('pagehide', onPageHide)
+    window.addEventListener('pageshow', onPageShow)
+    // M3: `online` and the Network Information API change now drive a FULL recovery
+    // (reconnect signaling + rebuild dead links), not just the P5 relay probe.
+    window.addEventListener('online', onNetworkChange)
     const conn = typeof navigator !== 'undefined' && navigator.connection
-    conn?.addEventListener?.('change', nudgeUpgradeProbes)
+    conn?.addEventListener?.('change', onNetworkChange)
     return () => {
+      if (recoverTimer) clearTimeout(recoverTimer)
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('focus', onVisibility)
-      window.removeEventListener('online', nudgeUpgradeProbes)
-      conn?.removeEventListener?.('change', nudgeUpgradeProbes)
+      window.removeEventListener('pagehide', onPageHide)
+      window.removeEventListener('pageshow', onPageShow)
+      window.removeEventListener('online', onNetworkChange)
+      conn?.removeEventListener?.('change', onNetworkChange)
     }
   }, [subscribeKnown])
 
