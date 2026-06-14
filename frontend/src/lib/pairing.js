@@ -139,3 +139,49 @@ export function parseSpokenCode(typed) {
   const [nameplate, password] = splitCode(normalized)
   return { nameplate, password, normalized }
 }
+
+/// STEERING: count word tokens (letter-runs of >= 2 chars) in a password —
+/// mirrors the CLI `password_word_tokens`. A user-chosen pairing password must
+/// contain >= 2 of these (a 1-word code is ~12 bits, below the floor the
+/// burn + 5/min rate-limit relies on). Digits / 1-letter fragments don't count.
+export function passwordWordTokens(password) {
+  const m = String(password || '').match(/[a-z]{2,}/g)
+  return m ? m.length : 0
+}
+
+/// STEERING preview for the browser "choose your own code" entry. Returns the
+/// shared-normalized {nameplate, password}, the >= 2-token strength verdict, and
+/// the FINAL code we'd create — exactly what SPAKE2 will hash. The nameplate is
+/// machine-assigned (`autoNameplate`) when the user typed none, shown dimmed in
+/// the UI; a typed nameplate is honored on the first create (server may bump it
+/// on collision). `pakeReady()` MUST have resolved before calling (uses WASM).
+export function previewCustomCode(typed, autoNameplate) {
+  const { password, nameplate, normalized } = splitChosenCode(typed)
+  const hasNumber = !!nameplate
+  const np = hasNumber ? nameplate : (autoNameplate || '')
+  const tokens = passwordWordTokens(password)
+  return {
+    password,
+    nameplate: np,
+    autoAssigned: !hasNumber, // the number was machine-appended (show dimmed)
+    strongEnough: tokens >= 2,
+    tokens,
+    normalized,
+    // The full code we'd create; empty until both halves exist.
+    full: password && np ? `${password}-${np}` : '',
+  }
+}
+
+/// Split a USER-CHOSEN code into {password, nameplate}. Unlike splitCode (which
+/// always strips the trailing group as the nameplate), here the trailing group
+/// is the nameplate ONLY if it is numeric (3-5 digits, the server's
+/// _NAMEPLATE_RE) — otherwise it is part of the words. So `gigantic-element`
+/// keeps BOTH words as the password (nameplate machine-assigned), while
+/// `gigantic-element-7` honors the typed number. Uses the shared normCode so the
+/// password is byte-identical to what SPAKE2 hashes.
+export function splitChosenCode(typed) {
+  const normalized = normCode(typed)
+  const [np, pw] = splitCode(normalized)
+  if (/^[0-9]{3,5}$/.test(np)) return { password: pw, nameplate: np, normalized }
+  return { password: normalized, nameplate: '', normalized }
+}

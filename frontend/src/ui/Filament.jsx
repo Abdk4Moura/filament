@@ -9,6 +9,8 @@ import { createPortal } from 'react-dom'
 import WebTerminal from './WebTerminal.jsx'
 import DeviceSheet from './DeviceSheet.jsx'
 import CommandPalette from './CommandPalette.jsx'
+import { pakeReady, previewCustomCode } from '../lib/pairing.js'
+import { mintNameplate } from '../lib/words.js'
 
 // Relay honesty (transport-resilience P1, §3.5). Relay (TURN) is still
 // end-to-end encrypted but is NOT a direct link — the "no middleman on the wire"
@@ -453,11 +455,74 @@ function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, pla
   )
 }
 
+// STEERING: "choose your own code" entry. The user types words (and optionally a
+// number); we show a LIVE normalized preview (the shared WASM normCode/splitCode,
+// so it matches what SPAKE2 hashes), auto-append a dimmed connect number when
+// they typed none, and gate Create on the >= 2-word strength floor — a gentle
+// nudge, never a hard block on typing. On Create we hand the RAW typed string to
+// onGenerateCode (the hook re-parses it with the same shared split).
+function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
+  const [typed, setTyped] = useState('')
+  const [ready, setReady] = useState(false)
+  // A stable machine-assigned number for the preview (so it doesn't reshuffle on
+  // every keystroke); the hook mints the real one at create time.
+  const autoNpRef = useRef(null)
+  if (autoNpRef.current == null) { try { autoNpRef.current = mintNameplate() } catch { autoNpRef.current = '0000' } }
+
+  useEffect(() => { pakeReady().then(() => setReady(true)).catch(() => setReady(true)) }, [])
+
+  const format = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
+  // Live preview via the shared split (only once WASM is ready).
+  let pv = null
+  if (ready && typed.trim()) {
+    try { pv = previewCustomCode(typed, autoNpRef.current) } catch { pv = null }
+  }
+  const canCreate = !!(pv && pv.strongEnough && pv.full)
+  const doCreate = () => { if (canCreate) onCreate(typed) }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <span style={{ fontSize: 9.5, letterSpacing: '.14em', color: T.dim }}>CHOOSE YOUR OWN · TWO WORDS OR MORE</span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <CodeInput autoFocus value={typed} onChange={setTyped} format={format}
+          onSubmit={doCreate} onCancel={onCancel}
+          placeholder="GIGANTIC ELEMENT" accent={accent} T={T} />
+        <button onClick={doCreate} disabled={!canCreate} data-testid="custom-create" style={{
+          font: 'inherit', fontSize: 11, padding: '7px 12px', whiteSpace: 'nowrap',
+          cursor: canCreate ? 'pointer' : 'not-allowed', opacity: canCreate ? 1 : 0.45,
+          background: canCreate ? accent : 'transparent', color: canCreate ? T.onAccent : T.text,
+          border: '1px solid ' + (canCreate ? accent : T.line) }}>create</button>
+        <button onClick={onCancel} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer',
+          background: 'transparent', color: T.text, border: '1px solid ' + T.line }}>cancel</button>
+      </div>
+      {/* Live normalized preview (what SPAKE2 will hash) + auto-number note. */}
+      {pv && pv.full && (
+        <div data-testid="custom-preview" style={{ fontSize: 13, letterSpacing: '.06em', color: T.text }}>
+          {pv.password}
+          <span style={{ color: pv.autoAssigned ? T.dim : T.text }}>-{pv.nameplate}</span>
+          {pv.autoAssigned && <span style={{ fontSize: 10.5, color: T.dim }}>  (number added for you)</span>}
+        </div>
+      )}
+      {/* Steering nudge: weak (single-word) input — typing stays allowed. */}
+      {pv && typed.trim() && !pv.strongEnough && (
+        <div data-testid="custom-nudge" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>
+          use at least two words, e.g. gigantic-element — easier to say, harder to guess
+        </div>
+      )}
+    </div>
+  )
+}
+
 function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, openEntryNonce, T, D, accent }) {
   const scope = state.roomScope || 'link'
   const [copied, fireCopy] = useCopied()
   const [entering, setEntering] = useState(false)
+  const [customizing, setCustomizing] = useState(false) // "choose your own code"
   const [code, setCode] = useState('')
+
+  // Hand the typed custom string to generateCode (the hook re-parses it with the
+  // shared split). Close the entry once minting begins.
+  const createCustom = (typed) => { setCustomizing(false); onGenerateCode(typed) }
 
   // The command palette's "Pair with code" raises this nonce; open our code
   // input in response (skip the initial 0 so we don't auto-open on mount).
@@ -538,7 +603,9 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         </div>
         {/* Codes work from ANY room — minting is additive (the claimer joins
             THIS room) — so the affordance belongs here too, not just in auto. */}
-        {entering ? (
+        {customizing ? (
+          <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
+        ) : entering ? (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
@@ -553,6 +620,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             {ghostBtn('pair with code', () => setEntering(true))}
             {ghostBtn('create code', onGenerateCode, true)}
+            {ghostBtn('choose your own', () => setCustomizing(true))}
           </div>
         )}
       </div>
@@ -567,7 +635,9 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         {state.network && <Pill T={T}>{state.network}</Pill>}
         <div style={{ marginLeft: 'auto' }}><LanChip localHelper={state.localHelper} T={T} /></div>
       </div>
-      {entering ? (
+      {customizing ? (
+        <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
+      ) : entering ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
@@ -582,6 +652,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           {ghostBtn('pair with code', () => setEntering(true))}
           {ghostBtn('create code', onGenerateCode, true)}
+          {ghostBtn('choose your own', () => setCustomizing(true))}
         </div>
       )}
     </div>

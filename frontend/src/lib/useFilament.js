@@ -15,7 +15,7 @@ import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
 import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
-import { pakeReady, PakePairing, parseSpokenCode, PAIR_V2_CAPS } from './pairing.js'
+import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the pairing
 // wordlists — imported from words.js (ADJ/ANIMAL) so there is a single source
@@ -925,14 +925,29 @@ export function useFilament() {
     // when pair-ok arrives (the server never echoes any words).
     await pakeReady()
     pakeReadyRef.current = true
+    // STEERING: a custom string the user typed ("choose your own"). Parse it with
+    // the SHARED split (normCode/splitCode via parseSpokenCode) so the words feed
+    // SPAKE2 byte-identically; the words are the password, the trailing number (if
+    // any) is the user's chosen nameplate. Any number the user supplied is honored
+    // ONCE; on collision we auto-pick a fresh nameplate (the number is never
+    // load-bearing for the secret). If they supplied no number we always mint one.
+    // Use the chosen-code split (trailing group is the nameplate ONLY if numeric;
+    // otherwise it's part of the words) so `gigantic-element` keeps both words.
+    const custom = kw ? splitChosenCode(kw) : null
+    const customPassword = custom && /[a-z]{2,}/.test(custom.password) ? custom.password : null
+    let chosenNameplate = custom && /^[0-9]{3,5}$/.test(custom.nameplate) ? custom.nameplate : null
     return new Promise((resolve) => {
       let retried = false
       const mintAndCreate = () => {
-        const words = mintWords()
-        const nameplate = mintNameplate()
+        // Words: the user's chosen password, else a fresh mint. Nameplate: the
+        // user's chosen one (first try) else a fresh mint; subsequent retries
+        // always mint fresh (the chosen one collided / timed out).
+        const words = customPassword || mintWords()
+        const nameplate = chosenNameplate || mintNameplate()
+        chosenNameplate = null // honor a user-chosen number only on the FIRST try
         const full = `${words}-${nameplate}`
         // Stash the password so the eventual peer can run SPAKE2 with us.
-        pendingPakeRef.current = { nameplate, password: words, full }
+        pendingPakeRef.current = { nameplate, password: words, full, askedNameplate: custom?.nameplate || null }
         sig.pairCreateV2(nameplate)
         return full
       }
@@ -954,8 +969,15 @@ export function useFilament() {
         }, 5000)
       let watchdog = arm()
       // Collision: the server says our nameplate is taken — re-mint and retry.
+      // If the user had CHOSEN that number, tell them which fresh one we used.
       sig.on('pair-error', function onTaken({ error }) {
-        if (error === 'taken') mintAndCreate()
+        if (error !== 'taken') return
+        const asked = pendingPakeRef.current?.askedNameplate
+        mintAndCreate()
+        const used = pendingPakeRef.current?.nameplate
+        if (asked && used && asked !== used) {
+          setPairStatus(`that number (${asked}) was busy — we used ${used}`)
+        }
       })
       sig.on('pair-ok', function onOk() {
         clearTimeout(watchdog)
