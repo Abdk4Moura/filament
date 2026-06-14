@@ -210,8 +210,9 @@ class PakeV2Nameplate(unittest.TestCase):
             claimer.get_received()
             claimer.emit("join", {"room": "claimer-solo", "name": "claimer", "uid": "uk"})
             claimer.get_received()
-            # The user TYPED "brave-otter-ruby-5151"; the client split it and sent
-            # ONLY the nameplate. The words must never appear server-side.
+            # The user TYPED "brave-otter-5151" (3-segment minted pairing code);
+            # the client split it and sent ONLY the nameplate. The words must
+            # never appear server-side.
             claimer.emit("pair-claim", {"nameplate": "5151", "v": 2})
             claimer_evs = claimer.get_received()
             creator_evs2 = creator.get_received()  # pair-used now arrives
@@ -225,15 +226,22 @@ class PakeV2Nameplate(unittest.TestCase):
         server_saw = buf.getvalue() + _json.dumps(creator_evs) + _json.dumps(claimer_evs)
 
         # NEGATIVE ASSERTION: no wordlist token (the password) appears anywhere.
+        # Minted pairing codes are now 3-segment `adj-animal-NNNN`, so the
+        # password is the two words `adj-animal`. We still also mirror the EXTRA
+        # color list (no longer minted, but allowed in user-chosen codes) as a
+        # belt-and-suspenders leak check.
         words = set(signaling._ADJ) | set(signaling._ANIMAL)
-        # The frontend's EXTRA list (colors) — mirror it here for completeness.
         words |= {"azure", "cobalt", "coral", "crimson", "emerald", "hazel", "indigo",
                   "ivory", "jade", "lilac", "olive", "rose", "ruby", "scarlet", "teal", "violet"}
         leaked = sorted(w for w in words if w in server_saw)
         self.assertEqual(leaked, [], f"PASSWORD LEAKED to the server: {leaked}")
-        # And no generic "word-word" pattern (a password shape) anywhere.
-        self.assertNotRegex(server_saw, r"[a-z]{3,8}-[a-z]{3,8}-[a-z]{3,8}",
-                            "a multi-word password shape leaked server-side")
+        # And no FULL minted code shape (`adj-animal-NNNN`, words + nameplate)
+        # leaked: the password segment must never travel with its nameplate. A
+        # bare 2-word shape would false-positive on server event names
+        # (pair-error, pair-matched, …), so we anchor on the word-word-DIGITS
+        # form that only a leaked code could produce.
+        self.assertNotRegex(server_saw, r"[a-z]{3,8}-[a-z]{3,8}-[0-9]{3,5}",
+                            "a full minted code (words+nameplate) leaked server-side")
 
     def test_v2_burn_once(self):
         app, sio = self._server()

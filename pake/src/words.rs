@@ -2,11 +2,15 @@
 //! load-bearing change). The server NEVER sees or generates these words; it
 //! only allocates/matches the numeric nameplate.
 //!
-//! Entropy (Decision #1: WIDEN to ~16 bits): 64 adjectives × 64 animals × 16
-//! "extra" words = 65,536 = 2^16 passwords. The adjective/animal lists are the
-//! existing vetted 64-word lists (short, common, phonetically distinct, easy to
-//! SAY); the extra list is 16 common colors. Reusing the vetted lists avoids
-//! the "256 sayable animals" problem (which forces obscure words).
+//! Entropy: 64 adjectives × 64 animals = 4,096 = 2^12 passwords. Minted codes
+//! are 3-segment `adj-animal-NNNN` (e.g. brave-otter-3141) — the same shape as
+//! a transfer code, so there is one code shape to learn. The adjective/animal
+//! lists are the existing vetted 64-word lists (short, common, phonetically
+//! distinct, easy to SAY). The 2^12 password floor is sound because the words
+//! never reach the server (relay-blind SPAKE2) and online guessing is bounded
+//! by claim-burn + the 5-claims/min rate-limit (≈1 guess per code, no offline
+//! attack). The `EXTRA` color list is kept defined (for any caller that still
+//! references it / for user-chosen 4-word codes) but is NO LONGER used by mint.
 //!
 //! NOTE: these words are NOT crypto-load-bearing for K agreement — K depends
 //! only on the literal typed string, normalized identically on both ends
@@ -38,7 +42,10 @@ pub const ANIMAL: [&str; 64] = [
     "stoat", "swan", "tern", "toucan", "vole", "wombat", "wren", "zebra",
 ];
 
-/// 16 common, distinct, easy-to-say colors — the third entropy word.
+/// 16 common, distinct, easy-to-say colors. Formerly the third minted entropy
+/// word; minting is now 3-segment `adj-animal-NNNN`, so this is no longer used
+/// by `mint_words`. Kept defined for user-chosen 4-word codes / interop.
+#[allow(dead_code)]
 pub const EXTRA: [&str; 16] = [
     "azure", "cobalt", "coral", "crimson", "emerald", "hazel", "indigo", "ivory",
     "jade", "lilac", "olive", "rose", "ruby", "scarlet", "teal", "violet",
@@ -53,16 +60,17 @@ fn pick<'a>(rng: &mut impl RngCore, list: &[&'a str]) -> &'a str {
     list[(rng.next_u32() & mask) as usize]
 }
 
-/// Mint the WORDS half of a spoken code (the password): `adj-animal-extra`.
-/// ~16 bits. Uses the OS CSPRNG.
+/// Mint the WORDS half of a spoken code (the password): `adj-animal`.
+/// 2^12 (4,096). Uses the OS CSPRNG. The full minted code is `adj-animal-NNNN`
+/// (3 segments) once the nameplate is appended.
 pub fn mint_words() -> String {
     let mut rng = super::os_rng();
-    format!("{}-{}-{}", pick(&mut rng, &ADJ), pick(&mut rng, &ANIMAL), pick(&mut rng, &EXTRA))
+    format!("{}-{}", pick(&mut rng, &ADJ), pick(&mut rng, &ANIMAL))
 }
 
 /// Mint with a caller RNG (tests/interop only).
 pub fn mint_words_with(rng: &mut impl RngCore) -> String {
-    format!("{}-{}-{}", pick(rng, &ADJ), pick(rng, &ANIMAL), pick(rng, &EXTRA))
+    format!("{}-{}", pick(rng, &ADJ), pick(rng, &ANIMAL))
 }
 
 /// Mint a 4-digit nameplate (the routing suffix the server sees). Widened to 4
@@ -91,14 +99,18 @@ mod tests {
         assert_eq!(ADJ.iter().collect::<HashSet<_>>().len(), 64);
         assert_eq!(ANIMAL.iter().collect::<HashSet<_>>().len(), 64);
         assert_eq!(EXTRA.iter().collect::<HashSet<_>>().len(), 16);
-        // 64*64*16 = 65536 = 2^16 — the widened password entropy (Decision #1).
-        assert_eq!(ADJ.len() * ANIMAL.len() * EXTRA.len(), 1 << 16);
+        // 64*64 = 4096 = 2^12 — the minted password entropy (3-seg adj-animal).
+        assert_eq!(ADJ.len() * ANIMAL.len(), 1 << 12);
     }
 
     #[test]
-    fn minted_words_are_three_parts() {
+    fn minted_words_are_two_parts() {
+        // The WORDS half is `adj-animal`; with the nameplate appended the full
+        // minted code is `adj-animal-NNNN` (3 segments).
         let w = mint_words();
         let parts: Vec<&str> = w.split('-').collect();
-        assert_eq!(parts.len(), 3, "adj-animal-extra");
+        assert_eq!(parts.len(), 2, "adj-animal");
+        let full = mint_spoken_code();
+        assert_eq!(full.split('-').count(), 3, "adj-animal-NNNN");
     }
 }

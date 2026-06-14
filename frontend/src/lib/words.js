@@ -1,11 +1,13 @@
 // Speakable pairing wordlists — CLIENT-SIDE minting (spec §2.0). The browser
 // mints the words locally; the server NEVER sees or generates them. Mirrors
-// pake/src/words.rs. ~16 bits: 64 adj × 64 animal × 16 extra = 65,536 = 2^16.
+// pake/src/words.rs. 2^12: 64 adj × 64 animal = 4,096. Minted codes are
+// 3-segment `adj-animal-NNNN` (the same shape as a transfer code).
 //
 // The words are NOT crypto-load-bearing for K agreement (K depends only on the
 // typed string, normalized by the shared normCode). This list governs entropy
 // + sayability. It need not be byte-identical to the Rust list, but we keep it
-// in sync for a consistent UX.
+// in sync for a consistent UX. The EXTRA list is kept exported (was the third
+// minted word; no longer used by mintWords) for any user-chosen 4-word code.
 
 export const ADJ = [
   'amber', 'bold', 'brave', 'brisk', 'calm', 'cheery', 'chill', 'civil',
@@ -42,9 +44,10 @@ function pick(list) {
   return list[buf[0] & (list.length - 1)]
 }
 
-/// Mint the WORDS half of a spoken code (the password): adj-animal-extra.
+/// Mint the WORDS half of a spoken code (the password): adj-animal. With the
+/// nameplate appended the full minted code is `adj-animal-NNNN` (3 segments).
 export function mintWords() {
-  return `${pick(ADJ)}-${pick(ANIMAL)}-${pick(EXTRA)}`
+  return `${pick(ADJ)}-${pick(ANIMAL)}`
 }
 
 /// Mint a 4-digit nameplate (the routing suffix the server sees). Widened to 4
