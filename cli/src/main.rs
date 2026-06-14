@@ -1,4 +1,4 @@
-// filament — anywhere-to-anywhere P2P file transfer, CLI end.
+// filament, anywhere-to-anywhere P2P file transfer, CLI end.
 //
 // Speaks the exact same wire protocol as the browser app at
 // https://filament.autumated.com: Socket.IO signaling, perfect-negotiation
@@ -12,7 +12,7 @@
 //   tar c logs | filament send - --name logs.tar --code
 //   filament recv -y --dir ~/Drops          auto-accept into a directory
 //
-// Failure-mode ledger: ../docs/cli-resilience.md — every resilience behavior
+// Failure-mode ledger: ../docs/cli-resilience.md, every resilience behavior
 // in this file carries its ledger number (C1..C17 / F1..F4).
 
 mod codeentry;
@@ -38,11 +38,11 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
-/// C7: content identity for resume — sha256 over the first 256 KiB.
+/// C7: content identity for resume, sha256 over the first 256 KiB.
 const HEAD_BYTES: u64 = 256 * 1024;
 /// C4/C6/C21: how long we wait for a vanished peer to rejoin. UNWARNED is the
 /// blind default; a peer that announced `brb` (e.g. the browser opening a
-/// mobile file picker suspends the whole tab) gets its declared ttl instead —
+/// mobile file picker suspends the whole tab) gets its declared ttl instead,
 /// informed waits are both longer when promised and shorter when not.
 const REJOIN_WINDOW: Duration = Duration::from_secs(120);
 fn rejoin_unwarned() -> Duration {
@@ -65,7 +65,7 @@ fn quiet_exit_window() -> Duration {
 /// C3/C4: connection (re)establishment attempts before failing honestly.
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Test/injection hooks — env-gated fault injectors used ONLY by the resilience
+/// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
 /// gates (runner/sim/*) to drive deterministic failure modes. They are compiled
 /// in ONLY under `--features test-hooks`; a default/release build strips them
 /// entirely (no env reads, no injection logic in the shipped binary). Each hook
@@ -114,7 +114,7 @@ mod test_hooks {
     /// truncation/ack gate corruption injector. `FILAMENT_TEST_CORRUPT_RECV=<id>`
     /// flips the last on-disk byte of the matching transfer; `_CORRUPT_ONCE=1`
     /// fires exactly once (proving auto-recovery). The "already fired" latch is a
-    /// process-global AtomicBool — no env mutation (the old code did an unsafe
+    /// process-global AtomicBool, no env mutation (the old code did an unsafe
     /// `set_var` of `FILAMENT_TEST_CORRUPT_FIRED` inside the async runtime).
     static CORRUPT_FIRED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -169,7 +169,7 @@ fn relay_forbidden() -> bool {
 /// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
 static NO_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// THE interactivity GATE — scripts/automation are safe BY DEFAULT. Three layers:
+/// THE interactivity GATE, scripts/automation are safe BY DEFAULT. Three layers:
 ///   1. stdin is not a TTY  -> never interactive (pipes, CI, `< /dev/null`).
 ///   2. TTY but opted out    -> never interactive: `--no-interactive` OR the env
 ///                              var `FILAMENT_NONINTERACTIVE` (any value).
@@ -185,19 +185,19 @@ fn interactive_allowed() -> bool {
 
 /// The one honest CLI line shown whenever a transfer/connection is actually on
 /// the TURN relay route (rung d). Relay is still end-to-end encrypted, but it is
-/// NOT a direct link — the "no middleman on the wire" property is gone, so we say
+/// NOT a direct link, the "no middleman on the wire" property is gone, so we say
 /// so, loudly (amber ⚠), reusing `ui::Tone::Warn`. §3.3 of the design.
 fn relay_banner() -> String {
     ui::paint(
         ui::Tone::Warn,
-        "⚠ on relay — via a TURN server, not a direct link (still end-to-end encrypted)",
+        "⚠ on relay, via a TURN server, not a direct link (still end-to-end encrypted)",
     )
 }
 
 /// P0 (GAP-1): stall-correction ladder bound. Attempt 0 is rung (a) (resume on
 /// the same transport); attempts 1..STALL_MAX_REPAIRS are rung (c) (repair the
-/// transport in place — a fresh direct dial / ICE-restart). At the ceiling the
-/// ladder is exhausted (P1's relay fallback is the next rung — a clean hook).
+/// transport in place, a fresh direct dial / ICE-restart). At the ceiling the
+/// ladder is exhausted (P1's relay fallback is the next rung, a clean hook).
 /// Slightly above MAX_ATTEMPTS because a fresh direct dial needs BOTH ends to
 /// re-offer within one race budget, which can take a couple of aligned ticks;
 /// a re-dial is cheap, so a few extra are worth a deterministic recovery.
@@ -208,7 +208,7 @@ const STALL_MAX_REPAIRS: u32 = 5;
 /// actually MOVING data (not just connected) before cutting over. It lives in the
 /// non-L2 sid space and far above any file-transfer counter, so it never collides;
 /// the receiver has no `by_sid` entry for it, so the inbound chunk is dropped
-/// harmlessly (after stamping inbound activity — which is the point: symmetric
+/// harmlessly (after stamping inbound activity, which is the point: symmetric
 /// verify). See `Conn::judge_upgrade_standby`.
 const VERIFY_PROBE_SID: u32 = 0x7FFF_FFFF;
 
@@ -216,7 +216,7 @@ const VERIFY_PROBE_SID: u32 = 0x7FFF_FFFF;
 /// whole-file sha256 didn't match on completion (truncated/corrupt) before it
 /// gives up and fails CLEARLY (kept partial, no silent bad file). A transient
 /// truncation recovers on the first resume; this bound only catches a payload
-/// that is genuinely, repeatedly corrupt — never a hang, never a silent accept.
+/// that is genuinely, repeatedly corrupt, never a hang, never a silent accept.
 const MAX_VERIFY_FAILS: u32 = 3;
 
 /// Gate-18 Mode B: the single predicate that decides whether a stuck/lost link
@@ -229,7 +229,7 @@ const MAX_VERIFY_FAILS: u32 = 3;
 /// - `completed`: files fully placed on disk so far.
 /// - `keep_open`: the receiver was asked to stay resident (gate 13).
 /// - `by_sid_empty`: NO stream is in flight (an in-progress reconnect/resume
-///   keeps a by_sid entry, which must keep the link reconnecting — gate 2/11c).
+///   keeps a by_sid entry, which must keep the link reconnecting, gate 2/11c).
 fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> bool {
     completed > 0 && !keep_open && by_sid_empty
 }
@@ -237,7 +237,7 @@ fn recv_transfer_done(completed: usize, keep_open: bool, by_sid_empty: bool) -> 
 /// Bug 5: after repeated stuck-while-connecting on establishment, the user has
 /// no clue WHY. The dominant single-host cause is a browser publishing mDNS
 /// (`*.local`) ICE candidates the CLI can't resolve when both ends share one
-/// machine — the candidate pair never nominates and the link wedges silently.
+/// machine, the candidate pair never nominates and the link wedges silently.
 /// Print this hint at most once per command. `shown` is the caller's one-shot
 /// latch so the hint never repeats and never fires on a normal first blip.
 fn maybe_hint_local_wedge(shown: &mut bool) {
@@ -247,7 +247,7 @@ fn maybe_hint_local_wedge(shown: &mut bool) {
     *shown = true;
     ui::say(&ui::paint(
         ui::Tone::Dim,
-        "  still can't connect — if both ends are on the SAME machine, a browser's \
+        "  still can't connect, if both ends are on the SAME machine, a browser's \
          mDNS (.local) ICE candidates can block this; try a different network path, \
          or disable mDNS ICE in the browser (chrome://flags → \"Anonymize local IPs\").",
     ));
@@ -261,7 +261,7 @@ EXAMPLES:
   filament clever-lynx-63            claim a code and receive
   filament send ./photos --code      directories tar on the fly
   filament recv <code> -o - | tar x  stream straight into a pipe
-  filament pair --name phone         remember a device — a ceremony, no file needed
+  filament pair --name phone         remember a device, a ceremony, no file needed
   filament send big.iso --to laptop  no code: a remembered device, verified by proof
   filament up --install              always-on drop target (trusted devices only)
   filament introduce laptop phone    vouch two of your devices to each other
@@ -269,7 +269,7 @@ EXAMPLES:
   The other end never needs anything installed: https://filament.autumated.com";
 
 #[derive(Parser)]
-#[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers — no upload, no account", after_help = EXAMPLES)]
+#[command(name = "filament", version = VERSION, about = "P2P file transfer between terminals and browsers, no upload, no account", after_help = EXAMPLES)]
 struct Cli {
     /// Signaling server (self-hosters: point at your own instance)
     #[arg(long, global = true, env = "FILAMENT_SERVER", default_value = DEFAULT_SERVER)]
@@ -278,7 +278,7 @@ struct Cli {
     #[arg(long, global = true)]
     relay: bool,
     /// Forbid relay: keep a hard direct-only promise. The never-flaky guarantee
-    /// is traded for "no middleman, ever" — a path that can't go direct FAILS
+    /// is traded for "no middleman, ever", a path that can't go direct FAILS
     /// CLEANLY (a clear error, a kept partial) instead of falling back to a TURN
     /// relay. Conflicts with --relay (which forces relay).
     #[arg(long, global = true, conflicts_with = "relay")]
@@ -297,7 +297,7 @@ struct Cli {
     /// FILAMENT_LOG.
     #[arg(short = 'q', long = "quiet", global = true, conflicts_with = "verbose")]
     quiet: bool,
-    /// Never drop into the guided interactive code entry — fail fast instead.
+    /// Never drop into the guided interactive code entry, fail fast instead.
     /// Use in scripts/automation. A non-TTY stdin is ALWAYS non-interactive even
     /// without this; the env var FILAMENT_NONINTERACTIVE=1 does the same thing.
     #[arg(long, global = true)]
@@ -367,7 +367,7 @@ enum Cmd {
         #[arg(long, short = 'o')]
         output: Option<String>,
     },
-    /// Remember a device — a pairing ceremony, no file needed. Mints a code
+    /// Remember a device, a pairing ceremony, no file needed. Mints a code
     /// (or claims one) and exchanges the pair secret with consent on both ends.
     ///
     /// In a terminal with no code (or a malformed one) this opens a guided,
@@ -399,8 +399,8 @@ enum Cmd {
         /// Drop directory (default: `filament config dir`, else ~/Filament)
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept seamless `filament ssh` from ANY paired (proof-verified) device
-        /// — no per-device `grant` needed. Enables the tunnel acceptor too, so you
+        /// Accept seamless `filament ssh` from ANY paired (proof-verified) device,
+        /// no per-device `grant` needed. Enables the tunnel acceptor too, so you
         /// don't also need FILAMENT_L2=1. Strangers still can't get in (pairing is
         /// required). Prints a security banner.
         #[arg(long)]
@@ -477,7 +477,7 @@ enum Cmd {
         args: Vec<String>,
     },
     /// Grant a known device a capability (deny-by-default). `shell` permits
-    /// seamless `filament ssh` into THIS machine — a separate consent from
+    /// seamless `filament ssh` into THIS machine, a separate consent from
     /// file transfer; pairing alone never yields a shell.
     Grant {
         /// Known device (petname)
@@ -495,7 +495,7 @@ enum Cmd {
     },
 }
 
-/// Petname management (C12): names are LOCAL aliases for pair secrets — the
+/// Petname management (C12): names are LOCAL aliases for pair secrets, the
 /// secret is the identity, the name is yours to fix when you mislabel one.
 #[derive(Subcommand)]
 enum DevicesAction {
@@ -508,7 +508,7 @@ enum DevicesAction {
 /// Looks like a speakable CODE of the shape `word-word-DIGITS` (3 segments: two
 /// lowercase words then a numeric trailing group of >= 2 digits). BOTH a minted
 /// transfer code (`adj-animal-NNN`, 3-digit) and a minted pairing code
-/// (`adj-animal-NNNN`, 4-digit) now share this shape — the pairing-vs-transfer
+/// (`adj-animal-NNNN`, 4-digit) now share this shape, the pairing-vs-transfer
 /// HINT is by trailing-number WIDTH (see `looks_like_pake_code`), not segment
 /// count. This is the claimable-code structural test (used by the `up` prompt).
 fn regex_lite_code(s: &str) -> bool {
@@ -534,16 +534,16 @@ fn trailing_num_width(s: &str) -> usize {
 
 /// ADVISORY hint that a typed code is a PAIRING code (vs a one-time transfer
 /// code). Both are now `word-word-DIGITS`; the only structural difference is the
-/// trailing-number WIDTH — a 4-digit nameplate is what `filament pair` / the
+/// trailing-number WIDTH, a 4-digit nameplate is what `filament pair` / the
 /// browser "create code" mints, whereas a transfer code ends in 3 digits. This
-/// is UX-only — it NEVER authenticates (PAKE/SPAKE2 does) — so it's safe to be
+/// is UX-only, it NEVER authenticates (PAKE/SPAKE2 does), so it's safe to be
 /// approximate; a mismatch still fails LOUDLY with the right next command.
 fn looks_like_pake_code(s: &str) -> bool {
     regex_lite_code(s) && trailing_num_width(s) >= 4
 }
 
-/// STEERING (min-strength floor): count the WORD tokens in a normalized password
-/// — maximal runs of >= 2 ASCII letters. A user-chosen password must contain at
+/// STEERING (min-strength floor): count the WORD tokens in a normalized password,
+/// maximal runs of >= 2 ASCII letters. A user-chosen password must contain at
 /// least 2 such tokens. WHY: a minted 2-word code is ~12 bits and online
 /// guessing is bounded by claim-burn + the 5/min rate-limit (≈1 guess per code,
 /// no offline attack); a single word like `cat` falls below that floor. Digits
@@ -567,7 +567,7 @@ pub(crate) fn password_word_tokens(normalized_password: &str) -> usize {
 // --------------------------------------------------------------- utilities --
 
 /// Persistent per-install identity (shared by every process using this
-/// config dir). Lets a sender recognize — and never target — its OWN daemon
+/// config dir). Lets a sender recognize, and never target, its OWN daemon
 /// when both sit on the same pair-presence channels.
 fn install_id() -> String {
     let p = devices_path().with_file_name("device.id");
@@ -668,7 +668,7 @@ pub(crate) fn human(bytes: u64) -> String {
     if i == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", U[i]) }
 }
 
-/// C7: hash of the first min(256 KiB, len) bytes — cheap content identity
+/// C7: hash of the first min(256 KiB, len) bytes, cheap content identity
 /// carried in file-offer so resume can detect a different file wearing the
 /// same name + size.
 fn head_hash(path: &Path) -> Option<String> {
@@ -687,11 +687,11 @@ fn head_hash(path: &Path) -> Option<String> {
     Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// P4 (GAP-5): sha256 over the WHOLE file — the end-to-end content digest the
+/// P4 (GAP-5): sha256 over the WHOLE file, the end-to-end content digest the
 /// receiver compares against on completion so a truncated/corrupt transfer can
 /// never be declared "done" (the runner had to bolt this above the transport;
 /// P4 makes it a core guarantee). Streamed in 1 MiB reads so a large payload
-/// doesn't have to be slurped into RAM. `None` if the file can't be read — the
+/// doesn't have to be slurped into RAM. `None` if the file can't be read, the
 /// offer then omits `full` and the receiver degrades to the legacy size-only
 /// check (backward-compat; bounded, never a hang).
 fn full_hash(path: &Path) -> Option<String> {
@@ -710,7 +710,7 @@ fn full_hash(path: &Path) -> Option<String> {
 
 /// Sidecar metadata for a partial receive (`<name>.part.meta`).
 /// JSON {"size":N,"head":"hex","full":"hex"}; legacy files hold a bare size string.
-/// `full` is the whole-file sha256 the sender offered (P4) — persisted so a
+/// `full` is the whole-file sha256 the sender offered (P4), persisted so a
 /// resume after a process restart can still verify-on-completion.
 struct PartMeta {
     size: u64,
@@ -755,7 +755,7 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
 // Persistent pairing: during a code-paired session, both sides exchange a
 // 32-byte secret END-TO-END over the DataChannel (the server never sees it)
 // and store it under a local nickname. Presence: subscribe with
-// sha256("filament-pair:" + secret) — the server learns only meeting points.
+// sha256("filament-pair:" + secret), the server learns only meeting points.
 // Trust: an HMAC(secret) proof exchanged after connect, so the server cannot
 // impersonate a known device. Full PAKE remains roadmap (ledger C15).
 
@@ -790,7 +790,7 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
     // addedAt) verbatim. Going through the (name, secret) tuples of
     // devices_load() silently rewrote every other device as bare
     // {name, secret}, wiping their `shell` grants on any store (pairing,
-    // introduce, rename) — a quiet privilege-loss bug.
+    // introduce, rename), a quiet privilege-loss bug.
     let mut arr: Vec<Value> = std::fs::read_to_string(&p)
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
@@ -814,7 +814,7 @@ fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// `caps` is deny-by-default; "transfer" is the L0 baseline. The on-disk shape
 /// grows `v` and `caps` but the existing `{name, secret}` fields are unchanged,
 /// so the reconnect path (`devices_load`, which reads only name+secret) keeps
-/// working byte-for-byte — no regression.
+/// working byte-for-byte, no regression.
 fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
     let p = devices_path();
     if let Some(dir) = p.parent() {
@@ -867,7 +867,7 @@ fn device_caps_at(path: &Path, name: &str) -> Option<Vec<String>> {
 #[allow(dead_code)]
 fn device_allows_at(path: &Path, name: &str, capability: &str) -> bool {
     if capability == "transfer" {
-        return true; // L0 baseline — never gated (spec §8)
+        return true; // L0 baseline, never gated (spec §8)
     }
     device_caps_at(path, name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
 }
@@ -879,7 +879,7 @@ fn device_allows_at(path: &Path, name: &str, capability: &str) -> bool {
 #[allow(dead_code)] // enforcement hook (gate 5); exercised by the capability gate
 fn device_allows(name: &str, capability: &str) -> bool {
     if capability == "transfer" {
-        return true; // L0 baseline — never gated (spec §8)
+        return true; // L0 baseline, never gated (spec §8)
     }
     device_caps(name).map(|c| c.iter().any(|g| g == capability)).unwrap_or(false)
 }
@@ -892,7 +892,7 @@ fn device_allows(name: &str, capability: &str) -> bool {
 fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
     let p = devices_path();
     let raw = std::fs::read_to_string(&p)
-        .map_err(|_| anyhow::anyhow!("no known device named '{name}' — pair first"))?;
+        .map_err(|_| anyhow::anyhow!("no known device named '{name}', pair first"))?;
     let mut arr: Vec<Value> = serde_json::from_str::<Value>(&raw)
         .ok()
         .and_then(|v| v.as_array().cloned())
@@ -919,7 +919,7 @@ fn device_set_cap(name: &str, capability: &str, grant: bool) -> Result<()> {
     }
     if !found {
         return Err(anyhow::anyhow!(
-            "no known device named '{name}' — run `filament devices` to see who you've paired"
+            "no known device named '{name}', run `filament devices` to see who you've paired"
         ));
     }
     std::fs::write(&p, serde_json::to_string_pretty(&arr)?)?;
@@ -985,7 +985,7 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
 
 /// C20: the proof binds the pair secret to the DTLS session. uids are
 /// order-normalized (direction-tagged by the prover's uid prefix) and BOTH
-/// certificate fingerprints are mixed in sorted order — a channel MITM'd by
+/// certificate fingerprints are mixed in sorted order, a channel MITM'd by
 /// anyone (including the signaling server) has different fingerprints, so
 /// the proof fails and auto-accept refuses.
 pub(crate) fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str, fp1: &str, fp2: &str) -> String {
@@ -1058,7 +1058,7 @@ fn daemon_alive() -> Option<u32> {
 /// M-1 (privilege-drop): when `--shell-user <name>` is set, drop the PTY to that
 /// account via `runuser -l <user>` (a clean setuid+login-shell wrapper available
 /// on every systemd distro). `runuser` does no PAM password prompt, so it only
-/// works when `up` itself runs as root — which is exactly the case the flag is
+/// works when `up` itself runs as root, which is exactly the case the flag is
 /// meant to de-fang (a root daemon should hand out a NON-root shell). Without the
 /// flag the PTY runs as the up-process user (often root on a server); this is an
 /// ACCEPTED RISK documented in docs/security/web-shell-review.md (M-1) and in the
@@ -1077,13 +1077,13 @@ fn shell_argv(shell_user: Option<&str>) -> Vec<String> {
 
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
 /// may `filament ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
-/// always enforced separately — this is purely the capability side.
+/// always enforced separately, this is purely the capability side.
 #[derive(Clone, Debug)]
 enum ShellPolicy {
     /// Default: only devices explicitly `grant`ed the `shell` cap.
     Granted,
     /// `up --shell`: any paired device. M-2: this INTENTIONALLY grants every
-    /// proof-verified paired device — including ones introduced later via
+    /// proof-verified paired device, including ones introduced later via
     /// pair-intro. Use `Only`/`--shell-only` to scope it.
     All,
     /// `up --shell-only a,b`: only these petnames auto-shell; others need a grant.
@@ -1149,14 +1149,14 @@ async fn up_cmd(
             .map(|st| st.success())
             .unwrap_or(false);
         if enabled {
-            ui::say(&format!("  {} service enabled and started — logs: journalctl --user -u filament", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+            ui::say(&format!("  {} service enabled and started, logs: journalctl --user -u filament", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
         } else {
             ui::say(&format!("  start it with: {}", ui::paint(ui::Tone::Bold, "systemctl --user enable --now filament")));
         }
         return Ok(());
     }
     if let Some(pid) = daemon_alive() {
-        bail!("already up (pid {pid}) — `filament status` / `filament down`");
+        bail!("already up (pid {pid}), `filament status` / `filament down`");
     }
     let dir = drop_dir(dir);
     std::fs::create_dir_all(&dir)?;
@@ -1166,7 +1166,7 @@ async fn up_cmd(
         // (current AND any introduced later via pair-intro). This is a broad,
         // deliberate over-grant; --shell-only is the scoped, safer alternative.
         ShellPolicy::All => ui::say(&format!(
-            "  {} seamless shell ON — ANY paired device (now or paired later) can `filament ssh` into this machine",
+            "  {} seamless shell ON, ANY paired device (now or paired later) can `filament ssh` into this machine",
             ui::paint(ui::Tone::Warn, "!"),
         )),
         ShellPolicy::Only(set) => {
@@ -1174,7 +1174,7 @@ async fn up_cmd(
             names.sort();
             let list = names.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
             ui::say(&format!(
-                "  {} seamless shell ON for: {list} — they can `filament ssh` into this machine",
+                "  {} seamless shell ON for: {list}, they can `filament ssh` into this machine",
                 ui::paint(ui::Tone::Warn, "!"),
             ));
         }
@@ -1185,7 +1185,7 @@ async fn up_cmd(
     // user (often root on a server). `--shell-user <name>` de-fangs this.
     if shell_policy.enables_l2() && shell_user.is_none() {
         ui::say(&format!(
-            "  {} shell PTYs run as THIS user (root if the daemon is root) — pass `--shell-user <name>` to drop to a non-root account",
+            "  {} shell PTYs run as THIS user (root if the daemon is root), pass `--shell-user <name>` to drop to a non-root account",
             ui::paint(ui::Tone::Warn, "!"),
         ));
     }
@@ -1197,7 +1197,7 @@ async fn up_cmd(
 fn status_cmd() -> Result<()> {
     match daemon_alive() {
         Some(pid) => ui::say(&format!("  {} up (pid {pid})", ui::paint(ui::Tone::Ok, ui::glyph_ok()))),
-        None => ui::say(&format!("  {} not running — start with: filament up", ui::paint(ui::Tone::Dim, "·"))),
+        None => ui::say(&format!("  {} not running, start with: filament up", ui::paint(ui::Tone::Dim, "·"))),
     }
     let n = devices_load().len();
     ui::say(&format!("  {} known device{}", n, if n == 1 { "" } else { "s" }));
@@ -1232,7 +1232,7 @@ fn down_cmd() -> Result<()> {
 // Vouched pairing: the hub (which already trusts A and B) mints a fresh
 // secret and delivers it to both over channels it has PROVEN itself on
 // (fingerprint-bound, C20). Receivers only honor pair-intro from a verified
-// link, so a stranger — or the server — can't inject trust.
+// link, so a stranger, or the server, can't inject trust.
 
 async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()> {
     let store = devices_load();
@@ -1244,7 +1244,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
     let solo = format!("intro-{}", fresh_secret());
-    // C30: the session repairs whatever these emits lose — and under gate L
+    // C30: the session repairs whatever these emits lose, and under gate L
     // they are the emits the loss shim adversarially drops.
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.room = Some(solo.clone());
@@ -1274,7 +1274,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
     direct_pending: HashMap::new(),
     stall_repairs: HashMap::new(),
     relay_committed: std::collections::HashSet::new(),
-    // P3 (GAP-3): warm redundancy is selective — OFF for one-shot / non-session
+    // P3 (GAP-3): warm redundancy is selective, OFF for one-shot / non-session
     // flows; the long-lived `up` acceptor turns it ON below. The override knob
     // (`FILAMENT_WARM_STANDBY`) can force it either way.
     warm_standby: net::warm_standby_override().unwrap_or(false),
@@ -1290,7 +1290,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
 
     loop {
         if Instant::now() > deadline {
-            bail!("timed out — both devices must be online (e.g. running `filament up`)");
+            bail!("timed out, both devices must be online (e.g. running `filament up`)");
         }
         let ev = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => ev,
@@ -1302,7 +1302,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
         match ev {
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
-                // C30 (dissolves the C28 belt): fresh sid — re-assert via session.
+                // C30 (dissolves the C28 belt): fresh sid, re-assert via session.
                 sess.invalidate();
             }
             Ev::Synced(v) => { sess.on_synced(&v); }
@@ -1369,7 +1369,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
 }
 
 // ----------------------------------------------------------------- pair ----
-// L1-a (PAKE v2): remembering a device is a first-class ceremony — no file
+// L1-a (PAKE v2): remembering a device is a first-class ceremony, no file
 // transfer to pretend through. The first-pairing now runs a real SPAKE2 PAKE
 // over the SPOKEN code so a malicious signaling server cannot MITM enrollment.
 //
@@ -1379,7 +1379,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
 //   - SPAKE2 runs over the opaque `signal` relay BEFORE any secret exists.
 //   - A key-confirmation MAC folds in the SORTED DTLS fingerprints + caps, so a
 //     server that substitutes a DTLS cert OR rewrites caps is DETECTED → abort.
-//   - The 32-byte pinned secret is HKDF(K) — AGREED, never transmitted. The old
+//   - The 32-byte pinned secret is HKDF(K), AGREED, never transmitted. The old
 //     `pair-keep` secret-over-DataChannel step is GONE from the v2 path.
 //   - Downgrade is structurally impossible: a v2 client NEVER sends pair-keep
 //     and NEVER stores a secret from a received pair-keep. A received pair-keep
@@ -1388,7 +1388,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
 //
 // Helpers below decode/encode the opaque PAKE payloads carried on `signal`.
 
-/// Base64 (no external dep — small alphabet table). Used only for the 33-byte
+/// Base64 (no external dep, small alphabet table). Used only for the 33-byte
 /// SPAKE2 element / 32-byte MAC opaque payloads on the signal relay.
 fn b64_encode(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1439,13 +1439,13 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 /// The capability set v2 first-pairing agrees on. "transfer" is the L0 baseline
 /// (always allowed); deny-by-default future caps are NOT granted at first
 /// enrollment. BOTH sides MAC the identical canonical string or confirmation
-/// fails — so this default is fixed and unconditional (spec §8 / gate 5).
+/// fails, so this default is fixed and unconditional (spec §8 / gate 5).
 fn pair_v2_caps() -> Vec<String> {
     vec!["transfer".to_string()]
 }
 
 /// The one-line dim banner shown right before we open the guided entry on a
-/// MALFORMED arg — so the user knows WHY the prompt appeared and how to make it
+/// MALFORMED arg, so the user knows WHY the prompt appeared and how to make it
 /// fail fast in scripts.
 fn malformed_entry_banner(arg: &str) {
     ui::say(&ui::paint(
@@ -1463,12 +1463,17 @@ fn cancelled() -> anyhow::Error {
 }
 
 async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, mut word: Option<String>, relay: bool) -> Result<()> {
-    // INTERACTIVE GATE (scripts safe by default — see `interactive_allowed`).
+    // INTERACTIVE GATE (scripts safe by default, see `interactive_allowed`).
     //   * `pair` with no code AND no --word -> guided CREATE entry. Empty submit
     //     falls back to today's auto-mint; typed words become the chosen password.
     //   * `pair <malformed>` (a positional that isn't a valid claim shape) ->
     //     banner, then guided CLAIM entry PRE-FILLED with the normalized input.
     // When the gate is closed we keep EXACTLY today's behavior below.
+    //
+    // If the guided CREATE entry runs, it mints the nameplate ONCE here and shows
+    // it in the preview; we carry it forward so the code we actually create uses
+    // the SAME number the user saw (no shown-one-number, got-another mismatch).
+    let mut preview_nameplate: Option<String> = None;
     if word.is_none() && interactive_allowed() {
         let malformed = code.as_deref().filter(|c| {
             // A "valid claim shape" is words + a trailing dash-group; anything that
@@ -1482,8 +1487,15 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             (None, _) => {
                 let auto_np = filament_pake::words::mint_nameplate();
                 match codeentry::run("  pair · choose words  ", codeentry::Mode::Create, "", &auto_np)? {
-                    codeentry::Outcome::Submitted(words) => word = Some(words),
-                    codeentry::Outcome::Empty => { /* fall through to auto-mint */ }
+                    codeentry::Outcome::Submitted(words) => {
+                        word = Some(words);
+                        // Reuse the SAME nameplate we just previewed, so the code
+                        // we mint matches the number the user saw.
+                        preview_nameplate = Some(auto_np);
+                    }
+                    // Empty submit -> fall through to auto-mint, but still keep the
+                    // previewed nameplate so an empty (auto-words) create reuses it.
+                    codeentry::Outcome::Empty => preview_nameplate = Some(auto_np),
                     codeentry::Outcome::Cancelled => return Err(cancelled()),
                 }
             }
@@ -1533,14 +1545,14 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     let sio = net::connect_signaling(server, tx.clone()).await?;
     // Meta must exist for pairing; an unguessable solo room keeps strangers
-    // out (the daemon's trick) — the pair-claim moves people, not the room.
+    // out (the daemon's trick), the pair-claim moves people, not the room.
     let solo = format!("pairc-{}", fresh_secret());
     // C30: the session repairs the solo-room membership/lease if the join dies.
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.room = Some(solo.clone());
     sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
     // A code that looks like a one-time TRANSFER code (word-word-NNN, 2-3 digit
-    // trailing) typed into `pair`, which runs the PAKE pairing ceremony —
+    // trailing) typed into `pair`, which runs the PAKE pairing ceremony,
     // redirect clearly before the handshake stalls against a peer that isn't
     // pairing. ADVISORY only (by trailing-number width); PAKE still authenticates.
     if let Some(c) = &code {
@@ -1563,7 +1575,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             let normalized = filament_pake::norm_code(c);
             let (np, pw) = filament_pake::split_code(&normalized);
             if pw.is_empty() || np.is_empty() {
-                bail!("that code doesn't look right — expected something like brave-otter-ruby-3141");
+                bail!("that code doesn't look right, expected something like brave-otter-ruby-3141");
             }
             my_words = pw;
             my_nameplate = np.clone();
@@ -1576,7 +1588,11 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             // the nameplate. The full code is displayed from our own words when
             // pair-ok arrives (the server never echoes any words).
             my_words = custom_words.clone().unwrap_or_else(filament_pake::words::mint_words);
-            my_nameplate = filament_pake::words::mint_nameplate();
+            // Reuse the nameplate the guided entry already previewed (if any), so
+            // the created code matches what the user saw; otherwise mint fresh.
+            my_nameplate = preview_nameplate
+                .clone()
+                .unwrap_or_else(filament_pake::words::mint_nameplate);
             // STEERING: echo the normalized code we're about to create so the
             // creator sees EXACTLY what their peer must type (== what SPAKE2 hashes).
             if custom_words.is_some() {
@@ -1634,12 +1650,12 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
     }
     let deadline = Instant::now() + Duration::from_secs(600); // code TTL
     // The pairing peer left before the ceremony finished. Give a short grace
-    // for a transient reconnect, then FAIL FAST — don't orphan in the room
+    // for a transient reconnect, then FAIL FAST, don't orphan in the room
     // for the full 10-min TTL (the D3/D5 divergence the monitor kept
     // catching: creator's connect failed, it quit, claimer sat silent).
     // Once the code is CLAIMED, the ceremony must finish in seconds. Bound it:
     // if it hasn't completed within this budget, the peer disconnected or could
-    // never connect — fail fast instead of orphaning in the room for the full
+    // never connect, fail fast instead of orphaning in the room for the full
     // 600s TTL (the D3/D5 divergence the monitor kept catching). 60s is generous
     // (covers a slow cross-NAT WebRTC with its 3×15s establishment retries);
     // FILAMENT_PAIR_GRACE_SECS shortens it for gate 17b.
@@ -1653,14 +1669,14 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
 
     loop {
         // Done when the petname is settled AND the PAKE agreed a secret (key
-        // confirmation passed). The secret is HKDF(K) — never transmitted, the
+        // confirmation passed). The secret is HKDF(K), never transmitted, the
         // same on both sides; it drops straight into devices.json.
         if let Some(n) = petname.clone() {
             if let Some(sec) = agreed_secret.clone() {
                 // caps_v2 (spec §8): record GRANTED caps, deny-by-default.
                 devices_store_v2(&n, &sec, &caps)?;
                 ui::say(&format!(
-                    "  {} {} mutually remembered — verified end-to-end (no key ever crossed the server)",
+                    "  {} {} mutually remembered, verified end-to-end (no key ever crossed the server)",
                     ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                     ui::paint(ui::Tone::Bold, &n),
                 ));
@@ -1671,13 +1687,13 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             }
         }
         if Instant::now() > deadline {
-            bail!("timed out — the code was never used (codes expire after 10 minutes)");
+            bail!("timed out, the code was never used (codes expire after 10 minutes)");
         }
         // Fail fast: the code was claimed but the ceremony didn't finish in
-        // time — the peer disconnected or never connected.
+        // time, the peer disconnected or never connected.
         if let Some(dl) = ceremony_deadline {
             if Instant::now() > dl {
-                bail!("the other device disconnected or could not connect before pairing finished — make sure both run `filament pair` at the same time, then try again");
+                bail!("the other device disconnected or could not connect before pairing finished, make sure both run `filament pair` at the same time, then try again");
             }
         }
         sess.tick(&sio).await; // C30: converge every iteration (incl. ticks)
@@ -1689,7 +1705,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
         if let Some(pid) = pake_peer.clone() {
             // gate 17b (FILAMENT_TEST_PAIR_STALL): never send our SPAKE2 element,
             // so the exchange can't complete on either side and the ceremony's
-            // fail-fast `ceremony_deadline` fires — proving the no-10-min-orphan
+            // fail-fast `ceremony_deadline` fires, proving the no-10-min-orphan
             // guard. Test-only: `stall` is set solely by that env var.
             if !sent_pake_msg && !stall {
                 sio.emit("signal", json!({ "to": pid, "data": {
@@ -1731,7 +1747,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         conn.maybe_adopt(p, true).await?;
                     }
                 }
-                sess.invalidate(); // C30: fresh sid — re-assert next tick
+                sess.invalidate(); // C30: fresh sid, re-assert next tick
             }
             Ev::Synced(v) => { sess.on_synced(&v); }
             Ev::PairOk(_v) => {
@@ -1753,23 +1769,23 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 bail!("this server returned a legacy code. Update the server (or the peer) to pair securely.");
             }
             Ev::PairUsed(_) => {
-                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting…"));
                 ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
             }
             Ev::PairMatched(v) => {
                 let room = v["room"].as_str().unwrap_or_default().to_string();
                 ceremony_deadline.get_or_insert_with(|| Instant::now() + ceremony_budget);
-                ui::say(&format!("  {} code accepted — connecting", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                ui::say(&format!("  {} code accepted, connecting", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 sess.room = Some(room.clone()); // C30: desire moves with us
                 sess.touch();
                 sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             }
             Ev::PairError(v) => {
                 // Creator nameplate collision: re-mint a FRESH nameplate (and
-                // fresh words) and retry — never reuse a burned code.
+                // fresh words) and retry, never reuse a burned code.
                 if creator && v["error"].as_str() == Some("taken") {
                     // Re-mint a FRESH nameplate; KEEP the creator's chosen words
-                    // (--word) — only mint fresh words when we minted them.
+                    // (--word), only mint fresh words when we minted them.
                     if custom_words.is_none() {
                         my_words = filament_pake::words::mint_words();
                     }
@@ -1782,8 +1798,8 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                     continue;
                 }
                 let hint = match v["why"].as_str() {
-                    Some("sender-gone") => "that code's creator already left — ask them for a fresh one".to_string(),
-                    _ => format!("{} — codes burn after one use; a failed pairing needs a FRESH code (re-run `filament pair`)", v["error"].as_str().unwrap_or("?")),
+                    Some("sender-gone") => "that code's creator already left, ask them for a fresh one".to_string(),
+                    _ => format!("{}, codes burn after one use; a failed pairing needs a FRESH code (re-run `filament pair`)", v["error"].as_str().unwrap_or("?")),
                 };
                 bail!("code rejected: {hint}");
             }
@@ -1830,7 +1846,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                         if filament_pake::verify_peer_confirm(&k, &my_fp, &their_fp, &caps_canon, &recv_mac) {
                             agreed_secret = Some(filament_pake::secret_from_k(&k));
                         } else {
-                            bail!("pairing REFUSED: key confirmation failed — wrong code, or the connection is being tampered with (a server cannot forge this). Nothing was stored; ask for a FRESH code.");
+                            bail!("pairing REFUSED: key confirmation failed, wrong code, or the connection is being tampered with (a server cannot forge this). Nothing was stored; ask for a FRESH code.");
                         }
                         continue;
                     }
@@ -1895,7 +1911,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             Ev::Control(_pid, v) => match v["type"].as_str() {
                 // L1-a downgrade-refusal (spec §6.1): a v2 client NEVER stores a
                 // secret handed over the DataChannel. Receiving a `pair-keep` means
-                // the PEER is a legacy v1 client. We refuse — pairing securely
+                // the PEER is a legacy v1 client. We refuse, pairing securely
                 // requires v2 on both ends. A malicious server stripping `v:2`
                 // cannot exploit this: there is no path here that stores a
                 // server-readable secret.
@@ -1914,11 +1930,11 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
             Ev::PeerLeft(v) => {
                 // A faster, friendlier signal than the ceremony budget when it
                 // arrives: the pairing peer left the room. (The budget is the
-                // hard backstop — server peer-left can lag behind a hard kill.)
+                // hard backstop, server peer-left can lag behind a hard kill.)
                 let gone = v["id"].as_str().and_then(|p| conn.link(p)).map(|l| l.name.clone());
                 conn.on_peer_left(&v);
                 let n = gone.unwrap_or_else(|| "the other device".into());
-                ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} disconnected — waiting briefly in case it reconnects…")));
+                ui::say(&ui::paint(ui::Tone::Dim, &format!("  {n} disconnected, waiting briefly in case it reconnects…")));
             }
             Ev::Interrupted => bail!("interrupted"),
             _ => {}
@@ -1934,11 +1950,11 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
 
 struct Link {
     /// WebRTC peer connection. `None` for a rung-1 direct link (no ICE/DTLS
-    /// negotiation — it rides authenticated QUIC), so every WebRTC-only call
+    /// negotiation, it rides authenticated QUIC), so every WebRTC-only call
     /// site (`handle_signal`, `fingerprints`, `restart_ice`, the watchdog's
     /// `is_connected`) is reachable only when this is `Some`.
     peer: Option<Arc<Peer>>,
-    info: Value, // {id,name,uid} as last seen — enough to re-establish
+    info: Value, // {id,name,uid} as last seen, enough to re-establish
     name: String,
     uid: Option<String>,
     transport: Option<Arc<dyn Transport>>,
@@ -1957,7 +1973,7 @@ struct Link {
     /// C26: what the status roster shows for this peer
     presence: Presence,
     /// rung-1 (FILAMENT_DIRECT): this link's transport is an authenticated direct
-    /// QUIC connection — its pair-secret MAC already proved identity, so the
+    /// QUIC connection, its pair-secret MAC already proved identity, so the
     /// post-channel DTLS pair-proof is skipped and the link is born trusted.
     direct: bool,
     /// Route label for a direct link (no WebRTC `route()` to query): `direct-quic`
@@ -1983,7 +1999,7 @@ fn presence_glyph(p: Presence) -> (&'static str, ui::Tone, &'static str) {
     }
 }
 
-/// C18: browsers are mesh peers — they connect to EVERY room member. The CLI
+/// C18: browsers are mesh peers, they connect to EVERY room member. The CLI
 /// must answer every offer politely or unanswered browsers wedge at
 /// "connecting" (and their retry storms degrade the whole room). So: a links
 /// MAP, every peer answered; SEND still aims transfers at one `active`
@@ -2006,7 +2022,7 @@ struct Conn {
     /// How long the current rejoin window runs (set when it opens; depends on
     /// whether the peer declared `brb`).
     rejoin_window: Duration,
-    /// (peer sid, until) — the peer told us it's stepping away (C21).
+    /// (peer sid, until), the peer told us it's stepping away (C21).
     away: Option<(String, Instant)>,
     chunk_size: usize,
     /// #28 (deferred drop): sids that got a peer-left while their data channel
@@ -2017,7 +2033,7 @@ struct Conn {
     /// sender). Instead we stash the original peer-left payload here and
     /// re-check on every main-loop tick: once the link goes idle past the
     /// flowing threshold (or its channel is dead), we re-inject the stored
-    /// peer-left so the normal handler runs verbatim — now dropping it. A live
+    /// peer-left so the normal handler runs verbatim, now dropping it. A live
     /// reconnect never goes idle (the transfer completes on it), so its entry
     /// is reaped harmlessly once done. Cleared in drop_link so a supersede of a
     /// deferred sid can't leave a stale blocker.
@@ -2030,17 +2046,17 @@ struct Conn {
     /// AFTER delivering every byte would otherwise FLAP the link forever
     /// (establish → connect → die → Stuck → establish …), each cycle resetting
     /// `attempts` (so MAX_ATTEMPTS never caps it) and re-arming `expected_secret`
-    /// (so `digest_says_alone` never holds) — `conn.links` never empties and the
+    /// (so `digest_says_alone` never holds), `conn.links` never empties and the
     /// quiet-exit never fires → RC=124 hang. Dropping the link empties
     /// `conn.links` and lets the quiet-exit fire. Recomputed PER TICK (never
     /// sticky) so a mid-transfer link (`by_sid` non-empty) always reconnects
-    /// normally — kill-resume (gate 2) and the #28 deferred-drop (gate 11c)
+    /// normally, kill-resume (gate 2) and the #28 deferred-drop (gate 11c)
     /// reconnect paths are untouched. Defaults false, so the send-side and
     /// connecting-phase `on_stuck` callers are unaffected.
     recv_done: bool,
     /// rung-1 (FILAMENT_DIRECT): in-flight direct-QUIC attempts, keyed by peer
     /// sid. While an attempt is pending we do NOT establish WebRTC for that peer
-    /// (sequential, per the design review — avoids two transports racing to
+    /// (sequential, per the design review, avoids two transports racing to
     /// ChannelReady). On deadline expiry with no DirectReady the entry is
     /// dropped and the normal WebRTC `establish` runs; the fallback is unchanged.
     direct_pending: HashMap<String, DirectPending>,
@@ -2059,11 +2075,11 @@ struct Conn {
     relay_committed: std::collections::HashSet<String>,
     /// P3 (GAP-3): the WARM-REDUNDANCY selectivity gate. TRUE only for long-lived
     /// / interactive sessions (the `up`/`up --shell` daemon acceptor; a transfer
-    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel)
-    /// — the sessions §2.4 says a mid-session drop is intolerable for. When set,
+    /// flagged interactive via `FILAMENT_WARM_STANDBY=1` standing in for a tunnel),
+    /// the sessions §2.4 says a mid-session drop is intolerable for. When set,
     /// `correct_stall` keeps the relay path as a pre-designated WARM standby and
     /// CUTS OVER to it on the FIRST stall (rung b) instead of grinding through the
-    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials — so the
+    /// slow direct-repair rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, so the
     /// failover is near-instant rather than a perceptible gap. FALSE for one-shot
     /// file `send` (the 90% case): the on-disk partial + C7 resume make the cold
     /// repair ladder correct and bounded, and a warm standby isn't worth a second
@@ -2071,7 +2087,7 @@ struct Conn {
     /// tradeoff, §2.4 / §6). Defaulted by session kind at construction, overridable
     /// by `net::warm_standby_override()` (`FILAMENT_WARM_STANDBY`).
     warm_standby: bool,
-    /// P3: per-peer warm-standby bookkeeping — peers whose relay standby has
+    /// P3: per-peer warm-standby bookkeeping, peers whose relay standby has
     /// already been cut over to in the current stall episode, so a flapping relay
     /// path can't re-fire the instant cutover every tick (it falls through to the
     /// bounded relay-stalled `Exhausted` honesty instead). Cleared by
@@ -2087,7 +2103,7 @@ struct Conn {
     /// P5: a snapshot of the local interface set (sorted IP strings) at the last
     /// probe schedule. A change (new/removed interface, wifi<->cellular,
     /// default-route move surfacing a new local IP) is the "walked home onto wifi"
-    /// signal — we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
+    /// signal, we re-probe IMMEDIATELY. Polled cheaply each tick (no platform
     /// netlink dependency); the portable best-effort trigger the plan asks for.
     iface_snapshot: Vec<String>,
 }
@@ -2110,16 +2126,16 @@ struct StallState {
 }
 
 /// P5 (GAP-6): one peer's relay->direct UPGRADE-PROBE state. Lifecycle:
-///   IDLE   — armed (relay-committed); `next_at` is when the next probe fires,
+///   IDLE  : armed (relay-committed); `next_at` is when the next probe fires,
 ///            `attempt` drives the exponential backoff (first_ms → steady_ms).
-///   PROBING— a direct dial is in flight (a `DirectPending{probe:true}` exists);
+///   PROBING: a direct dial is in flight (a `DirectPending{probe:true}` exists);
 ///            we don't re-fire until it resolves (win → VERIFYING, or expiry →
 ///            back to IDLE with a longer backoff).
-///   VERIFYING — a direct standby CONNECTED (`standby` set). It must move data
+///   VERIFYING: a direct standby CONNECTED (`standby` set). It must move data
 ///            CONTINUOUSLY for `verify_ms` before we cut over; `verify_started`
 ///            marks when it connected. If it goes idle past `verify_idle_ms` or
 ///            never reaches `verify_ms` of sustained progress, it is DISCARDED
-///            and we go back to IDLE (stay on relay — the no-flap guard).
+///            and we go back to IDLE (stay on relay, the no-flap guard).
 struct UpgradeProbe {
     /// failed-probe count; each failure backs the cadence off toward steady_ms.
     attempt: u32,
@@ -2130,7 +2146,7 @@ struct UpgradeProbe {
     standby: Option<Arc<dyn Transport>>,
     /// the route label of the standby (`direct-quic` / `holepunched`).
     standby_route: &'static str,
-    /// when the standby connected — the start of the verify window.
+    /// when the standby connected, the start of the verify window.
     verify_started: Option<Instant>,
     /// the standby's `idle_ms()` floor observed so far in the verify window, used
     /// to require SUSTAINED progress (it must keep moving, not just connect).
@@ -2163,14 +2179,14 @@ enum Rung {
     /// and prints the honest relay banner.
     Relayed,
     /// rungs a→d unavailable: direct rungs spent AND relay is forbidden
-    /// (`--no-relay`) or we were already on relay. The caller FAILS CLEANLY — a
+    /// (`--no-relay`) or we were already on relay. The caller FAILS CLEANLY, a
     /// kept partial, a clear error, never a hang.
     Exhausted,
 }
 
 /// rung-1: state for one in-flight direct-QUIC attempt.
 struct DirectPending {
-    /// (name, secret) for the known device — gates the attempt and keys the MAC.
+    /// (name, secret) for the known device, gates the attempt and keys the MAC.
     secret: (String, String),
     /// budget deadline; on expiry with no DirectReady we fall back to WebRTC.
     deadline: Instant,
@@ -2187,12 +2203,12 @@ struct DirectPending {
     /// rung-2: our advertised srflx (logged at offer time; kept for diagnostics).
     #[allow(dead_code)]
     my_srflx: Option<std::net::SocketAddr>,
-    /// P5 (GAP-6): this is a relay->direct UPGRADE probe — a direct dial run
+    /// P5 (GAP-6): this is a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE a live relay link (not the cold establishment path). When the
     /// race wins, `on_transport_offer` posts `Ev::DirectUpgradeReady` (verify-
     /// before-upgrade) instead of `Ev::DirectReady` (which would clobber the
     /// serving relay link). When the budget expires with no winner, `expired_direct`
-    /// just DROPS the pending (no WebRTC fallback — the relay link is still serving)
+    /// just DROPS the pending (no WebRTC fallback, the relay link is still serving)
     /// and the prober schedules the next backoff.
     probe: bool,
 }
@@ -2205,7 +2221,7 @@ impl Conn {
     /// `warm_standby_default` is the per-session-kind default that the
     /// `FILAMENT_WARM_STANDBY` override (via `net::warm_standby_override`) can
     /// still force either way. NOTE: the long-lived `up` daemon loop keeps its
-    /// own literal on purpose — it is a different (non-command) session.
+    /// own literal on purpose, it is a different (non-command) session.
     fn for_command(
         server: &str,
         sio: rust_socketio::asynchronous::Client,
@@ -2284,7 +2300,7 @@ impl Conn {
     }
 
     /// May this peer become the TRANSFER TARGET? (Filters gate targeting,
-    /// never answering — every peer still gets a polite link.)
+    /// never answering, every peer still gets a polite link.)
     fn targetable(&self, name: &str, peer_uid: Option<&str>) -> bool {
         if let Some(filter) = &self.to_filter {
             if !name.to_lowercase().contains(&filter.to_lowercase()) {
@@ -2311,12 +2327,12 @@ impl Conn {
             return Ok(false);
         }
         // NOTE: same-install peers (our own daemon) are filtered at the
-        // KnownPeer call sites, NOT here — room discovery must keep working
+        // KnownPeer call sites, NOT here, room discovery must keep working
         // between two processes of one machine (loopback self-send is the
         // first thing every new user tries).
         self.roster.insert(peer_id.clone(), v.clone());
 
-        // C6: same device on a NEW sid — supersede the stale link.
+        // C6: same device on a NEW sid, supersede the stale link.
         let stale: Option<String> = self
             .links
             .iter()
@@ -2325,15 +2341,15 @@ impl Conn {
         if let Some(old_sid) = stale {
             // #28: the same device reconnected its signaling socket (fresh sid).
             // If its existing data channel is still flowing, the reconnect is
-            // cosmetic — superseding would tear down an active transfer. Keep the
+            // cosmetic, superseding would tear down an active transfer. Keep the
             // old link; once it goes idle a later roster/presence event supersedes.
             if self.link_flowing(&old_sid) {
                 // Observable so a gate can assert the keep happened (true
                 // positive), not merely that no supersede line appeared.
-                ui::debug(&format!("{name} reconnected — keeping active link"));
+                ui::debug(&format!("{name} reconnected, keeping active link"));
                 return Ok(self.is_active(&old_sid));
             }
-            ui::debug(&format!("{name} reconnected — superseding old link"));
+            ui::debug(&format!("{name} reconnected, superseding old link"));
             let was_active = self.is_active(&old_sid);
             let secret = self.links.get(&old_sid).and_then(|l| l.expected_secret.clone());
             self.drop_link(&old_sid);
@@ -2358,7 +2374,7 @@ impl Conn {
         // same-uid reconnect's supersede still sees it active, and the live
         // transfer's offer/exit machinery is undisturbed). But a DIFFERENT-uid
         // replacement (gate 2: hard-killed receiver, fresh recv) must still be
-        // able to take over — otherwise the deferred link squats the slot until
+        // able to take over, otherwise the deferred link squats the slot until
         // the reap, and the replacement (whose ChannelReady already fired) never
         // gets promoted or offered the file. Treating a deferred active as
         // "claimable" promotes the replacement at peer-joined, before its
@@ -2385,7 +2401,7 @@ impl Conn {
     }
 
     fn drop_link(&mut self, pid: &str) {
-        // #28: dropping a link also discharges any deferred peer-left for it —
+        // #28: dropping a link also discharges any deferred peer-left for it,
         // so a supersede (maybe_adopt) of a deferred same-uid sid can't leave a
         // stale entry blocking adoption. Invariant: deferred_left only ever
         // holds sids that are still live links.
@@ -2409,7 +2425,7 @@ impl Conn {
     }
 
     /// `force_polite: Some(true)` builds a pure responder link (no local offer)
-    /// regardless of uid comparison — required when the link exists to ANSWER
+    /// regardless of uid comparison, required when the link exists to ANSWER
     /// an incoming offer (ensure_responder / glare rebuild). The uid-based role
     /// can come out impolite there (especially on the bare `{id}` roster-miss
     /// fallback, which compares sids), making the "responder" offer too: glare.
@@ -2425,7 +2441,7 @@ impl Conn {
         // P1 (GAP-4): once a peer is committed to relay, a live link already
         // carries (or is converging on) the relay route. Re-establish events
         // (KnownPeer re-announce, expired_direct fallback, a watchdog tick) must
-        // NOT tear it down and rebuild mid-handshake — that thrash is exactly why
+        // NOT tear it down and rebuild mid-handshake, that thrash is exactly why
         // the relay link got "stuck while connecting". A genuinely failed link is
         // removed by the normal drop path (on_pc_state/GraceExpired) FIRST, so when
         // no link is present here we DO proceed to (re)build the relay link.
@@ -2445,17 +2461,17 @@ impl Conn {
         self.next_gen += 1;
         let generation = self.next_gen;
         // P1 relay-fallback gate (test-only): FILAMENT_TEST_WEBRTC_RELAY_ONLY=1
-        // models a peer with NO direct WebRTC path (hard NAT) — every WebRTC link
+        // models a peer with NO direct WebRTC path (hard NAT), every WebRTC link
         // is relay-only, so when the direct-QUIC ladder freezes/exhausts the
         // transfer can ONLY complete over the TURN relay. Faithful to the real
         // "direct can't, relay can" condition the auto-fallback exists for; never a
         // product knob. OR'd with the real relay_only (set by --relay or by an
         // auto escalate_to_relay).
         let relay_ice = self.relay_only || test_hooks::webrtc_relay_only();
-        // P1 (GAP-4): --no-relay is a HARD direct-only promise — never traverse a
+        // P1 (GAP-4): --no-relay is a HARD direct-only promise, never traverse a
         // relay. Strip TURN servers from the ICE config so no relay candidate can
         // ever be gathered. A peer reachable ONLY via relay then simply fails to
-        // connect — honestly, by the user's own choice — instead of silently using
+        // connect, honestly, by the user's own choice, instead of silently using
         // a middleman. (The ICE policy is left as-is: a relay-only policy with no
         // relay servers has no candidates and fails cleanly, which is the point.)
         if relay_forbidden() {
@@ -2502,7 +2518,7 @@ impl Conn {
 
     /// Begin a direct attempt against `pid`: bind a quinn endpoint, advertise our
     /// candidates via a relayed `transport-offer`, and stash the pending state.
-    /// No Link is created yet — it is born (with `peer: None`, pre-trusted) only
+    /// No Link is created yet, it is born (with `peer: None`, pre-trusted) only
     /// when an authenticated connection wins (Ev::DirectReady). Idempotent per
     /// peer (a second call while pending is a no-op). The peer's own
     /// transport-offer (Ev::TransportOffer) drives the race.
@@ -2510,7 +2526,7 @@ impl Conn {
         self.start_direct_inner(pid, name, secret, false).await
     }
 
-    /// P5 (GAP-6): arm a relay->direct UPGRADE probe — a direct dial run
+    /// P5 (GAP-6): arm a relay->direct UPGRADE probe, a direct dial run
     /// ALONGSIDE the live relay link. Bypasses the `relay_committed` /
     /// already-linked early-returns of `start_direct` (the whole POINT is to dial
     /// direct while a relay link serves), and marks the `DirectPending` as a
@@ -2518,7 +2534,7 @@ impl Conn {
     /// rather than clobbering the serving relay link. A no-op if a probe is
     /// already in flight for this peer.
     async fn start_upgrade_probe(&mut self, pid: &str, name: &str, secret: &str) {
-        // A probe already in flight (its own DirectPending) — don't double-dial.
+        // A probe already in flight (its own DirectPending), don't double-dial.
         if self.direct_pending.contains_key(pid) {
             return;
         }
@@ -2530,14 +2546,14 @@ impl Conn {
             return;
         }
         if !probe && self.relay_committed.contains(pid) {
-            // P1: this peer escalated to relay — never re-dial direct (it would
+            // P1: this peer escalated to relay, never re-dial direct (it would
             // only re-freeze and race the relay link). If a link already exists
             // (the relay link that escalate_to_relay built, possibly still
-            // converging), DON'T rebuild it — repeated KnownPeer/`appeared` events
+            // converging), DON'T rebuild it, repeated KnownPeer/`appeared` events
             // would otherwise tear it down and re-establish mid-handshake, so it
             // never connects ("stuck while connecting"). Only (re)establish over
             // relay when there is no link at all to carry the session.
-            // P5 (GAP-6): a `probe` deliberately bypasses this guard — it dials
+            // P5 (GAP-6): a `probe` deliberately bypasses this guard, it dials
             // direct ALONGSIDE the serving relay link (warm direct standby) and
             // never touches `links`, so it cannot disturb the relay path.
             if !self.links.contains_key(pid) {
@@ -2562,7 +2578,7 @@ impl Conn {
 
         // rung-2 (FILAMENT_HOLEPUNCH): bind a SECOND raw socket and STUN it so we
         // can advertise a server-reflexive candidate. This socket is kept RAW
-        // (not handed to quinn) — its NAT mapping is the one we'll punch + run
+        // (not handed to quinn), its NAT mapping is the one we'll punch + run
         // QUIC on if rung-1's host-candidate race fails. STUN failure is graceful:
         // no srflx is advertised and rung-2 simply won't fire for this peer.
         let (punch_sock, my_srflx) = if holepunch::holepunch_enabled() {
@@ -2581,7 +2597,7 @@ impl Conn {
             offer["srflx"] = json!(s.to_string());
         }
         // P5 (GAP-6): tag a probe offer so the PEER races it as an upgrade probe
-        // too — its winning side then posts Ev::DirectUpgradeReady (verify-before-
+        // too, its winning side then posts Ev::DirectUpgradeReady (verify-before-
         // upgrade) instead of clobbering ITS serving relay link. Both ends must
         // treat the new direct path as a standby until verified, or one end would
         // tear down its relay link unilaterally.
@@ -2592,17 +2608,17 @@ impl Conn {
             .sio
             .emit("signal", json!({ "to": pid, "data": offer.clone() }))
             .await;
-        // TRACE — direct-offer / signaling detail.
+        // TRACE, direct-offer / signaling detail.
         ui::trace(&format!(
-            "filament: {} sent to {name} ({pid}) — port {} srflx {}",
+            "filament: {} sent to {name} ({pid}), port {} srflx {}",
             if probe { "UPGRADE-PROBE-OFFER" } else { "DIRECT-OFFER" },
             port,
             my_srflx.map(|s| s.to_string()).unwrap_or_else(|| "-".into())
         ));
         // Re-send the offer periodically. The L2 initiator (netcat/ssh) subscribes
         // to the channel AFTER us, so on a late join it can miss BOTH our single
-        // fire-once offer AND its own KnownPeer for us (presence delivery is racy)
-        // — the cross-machine stall. Re-emitting lets it catch a later offer and
+        // fire-once offer AND its own KnownPeer for us (presence delivery is racy),
+        // the cross-machine stall. Re-emitting lets it catch a later offer and
         // dial our (reachable) candidates; the initiator only races the FIRST
         // offer it gets, so the extra emits are harmless once linked.
         {
@@ -2620,8 +2636,8 @@ impl Conn {
         // The WebRTC fallback reaper (`expired_direct`) fires at this deadline.
         // rung-1's race always burns the full DIRECT_BUDGET when it can't win
         // (its acceptor future never self-completes), so with hole-punch enabled
-        // the deadline MUST cover the WHOLE ladder — rung-1 budget + punch budget
-        // + QUIC handshake slack — or the reaper would race WebRTC against an
+        // the deadline MUST cover the WHOLE ladder, rung-1 budget + punch budget
+        // + QUIC handshake slack, or the reaper would race WebRTC against an
         // in-flight punch and the route would be a coin flip. Flag-gated, so
         // rung-1-only timing is byte-identical.
         let deadline = if holepunch::holepunch_enabled() {
@@ -2654,7 +2670,7 @@ impl Conn {
             .collect();
         let stun_addr = holepunch::stun_server_addr(&stun_urls)?;
         let sock = holepunch::bind_punch_socket().ok()?;
-        // STUN is blocking UDP I/O — run it off the reactor.
+        // STUN is blocking UDP I/O, run it off the reactor.
         tokio::task::spawn_blocking(move || {
             holepunch::stun_srflx(&sock, stun_addr).map(|srflx| (sock, srflx))
         })
@@ -2666,7 +2682,7 @@ impl Conn {
     /// The peer advertised its candidates. If we have a matching pending attempt
     /// and haven't started the race yet, consume the endpoint and spawn the
     /// simultaneous-open + auth race; the winner posts Ev::DirectReady (or, for an
-    /// upgrade probe, Ev::DirectUpgradeReady — verify-before-upgrade).
+    /// upgrade probe, Ev::DirectUpgradeReady, verify-before-upgrade).
     fn on_transport_offer(&mut self, pid: &str, peer_cands: Vec<String>, peer_srflx: Option<String>) {
         let Some(p) = self.direct_pending.get_mut(pid) else { return };
         if p.racing {
@@ -2707,8 +2723,8 @@ impl Conn {
             // through to the WebRTC step-down via the per-tick reaper.
             if holepunch::holepunch_enabled() {
                 if let (Some(sock), Some(peer_srflx)) = (punch_sock, peer_srflx_addr) {
-                    // TRACE — direct/hole-punch detail.
-                    ui::trace(&format!("filament: rung-1 failed — attempting hole-punch to {peer_srflx}"));
+                    // TRACE, direct/hole-punch detail.
+                    ui::trace(&format!("filament: rung-1 failed, attempting hole-punch to {peer_srflx}"));
                     if let Some(t) = holepunch::connect(
                         sock,
                         peer_srflx,
@@ -2733,7 +2749,7 @@ impl Conn {
     /// complete (both ends must offer their candidates for the QUIC simultaneous-
     /// open race). Only fires for a peer we are actually serving on relay
     /// (`relay_committed` + a live link) and only when the prober is enabled and
-    /// relay isn't forbidden — otherwise the probe offer is ignored.
+    /// relay isn't forbidden, otherwise the probe offer is ignored.
     async fn answer_upgrade_probe(&mut self, pid: &str) {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
@@ -2742,7 +2758,7 @@ impl Conn {
             return;
         }
         if self.direct_pending.contains_key(pid) {
-            return; // our own probe is already in flight — its race will consume the offer
+            return; // our own probe is already in flight, its race will consume the offer
         }
         let known = self.links.get(pid).and_then(|l| l.expected_secret.clone());
         if let Some((name, secret)) = known {
@@ -2752,7 +2768,7 @@ impl Conn {
 
     /// Create the Link for a direct connection that won the race. `peer: None`
     /// (no WebRTC), `direct: true`, `trusted: true` (the pair-secret MAC already
-    /// proved identity — at least as strong as the DTLS pair-proof it replaces).
+    /// proved identity, at least as strong as the DTLS pair-proof it replaces).
     fn adopt_direct(&mut self, pid: &str, t: Arc<dyn Transport>, route: &'static str) {
         let pend = self.direct_pending.remove(pid);
         let (name, secret) = match pend {
@@ -2796,13 +2812,13 @@ impl Conn {
 
     /// Per-tick: a direct attempt whose budget expired without an authenticated
     /// connection falls back to the WebRTC `establish` (unchanged). Returns the
-    /// list of (pid, info) to establish — caller awaits establish outside the
+    /// list of (pid, info) to establish, caller awaits establish outside the
     /// borrow. Also drops any pending whose Link already exists.
     fn expired_direct(&mut self) -> Vec<(String, Value, (String, String))> {
         let now = Instant::now();
         let mut fell_back = Vec::new();
         // P5 (GAP-6): an UPGRADE-PROBE pending whose budget expired with no winner
-        // must NOT fall back to WebRTC — the relay link is still serving and the
+        // must NOT fall back to WebRTC, the relay link is still serving and the
         // whole point of the probe was to find a DIRECT path. Just DROP it and let
         // the prober's backoff schedule the next attempt (mark_probe_failed). The
         // cold (non-probe) pendings keep their existing WebRTC-fallback behavior.
@@ -2814,8 +2830,8 @@ impl Conn {
             .collect();
         for pid in expired_probes {
             self.direct_pending.remove(&pid);
-            // DEBUG — resilience internal (upgrade probe found no path).
-            ui::debug(&format!("filament: UPGRADE-PROBE for {pid} found no direct path in budget — staying on relay"));
+            // DEBUG, resilience internal (upgrade probe found no path).
+            ui::debug(&format!("filament: UPGRADE-PROBE for {pid} found no direct path in budget, staying on relay"));
             self.mark_probe_failed(&pid);
         }
         let expired: Vec<String> = self
@@ -2831,16 +2847,16 @@ impl Conn {
                     .get(&pid)
                     .cloned()
                     .unwrap_or_else(|| json!({ "id": pid, "name": p.secret.0 }));
-                // DEBUG — resilience internal (direct→WebRTC fallback).
+                // DEBUG, resilience internal (direct→WebRTC fallback).
                 ui::debug(&format!(
-                    "filament: DIRECT-FALLBACK for {} — no authenticated QUIC in budget, using WebRTC",
+                    "filament: DIRECT-FALLBACK for {}, no authenticated QUIC in budget, using WebRTC",
                     p.secret.0
                 ));
                 fell_back.push((pid, info, p.secret));
             }
         }
         // Drop pendings whose link landed by another route (cleanup). P5 (GAP-6):
-        // EXCLUDE upgrade probes — a probe pending ALWAYS coexists with the serving
+        // EXCLUDE upgrade probes, a probe pending ALWAYS coexists with the serving
         // relay link (that's the point), so this cleanup must not reap it before its
         // race runs; a probe is reaped only by its own deadline (above) or by the
         // upgrade cutover consuming it.
@@ -2856,12 +2872,12 @@ impl Conn {
         fell_back
     }
 
-    /// C3/C4: watchdog or grace expiry — retry that LINK with fresh config,
+    /// C3/C4: watchdog or grace expiry, retry that LINK with fresh config,
     /// up to MAX_ATTEMPTS, then drop it. Returns true when the exhausted link
     /// was the active transfer target (send decides whether that is fatal).
     async fn on_stuck(&mut self, pid: &str, generation: u32, why: &str) -> Result<bool> {
         // C21: don't burn retry attempts against a peer that told us it's
-        // away — re-dialing a suspended tab is wasted attrition.
+        // away, re-dialing a suspended tab is wasted attrition.
         if self.is_away(pid) {
             return Ok(false);
         }
@@ -2877,8 +2893,8 @@ impl Conn {
         // Gate-18 Mode B: the transfer is COMPLETE (recv_done; recomputed per
         // tick by the recv loop, so this can only be true with by_sid empty and
         // !keep_open) and this link just went stuck/lost. Reconnecting would
-        // fetch nothing and merely FLAP the link — resetting attempts and
-        // re-arming expected_secret each cycle — so conn.links never empties and
+        // fetch nothing and merely FLAP the link, resetting attempts and
+        // re-arming expected_secret each cycle, so conn.links never empties and
         // the quiet-exit can't fire (RC=124 hang under contention). DROP it
         // instead: links empties, quiet-exit fires. Fenced to complete-only, so
         // a mid-transfer link (recv_done=false) reconnects normally (gate 2/11c).
@@ -2887,7 +2903,7 @@ impl Conn {
         // hangs to RC=124 under the churn hook; fix (toggle unset) exits cleanly.
         if self.recv_done && !test_hooks::disable_modeb_drop() {
             let was_active = self.is_active(pid);
-            ui::debug(&ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after completion — nothing left to fetch)")));
+            ui::debug(&ui::paint(ui::Tone::Dim, &format!("dropping peer (connection {why} after completion, nothing left to fetch)")));
             self.drop_link(pid);
             return Ok(was_active);
         }
@@ -2898,12 +2914,12 @@ impl Conn {
             self.drop_link(pid);
             return Ok(was_active);
         }
-        // DEBUG — resilience internal (link retry).
-        ui::debug(&format!("connection {why} — retrying ({}/{})", attempts + 1, MAX_ATTEMPTS));
+        // DEBUG, resilience internal (link retry).
+        ui::debug(&format!("connection {why}, retrying ({}/{})", attempts + 1, MAX_ATTEMPTS));
         let info = l.info.clone();
         let secret = l.expected_secret.clone();
         // C26: a link that was ever up is *re*connecting; one that never
-        // connected is still just connecting — keeps "recovered" honest.
+        // connected is still just connecting, keeps "recovered" honest.
         let prev = match l.presence {
             Presence::Connecting => Presence::Connecting,
             _ => Presence::Reconnecting,
@@ -2928,7 +2944,7 @@ impl Conn {
     // both send and receive. #28 wired it ONLY to the supersede decision; this
     // is the second consumer the audit calls the core gap: a watchdog that
     // declares an OPEN, ALIVE link bad when an in-flight transfer moves zero
-    // bytes — the "stuck at 0%" hang — and drives the least-disruptive
+    // bytes, the "stuck at 0%" hang, and drives the least-disruptive
     // correction. Run from the main event loop's tick (no new concurrency: F8).
 
     /// Per-tick check: if a transfer is in flight (`in_flight`) on a link whose
@@ -2936,7 +2952,7 @@ impl Conn {
     /// the loop can emit `Ev::TransferStalled`. Returns `None` for a flowing or
     /// idle-but-empty link. Resetting bookkeeping on observed progress lives in
     /// `note_progress`, so a slow-but-MOVING link (which keeps advancing
-    /// idle_ms's baseline) never trips — the threshold is on time-since-last-byte,
+    /// idle_ms's baseline) never trips, the threshold is on time-since-last-byte,
     /// never on throughput.
     fn detect_stall(&mut self, pid: &str, in_flight: bool) -> Option<u64> {
         let in_episode = self.stall_repairs.get(pid).map(|s| s.pending).unwrap_or(false);
@@ -2945,7 +2961,7 @@ impl Conn {
         let threshold = net::stall_ms();
 
         // FLOWING again: a transport exists and moved a byte within the window.
-        // This is the ONLY thing that clears an open episode — so the brief
+        // This is the ONLY thing that clears an open episode, so the brief
         // windows during a repair (by_sid flushed empty, or the new transport
         // not yet up) do NOT reset the attempt counter and re-arm rung (a).
         if matches!(idle, Some(ms) if ms < threshold) {
@@ -2959,7 +2975,7 @@ impl Conn {
             match (in_flight, idle) {
                 (true, Some(ms)) if ms >= threshold => return Some(ms),
                 _ => {
-                    // Idle-but-empty / still establishing / flowing — clear stray
+                    // Idle-but-empty / still establishing / flowing, clear stray
                     // bookkeeping and do nothing.
                     self.stall_repairs.remove(pid);
                     return None;
@@ -2984,7 +3000,7 @@ impl Conn {
         // on the next observation. We treat `direct_pending` as the convergence
         // signal for rung (c)'s fresh dial. P1: a relay escalation (rung d) builds
         // a fresh WebRTC link NOT tracked by `direct_pending`, so the per-episode
-        // `relayed` latch is its convergence signal — both keep the watchdog from
+        // `relayed` latch is its convergence signal, both keep the watchdog from
         // re-firing while the replacement transport is still establishing.
         if self.direct_pending.contains_key(pid) {
             return true;
@@ -2992,11 +3008,11 @@ impl Conn {
         self.stall_repairs.get(pid).map(|s| s.relayed).unwrap_or(false)
     }
 
-    /// Clear a peer's stall episode — called when bytes are observed moving
+    /// Clear a peer's stall episode, called when bytes are observed moving
     /// again (the link recovered) or nothing is in flight.
     fn note_progress(&mut self, pid: &str) {
         self.stall_repairs.remove(pid);
-        // P3: a fresh byte means the (warm-cut-over) path is healthy again — let a
+        // P3: a fresh byte means the (warm-cut-over) path is healthy again, let a
         // FUTURE episode warm-cut-over once more if it too stalls.
         self.warm_cutover.remove(pid);
     }
@@ -3007,8 +3023,8 @@ impl Conn {
     /// "data wedged, link alive" (→ correction ladder) from "link dead" (→ the
     /// established C3/C4 establishment-retry path, which already handles it).
     /// We send a cheap `ping` control frame; success ⇒ alive. We do NOT await a
-    /// pong (F8: the event loop must never block on something a remote controls)
-    /// — a send that returns Ok over a reliable channel is sufficient evidence
+    /// pong (F8: the event loop must never block on something a remote controls),
+    /// a send that returns Ok over a reliable channel is sufficient evidence
     /// the transport itself is up; a dead transport errors or is flagged dead and
     /// returns Err here.
     async fn link_alive(&self, pid: &str) -> bool {
@@ -3023,28 +3039,28 @@ impl Conn {
 
     /// Decide the correction RUNG for the current stall episode and (for rung c)
     /// repair the transport in place WITHOUT tearing the session down. Returns:
-    ///   `Rung::Resume`  — rung (a): caller re-offers unfinished transfers with
+    ///   `Rung::Resume`: rung (a): caller re-offers unfinished transfers with
     ///                     resume:true on the SAME transport (cheapest).
-    ///   `Rung::Repaired`— rung (c): the transport was repaired in place
+    ///   `Rung::Repaired`: rung (c): the transport was repaired in place
     ///                     (direct: fresh QUIC dial of the known device;
-    ///                     WebRTC: restart_ice) — caller re-offers once it's back.
-    ///   `Rung::Relayed` — rung (b)/(d): re-established over the TURN relay. P3
+    ///                     WebRTC: restart_ice), caller re-offers once it's back.
+    ///   `Rung::Relayed`, rung (b)/(d): re-established over the TURN relay. P3
     ///                     reaches this on the FIRST stall for a warm-standby
-    ///                     (interactive) session — instant failover to the
+    ///                     (interactive) session, instant failover to the
     ///                     pre-designated warm alternate; P1 reaches it at the
     ///                     ladder ceiling for a one-shot transfer.
-    ///   `Rung::Exhausted`— rungs a→c spent (MAX_ATTEMPTS) AND relay unavailable
-    ///                     (forbidden / already on relay) — fail clean, kept partial.
+    ///   `Rung::Exhausted`: rungs a→c spent (MAX_ATTEMPTS) AND relay unavailable
+    ///                     (forbidden / already on relay), fail clean, kept partial.
     /// Bounds the episode by MAX_ATTEMPTS, reusing the same ceiling as on_stuck.
     async fn correct_stall(&mut self, pid: &str) -> Rung {
         // P3 (GAP-3): once this episode has CUT OVER to the warm relay standby, a
         // SECOND Ev::TransferStalled that was already QUEUED before the cutover ran
         // (the loops emit one per tick while the stall holds) must NOT re-enter the
-        // ladder and run a COLD in-place repair on top of the converging cutover —
+        // ladder and run a COLD in-place repair on top of the converging cutover,
         // that tore the fresh relay link down ("ICE Agent can not be restarted when
         // gathering"). Swallow it as a no-op (`Repaired` is the benign "in flight,
         // nothing to do" for both handlers). This guard is keyed on `warm_cutover`,
-        // which is ONLY ever set on the warm path — so the COLD ladder (P0/P1) is
+        // which is ONLY ever set on the warm path, so the COLD ladder (P0/P1) is
         // byte-for-byte unchanged and still climbs rung a→c→d normally. Cleared by
         // `note_progress` when the relay path moves a byte.
         if self.warm_cutover.contains(pid) {
@@ -3059,7 +3075,7 @@ impl Conn {
         // / interactive session (`warm_standby`), the relay is a PRE-DESIGNATED
         // WARM standby kept ready alongside the primary direct path. On the FIRST
         // detected stall we CUT OVER to it IMMEDIATELY rather than grinding through
-        // the slow direct-repair rungs — rung (a)'s resume-and-wait-another-stall,
+        // the slow direct-repair rungs, rung (a)'s resume-and-wait-another-stall,
         // then rung (c)'s up-to-MAX_ATTEMPTS cold re-dials, each of which costs a
         // full stall threshold before it gives up. Those rungs are correct for a
         // one-shot file (the on-disk partial makes a cold repair fine), but for an
@@ -3073,10 +3089,10 @@ impl Conn {
         //   - `warm_standby` (session-kind selectivity) must be on;
         //   - relay must be PERMITTED (`--no-relay` keeps the hard direct-only
         //     promise → fall through to the normal ladder, which fails clean);
-        //   - we must not be ON relay already (`relay_only`) — then relay is the
+        //   - we must not be ON relay already (`relay_only`), then relay is the
         //     PRIMARY that stalled, so there's no warmer alternate; fall through to
         //     the ladder, which lands on the honest "still stalled on relay" exit;
-        //   - we cut over at most ONCE per episode (`warm_cutover`) — a flapping
+        //   - we cut over at most ONCE per episode (`warm_cutover`), a flapping
         //     relay can't re-fire instant cutover every tick; the second stall on
         //     the relay path falls through to the bounded relay-stalled honesty.
         let warm_eligible = self.warm_standby
@@ -3084,11 +3100,11 @@ impl Conn {
             && !self.relay_only
             && !self.warm_cutover.contains(pid);
         if attempt == 0 && warm_eligible {
-            // DEBUG — resilience internal (warm cutover). Visible at -v / the gates
+            // DEBUG, resilience internal (warm cutover). Visible at -v / the gates
             // run with FILAMENT_LOG=debug.
             ui::debug(&ui::paint(
                 ui::Tone::Warn,
-                "  transfer stalled — cutting over to the warm relay standby (instant failover)",
+                "  transfer stalled, cutting over to the warm relay standby (instant failover)",
             ));
             self.warm_cutover.insert(pid.to_string());
             // Latch the episode as relaying so detect_stall waits for the fresh
@@ -3103,51 +3119,51 @@ impl Conn {
         }
 
         if attempt == 0 {
-            // Rung (a): cheapest — re-issue on the same transport. The caller
+            // Rung (a): cheapest, re-issue on the same transport. The caller
             // owns `outgoing`, so it does the actual re-offer; we just classify.
-            // (Reached when warm redundancy is OFF — the one-shot `send` default —
+            // (Reached when warm redundancy is OFF, the one-shot `send` default,
             // or relay is forbidden / already in use; the P0/P1 ladder is correct
             // and bounded there.)
-            // DEBUG — resilience internal (rung (a) resume on the same link).
-            ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled — resuming on the same link"));
+            // DEBUG, resilience internal (rung (a) resume on the same link).
+            ui::debug(&ui::paint(ui::Tone::Warn, "  transfer stalled, resuming on the same link"));
             return Rung::Resume;
         }
         if attempt >= STALL_MAX_REPAIRS {
-            // Rungs (a)+(c) spent — the direct/in-place-repair ladder is exhausted.
+            // Rungs (a)+(c) spent, the direct/in-place-repair ladder is exhausted.
             // P1 (GAP-4): this is the rung-(d) seam. Either auto-escalate to the
             // TURN relay (the never-flaky promise) or, if the user forbade relay
             // / we're already on relay, FAIL CLEANLY with a kept partial.
             let already_relayed = self.relay_only;
             if relay_forbidden() {
                 // The hard direct-only promise: never silently fall to a relay.
-                // CRITICAL — a clean fatal path-decision the user must see (-q too).
+                // CRITICAL, a clean fatal path-decision the user must see (-q too).
                 ui::critical(&ui::paint(
                     ui::Tone::Warn,
-                    "  couldn't establish a direct path; relay disabled (--no-relay) \
-                     — partial kept on disk. Re-run to resume, or drop --no-relay to \
+                    "  couldn't establish a direct path; relay disabled (--no-relay), \
+                    partial kept on disk. Re-run to resume, or drop --no-relay to \
                      allow relay fallback.",
                 ));
                 return Rung::Exhausted;
             }
             if already_relayed {
-                // We already re-established over relay and it ALSO stalled — there
+                // We already re-established over relay and it ALSO stalled, there
                 // is no harder rung. Stop honestly with the partial preserved
                 // (this is the genuine out-of-scope case: no path exists).
-                // CRITICAL — a terminal honesty line the user must see (-q too).
+                // CRITICAL, a terminal honesty line the user must see (-q too).
                 ui::critical(&ui::paint(
                     ui::Tone::Warn,
-                    "  transfer still stalled on the relay route — partial kept on disk. \
+                    "  transfer still stalled on the relay route, partial kept on disk. \
                      Re-run to resume.",
                 ));
                 return Rung::Exhausted;
             }
             // Rung (d): re-establish this transfer over the TURN relay, preserving
             // the on-disk partial (C7 resume). Bounded: one escalation per episode.
-            // CRITICAL — P1's value-prop: the never-flaky promise kicking in. The
+            // CRITICAL, P1's value-prop: the never-flaky promise kicking in. The
             // user must see the path change to relay even under -q.
             ui::critical(&ui::paint(
                 ui::Tone::Warn,
-                "  direct paths exhausted — falling back to the TURN relay",
+                "  direct paths exhausted, falling back to the TURN relay",
             ));
             // Latch the episode as "relaying": the fresh relay link establishes
             // with no transport yet, so this stops detect_stall from re-firing the
@@ -3160,10 +3176,10 @@ impl Conn {
             return Rung::Relayed;
         }
         // Rung (c): repair the transport IN PLACE under the live session.
-        // DEBUG — resilience internal (in-place repair).
+        // DEBUG, resilience internal (in-place repair).
         ui::debug(&ui::paint(
             ui::Tone::Warn,
-            &format!("  transfer stalled — repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
+            &format!("  transfer stalled, repairing the link in place (attempt {}/{})", attempt, STALL_MAX_REPAIRS),
         ));
         self.repair_link_in_place(pid).await;
         Rung::Repaired
@@ -3176,7 +3192,7 @@ impl Conn {
     ///   matching re-dial (it runs the same watchdog) completes a FRESH
     ///   authenticated QUIC connection → `Ev::DirectReady` → `adopt_direct` swaps
     ///   in the new transport → ChannelReady re-offers the unfinished transfers.
-    /// - WebRTC link: `restart_ice()` — keeps the RTCPeerConnection + DTLS keys;
+    /// - WebRTC link: `restart_ice()`, keeps the RTCPeerConnection + DTLS keys;
     ///   only ICE re-gathers, so transfers resume on the same channel once ICE
     ///   re-converges (no re-key, the preferred repair when available).
     async fn repair_link_in_place(&mut self, pid: &str) {
@@ -3185,7 +3201,7 @@ impl Conn {
             // Fresh QUIC dial of the known device. Pull the (name,secret) the
             // link was born with so the re-dial re-authenticates to the SAME pair
             // secret (session identity is stable across the swap; only the wire
-            // keys rotate — documented in §2.5).
+            // keys rotate, documented in §2.5).
             let known = l.expected_secret.clone();
             let info = l.info.clone();
             let was_active = self.is_active(pid);
@@ -3198,7 +3214,7 @@ impl Conn {
                     self.active = Some(pid.to_string());
                 }
             } else {
-                // No stored secret to re-dial direct — fall back to a WebRTC
+                // No stored secret to re-dial direct, fall back to a WebRTC
                 // re-establish under the session (still preserves the partial).
                 let _ = self.establish(info).await;
                 if was_active {
@@ -3206,12 +3222,12 @@ impl Conn {
                 }
             }
         } else if let Some(p) = l.peer.clone() {
-            // WebRTC: ICE-restart in place — no teardown, no re-key.
+            // WebRTC: ICE-restart in place, no teardown, no re-key.
             p.restart_ice().await;
         }
     }
 
-    /// Rung (d) — P1 (GAP-4): the direct/in-place ladder is exhausted, so
+    /// Rung (d), P1 (GAP-4): the direct/in-place ladder is exhausted, so
     /// RE-ESTABLISH this transfer over the TURN relay (relay-only ICE), the
     /// automatic version of the manual `--relay` the Pixel delivery and the runner
     /// both had to perform by hand. The on-disk partial is preserved at the seam:
@@ -3221,7 +3237,7 @@ impl Conn {
     /// connection-wide `relay_only` flag also makes any subsequent repair on this
     /// session relay-only, so we don't bounce back to a known-bad direct path.
     /// Session identity (the pair secret / verified petname) is stable across the
-    /// swap — only the wire keys rotate (§2.5). Bounded: one escalation per stall
+    /// swap, only the wire keys rotate (§2.5). Bounded: one escalation per stall
     /// episode (the caller returns `Rung::Relayed` and the `stall_repairs` counter
     /// is already at the ceiling, so the ladder can't re-fire until progress
     /// resumes and resets it).
@@ -3257,13 +3273,13 @@ impl Conn {
             self.active = Some(pid.to_string());
         }
         // Honest, loud: the user must know this session is now on a relay.
-        // CRITICAL — the value-prop path label; shown even under -q.
+        // CRITICAL, the value-prop path label; shown even under -q.
         ui::critical(&format!("  {}", relay_banner()));
         // P5 (GAP-6): ARM the relay->direct upgrade prober for this peer. Relay is
         // a way-station, not a destination: while we serve on relay we keep probing
         // for a direct path and upgrade back the moment one is confirmed stable.
         // Eligibility mirrors warm redundancy (long-lived/interactive sessions +
-        // the daemon — a one-shot send that already completed doesn't need it) and
+        // the daemon, a one-shot send that already completed doesn't need it) and
         // requires relay to be PERMITTED. The kill switch (`FILAMENT_UPGRADE_PROBE=0`)
         // and `--no-relay` both make this a no-op.
         if self.upgrade_eligible() {
@@ -3272,7 +3288,7 @@ impl Conn {
                 .or_insert_with(UpgradeProbe::armed);
             ui::say(&ui::paint(
                 ui::Tone::Dim,
-                "  on relay — will keep trying for a direct path and upgrade automatically",
+                "  on relay, will keep trying for a direct path and upgrade automatically",
             ));
         }
     }
@@ -3289,7 +3305,7 @@ impl Conn {
     /// P5 (GAP-6): a portable network-change-ish event fired (a signaling
     /// reconnect / fresh welcome). Re-probe every relay-committed peer IMMEDIATELY
     /// (reset its backoff to fire now), unless it's already mid-verify on a standby.
-    /// Cheap and idempotent — the prober tick does the actual dialing.
+    /// Cheap and idempotent, the prober tick does the actual dialing.
     fn reprobe_on_network_event(&mut self) {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
@@ -3324,7 +3340,7 @@ impl Conn {
     /// if it regressed); (2) else if a probe is due (`next_at`), fire a fresh
     /// direct dial ALONGSIDE the relay link (warm direct standby) without
     /// disturbing it. Also detects a local interface change (`iface_snapshot`) and
-    /// re-probes IMMEDIATELY — the "walked home onto wifi" trigger.
+    /// re-probes IMMEDIATELY, the "walked home onto wifi" trigger.
     async fn tick_upgrade_prober(&mut self) {
         if !net::upgrade_prober_enabled() || relay_forbidden() {
             return;
@@ -3339,10 +3355,10 @@ impl Conn {
         let snap = direct::local_ip_snapshot();
         if snap != self.iface_snapshot {
             if !self.iface_snapshot.is_empty() {
-                // DEBUG — resilience internal (upgrade-probe trigger).
+                // DEBUG, resilience internal (upgrade-probe trigger).
                 ui::debug(&ui::paint(
                     ui::Tone::Dim,
-                    "  network changed — re-probing for a direct path now",
+                    "  network changed, re-probing for a direct path now",
                 ));
                 for up in self.upgrade_probe.values_mut() {
                     if up.standby.is_none() {
@@ -3363,7 +3379,7 @@ impl Conn {
                 self.direct_pending.remove(&pid);
                 continue;
             }
-            // VERIFYING: a standby connected — judge it before scheduling anything.
+            // VERIFYING: a standby connected, judge it before scheduling anything.
             let verifying = self
                 .upgrade_probe
                 .get(&pid)
@@ -3373,7 +3389,7 @@ impl Conn {
                 self.judge_upgrade_standby(&pid).await;
                 continue;
             }
-            // PROBING: a direct dial is in flight (its DirectPending) — wait for it
+            // PROBING: a direct dial is in flight (its DirectPending), wait for it
             // to win (→ DirectUpgradeReady) or expire (→ expired_direct backoff).
             if self.direct_pending.contains_key(&pid) {
                 continue;
@@ -3396,12 +3412,12 @@ impl Conn {
             // Fire a probe: dial direct ALONGSIDE the relay link.
             let known = self.links.get(&pid).and_then(|l| l.expected_secret.clone());
             let Some((name, secret)) = known else {
-                // No stored secret to authenticate a direct dial — can't probe;
+                // No stored secret to authenticate a direct dial, can't probe;
                 // disarm so we don't spin.
                 self.upgrade_probe.remove(&pid);
                 continue;
             };
-            // DEBUG — resilience internal (upgrade probe attempt).
+            // DEBUG, resilience internal (upgrade probe attempt).
             ui::debug(&ui::paint(
                 ui::Tone::Dim,
                 "  probing for a direct path (alongside the relay)…",
@@ -3419,7 +3435,7 @@ impl Conn {
     ///     `verify_ms`, perform the upgrade (clear relay_committed/relay_only, cut
     ///     over to the direct transport, tear down relay, re-offer transfers);
     ///   - if it goes idle past `verify_idle_ms` before that, DISCARD it and stay
-    ///     on relay (back off) — the mandatory no-flap guard against a flaky direct
+    ///     on relay (back off), the mandatory no-flap guard against a flaky direct
     ///     path that connects then immediately re-stalls.
     /// We drive a tiny VERIFY heartbeat over the standby (a control ping) so a
     /// healthy path keeps stamping its `idle_ms()` low even before the session's
@@ -3429,16 +3445,16 @@ impl Conn {
         let verify_idle_ms = net::upgrade_verify_idle_ms();
         // Heartbeat the standby with a real DATA frame (reserved verify sid) so a
         // healthy path advances its activity clock (`idle_ms()` stays low) while a
-        // stalled/flaky standby — which black-holes the DATA path, not the control
-        // path — either errors here or lets idle climb. A control ping would wrongly
+        // stalled/flaky standby, which black-holes the DATA path, not the control
+        // path, either errors here or lets idle climb. A control ping would wrongly
         // pass on a flaky standby (whose control path stays alive), so we MUST probe
         // the data path. The peer drops the unknown-sid chunk harmlessly but stamps
         // its inbound activity, so its side's idle drops too (symmetric verify).
         let standby = self.upgrade_probe.get(pid).and_then(|u| u.standby.clone());
         let Some(standby) = standby else { return };
         // BOUND the heartbeat (F8: never block the event loop on something a remote
-        // / a wedged path controls). A flaky standby's data path black-holes — the
-        // send_frame would park forever — so a timeout reads as "didn't hold".
+        // / a wedged path controls). A flaky standby's data path black-holes, the
+        // send_frame would park forever, so a timeout reads as "didn't hold".
         let beat_ok = matches!(
             tokio::time::timeout(
                 Duration::from_millis(500),
@@ -3460,10 +3476,10 @@ impl Conn {
         // Regressed: control send failed OR the path went idle past the guard.
         // Discard the standby, stay on relay, back off (the no-flap guard).
         if !beat_ok || idle >= verify_idle_ms {
-            // DEBUG — resilience internal (no-flap guard rejecting a standby).
+            // DEBUG, resilience internal (no-flap guard rejecting a standby).
             ui::debug(&ui::paint(
                 ui::Tone::Warn,
-                "  direct path connected but didn't hold — staying on relay (no flap)",
+                "  direct path connected but didn't hold, staying on relay (no flap)",
             ));
             self.direct_pending.remove(pid);
             self.mark_probe_failed(pid);
@@ -3478,7 +3494,7 @@ impl Conn {
         }
     }
 
-    /// P5 (GAP-6): the upgrade cutover. The direct standby is CONFIRMED stable —
+    /// P5 (GAP-6): the upgrade cutover. The direct standby is CONFIRMED stable,
     /// commit it as the session's transport, preserving the session (the same
     /// cutover seam P1/P3 use): clear `relay_committed` + `relay_only` so direct
     /// may win again, swap the verified direct transport into the link (the relay
@@ -3503,10 +3519,10 @@ impl Conn {
         if was_active {
             self.active = Some(pid.to_string());
         }
-        // CRITICAL — P5's value-prop line: relay released, back on a direct path.
+        // CRITICAL, P5's value-prop line: relay released, back on a direct path.
         ui::critical(&ui::paint(
             ui::Tone::Ok,
-            &format!("  upgraded back to a direct path (route: {route}) — relay released"),
+            &format!("  upgraded back to a direct path (route: {route}), relay released"),
         ));
         // Re-offer unfinished transfers on the new direct transport (resume:true);
         // the ChannelReady re-emit drives the same path for the send loop.
@@ -3515,7 +3531,7 @@ impl Conn {
 
     /// P5 (GAP-6): build the post-upgrade DIRECT link from a verified standby
     /// transport, reusing the known identity (so the session/petname is stable
-    /// across the relay->direct swap — only the wire path changes). Mirrors
+    /// across the relay->direct swap, only the wire path changes). Mirrors
     /// `adopt_direct` but takes an already-connected transport and a carried
     /// (name,secret) instead of consuming a `DirectPending`.
     fn adopt_direct_transport(
@@ -3560,7 +3576,7 @@ impl Conn {
 
     /// P5 (GAP-6): a relay->direct upgrade probe's direct standby CONNECTED. Stash
     /// it on the peer's `UpgradeProbe` and START the verify window. Crucially, do
-    /// NOT touch `links` — the relay link keeps serving until the standby is proven
+    /// NOT touch `links`, the relay link keeps serving until the standby is proven
     /// stable. If we have no armed probe for this peer (it upgraded/left while the
     /// race was in flight), just drop the transport (it closes on drop). Idempotent:
     /// a second DirectUpgradeReady for an already-stashed standby is ignored.
@@ -3569,7 +3585,7 @@ impl Conn {
         // out from under the verify (the race already won).
         self.direct_pending.remove(pid);
         let Some(up) = self.upgrade_probe.get_mut(pid) else {
-            // No armed probe — the transport is unowned; dropping it tears it down.
+            // No armed probe, the transport is unowned; dropping it tears it down.
             return;
         };
         if up.standby.is_some() {
@@ -3579,14 +3595,14 @@ impl Conn {
         up.standby_route = route;
         up.verify_started = None; // judge_upgrade_standby stamps it on first look
         up.verify_last_idle = u64::MAX;
-        // DEBUG — resilience internal (upgrade verify window opening).
+        // DEBUG, resilience internal (upgrade verify window opening).
         ui::debug(&ui::paint(
             ui::Tone::Dim,
-            "  direct path connected — verifying it holds before upgrading…",
+            "  direct path connected, verifying it holds before upgrading…",
         ));
     }
 
-    /// C4: transient `disconnected` — nudge ICE from the impolite side and
+    /// C4: transient `disconnected`, nudge ICE from the impolite side and
     /// give it grace before treating it as failure. C21: a peer that said
     /// `brb` gets its declared window instead of the 6 s blip grace, and no
     /// scary message.
@@ -3642,7 +3658,7 @@ impl Conn {
     /// the recovery). Returns true if the ACTIVE peer left.
     ///
     /// #28 DEFERRED DROP: peer-left fires when a sid LEAVES THE ROOM, but the
-    /// WebRTC data channel is independent and may still be flowing — either a
+    /// WebRTC data channel is independent and may still be flowing, either a
     /// cosmetic signaling reconnect mid-transfer (keep it!) or a hard-killed
     /// peer whose channel reads flowing for a beat before DTLS notices (must
     /// still drop, or the sender strands). We can't tell the two apart at this
@@ -3659,7 +3675,7 @@ impl Conn {
         if !self.links.contains_key(&pid) {
             return false;
         }
-        // Defer the drop while the data channel is still moving bytes — unless
+        // Defer the drop while the data channel is still moving bytes, unless
         // this is the force re-injection from reap_deferred (the link has since
         // gone idle/dead and must drop now). FILAMENT_TEST_NO_DEFER reverts to
         // the old unconditional-drop behaviour so an A/B repro can prove the
@@ -3671,14 +3687,14 @@ impl Conn {
             // payload; a duplicate is swallowed (no double-defer, no drop).
             self.deferred_left.entry(pid.clone()).or_insert_with(|| v.clone());
             let name = self.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "peer".into());
-            // DEBUG — resilience internal (deferred drop while channel flowing).
-            ui::debug(&format!("{name} signaling left — data channel still flowing, deferring drop"));
+            // DEBUG, resilience internal (deferred drop while channel flowing).
+            ui::debug(&format!("{name} signaling left, data channel still flowing, deferring drop"));
             return false;
         }
         let was_active = self.is_active(&pid);
         self.drop_link(&pid);
         if was_active {
-            // C21: informed waits — a peer that declared `brb` gets its
+            // C21: informed waits, a peer that declared `brb` gets its
             // promised window (plus slack); an unannounced vanish gets the
             // short default. Their client auto-rejoins; C6 supersede or a
             // fresh adopt completes the recovery.
@@ -3695,14 +3711,14 @@ impl Conn {
 
     /// #28: re-check every deferred peer-left. Called on every main-loop tick
     /// (idempotent, cheap). A deferred sid is discharged when it is no longer
-    /// flowing — its data channel went idle past the threshold OR died
+    /// flowing, its data channel went idle past the threshold OR died
     /// (idle_ms == u64::MAX). We then re-inject the ORIGINAL peer-left payload
-    /// (flagged force) so the normal Ev::PeerLeft handler runs verbatim — same
+    /// (flagged force) so the normal Ev::PeerLeft handler runs verbatim, same
     /// loop-side flush/messaging/rejoin behaviour as a non-deferred leave, with
     /// the link now correctly dropped. A sid that vanished from `links` (e.g. a
     /// supersede dropped it; drop_link already cleared its entry, but belt-and-
     /// braces) is forgotten silently. A still-flowing sid is left to keep
-    /// flowing — the reconnect case, where the transfer completes on the live
+    /// flowing, the reconnect case, where the transfer completes on the live
     /// channel and the all-done exit reaps it.
     fn reap_deferred(&mut self) {
         if self.deferred_left.is_empty() {
@@ -3724,8 +3740,8 @@ impl Conn {
                 obj.insert("__fil_force_drop".into(), Value::Bool(true));
             }
             let name = self.link(&sid).map(|l| l.name.clone()).unwrap_or_else(|| "peer".into());
-            // DEBUG — resilience internal (deferred-leave reap).
-            ui::debug(&format!("{name} link went idle after deferred leave — dropping now"));
+            // DEBUG, resilience internal (deferred-leave reap).
+            ui::debug(&format!("{name} link went idle after deferred leave, dropping now"));
             // Re-inject so the loop's own peer-left branch handles partials,
             // messaging and the rejoin window exactly as a fresh leave would.
             let _ = self.tx.send(Ev::PeerLeft(payload));
@@ -3764,7 +3780,7 @@ impl Conn {
     }
 
     /// C26: one static colored status line showing EVERY peer, the changed
-    /// one carrying the note — `✓ daring-wombat   ● deft-gibbon  away…`.
+    /// one carrying the note, `✓ daring-wombat   ● deft-gibbon  away…`.
     /// `fallback_name` covers a peer already dropped from the map (peer-left).
     fn roster(&self, pid: &str, mark: &str, tone: ui::Tone, note: &str, fallback_name: &str) -> String {
         let mut links: Vec<(&String, &Link)> = self.links.iter().collect();
@@ -3825,12 +3841,12 @@ impl Conn {
             // Answer a WebRTC offer from a channel-peer EVEN IF we never got its
             // known-peer. The existing-member known-peer notification is
             // unreliable on prod (proven via the signaling harness: the NEW
-            // joiner is reliably notified, but the EXISTING member often is NOT)
-            // — which left the acceptor ignoring a valid initiator's offer and
+            // joiner is reliably notified, but the EXISTING member often is NOT),
+            // which left the acceptor ignoring a valid initiator's offer and
             // looking like "stuck connecting". One-sided discovery is now enough:
             // whoever discovers drives, the other answers. SAFE: trust still
             // gates entirely on the pair-proof MAC (an attacker without the
-            // secret fails it and is never trusted) — we only answer the offer
+            // secret fails it and is never trusted), we only answer the offer
             // and let the proof decide. A later known-peer refreshes name/uid.
             let info = self
                 .roster
@@ -3847,7 +3863,7 @@ impl Conn {
 }
 
 /// Receive the next event; while a rejoin window is open, tick every second
-/// so the window can expire AND the countdown stays visible (C22 — "45s"
+/// so the window can expire AND the countdown stays visible (C22, "45s"
 /// frozen on screen reads as broken).
 async fn next_ev(
     rx: &mut mpsc::UnboundedReceiver<Ev>,
@@ -3866,7 +3882,7 @@ async fn next_ev(
             let left = conn.rejoin_window.saturating_sub(since.elapsed()).as_secs();
             ui::sticky(&ui::paint(
                 ui::Tone::Dim,
-                &format!("  {} holding the line — {left}s for them to come back (Ctrl-C to stop)", ui::spinner_frame()),
+                &format!("  {} holding the line, {left}s for them to come back (Ctrl-C to stop)", ui::spinner_frame()),
             ));
         }
         match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
@@ -3875,7 +3891,7 @@ async fn next_ev(
             Err(_) => Ok(None), // tick
         }
     } else {
-        // C30: never block indefinitely — a 2s tick lets the convergent
+        // C30: never block indefinitely, a 2s tick lets the convergent
         // session repair lost emits even when no events arrive.
         match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
             Ok(Some(ev)) => Ok(Some(ev)),
@@ -3902,12 +3918,12 @@ async fn main() -> Result<()> {
                 argv.push("--code".into());
             } else if looks_like_pake_code(first) {
                 // A `word-word-NNNN` pairing code (4-digit nameplate, from
-                // `filament pair` / browser "create code") — claim it via the
+                // `filament pair` / browser "create code"), claim it via the
                 // pairing ceremony. Checked FIRST: pairing and transfer codes are
                 // both 3-segment now, distinguished only by trailing-number width.
                 argv.insert(1, "pair".into());
             } else if regex_lite_code(first) {
-                // A `word-word-NNN` transfer code (2-3 digit) — receive it.
+                // A `word-word-NNN` transfer code (2-3 digit), receive it.
                 argv.insert(1, "recv".into());
             }
         }
@@ -3969,7 +3985,7 @@ async fn main() -> Result<()> {
                 None => {
                     let all = devices_load();
                     if all.is_empty() {
-                        println!("no known devices yet — run `filament pair` to add one");
+                        println!("no known devices yet, run `filament pair` to add one");
                     }
                     for (n, s) in all {
                         // Show the granted capability set so `grant shell` is
@@ -3981,10 +3997,10 @@ async fn main() -> Result<()> {
                 Some(DevicesAction::Forget { name }) => {
                     let had = devices_load().iter().any(|(n, _)| n == &name);
                     if !had {
-                        bail!("no device named '{name}' — see `filament devices`");
+                        bail!("no device named '{name}', see `filament devices`");
                     }
                     devices_remove(&name)?;
-                    println!("forgot '{name}' — it can no longer find or auto-connect to this machine");
+                    println!("forgot '{name}', it can no longer find or auto-connect to this machine");
                     println!("(their side still holds its half; it will hear \"never met you\" on the next proof)");
                 }
                 Some(DevicesAction::Rename { old, new }) => {
@@ -3997,10 +4013,10 @@ async fn main() -> Result<()> {
                         .and_then(|v| v.as_array().cloned())
                         .unwrap_or_default();
                     if !arr.iter().any(|d| d["name"].as_str() == Some(old.as_str())) {
-                        bail!("no device named '{old}' — see `filament devices`");
+                        bail!("no device named '{old}', see `filament devices`");
                     }
                     if arr.iter().any(|d| d["name"].as_str() == Some(new.as_str())) {
-                        bail!("'{new}' already exists — forget it first or pick another name");
+                        bail!("'{new}' already exists, forget it first or pick another name");
                     }
                     for d in arr.iter_mut() {
                         if d["name"].as_str() == Some(old.as_str()) {
@@ -4013,7 +4029,7 @@ async fn main() -> Result<()> {
                         use std::os::unix::fs::PermissionsExt;
                         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
                     }
-                    println!("renamed '{old}' -> '{new}' (local alias only — the secret, and the other side, are unchanged)");
+                    println!("renamed '{old}' -> '{new}' (local alias only, the secret, and the other side, are unchanged)");
                 }
             }
             Ok(())
@@ -4083,7 +4099,7 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
 
     // Latest cli-v* release via the API (releases/latest may point at a web
     // release tag, so filter explicitly). Prereleases are SKIPPED unless the
-    // user opted in (--beta) or is already running a prerelease — a beta tag
+    // user opted in (--beta) or is already running a prerelease, a beta tag
     // must never be pushed onto stable users.
     let beta_ok = beta || env!("CARGO_PKG_VERSION").contains('-');
     let releases: Value = client
@@ -4094,7 +4110,7 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         .await?;
     // semver-aware: never "update" to an older or equal release (betas of
     // the next version outrank the previous release; -pre < its release;
-    // beta.2 > beta.1 — the prerelease NUMBER counts, found live when
+    // beta.2 > beta.1, the prerelease NUMBER counts, found live when
     // `--beta` kept offering beta.1 to beta.2).
     fn key(v: &str) -> (u64, u64, u64, bool, u64) {
         let (core, pre) = v.split_once('-').map(|(c, p)| (c, Some(p))).unwrap_or((v, None));
@@ -4102,7 +4118,7 @@ async fn update_cmd(check_only: bool, beta: bool) -> Result<()> {
         let pre_num = pre.and_then(|p| p.rsplit('.').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
         (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0), pre.is_none(), pre_num)
     }
-    // Pick the HIGHEST eligible version, not the first listed — the API's
+    // Pick the HIGHEST eligible version, not the first listed, the API's
     // order is not newest-tag-first (observed live: cli-v0.2.0 listed above
     // cli-v0.2.1-beta.1, which made --beta serve stable).
     let latest = releases
@@ -4193,9 +4209,9 @@ struct Outgoing {
     head: Option<String>,
     /// P4 (GAP-5): sha256 of the WHOLE file, carried in file-offer as `full`. The
     /// receiver compares its received bytes against this on completion and only
-    /// accepts (and acks) on a match — so no transfer can "complete" truncated or
+    /// accepts (and acks) on a match, so no transfer can "complete" truncated or
     /// corrupt. `None` only when the digest couldn't be computed (degrades to the
-    /// legacy size-only check on the receiver — bounded, never a hang).
+    /// legacy size-only check on the receiver, bounded, never a hang).
     full: Option<String>,
     path: PathBuf,
     temp: bool,          // delete after sending (tar spools, stdin spools)
@@ -4206,7 +4222,7 @@ struct Outgoing {
     /// fallback fires for a peer too old to ack).
     sent: bool,
     /// P4: the receiver returned a verified `delivery-ack` for this id. This is
-    /// the deterministic "it landed intact" signal — `send` completes only when
+    /// the deterministic "it landed intact" signal, `send` completes only when
     /// every transfer is acked (or the bounded no-ack fallback declared it done).
     acked: bool,
     done: bool,
@@ -4225,7 +4241,7 @@ async fn send_cmd(
     remember: Option<String>,
 ) -> Result<()> {
     if paths.is_empty() {
-        bail!("nothing to send — pass files, directories, or '-' for stdin");
+        bail!("nothing to send, pass files, directories, or '-' for stdin");
     }
     // INTERACTIVE GATE: `send <files>` with no --code/--word/--to and not piping
     // from stdin -> offer to mint a shareable code. Enter = local network
@@ -4317,7 +4333,7 @@ async fn send_cmd(
     sess.room = Some(room.clone());
     sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
 
-    // C12: --to matching a remembered device switches to identity mode —
+    // C12: --to matching a remembered device switches to identity mode,
     // subscribe to its presence channel and wait for known-peer.
     let known_target: Option<(String, String)> =
         to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
@@ -4359,7 +4375,7 @@ async fn send_cmd(
         conn.to_filter = None; // identity supersedes name matching
     }
     let mut code_used = !use_code && known_target.is_none();
-    // C30 phase 3: link mini-sync — pings out, divergence corrections in.
+    // C30 phase 3: link mini-sync, pings out, divergence corrections in.
     let mut last_state_ping = Instant::now();
     let mut reproved: std::collections::HashSet<String> = Default::default();
     {
@@ -4388,7 +4404,7 @@ async fn send_cmd(
     let mut stuck_while_connecting = 0u32;
     let mut wedge_hint_shown = false;
     // P4 (delivery-ack BOUNDED FALLBACK): when every transfer's bytes have been
-    // `sent` but the whole-file `delivery-ack` hasn't landed, we wait — but only
+    // `sent` but the whole-file `delivery-ack` hasn't landed, we wait, but only
     // up to this bound, then declare done anyway so an OLD receiver (one that
     // verifies-on-size but never learned to send the ack) can never make `send`
     // hang forever. The link's data path drained (`drain_finish`) before we even
@@ -4403,7 +4419,7 @@ async fn send_cmd(
     let mut sent_all_at: Option<Instant> = None;
 
     loop {
-        // Bug 6: no data channel has come up within the establishment window —
+        // Bug 6: no data channel has come up within the establishment window,
         // an ICE wedge or a peer that claimed the code but never connected. Fail
         // honestly instead of spinning forever. A non-zero deadline only; a live
         // channel (established) disarms it so big transfers are never cut off.
@@ -4413,19 +4429,19 @@ async fn send_cmd(
         {
             ui::clear_sticky();
             bail!(
-                "no peer connected within {}s — is a receiver running / the page open? \
+                "no peer connected within {}s, is a receiver running / the page open? \
                  (set FILAMENT_SEND_TIMEOUT to change or 0 to disable)",
                 establish_deadline.as_secs()
             );
         }
         // The wait-for-peer deadline only applies while we have no peer (F3).
         let ev = if conn.active.is_none() && conn.waiting_rejoin.is_none() {
-            // C30: read in ≤2s slices — a blocking full-deadline read starves
+            // C30: read in ≤2s slices, a blocking full-deadline read starves
             // the session tick, so a dropped initial subscribe was never
             // repaired and the wait could NEVER succeed (found by gate L's
             // seed-16 choreography: the daemon healed, the sender starved).
             if started.elapsed() >= claim_deadline {
-                bail!("timed out waiting for a peer — is the other device online and on the same server? (--code makes pairing explicit)");
+                bail!("timed out waiting for a peer, is the other device online and on the same server? (--code makes pairing explicit)");
             }
             let slice = Duration::from_secs(2).min(claim_deadline.saturating_sub(started.elapsed()));
             match tokio::time::timeout(slice, rx.recv()).await {
@@ -4472,7 +4488,7 @@ async fn send_cmd(
         // P0 (GAP-1): bytes-moved STALL watchdog (send side). A transfer is in
         // flight once the active peer accepted an offer that isn't done; if that
         // link then moves zero bytes past the stall threshold (a black-holed data
-        // path — the 0% hang) we emit Ev::TransferStalled, which drives the
+        // path, the 0% hang) we emit Ev::TransferStalled, which drives the
         // correction ladder below. The control-channel liveness probe gates it so
         // a genuinely DEAD link falls to the C3/C4 path instead.
         if let Some(active) = conn.active.clone() {
@@ -4501,7 +4517,7 @@ async fn send_cmd(
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
                 // P5 (GAP-6): a fresh signaling welcome (reconnect) is a moment a
-                // new direct path may have appeared — re-probe immediately for any
+                // new direct path may have appeared, re-probe immediately for any
                 // relay-committed peer rather than waiting out the backoff.
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
@@ -4533,7 +4549,7 @@ async fn send_cmd(
             }
             Ev::PairError(v) => bail!("pairing failed: {}", v["error"].as_str().unwrap_or("?")),
             Ev::PairUsed(_) => {
-                ui::say("code claimed — connecting...");
+                ui::say("code claimed, connecting...");
                 code_used = true;
             }
             Ev::PeerJoined(v) => {
@@ -4545,9 +4561,9 @@ async fn send_cmd(
                 }
                 if let Some((n, sec)) = &known_target {
                     if v["channel"].as_str() == Some(channel_of(sec).as_str()) {
-                        ui::say(&format!("known device '{n}' is online — connecting"));
+                        ui::say(&format!("known device '{n}' is online, connecting"));
                         let pid = v["id"].as_str().unwrap_or_default().to_string();
-                        // rung-1: both ends are CLIs (known device) — try direct
+                        // rung-1: both ends are CLIs (known device), try direct
                         // QUIC FIRST. start_direct records the pending so the
                         // maybe_adopt->establish below skips the WebRTC offer
                         // until the budget expires (then it falls back).
@@ -4564,7 +4580,7 @@ async fn send_cmd(
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // rung-1: a relayed transport-offer carries the peer's direct
-                // candidates — kick off the simultaneous-open + auth race.
+                // candidates, kick off the simultaneous-open + auth race.
                 if data["type"].as_str() == Some("transport-offer") {
                     let cands: Vec<String> = data["addrs"]
                         .as_array()
@@ -4575,8 +4591,8 @@ async fn send_cmd(
                     // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
                     // probe from the other end. If we're serving this peer on relay
                     // and have no probe of our own yet, ARM one so the symmetric
-                    // direct dial can complete (a later re-send of the offer — the
-                    // peer re-emits 6x — is consumed by our now-armed pending). The
+                    // direct dial can complete (a later re-send of the offer, the
+                    // peer re-emits 6x, is consumed by our now-armed pending). The
                     // winner posts DirectUpgradeReady (verify-before-upgrade), never
                     // clobbering the serving relay link.
                     if data["probe"].as_bool() == Some(true) {
@@ -4593,7 +4609,7 @@ async fn send_cmd(
             // rung-1: the authenticated direct-QUIC connection won the race.
             // Create the (pre-trusted) Link, then funnel into the SAME ready
             // handler the WebRTC path uses (announce + offers) by re-emitting
-            // ChannelReady — the transfer logic rides the trait unchanged.
+            // ChannelReady, the transfer logic rides the trait unchanged.
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
                 let _ = tx.send(Ev::ChannelReady(pid, t));
@@ -4617,7 +4633,7 @@ async fn send_cmd(
                     continue;
                 }
                 // Bug 6: a live channel to the active peer disarms the
-                // establishment timeout — the rest of the transfer is unbounded.
+                // establishment timeout, the rest of the transfer is unbounded.
                 established = true;
                 waiting.store(false, std::sync::atomic::Ordering::Relaxed);
                 if let Some(l) = conn.link(&pid) {
@@ -4632,7 +4648,7 @@ async fn send_cmd(
                             for _ in 0..6 {
                                 tokio::time::sleep(Duration::from_millis(400)).await;
                                 if let Some(r) = p.route().await {
-                                    // CRITICAL: the route label is the value-prop —
+                                    // CRITICAL: the route label is the value-prop,
                                     // direct vs relayed. Always shown, even under -q.
                                     ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                     // Relay honesty (§3.3): the quiet `route:` line
@@ -4664,7 +4680,7 @@ async fn send_cmd(
                                 "mac": proof_for(sec, &conn.my_uid, &conn.my_uid, l.uid.as_deref().unwrap_or(""), &my_fp, &their_fp),
                             })).await?;
                         } else {
-                            ui::say(&ui::paint(ui::Tone::Warn, "no DTLS fingerprints available — skipping identity proof"));
+                            ui::say(&ui::paint(ui::Tone::Warn, "no DTLS fingerprints available, skipping identity proof"));
                         }
                     } else if let (Some(name), true) = (&remember, use_code) {
                         let sec = fresh_secret();
@@ -4701,7 +4717,7 @@ async fn send_cmd(
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
                     conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
                     let n = conn.link_presence(&pid, Presence::Away);
-                    ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away — holding the line", &n));
+                    ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away, holding the line", &n));
                 }
                 Some("back") => {
                     let was_away = conn.is_away(&pid);
@@ -4711,7 +4727,7 @@ async fn send_cmd(
                         ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
                     }
                 }
-                // C30 phase 3: the peer's periodic truth — correct one-sided
+                // C30 phase 3: the peer's periodic truth, correct one-sided
                 // beliefs instead of letting them persist.
                 Some("state") => {
                     let was_away = conn.is_away(&pid);
@@ -4721,15 +4737,15 @@ async fn send_cmd(
                         ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
                     }
                     // Transfer divergence: I believe it complete; the peer
-                    // holds fewer bytes — the END/tail was lost. Re-offer.
+                    // holds fewer bytes, the END/tail was lost. Re-offer.
                     if let Some(obj) = v["transfers"].as_object() {
                         let mut out = outgoing.lock().await;
                         for o in out.iter_mut() {
                             if let Some(b) = obj.get(&o.id).and_then(|x| x.as_u64()) {
                                 if o.done && b < o.size {
                                     o.done = false; // not actually done
-                                    // DEBUG — resilience internal (state-divergence re-offer).
-                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!("  state-diverged: {} — peer holds {b}/{}; re-offering", o.name, o.size)));
+                                    // DEBUG, resilience internal (state-divergence re-offer).
+                                    ui::debug(&ui::paint(ui::Tone::Warn, &format!("  state-diverged: {}, peer holds {b}/{}; re-offering", o.name, o.size)));
                                     if let Some(t) = conn.transport_of(&pid) {
                                         let mut offer = json!({
                                             "type": "file-offer", "id": o.id, "sid": o.sid,
@@ -4749,7 +4765,7 @@ async fn send_cmd(
                         }
                     }
                     // Trust divergence: they don't recognize us but we hold a
-                    // pair secret for them — re-prove ONCE per link.
+                    // pair secret for them, re-prove ONCE per link.
                     if v["trusted"].as_bool() == Some(false) && !reproved.contains(&pid) {
                         let proof = match conn.link(&pid) {
                             Some(l) => match &l.expected_secret {
@@ -4774,21 +4790,21 @@ async fn send_cmd(
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if v["ok"].as_bool() == Some(false) {
                             devices_remove(name)?;
-                            ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "declined to be remembered — nothing stored", &n));
+                            ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "declined to be remembered, nothing stored", &n));
                         } else {
-                            ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "mutually remembered — you'll reconnect automatically", &n));
+                            ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "mutually remembered, you'll reconnect automatically", &n));
                         }
                     }
                 }
                 // C27: their verdict on our identity proof. false = they have
-                // no memory of us — stop acting like a known device.
+                // no memory of us, stop acting like a known device.
                 Some("pair-proof-ack") => {
                     if v["ok"].as_bool() == Some(false) {
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         if let Some(l) = conn.link_mut(&pid) {
                             l.expected_secret = None;
                         }
-                        ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "doesn't recognize this device — re-pair with --remember", &n));
+                        ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "doesn't recognize this device, re-pair with --remember", &n));
                     }
                 }
                 Some("file-accept") => {
@@ -4829,7 +4845,7 @@ async fn send_cmd(
                     }
                 }
                 // P4 (delivery-ack): the receiver computed the whole-file sha256
-                // of every byte it received and it MATCHED our offered digest —
+                // of every byte it received and it MATCHED our offered digest,
                 // the bytes landed INTACT. Only now is the transfer truly `done`
                 // (vs the old fire-and-forget where `file-end` alone "completed"
                 // it). This closes the loop the runner had to fake above the
@@ -4850,8 +4866,8 @@ async fn send_cmd(
             Ev::TransferFailed { id, err } => {
                 let out = outgoing.lock().await;
                 let name = out.iter().find(|o| o.id == id).map(|o| o.name.as_str()).unwrap_or("?");
-                // DEBUG — resilience internal (transfer interrupted, will resume).
-                ui::debug(&format!("{name}: interrupted ({err}) — will resume on reconnect"));
+                // DEBUG, resilience internal (transfer interrupted, will resume).
+                ui::debug(&format!("{name}: interrupted ({err}), will resume on reconnect"));
             }
             // P0 (GAP-1): the bytes-moved watchdog declared this transfer stalled.
             // Drive the least-disruptive correction ladder, preserving the on-disk
@@ -4860,8 +4876,8 @@ async fn send_cmd(
                 if !conn.is_active(&pid) {
                     continue; // only the transfer-target peer's stall matters
                 }
-                // DEBUG — resilience internal (stall detection).
-                ui::debug(&ui::paint(ui::Tone::Warn, &format!("  stall detected: {idle_ms}ms with no data — correcting")));
+                // DEBUG, resilience internal (stall detection).
+                ui::debug(&ui::paint(ui::Tone::Warn, &format!("  stall detected: {idle_ms}ms with no data, correcting")));
                 match conn.correct_stall(&pid).await {
                     Rung::Resume => {
                         // Rung (a): re-issue every unfinished transfer with
@@ -4889,37 +4905,37 @@ async fn send_cmd(
                     // Rung (c): the transport was repaired in place inside
                     // correct_stall (fresh direct dial / ICE-restart). The new
                     // transport's ChannelReady re-offers the unfinished transfers
-                    // (resume:true) — nothing more to do here.
+                    // (resume:true), nothing more to do here.
                     Rung::Repaired => {}
                     // Rung (d) P1: correct_stall re-established this transfer over
                     // the TURN relay (relay-only ICE), preserving the partial. The
                     // fresh relay link's ChannelReady re-offers the unfinished
-                    // transfers (resume:true) and prints the route — nothing more
+                    // transfers (resume:true) and prints the route, nothing more
                     // to do here.
                     Rung::Relayed => {}
                     // Direct rungs spent AND relay forbidden (--no-relay) or relay
                     // itself stalled: the ladder failed CLEANLY (a kept partial, the
                     // clear cause already shown in correct_stall). PROMPTLY end the
-                    // send rather than letting the frozen transfer hang to a timeout
-                    // — the hard direct-only promise is "fail clean, fast", never a
+                    // send rather than letting the frozen transfer hang to a timeout,
+                    // the hard direct-only promise is "fail clean, fast", never a
                     // hang. The receiver kept its `.part`, so re-running resumes.
                     Rung::Exhausted => {
-                        // The hard direct-only promise is "fail clean AND FAST" — never
+                        // The hard direct-only promise is "fail clean AND FAST", never
                         // a hang. A signaling socket wedged by the same frozen path can
                         // make `disconnect()` itself block, so BOUND it: a 2s cap keeps
                         // the exit prompt (we're tearing down anyway; the OS reaps the
-                        // socket). This only affects the already-failing path — it can
+                        // socket). This only affects the already-failing path, it can
                         // never delay or alter a successful send.
                         let _ = tokio::time::timeout(Duration::from_secs(2), sio.disconnect()).await;
                         if relay_forbidden() {
-                            bail!("couldn't establish a direct path and relay is disabled (--no-relay) — partial kept; re-run to resume, or drop --no-relay");
+                            bail!("couldn't establish a direct path and relay is disabled (--no-relay), partial kept; re-run to resume, or drop --no-relay");
                         }
-                        bail!("transfer stalled and no usable path remains — partial kept; re-run to resume");
+                        bail!("transfer stalled and no usable path remains, partial kept; re-run to resume");
                     }
                 }
             }
             Ev::Interrupted => {
-                ui::say(&format!("  {} interrupted — the receiver keeps its partial; re-run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                ui::say(&format!("  {} interrupted, the receiver keeps its partial; re-run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
                 let _ = sio.disconnect().await;
                 std::process::exit(130);
             }
@@ -4950,9 +4966,9 @@ async fn send_cmd(
                         let secs = REJOIN_WINDOW.as_secs();
                         let gid = v["id"].as_str().unwrap_or_default();
                         match gone {
-                            Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, &format!("disconnected — waiting up to {secs}s"), &n)),
-                            // DEBUG — resilience internal (peer-disconnect wait).
-                            None => ui::debug(&format!("peer disconnected — waiting up to {secs}s for them to come back")),
+                            Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, &format!("disconnected, waiting up to {secs}s"), &n)),
+                            // DEBUG, resilience internal (peer-disconnect wait).
+                            None => ui::debug(&format!("peer disconnected, waiting up to {secs}s for them to come back")),
                         }
                     }
                 }
@@ -4962,12 +4978,12 @@ async fn send_cmd(
         // P4: every transfer's BYTES have left this side (`sent`), but a transfer
         // is only truly `done` once the receiver returns a whole-file-verified
         // `delivery-ack`. Drain the wire first (so the bytes are actually on it,
-        // not parked in a send buffer), then WAIT — bounded by `ack_wait` — for
+        // not parked in a send buffer), then WAIT, bounded by `ack_wait`, for
         // the ack. A modern receiver acks within a round-trip of finishing its
         // verify; an OLD receiver (verifies-on-size, never learned the ack) never
         // sends one, so after the bound we declare it done anyway rather than hang
         // (graceful backward-compat). The wait is on the KNOW-it-landed signal,
-        // never on delivery — the drain already put the bytes on the wire.
+        // never on delivery, the drain already put the bytes on the wire.
         {
             let mut out = outgoing.lock().await;
             let all_sent = !out.is_empty() && out.iter().all(|o| o.sent);
@@ -4978,7 +4994,7 @@ async fn send_cmd(
                     // Flush (NOT drain_finish) on first reaching the all-sent point:
                     // push the wire so the receiver can finish + verify + ack. We do
                     // NOT call drain_finish here because on direct-QUIC that ends the
-                    // send half (`finish()`) — which would block a corrupt-case
+                    // send half (`finish()`), which would block a corrupt-case
                     // RE-FETCH that needs to stream more bytes. The final exit block
                     // does the authoritative drain_finish once the ack lands (no more
                     // re-fetch possible by then). On a DataChannel both are just
@@ -4987,13 +5003,13 @@ async fn send_cmd(
                         let _ = t.flush().await;
                     }
                 }
-                // Bounded fallback: ack never came (old/ack-less peer) — accept on
+                // Bounded fallback: ack never came (old/ack-less peer), accept on
                 // size, note it honestly, stop waiting. ack_wait==0 disables the
                 // wait entirely (explicit legacy fire-and-forget).
                 if sent_all_at.map(|t| t.elapsed() >= ack_wait).unwrap_or(false) {
                     for o in out.iter_mut().filter(|o| !o.done) {
                         ui::say(&ui::paint(ui::Tone::Warn, &format!(
-                            "  {}: no delivery-ack within {}s — peer may be too old to confirm; accepting on size (bytes were delivered + drained)",
+                            "  {}: no delivery-ack within {}s, peer may be too old to confirm; accepting on size (bytes were delivered + drained)",
                             o.name, ack_wait.as_secs()
                         )));
                         o.done = true;
@@ -5007,14 +5023,14 @@ async fn send_cmd(
             let out = outgoing.lock().await;
             if !out.is_empty() && out.iter().all(|o| o.done) {
                 if let Some(t) = conn.transport() {
-                    // Block until the peer has acked every byte before we exit —
+                    // Block until the peer has acked every byte before we exit,
                     // a torn-down QUIC connection drops un-acked send-buffer bytes
                     // and truncates the last file (no-op on DataChannel, which
                     // already drained in flush()). Surface a drain failure rather
                     // than silently reporting "done" on a partial transfer.
                     if let Err(e) = t.drain_finish().await {
-                        // CRITICAL — a possibly-incomplete delivery; must-see even under -q.
-                        ui::critical(&ui::paint(ui::Tone::Warn, &format!("warning: transfer may be incomplete — {e}")));
+                        // CRITICAL, a possibly-incomplete delivery; must-see even under -q.
+                        ui::critical(&ui::paint(ui::Tone::Warn, &format!("warning: transfer may be incomplete, {e}")));
                     }
                 }
                 for o in out.iter().filter(|o| o.temp) {
@@ -5044,11 +5060,11 @@ async fn stream_one(
         (o.sid, o.name.clone(), o.size, o.path.clone())
     };
     if offset > 0 {
-        // DEBUG — resilience internal (transfer resuming from a saved offset).
+        // DEBUG, resilience internal (transfer resuming from a saved offset).
         ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
     }
     // #28 deterministic test hook: once we cross this byte offset, synthesize a
-    // peer-left for the ACTIVE peer WITHOUT touching the data channel — exactly
+    // peer-left for the ACTIVE peer WITHOUT touching the data channel, exactly
     // the "signaling reconnect mid-transfer, channel stays alive" case. The
     // deferred-drop path must keep the link and let the transfer finish on it.
     // Injecting the active sid is critical: a wrong id makes on_peer_left
@@ -5081,13 +5097,13 @@ async fn stream_one(
     bar.done(sent - offset);
     let mut out = outgoing.lock().await;
     if let Some(o) = out.iter_mut().find(|o| o.id == id) {
-        // P4: the bytes + file-end left this side — but the transfer is NOT
+        // P4: the bytes + file-end left this side, but the transfer is NOT
         // `done` yet. It is `done` only once the receiver returns a whole-file-
         // verified `delivery-ack` (or the bounded no-ack fallback fires). A peer
         // that has nothing more to send for THIS file is `sent`; the all-done
         // exit waits on `acked`. If this file carries no `full` digest (we
         // couldn't hash it), there's nothing for the receiver to verify-and-ack,
-        // so it's done on send — the legacy fire-and-forget behaviour, scoped to
+        // so it's done on send, the legacy fire-and-forget behaviour, scoped to
         // exactly the un-hashable case.
         o.sent = true;
         if o.full.is_none() {
@@ -5108,7 +5124,7 @@ struct IncomingFile {
     file: tokio::io::BufWriter<tokio::fs::File>,
     part_path: PathBuf,
     /// P4 (GAP-5): the whole-file sha256 the SENDER offered (`full`). On
-    /// completion we hash the received `.part` and compare — only a match
+    /// completion we hash the received `.part` and compare, only a match
     /// finalizes + acks. `None` = the sender offered no digest (old peer / an
     /// un-hashable source); we fall back to the legacy size-only acceptance and
     /// do NOT ack (nothing to verify), which the sender's bounded fallback covers.
@@ -5135,7 +5151,7 @@ async fn recv_cmd(
     shell_user: Option<String>,
 ) -> Result<()> {
     let to_stdout = output.as_deref() == Some("-");
-    // INTERACTIVE GATE (CLI `recv` only — never the daemon/`up`). With no code,
+    // INTERACTIVE GATE (CLI `recv` only, never the daemon/`up`). With no code,
     // offer: type a code to connect to a specific person, or press Enter on an
     // empty buffer to use the local network (today's default). When the gate is
     // closed we fall straight through to the auto-room default below.
@@ -5152,7 +5168,7 @@ async fn recv_cmd(
     }
     // A code that looks like a PAIRING code (word-word-NNNN, 4-digit trailing,
     // from `filament pair`) typed into `recv`, which claims one-time transfer
-    // codes — fail with a clear redirect instead of a silent never-connect.
+    // codes, fail with a clear redirect instead of a silent never-connect.
     // ADVISORY only (by trailing-number width); PAKE still authenticates.
     if let Some(c) = &code {
         if looks_like_pake_code(c) {
@@ -5168,17 +5184,17 @@ async fn recv_cmd(
     let (tx, mut rx) = mpsc::unbounded_channel::<Ev>();
     // P2 (GAP-2): `mut` so the long-lived acceptor's outer reconnect loop can
     // swap in a freshly-dialed signaling client after a drop (see below). The
-    // short-lived `recv`/`send` paths never reconnect — they re-invoke fresh —
+    // short-lived `recv`/`send` paths never reconnect, they re-invoke fresh,
     // so this is only exercised by the daemon (`up`/`up --dir`).
     let mut sio = net::connect_signaling(server, tx.clone()).await?;
 
     let mut paired = code.is_some();
-    // C24: at most one typed claim in flight — a second typed code while one
+    // C24: at most one typed claim in flight, a second typed code while one
     // is pending was silently dropped in live use; now it queues a message.
     let mut claim_in_flight = false;
     // C29: an in-session pairing ceremony (daemon mode): typed code or a
-    // minted one — exactly ONE side hands over a fresh secret (creator
-    // initiates; a claimer waits 3 s for the creator, then takes over —
+    // minted one, exactly ONE side hands over a fresh secret (creator
+    // initiates; a claimer waits 3 s for the creator, then takes over,
     // browsers never initiate). Some(true) = we minted; Some(false) = we
     // claimed; None = no ceremony pending.
     let mut ceremony: Option<bool> = None;
@@ -5189,7 +5205,7 @@ async fn recv_cmd(
     let mut question_shown = Instant::now();
     let mut devices = devices_load(); // channel -> identity lookup for proofs
     // C30: the convergent session repairs whatever the one-shot emits below
-    // lose — room membership, channel subscriptions, the lease. The emits
+    // lose, room membership, channel subscriptions, the lease. The emits
     // stay as the fast path (and old-server compat); the session is truth.
     let mut sess = session::Session::new(&display_name(), &my_uid);
     sess.channels = devices.iter().map(|(_, s)| channel_of(s)).collect();
@@ -5199,7 +5215,7 @@ async fn recv_cmd(
         }
         None if daemon => {
             // C19: the daemon joins NO room. Presence-channel subscriptions
-            // only — strangers can't see it, probe it, or offer to it.
+            // only, strangers can't see it, probe it, or offer to it.
             // (We still `join` an unguessable solo room so the registry holds
             // our meta for known-peer events, but nobody else can land there.)
             let solo = format!("up-{}", fresh_secret());
@@ -5207,12 +5223,12 @@ async fn recv_cmd(
             sess.emit(&sio, "join", json!({ "room": solo, "name": display_name(), "uid": my_uid })).await;
             // C29: an interactive up can START empty and pair in-session.
             if devices.is_empty() && !std::io::stdin().is_terminal() {
-                bail!("no known devices — run `filament pair` once, or `filament up` in a terminal to pair interactively");
+                bail!("no known devices, run `filament pair` once, or `filament up` in a terminal to pair interactively");
             }
             let chans: Vec<String> = devices.iter().map(|(_, s)| channel_of(s)).collect();
             sess.emit(&sio, "subscribe", json!({ "channels": chans })).await;
             ui::say(&format!(
-                "  {} filament up — {} known device{} {} {}",
+                "  {} filament up, {} known device{} {} {}",
                 ui::paint(ui::Tone::Brand, "●"),
                 devices.len(),
                 if devices.len() == 1 { "" } else { "s" },
@@ -5220,7 +5236,7 @@ async fn recv_cmd(
                 ui::paint(ui::Tone::Bold, &dir.display().to_string()),
             ));
             ui::say(&ui::paint(ui::Tone::Dim, "  trusted devices only · invisible to strangers · Ctrl-C or `filament down` to stop"));
-            // C29: this is a SESSION, like a browser tab — pairing and petname
+            // C29: this is a SESSION, like a browser tab, pairing and petname
             // management happen right here.
             if std::io::stdin().is_terminal() {
                 ui::say(&ui::paint(
@@ -5234,10 +5250,10 @@ async fn recv_cmd(
                 Some(r) => r.clone(),
                 None => net::fetch_auto_room(server).await?,
             };
-            // C22: proactive affordance — tell the user what they CAN do,
+            // C22: proactive affordance, tell the user what they CAN do,
             // cargo-style gutter, before they have to guess.
             ui::say(&format!(
-                "  {} listening — same-network devices appear automatically  {}",
+                "  {} listening, same-network devices appear automatically  {}",
                 ui::paint(ui::Tone::Brand, "●"),
                 ui::paint(ui::Tone::Dim, &format!("(room {room} · dir {})", dir.display())),
             ));
@@ -5285,7 +5301,7 @@ async fn recv_cmd(
             }
         });
     }
-    // A listening recv accepts a code typed straight into it — the first
+    // A listening recv accepts a code typed straight into it, the first
     // thing real users try (observed live). C22: stdin runs RAW (cbreak) on a
     // tty so an open y/N question resolves on a single keypress, no Enter;
     // outside a question, bytes accumulate into lines (echoed manually since
@@ -5338,23 +5354,23 @@ async fn recv_cmd(
     // unrecoverable corruption fails CLEARLY after a few rounds rather than
     // looping forever. Keyed by transfer id.
     let mut verify_fails: HashMap<String, u32> = HashMap::new();
-    // C22: offers awaiting consent — exactly ONE stdin owner (the reader
+    // C22: offers awaiting consent, exactly ONE stdin owner (the reader
     // task); answers arrive as StdinLine events, never via a competing
     // blocking read racing for the user's "y".
     let mut pending: std::collections::VecDeque<(String, Value)> = Default::default();
     let mut completed = 0usize;
-    // G-k: peer-left delivery is best-effort — a browser can close having
+    // G-k: peer-left delivery is best-effort, a browser can close having
     // delivered every byte yet never emit its leave (observed under load,
     // gate 6). Tick the loop on a 2s timeout so a fallback quiet-check can
     // exit cleanly instead of idling to the connect-timeout.
     let mut last_quiet: Option<Instant> = None;
     let quiet_window = quiet_exit_window();
-    // C30 phase 2: roster reconciliation from sync digests — a missed
+    // C30 phase 2: roster reconciliation from sync digests, a missed
     // peer-joined/left self-corrects. Absence must hold for TWO consecutive
     // digests before a drop (one digest can race a join in flight).
     let mut digest_absent: HashMap<String, u8> = HashMap::new();
     let mut digest_alone = false;
-    // C30 phase 3: link mini-sync — state pings every ~10s per link.
+    // C30 phase 3: link mini-sync, state pings every ~10s per link.
     let mut last_state_ping = Instant::now();
     // L2 (ssh/TCP tunnel) acceptor: one mux per link, created on the first
     // l2-open seen on that link. OFF unless FILAMENT_L2=1 (opt-in) OR an active
@@ -5373,8 +5389,8 @@ async fn recv_cmd(
     // C12 live-pairing: the roster (`devices`) is loaded ONCE at startup, and
     // KnownPeer events only fire for channels we've SUBSCRIBED. A device paired
     // into the shared store by a SEPARATE `filament pair` process AFTER the
-    // daemon is up was therefore invisible until restart — it never got a
-    // subscription, so its "appeared — connecting" flow never fired and it
+    // daemon is up was therefore invisible until restart, it never got a
+    // subscription, so its "appeared, connecting" flow never fired and it
     // could not connect (no transfer, no web-shell). We now re-scan the store
     // on a modest cadence and subscribe to any NEW device's channel live; the
     // session digest (which includes `sess.channels`) repairs a lost subscribe
@@ -5385,7 +5401,7 @@ async fn recv_cmd(
 
     // P2 (GAP-2): outer reconnect / re-announce loop state for the long-lived
     // acceptor. `reconnect(false)` means a severed signaling TCP leaves the
-    // socket dead with NO further events — the acceptor zombies and the sender
+    // socket dead with NO further events, the acceptor zombies and the sender
     // can't rediscover it (the documented `no peer connected` failure that
     // up_supervisor.sh patched from outside the binary). We close it IN-CORE:
     //  - `last_signaling`  : monotonic time of the last inbound signaling event;
@@ -5393,7 +5409,7 @@ async fn recv_cmd(
     //                        it (welcome/synced/peer-*/signal/known-peer/...).
     //  - silence watchdog  : if it goes silent past `signaling_silence_ms` (and
     //                        a forced `sync` emit doesn't restore it), the link
-    //                        is dead — re-dial. This is the AUTHORITATIVE trigger
+    //                        is dead, re-dial. This is the AUTHORITATIVE trigger
     //                        because a hard TCP sever fires no close callback.
     //  - Ev::SignalingDown : the socket.io close/error fast-path accelerant.
     // Only the daemon acceptor self-heals (`signaling_self_heal`); the one-shot
@@ -5416,7 +5432,7 @@ async fn recv_cmd(
         .await
         {
             Ok(res) => res?,
-            Err(_) => None, // 2s tick — run the fallback quiet-check below
+            Err(_) => None, // 2s tick, run the fallback quiet-check below
         };
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
@@ -5446,20 +5462,20 @@ async fn recv_cmd(
                 _ => {}
             }
 
-            // (2) Silence watchdog — the AUTHORITATIVE trigger. A hard TCP sever
+            // (2) Silence watchdog, the AUTHORITATIVE trigger. A hard TCP sever
             // fires no close callback, so we watch the inbound gap. Once it
             // exceeds the threshold, fire ONE forced `sync` (the heartbeat); if
             // the socket is alive the server's `synced` ack lands within a tick
             // and resets the gap. If a second threshold passes with still no
-            // event, the socket is dead — declare it down.
+            // event, the socket is dead, declare it down.
             let silence = net::signaling_silence_ms();
             let silent_ms = last_signaling.elapsed().as_millis() as u64;
             if signaling_down_since.is_none() {
                 if saw_down {
                     signaling_down_since = Some(Instant::now());
                     last_reconnect_try = Instant::now() - Duration::from_secs(60); // re-dial now
-                    // DEBUG — resilience internal (signaling reconnect).
-                    ui::debug(&ui::paint(ui::Tone::Warn, "  signaling link closed — reconnecting"));
+                    // DEBUG, resilience internal (signaling reconnect).
+                    ui::debug(&ui::paint(ui::Tone::Warn, "  signaling link closed, reconnecting"));
                 } else if silent_ms >= silence {
                     if !probed_silence {
                         // Heartbeat probe: force a sync NOW (bypassing the C30
@@ -5470,8 +5486,8 @@ async fn recv_cmd(
                     } else if silent_ms >= silence.saturating_mul(2) {
                         signaling_down_since = Some(Instant::now());
                         last_reconnect_try = Instant::now() - Duration::from_secs(60);
-                        // DEBUG — resilience internal (signaling reconnect).
-                        ui::debug(&ui::paint(ui::Tone::Warn, &format!("  signaling silent for {silent_ms}ms — reconnecting")));
+                        // DEBUG, resilience internal (signaling reconnect).
+                        ui::debug(&ui::paint(ui::Tone::Warn, &format!("  signaling silent for {silent_ms}ms, reconnecting")));
                     }
                 }
             }
@@ -5479,7 +5495,7 @@ async fn recv_cmd(
             // (3) Re-dial with backoff + jitter. Idempotent: a fresh `welcome`
             // re-asserts room + channel subscriptions through the C30 session
             // (sess.invalidate forces it next tick). Live DATA links are NOT torn
-            // down — they ride independent WebRTC/QUIC transports and keep
+            // down, they ride independent WebRTC/QUIC transports and keep
             // flowing across the cosmetic signaling reconnect (the #28 contract).
             if let Some(down_at) = signaling_down_since {
                 // backoff: 0.5s, 1s, 2s, 4s … capped at 8s, +/-25% jitter.
@@ -5494,7 +5510,7 @@ async fn recv_cmd(
                         Ok(new_sio) => {
                             sio = new_sio;
                             conn.sio = sio.clone();
-                            // C30: a fresh sid voids everything the server held —
+                            // C30: a fresh sid voids everything the server held,
                             // re-assert room + channels on the next tick. Re-fire
                             // the fast-path join/subscribe immediately too.
                             sess.invalidate();
@@ -5511,12 +5527,12 @@ async fn recv_cmd(
                             last_signaling = Instant::now();
                             signaling_down_since = None;
                             probed_silence = false;
-                            // DEBUG — resilience internal (signaling reconnected).
-                            ui::debug(&ui::paint(ui::Tone::Ok, "  signaling reconnected — re-announcing presence"));
+                            // DEBUG, resilience internal (signaling reconnected).
+                            ui::debug(&ui::paint(ui::Tone::Ok, "  signaling reconnected, re-announcing presence"));
                         }
                         Err(e) => {
-                            // DEBUG — resilience internal (signaling reconnect retry).
-                            ui::debug(&ui::paint(ui::Tone::Dim, &format!("  signaling reconnect failed ({e}) — retrying with backoff")));
+                            // DEBUG, resilience internal (signaling reconnect retry).
+                            ui::debug(&ui::paint(ui::Tone::Dim, &format!("  signaling reconnect failed ({e}), retrying with backoff")));
                         }
                     }
                 }
@@ -5535,7 +5551,7 @@ async fn recv_cmd(
             for (n, s) in devices_load() {
                 let ch = channel_of(&s);
                 if known_channels.insert(ch.clone()) {
-                    ui::say(&format!("new device '{n}' paired — now reachable"));
+                    ui::say(&format!("new device '{n}' paired, now reachable"));
                     devices.push((n, s));
                     new_chans.push(ch);
                 }
@@ -5561,7 +5577,7 @@ async fn recv_cmd(
             }
         }
 
-        // C30 phase 3: state pings — each open link hears our transfer/away
+        // C30 phase 3: state pings, each open link hears our transfer/away
         // truth every ~10s, so one-sided beliefs between PEERS can't persist.
         if last_state_ping.elapsed() >= Duration::from_secs(10) {
             last_state_ping = Instant::now();
@@ -5590,7 +5606,7 @@ async fn recv_cmd(
 
         // Gate-18 Mode B: recompute the completion flag AFTER the sweep, every
         // tick (never sticky). When true, a stuck/lost link is DROPPED in
-        // on_stuck instead of re-established — see Conn::recv_done. Refreshing it
+        // on_stuck instead of re-established, see Conn::recv_done. Refreshing it
         // here, where `completed`/`by_sid` were just settled, makes the gate-2/
         // gate-11c fence exact: a mid-transfer link (by_sid non-empty) sees
         // recv_done=false and reconnects unchanged.
@@ -5603,7 +5619,7 @@ async fn recv_cmd(
         // the peer that visibly hangs at 0%: when an inbound transfer is in
         // flight (`by_sid` non-empty for a link) but no data byte has arrived
         // past the stall threshold, its transport's idle_ms() climbs. The
-        // RECEIVER must also act so a direct-QUIC repair is SYMMETRIC — a fresh
+        // RECEIVER must also act so a direct-QUIC repair is SYMMETRIC, a fresh
         // authenticated QUIC connection needs both ends to re-dial. We emit
         // Ev::TransferStalled for each such link (liveness-gated), whose handler
         // re-arms this side's direct dial (rung c). The on-disk `.part` is kept,
@@ -5612,7 +5628,7 @@ async fn recv_cmd(
             // Per-link: in_flight = this peer has an inbound file mid-transfer
             // (a by_sid entry) OR a stall episode is already open for it (the
             // .part was flushed to disk mid-repair, so by_sid is momentarily
-            // empty — detect_stall keeps the episode alive until fresh progress).
+            // empty, detect_stall keeps the episode alive until fresh progress).
             let all_pids: Vec<String> = conn.links.keys().cloned().collect();
             for pid in all_pids {
                 let in_flight = by_sid.keys().any(|(p, _)| *p == pid);
@@ -5635,7 +5651,7 @@ async fn recv_cmd(
         // Gate-18 Mode B DETERMINISTIC repro hook: simulate the post-completion
         // FLAP that contention triggers in the wild (the sender's departure puts
         // the receiver's link into the C4 reconnect loop). Once everything is on
-        // disk, force each surviving link to go stuck repeatedly — reset its
+        // disk, force each surviving link to go stuck repeatedly, reset its
         // attempts (mirroring the real flap's attempts-reset, so MAX_ATTEMPTS
         // can never cap it) and re-inject Ev::Stuck. On the BASELINE (no fix)
         // on_stuck re-establishes → link persists → conn.links never empties →
@@ -5665,7 +5681,7 @@ async fn recv_cmd(
         // #28 exit reconciliation: once everything is received and the only links
         // left are ones held open purely for their deferred-drop reap (their
         // sender's signaling left AFTER the transfer finished), there is nothing
-        // in flight to protect — exit promptly instead of paying the full
+        // in flight to protect, exit promptly instead of paying the full
         // FILAMENT_ADOPT_ACTIVE_MS deferral. Restores the pre-#28 prompt exit; an
         // in-progress reconnect keeps `by_sid` non-empty and so is unaffected.
         if completed > 0 && !keep_open && by_sid.is_empty() && pending.is_empty()
@@ -5679,7 +5695,7 @@ async fn recv_cmd(
         // Bug 2: the transfer is COMPLETE and the sender's link is fully GONE
         // (dropped via peer-left, or via the grace/Mode-B path when peer-left
         // was lost). With no live link and nothing left to fetch there is
-        // nothing to wait for — exit at once instead of holding out the full
+        // nothing to wait for, exit at once instead of holding out the full
         // rejoin window (peer-left case) or the quiet-exit window (lost-peer-left
         // case). Fenced exactly like the exits above: by_sid empty + no pending
         // questions, so a mid-transfer reconnect (which keeps `by_sid`
@@ -5695,22 +5711,22 @@ async fn recv_cmd(
         }
 
         // G-k fallback: everything done, nobody attached, no questions
-        // outstanding — if that holds quietly for the quiet-exit window (10s
+        // outstanding, if that holds quietly for the quiet-exit window (10s
         // default, FILAMENT_QUIET_EXIT_SECS overrides), the peer-left we were
         // counting on for a clean exit never arrived; exit anyway. C30 ph2:
         // ALSO satisfied when the server's digest says the room is empty and
-        // no room-independent (channel) link remains — lingering dead links
+        // no room-independent (channel) link remains, lingering dead links
         // can't block the exit when the server knows nobody's there.
         let digest_says_alone = digest_alone && conn.links.values().all(|l| l.expected_secret.is_none());
-        // #28 Mode B: a dead link that keeps FLAPPING — on_stuck reconnect, or a
+        // #28 Mode B: a dead link that keeps FLAPPING, on_stuck reconnect, or a
         // roster/session reconcile re-adopting the gone sender and re-arming
-        // `expected_secret` so `digest_says_alone` never holds — must NOT block
+        // `expected_secret` so `digest_says_alone` never holds, must NOT block
         // this fallback once everything is received; `conn.links` may never
         // empty under churn (the RC=124 hang). Surgical: discriminate on link
-        // HEALTH, not existence — a churning/reconnecting/dead link (never
+        // HEALTH, not existence, a churning/reconnecting/dead link (never
         // `Ready`) does not block exit, but a healthy `Ready` link (e.g. a
         // bystander between two human-paced sends, gate 6) STILL does. So this is
-        // a no-op for healthy peers, not a behaviour change — only a peer we've
+        // a no-op for healthy peers, not a behaviour change, only a peer we've
         // lost contact with stops blocking. FILAMENT_TEST_DISABLE_MODEB_DROP
         // restores the old links-gated behaviour so gate 18b proves the A/B
         // (baseline hangs, fix exits) with one binary.
@@ -5724,7 +5740,7 @@ async fn recv_cmd(
             match last_quiet {
                 None => last_quiet = Some(Instant::now()),
                 Some(since) if since.elapsed() > quiet_window => {
-                    ui::say(&ui::paint(ui::Tone::Dim, "  (peer-left never arrived — exiting on quiet)"));
+                    ui::say(&ui::paint(ui::Tone::Dim, "  (peer-left never arrived, exiting on quiet)"));
                     ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
                     let _ = sio.disconnect().await;
                     return Ok(());
@@ -5738,7 +5754,7 @@ async fn recv_cmd(
         let Some(ev) = ev else { continue };
 
         // C23: questions from links that died (supersede/peer-left) are
-        // moot — the sender re-offers on its new link. Purge them so a 'y'
+        // moot, the sender re-offers on its new link. Purge them so a 'y'
         // can never accept a ghost (the duplicate-stream ENOENT crash).
         if !pending.is_empty() {
             let front_id = pending.front().map(|(_, v)| v["id"].clone());
@@ -5763,13 +5779,13 @@ async fn recv_cmd(
             Ev::PairMatched(v) => {
                 claim_in_flight = false;
                 let room = v["room"].as_str().unwrap_or_default().to_string();
-                ui::say(&format!("  {} code accepted — joining sender", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                ui::say(&format!("  {} code accepted, joining sender", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                 sess.room = Some(room.clone()); // C30: desire moves; session repairs if the join dies
                 sess.touch();
                 sess.emit(&sio, "join", json!({ "room": room, "name": display_name(), "uid": my_uid })).await;
             }
             // C30: server confirmed our session digest. Phase 2: reconcile
-            // the roster it carries — missed peer-joined/left self-correct.
+            // the roster it carries, missed peer-joined/left self-correct.
             Ev::Synced(v) => {
                 if let Some(peers) = sess.on_synced(&v) {
                     digest_alone = peers.is_empty();
@@ -5804,7 +5820,7 @@ async fn recv_cmd(
                         digest_absent.remove(&pid);
                         let name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
                         conn.drop_link(&pid);
-                        ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left (digest reconcile) — still listening", &name));
+                        ui::say(&conn.roster(&pid, "○", ui::Tone::Dim, "left (digest reconcile), still listening", &name));
                     }
                 }
             }
@@ -5815,18 +5831,18 @@ async fn recv_cmd(
                 ui::say("");
                 ui::say(&format!("      {}", ui::paint(ui::Tone::Brand, &c.to_uppercase())));
                 ui::say("");
-                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud — they type it in the web app or `filament pair <code>` · one claim · 10 min"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  say it aloud, they type it in the web app or `filament pair <code>` · one claim · 10 min"));
             }
             Ev::PairUsed(_) => {
-                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
+                ui::say(&ui::paint(ui::Tone::Dim, "  code claimed, connecting…"));
             }
             Ev::PairError(v) => {
                 let why = v["error"].as_str().unwrap_or("?").to_string();
                 // The server distinguishes (additively) a dead creator from a
-                // typo'd/expired code — say the actionable thing for each.
+                // typo'd/expired code, say the actionable thing for each.
                 let hint = match v["why"].as_str() {
-                    Some("sender-gone") => "the sender who made that code already left — ask them for a fresh one".to_string(),
-                    _ => format!("{why} — codes burn after one use and expire after 10 min"),
+                    Some("sender-gone") => "the sender who made that code already left, ask them for a fresh one".to_string(),
+                    _ => format!("{why}, codes burn after one use and expire after 10 min"),
                 };
                 if code.is_some() && conn.links.is_empty() && completed == 0 {
                     // started WITH a code that failed: nothing else to do
@@ -5843,7 +5859,7 @@ async fn recv_cmd(
             Ev::Welcome(v) => {
                 conn.my_id = v["id"].as_str().unwrap_or_default().to_string();
                 // P5 (GAP-6): a fresh welcome (signaling reconnect) may mean the
-                // network just changed under us — re-probe relay-committed peers for
+                // network just changed under us, re-probe relay-committed peers for
                 // a direct path immediately instead of waiting out the backoff.
                 conn.reprobe_on_network_event();
                 if let Some(peers) = v["peers"].as_array() {
@@ -5851,7 +5867,7 @@ async fn recv_cmd(
                         conn.maybe_adopt(p, true).await?;
                     }
                 }
-                // C30 (dissolves the C28 belt): a welcome means a fresh sid —
+                // C30 (dissolves the C28 belt): a welcome means a fresh sid,
                 // everything sid-keyed (subscriptions, lease) died with the
                 // old one. Invalidate; the next tick re-asserts everything.
                 sess.invalidate();
@@ -5861,7 +5877,7 @@ async fn recv_cmd(
                     continue; // our own sender/daemon shares these channels
                 }
                 if let Some((n, sec)) = devices.iter().find(|(_, s)| channel_of(s) == v["channel"].as_str().unwrap_or("")) {
-                    ui::say(&format!("known device '{n}' appeared — connecting"));
+                    ui::say(&format!("known device '{n}' appeared, connecting"));
                     let pid = v["id"].as_str().unwrap_or_default().to_string();
                     // rung-1: known device = both CLIs; try direct QUIC first.
                     let (n, sec) = (n.clone(), sec.clone());
@@ -5884,7 +5900,7 @@ async fn recv_cmd(
                 let from = v["from"].as_str().unwrap_or_default().to_string();
                 let data = v["data"].clone();
                 // rung-1: a relayed transport-offer carries the peer's direct
-                // candidates — start the simultaneous-open + auth race.
+                // candidates, start the simultaneous-open + auth race.
                 if data["type"].as_str() == Some("transport-offer") {
                     let cands: Vec<String> = data["addrs"]
                         .as_array()
@@ -5895,8 +5911,8 @@ async fn recv_cmd(
                     // P5 (GAP-6): a `probe:true` offer is a relay->direct UPGRADE
                     // probe from the other end. If we're serving this peer on relay
                     // and have no probe of our own yet, ARM one so the symmetric
-                    // direct dial can complete (a later re-send of the offer — the
-                    // peer re-emits 6x — is consumed by our now-armed pending). The
+                    // direct dial can complete (a later re-send of the offer, the
+                    // peer re-emits 6x, is consumed by our now-armed pending). The
                     // winner posts DirectUpgradeReady (verify-before-upgrade), never
                     // clobbering the serving relay link.
                     if data["probe"].as_bool() == Some(true) {
@@ -5910,14 +5926,14 @@ async fn recv_cmd(
                 conn.ensure_responder(&from, &data).await?;
                 conn.apply_signal(&from, data).await;
             }
-            // rung-1: authenticated direct-QUIC won the race — adopt as a
+            // rung-1: authenticated direct-QUIC won the race, adopt as a
             // pre-trusted Link, then funnel into the normal ChannelReady handler.
             Ev::DirectReady(pid, t, route) => {
                 conn.adopt_direct(&pid, t.clone(), route);
                 let _ = tx.send(Ev::ChannelReady(pid, t));
             }
             // P5 (GAP-6): relay->direct upgrade standby connected (receiver side).
-            // Stash + VERIFY rather than adopt — see the send-loop twin.
+            // Stash + VERIFY rather than adopt, see the send-loop twin.
             Ev::DirectUpgradeReady(pid, t, route) => {
                 conn.stash_upgrade_standby(&pid, t, route);
             }
@@ -5941,7 +5957,7 @@ async fn recv_cmd(
                             for _ in 0..6 {
                                 tokio::time::sleep(Duration::from_millis(400)).await;
                                 if let Some(r) = p.route().await {
-                                    // CRITICAL: the route label is the value-prop —
+                                    // CRITICAL: the route label is the value-prop,
                                     // direct vs relayed. Always shown, even under -q.
                                     ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {r}"))));
                                     // Relay honesty (§3.3): the quiet `route:` line
@@ -5960,20 +5976,20 @@ async fn recv_cmd(
                         ui::critical(&format!("    {}", ui::paint(ui::Tone::Dim, &format!("route: {direct_route}"))));
                     }
                 }
-                // C29: an in-session pairing — exactly one side hands over a
+                // C29: an in-session pairing, exactly one side hands over a
                 // secret; consent (pair-keep-ack / our store) completes it.
                 // Only links that aren't ALREADY known are candidates.
                 let fresh_link = conn.link(&pid).map(|l| l.expected_secret.is_none()).unwrap_or(false);
                 if fresh_link {
                     match ceremony {
                         Some(true) => {
-                            // we minted the code — initiate now
+                            // we minted the code, initiate now
                             ceremony = None;
                             ceremony_pid = Some(pid.clone());
                             t.send_control(&json!({ "type": "pair-keep", "secret": ceremony_secret })).await.ok();
                         }
                         Some(false) => {
-                            // we claimed — give a CLI creator 3 s to initiate
+                            // we claimed, give a CLI creator 3 s to initiate
                             // (browsers never do), then take over.
                             let tx = tx.clone();
                             let pid = pid.clone();
@@ -6006,7 +6022,7 @@ async fn recv_cmd(
                         l2::OpenVerdict::Deny { sid, err } => {
                             // Log refused dials (threat model: port-scan / SSRF
                             // visibility). The gate observes this line.
-                            // DEBUG — l2 diagnostic (port-scan / SSRF visibility).
+                            // DEBUG, l2 diagnostic (port-scan / SSRF visibility).
                             ui::debug(&format!("l2: refused stream {sid:#x}: {err}"));
                             let _ = t
                                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
@@ -6014,14 +6030,14 @@ async fn recv_cmd(
                         }
                         l2::OpenVerdict::Ignore => {}
                     }
-                    // A PTY stream closing frees its resize channel — handled by
+                    // A PTY stream closing frees its resize channel, handled by
                     // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
                     // the mux now, so it can't leak past the stream).
                 }
                 // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
                 // when the link is proof-verified (`trusted`) AND the proven
-                // device holds the NEW `shell` capability — distinct from
+                // device holds the NEW `shell` capability, distinct from
                 // `transfer`, so pairing for file transfer never yields a shell.
                 // The write happens only here (over the authenticated channel)
                 // into a clearly-marked, removable authorized_keys block.
@@ -6073,7 +6089,7 @@ async fn recv_cmd(
                         Ok(()) => {
                             let hostkeys = sshkeys::host_pubkeys();
                             let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
-                            ui::say(&format!("l2: shell granted to '{device}' — installed managed key (filament-managed block)"));
+                            ui::say(&format!("l2: shell granted to '{device}', installed managed key (filament-managed block)"));
                             let _ = t
                                 .send_control(&json!({
                                     "type": "shell-bootstrap-ack",
@@ -6095,7 +6111,7 @@ async fn recv_cmd(
                 }
                 // web-shell (browser terminal): spawn a login shell in a PTY and
                 // bridge it to a sid stream. Same deny-by-default gate as
-                // shell-bootstrap — a PTY is a superset of ssh-key access, so it
+                // shell-bootstrap, a PTY is a superset of ssh-key access, so it
                 // reuses the `shell` cap / --shell policy and requires `trusted`.
                 Some("pty-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else { continue };
@@ -6140,9 +6156,9 @@ async fn recv_cmd(
                     let rx = mux.register_stream(sid).await; // before spawn (race fix)
                     let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
                     // Resizer is owned by the mux so it is freed on EVERY teardown
-                    // path (inbound l2-close, serve_pty exit, link death) — H-1.
+                    // path (inbound l2-close, serve_pty exit, link death), H-1.
                     mux.register_resizer(sid, rtx).await;
-                    ui::say(&format!("l2: pty granted to '{}' — {cols}x{rows}", dev.unwrap_or_default()));
+                    ui::say(&format!("l2: pty granted to '{}', {cols}x{rows}", dev.unwrap_or_default()));
                     let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
                     tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(shell_user.as_deref()), rx, rrx, pty_guard));
                 }
@@ -6160,7 +6176,7 @@ async fn recv_cmd(
                     let ttl = v["ttl"].as_u64().unwrap_or(120).min(300);
                     conn.away = Some((pid.clone(), Instant::now() + Duration::from_secs(ttl)));
                     let n = conn.link_presence(&pid, Presence::Away);
-                    ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away — choosing a file · holding the line", &n));
+                    ui::say(&conn.roster(&pid, "●", ui::Tone::Warn, "away, choosing a file · holding the line", &n));
                 }
                 Some("back") => {
                     let was_away = conn.is_away(&pid);
@@ -6170,7 +6186,7 @@ async fn recv_cmd(
                         ui::say(&conn.roster(&pid, ui::glyph_ok(), ui::Tone::Ok, "back", &n));
                     }
                 }
-                // C30 phase 3: a state ping proves the peer is alive — clear
+                // C30 phase 3: a state ping proves the peer is alive, clear
                 // any away-mark (the receiver side has no sender corrections).
                 Some("state") => {
                     let was_away = conn.is_away(&pid);
@@ -6185,10 +6201,10 @@ async fn recv_cmd(
                     if sec.len() == 64 {
                         let kept = if let Some(name) = &remember {
                             devices_store(name, &sec)?;
-                            ui::say(&format!("remembered this device as '{name}' — future sends auto-accept after proof"));
+                            ui::say(&format!("remembered this device as '{name}', future sends auto-accept after proof"));
                             true
                         } else if ceremony == Some(false) {
-                            // C29: we typed their code into this session — the
+                            // C29: we typed their code into this session, the
                             // creator initiated first; that's our ceremony.
                             ceremony = None;
                             let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "device".into());
@@ -6198,7 +6214,7 @@ async fn recv_cmd(
                             sess.touch();
                             sio.emit("subscribe", json!({ "channels": [channel_of(&sec)] })).await.ok();
                             ui::say(&format!(
-                                "  {} {} mutually remembered — rename anytime: filament devices rename {n} <new>",
+                                "  {} {} mutually remembered, rename anytime: filament devices rename {n} <new>",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
@@ -6207,14 +6223,14 @@ async fn recv_cmd(
                             ui::say("(sender offered to be remembered; re-run with --remember <name> to keep it)");
                             false
                         };
-                        // C27: answer either way — a declined sender discards
+                        // C27: answer either way, a declined sender discards
                         // its half instead of waving at a dead meeting point.
                         if let Some(t) = conn.transport_of(&pid) {
                             t.send_control(&json!({ "type": "pair-keep-ack", "ok": kept })).await.ok();
                         }
                     }
                 }
-                // C29: claimer fallback — the creator never initiated
+                // C29: claimer fallback, the creator never initiated
                 // (browsers don't); hand over OUR secret instead.
                 Some("__pair_fallback") => {
                     if ceremony == Some(false) {
@@ -6231,7 +6247,7 @@ async fn recv_cmd(
                         ceremony_pid = None;
                         let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_else(|| "device".into());
                         if v["ok"].as_bool() == Some(false) {
-                            ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "declined to be remembered — nothing stored", &n));
+                            ui::say(&conn.roster(&pid, ui::glyph_err(), ui::Tone::Warn, "declined to be remembered, nothing stored", &n));
                         } else {
                             devices_store(&n, &ceremony_secret)?;
                             devices.push((n.clone(), ceremony_secret.clone()));
@@ -6240,7 +6256,7 @@ async fn recv_cmd(
                             sio.emit("subscribe", json!({ "channels": [channel_of(&ceremony_secret)] })).await.ok();
                             ceremony_secret = fresh_secret(); // never reuse across devices
                             ui::say(&format!(
-                                "  {} {} mutually remembered — rename anytime: filament devices rename {n} <new>",
+                                "  {} {} mutually remembered, rename anytime: filament devices rename {n} <new>",
                                 ui::paint(ui::Tone::Ok, ui::glyph_ok()),
                                 ui::paint(ui::Tone::Bold, &n),
                             ));
@@ -6255,14 +6271,14 @@ async fn recv_cmd(
                         None => None,
                     };
                     let Some((my_fp, their_fp)) = fps else {
-                        ui::debug("pair-proof received before fingerprints known — ignoring");
+                        ui::debug("pair-proof received before fingerprints known, ignoring");
                         continue;
                     };
-                    // #9: pair secrets are symmetric — our own install holds
+                    // #9: pair secrets are symmetric, our own install holds
                     // every secret we do, so a same-host process could prove
                     // "pop2" and tunnel callers into the WRONG machine. Refuse.
                     let hit = if is_self_uid(&conn.my_uid, Some(peer_uid.as_str())) {
-                        ui::debug("pair-proof from our own install — refusing (self-connect)");
+                        ui::debug("pair-proof from our own install, refusing (self-connect)");
                         None
                     } else {
                         devices
@@ -6272,7 +6288,7 @@ async fn recv_cmd(
                     let ok = if let Some((n, _)) = hit {
                         if let Some(l) = conn.link_mut(&pid) {
                             l.trusted = true;
-                            // Record the proven devices.json petname — the cap
+                            // Record the proven devices.json petname, the cap
                             // store key (the `shell` bootstrap gate looks up caps
                             // under exactly this, not the presence display name).
                             l.verified_name = Some(n.clone());
@@ -6280,11 +6296,11 @@ async fn recv_cmd(
                         ui::say(&format!("identity verified: '{n}' (auto-accepting)"));
                         true
                     } else {
-                        // CRITICAL — a security verdict the user must see (-q too).
-                        ui::critical(&ui::paint(ui::Tone::Warn, "pair-proof FAILED verification — treating peer as untrusted"));
+                        // CRITICAL, a security verdict the user must see (-q too).
+                        ui::critical(&ui::paint(ui::Tone::Warn, "pair-proof FAILED verification, treating peer as untrusted"));
                         false
                     };
-                    // C27: tell the prover the verdict — a rejected prover
+                    // C27: tell the prover the verdict, a rejected prover
                     // learns we never met and stops claiming acquaintance.
                     if let Some(t) = conn.transport_of(&pid) {
                         t.send_control(&json!({ "type": "pair-proof-ack", "ok": ok })).await.ok();
@@ -6304,7 +6320,7 @@ async fn recv_cmd(
                         sess.touch();
                         sio.emit("subscribe", json!({ "channels": [channel_of(&isec)] })).await.ok();
                         ui::say(&format!(
-                            "  {} introduced to '{}' by {} — now a known device",
+                            "  {} introduced to '{}' by {}, now a known device",
                             ui::paint(ui::Tone::Ok, ui::glyph_ok()), iname, hub
                         ));
                     } else {
@@ -6343,14 +6359,14 @@ async fn recv_cmd(
                             Some(m) if m.size == size && prior <= size => {
                                 let head_ok = match (&m.head, &offer_head) {
                                     (Some(a), Some(b)) => a == b,
-                                    _ => true, // legacy peer — size-only fallback
+                                    _ => true, // legacy peer, size-only fallback
                                 };
                                 if head_ok {
                                     offset = prior;
                                     prior_full = m.full;
                                 } else {
-                                    // DEBUG — resilience internal (resume mismatch, restart).
-                                    ui::debug(&format!("{name}: same name+size but different content — restarting from 0"));
+                                    // DEBUG, resilience internal (resume mismatch, restart).
+                                    ui::debug(&format!("{name}: same name+size but different content, restarting from 0"));
                                 }
                             }
                             _ => {}
@@ -6360,7 +6376,7 @@ async fn recv_cmd(
                     // C14/C22: consent. -y accepts everything; a resume of a
                     // partial we already said yes to auto-accepts; a verified
                     // device auto-accepts; otherwise the question joins the
-                    // pending queue and the answer arrives via StdinLine — a
+                    // pending queue and the answer arrives via StdinLine, a
                     // per-process token marks re-enqueued offers so a remote
                     // peer can't forge "already consented".
                     let sender_name = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
@@ -6388,13 +6404,13 @@ async fn recv_cmd(
                         }
                         ui::say(&ui::paint(ui::Tone::Dim, &format!(
                             "  declined {name} from {sender_name} ({})",
-                            if daemon { "unverified peer" } else { "no tty — use -y to auto-accept" }
+                            if daemon { "unverified peer" } else { "no tty, use -y to auto-accept" }
                         )));
                         t.send_control(&json!({ "type": "file-decline", "id": id })).await?;
                         continue;
                     }
 
-                    // C23: never run two streams into one .part — a rejoin
+                    // C23: never run two streams into one .part, a rejoin
                     // can re-offer a file whose first stream is still live;
                     // accepting both corrupted the path and crashed on the
                     // second rename. First stream wins.
@@ -6403,7 +6419,7 @@ async fn recv_cmd(
                     // (resume:true) on a FRESH transport while the OLD stream's
                     // by_sid entry may still linger (its data path went dark). If
                     // the existing stream's transport is itself STALLED past the
-                    // threshold, the "first stream" is the wedged one — flush it to
+                    // threshold, the "first stream" is the wedged one, flush it to
                     // its .part and accept the resume on the live link instead of
                     // declining (a decline would mark the SENDER's transfer done
                     // and abort the recovery). A genuinely FLOWING duplicate still
@@ -6423,13 +6439,13 @@ async fn recv_cmd(
                                     .unwrap_or(false)
                             });
                             if any_flowing {
-                                // A real concurrent duplicate — first (flowing)
+                                // A real concurrent duplicate, first (flowing)
                                 // stream wins. Ignore WITHOUT marking the sender
                                 // done (a benign skip, not a user decline).
-                                ui::say(&ui::paint(ui::Tone::Dim, &format!("  (duplicate offer for {name} ignored — already receiving it)")));
+                                ui::say(&ui::paint(ui::Tone::Dim, &format!("  (duplicate offer for {name} ignored, already receiving it)")));
                                 continue;
                             }
-                            // The lingering stream(s) are STALLED — flush their
+                            // The lingering stream(s) are STALLED, flush their
                             // partials to disk and drop them so the resume below
                             // re-opens the .part from its saved offset.
                             for k in dup_keys {
@@ -6441,7 +6457,7 @@ async fn recv_cmd(
                     }
 
                     if to_stdout {
-                        // Pipe mode: no part files, no resume — pure stream.
+                        // Pipe mode: no part files, no resume, pure stream.
                         // Write through a dup'd stdout fd so dropping the
                         // writer never closes the process's real fd 1; the
                         // /dev/stdout open is the portable-unix way to dup.
@@ -6462,7 +6478,7 @@ async fn recv_cmd(
                                 file: tokio::io::BufWriter::with_capacity(1 << 20, out),
                                 part_path: PathBuf::new(),
                                 // Pipe mode streams to a fd we can't re-read, so we
-                                // can't recompute the digest — no verify, no ack
+                                // can't recompute the digest, no verify, no ack
                                 // (the sender's bounded fallback covers it).
                                 full: None,
                                 bar: ui::Progress::new("(stdout)", size),
@@ -6471,11 +6487,11 @@ async fn recv_cmd(
                             continue;
                         }
                     }
-                    // P4: the digest to verify against on completion — the current
+                    // P4: the digest to verify against on completion, the current
                     // offer's, else the one persisted with the partial (resume).
                     let effective_full = offer_full.clone().or(prior_full);
                     let file = if offset > 0 {
-                        // DEBUG — resilience internal (receiver resuming from offset).
+                        // DEBUG, resilience internal (receiver resuming from offset).
                         ui::debug(&format!("{name}: resuming at {} ({:.0}%)", human(offset), offset as f64 / size.max(1) as f64 * 100.0));
                         tokio::fs::OpenOptions::new().append(true).open(&part_path).await?
                     } else {
@@ -6498,7 +6514,7 @@ async fn recv_cmd(
                 Some("file-end") => {
                     // Test hook (gate 18 standalone repro): drop the file-end
                     // control frame so a fully-received stream is stranded in
-                    // by_sid — mirrors a sender whose PC tears down before the
+                    // by_sid, mirrors a sender whose PC tears down before the
                     // best-effort file-end is delivered. The G-k completion
                     // sweep must then finalize it on size and quiet-exit.
                     if test_hooks::drop_file_end() {
@@ -6515,11 +6531,11 @@ async fn recv_cmd(
                         // file's full sha256 (`inc.full`). Before declaring "done",
                         // recompute it over the received `.part` and COMPARE. A
                         // truncated or corrupt receive (the 7 KB stub class) must
-                        // NOT be accepted — instead keep the partial and re-request
+                        // NOT be accepted, instead keep the partial and re-request
                         // until the bytes are whole and the hash matches, or fail
                         // CLEARLY after a bound. Only on a MATCH do we finalize +
                         // send the delivery-ack. An old peer that offered no digest
-                        // (`inc.full == None`) degrades to the legacy size check —
+                        // (`inc.full == None`) degrades to the legacy size check,
                         // no verify, no ack (the sender's bounded fallback covers
                         // it), so this never hangs against an ack-less peer.
                         let id = inc.id.clone();
@@ -6527,7 +6543,7 @@ async fn recv_cmd(
                             let verdict = verify_incoming(&mut inc).await;
                             match verdict {
                                 VerifyResult::Match => {
-                                    // INTACT — finalize, then tell the sender it
+                                    // INTACT, finalize, then tell the sender it
                                     // landed whole (the deterministic delivery-ack).
                                     verify_fails.remove(&id);
                                     let rename_to = if completed == 0 { output.clone() } else { None };
@@ -6539,12 +6555,12 @@ async fn recv_cmd(
                                             let _ = t.send_control(&json!({
                                                 "type": "delivery-ack", "id": id, "sid": sid, "v": 1,
                                             })).await;
-                                            ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched) — acked", )));
+                                            ui::say(&ui::paint(ui::Tone::Dim, &format!("    {nm} verified (whole-file sha256 matched), acked", )));
                                         }
                                     }
                                 }
                                 VerifyResult::Mismatch { restart_from_zero } => {
-                                    // TRUNCATED or CORRUPT — do NOT accept. Bound the
+                                    // TRUNCATED or CORRUPT, do NOT accept. Bound the
                                     // re-request so a genuinely-unrecoverable payload
                                     // fails clearly instead of looping forever.
                                     let fails = verify_fails.entry(id.clone()).or_insert(0);
@@ -6553,10 +6569,10 @@ async fn recv_cmd(
                                         // Give up CLEANLY: keep the partial, surface
                                         // the cause, do not finalize, do not ack. No
                                         // silent bad file; re-running can still retry.
-                                        // CRITICAL — a clean terminal refusal (corrupt file
+                                        // CRITICAL, a clean terminal refusal (corrupt file
                                         // rejected); the user must see it even under -q.
                                         ui::critical(&ui::paint(ui::Tone::Err, &format!(
-                                            "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches — refusing to accept a corrupt file (partial kept)",
+                                            "  {}: whole-file checksum still wrong after {MAX_VERIFY_FAILS} re-fetches, refusing to accept a corrupt file (partial kept)",
                                             inc.name
                                         )));
                                         verify_fails.remove(&id);
@@ -6569,21 +6585,21 @@ async fn recv_cmd(
                                     // Re-request: a truncated tail resumes from the
                                     // current `.part` offset; a corrupt body (full
                                     // size, wrong hash) restarts from 0 (the .part is
-                                    // poisoned — truncate it and re-fetch whole).
+                                    // poisoned, truncate it and re-fetch whole).
                                     let mut req_offset = inc.received;
                                     if restart_from_zero {
                                         let _ = tokio::fs::File::create(&inc.part_path).await; // truncate to 0
                                         inc.received = 0;
                                         req_offset = 0;
-                                        // DEBUG — resilience internal (P4 whole-file re-fetch).
+                                        // DEBUG, resilience internal (P4 whole-file re-fetch).
                                         ui::debug(&ui::paint(ui::Tone::Warn, &format!(
-                                            "  {}: received all bytes but whole-file checksum FAILED (corrupt) — re-fetching from 0 (attempt {})",
+                                            "  {}: received all bytes but whole-file checksum FAILED (corrupt), re-fetching from 0 (attempt {})",
                                             inc.name, *fails
                                         )));
                                     } else {
-                                        // DEBUG — resilience internal (P4 truncation re-request).
+                                        // DEBUG, resilience internal (P4 truncation re-request).
                                         ui::debug(&ui::paint(ui::Tone::Warn, &format!(
-                                            "  {}: TRUNCATED ({}/{}) — checksum can't match yet; re-requesting the rest (attempt {})",
+                                            "  {}: TRUNCATED ({}/{}), checksum can't match yet; re-requesting the rest (attempt {})",
                                             inc.name, human(inc.received), human(inc.size), *fails
                                         )));
                                     }
@@ -6619,7 +6635,7 @@ async fn recv_cmd(
                 _ => {}
             },
             Ev::Chunk(pid, sid, data) => {
-                // L2 streams live in the HIGH half of the sid space — route them
+                // L2 streams live in the HIGH half of the sid space, route them
                 // to the tunnel mux, never the file-transfer table (the pure
                 // high-bit prefix check keeps file send/recv byte-identical).
                 if l2_enabled && l2::is_l2_sid(sid) {
@@ -6635,7 +6651,7 @@ async fn recv_cmd(
             Ev::StdinLine(line) => {
                 let ans = line.to_lowercase();
                 if !pending.is_empty() {
-                    // C22/C25: an open question owns stdin — but ONLY explicit
+                    // C22/C25: an open question owns stdin, but ONLY explicit
                     // answers count. An empty line (stray CR, idle Enter) used
                     // to default-decline an offer the user never saw; and any
                     // keypress within 300ms of the question appearing is a
@@ -6664,7 +6680,7 @@ async fn recv_cmd(
                         let s = conn.link(qpid).map(|l| l.name.clone()).unwrap_or_default();
                         let q = offer_question(&s, qv["name"].as_str().unwrap_or("file"), qv["size"].as_u64().unwrap_or(0), paired);
                         if answered {
-                            ui::say(&q); // a NEW question fronted — permanent line (C25)
+                            ui::say(&q); // a NEW question fronted, permanent line (C25)
                             question_shown = Instant::now();
                         }
                         ui::sticky(&q);
@@ -6672,9 +6688,9 @@ async fn recv_cmd(
                         question_open.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
                 } else if ans == "devices" {
-                    // C29: session commands — `up` is a place you live in.
+                    // C29: session commands, `up` is a place you live in.
                     if devices.is_empty() {
-                        ui::say(&ui::paint(ui::Tone::Dim, "  no known devices yet — type a code or `pair` to add one"));
+                        ui::say(&ui::paint(ui::Tone::Dim, "  no known devices yet, type a code or `pair` to add one"));
                     }
                     for (n, s) in &devices {
                         ui::say(&format!("  {}  {}", ui::paint(ui::Tone::Bold, n), ui::paint(ui::Tone::Dim, &format!("(channel {})", &channel_of(s)[..12]))));
@@ -6684,7 +6700,7 @@ async fn recv_cmd(
                     if devices.iter().any(|(dn, _)| dn == n) {
                         devices_remove(n)?;
                         devices.retain(|(dn, _)| dn != n);
-                        ui::say(&format!("  {} forgot '{n}' — it can no longer find this machine", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
+                        ui::say(&format!("  {} forgot '{n}', it can no longer find this machine", ui::paint(ui::Tone::Ok, ui::glyph_ok())));
                     } else {
                         ui::say(&ui::paint(ui::Tone::Dim, &format!("  no device named '{n}' (try `devices`)")));
                     }
@@ -6697,7 +6713,7 @@ async fn recv_cmd(
                     sio.emit("pair-create", json!({})).await.ok();
                 } else if regex_lite_code(&line) {
                     if claim_in_flight {
-                        ui::say(&ui::paint(ui::Tone::Dim, "  (a claim is already in flight — wait for it to resolve)"));
+                        ui::say(&ui::paint(ui::Tone::Dim, "  (a claim is already in flight, wait for it to resolve)"));
                     } else {
                         ui::say(&format!("  claiming {}…", ui::paint(ui::Tone::Brand, &line)));
                         paired = true;
@@ -6713,7 +6729,7 @@ async fn recv_cmd(
             }
             Ev::Interrupted => {
                 flush_inflight(&mut by_sid).await;
-                ui::say(&format!("  {} interrupted — partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
+                ui::say(&format!("  {} interrupted, partials kept; run the same command to resume", ui::paint(ui::Tone::Warn, "!")));
                 if let Some(g) = &tty_guard {
                     g.restore(); // process::exit skips Drop
                 }
@@ -6728,14 +6744,14 @@ async fn recv_cmd(
             // saved offset (no restart-from-zero). For a WebRTC link the repair
             // is the impolite-side ICE-restart inside correct_stall.
             Ev::TransferStalled(pid, idle_ms) => {
-                // DEBUG — resilience internal (inbound stall detection).
-                ui::debug(&ui::paint(ui::Tone::Warn, &format!("  inbound stall: {idle_ms}ms with no data from peer — repairing link")));
+                // DEBUG, resilience internal (inbound stall detection).
+                ui::debug(&ui::paint(ui::Tone::Warn, &format!("  inbound stall: {idle_ms}ms with no data from peer, repairing link")));
                 // P0 partial-preservation: flush THIS peer's in-flight partials
                 // to their `.part` on disk and release the in-memory handles, so
                 // the C23 "already receiving" guard doesn't reject the sender's
                 // resume-offer on the FRESH repair link. The `.part` + `.meta`
                 // stay on disk; the resume re-opens them from the saved offset
-                // (no restart-from-zero). Only this peer's streams are dropped —
+                // (no restart-from-zero). Only this peer's streams are dropped,
                 // other links keep flowing.
                 let stale: Vec<(String, u32)> =
                     by_sid.keys().filter(|(p, _)| *p == pid).cloned().collect();
@@ -6747,12 +6763,12 @@ async fn recv_cmd(
                 }
                 match conn.correct_stall(&pid).await {
                     // Receiver has nothing to re-offer; the sender owns the offer.
-                    // Rung (a) is a no-op here — wait for the sender's re-offer.
+                    // Rung (a) is a no-op here, wait for the sender's re-offer.
                     Rung::Resume => {}
                     Rung::Repaired => {}
                     // Rung (d) P1: the receiver re-established over the TURN relay
                     // (relay-only ICE), preserving its `.part`. The sender re-offers
-                    // resume:true on the fresh relay link — the file continues from
+                    // resume:true on the fresh relay link, the file continues from
                     // its saved offset. Nothing to do here.
                     Rung::Relayed => {}
                     // Direct rungs spent AND relay forbidden / already on relay:
@@ -6760,7 +6776,7 @@ async fn recv_cmd(
                     Rung::Exhausted => {}
                 }
             }
-            // Losing the sender is only an ERROR when nothing completed —
+            // Losing the sender is only an ERROR when nothing completed,
             // after a successful transfer it's just closure (the quiet-exit
             // prints the same `done (N files).` the peer-left path would).
             Ev::Stuck(pid, generation) => {
@@ -6774,7 +6790,7 @@ async fn recv_cmd(
                 }
                 if conn.on_stuck(&pid, generation, "stuck while connecting").await? && paired && !keep_open {
                     // G-k: the dropped link may have delivered every byte but
-                    // lost its file-end — finalize before deciding it's fatal.
+                    // lost its file-end, finalize before deciding it's fatal.
                     sweep_completed_streams(&mut by_sid, &conn, &dir, &output, to_stdout, daemon, &mut completed).await?;
                     if completed == 0 {
                         bail!("lost the sender after {} attempts", MAX_ATTEMPTS);
@@ -6803,7 +6819,7 @@ async fn recv_cmd(
                 // Test hook (gate 18): peer-left delivery is best-effort in the
                 // real world; this simulates the loss deterministically so the
                 // quiet-exit fallback (G-k) can be exercised. SIGSTOP can't do
-                // it — engine.io's ping timeout reaps a frozen client in ~30s
+                // it, engine.io's ping timeout reaps a frozen client in ~30s
                 // and the legit peer-left wins the race.
                 if test_hooks::drop_peer_left() {
                     continue;
@@ -6814,25 +6830,25 @@ async fn recv_cmd(
                     if !by_sid.is_empty() {
                         // Keep partials writable-but-parked; resume comes via
                         // rejoin (C6) or a later re-offer against the .part.
-                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  sender disconnected mid-transfer — waiting up to {secs}s")));
+                        ui::say(&ui::paint(ui::Tone::Dim, &format!("  sender disconnected mid-transfer, waiting up to {secs}s")));
                         flush_inflight(&mut by_sid).await;
                     } else if completed > 0 && !keep_open {
                         ui::say(&format!("done ({completed} file{}).", if completed == 1 { "" } else { "s" }));
                         let _ = sio.disconnect().await;
                         return Ok(());
                     } else if paired && !keep_open {
-                        // C21: NOT fatal — a phone opening its file picker
+                        // C21: NOT fatal, a phone opening its file picker
                         // suspends the whole tab and drops the socket. Hold
                         // the line; their client rejoins on refocus.
                         let gid = v["id"].as_str().unwrap_or_default();
                         let n = gone.unwrap_or_else(|| "sender".into());
-                        ui::say(&conn.roster(gid, "●", ui::Tone::Warn, &format!("stepped away — holding the line up to {secs}s (Ctrl-C to stop)"), &n));
+                        ui::say(&conn.roster(gid, "●", ui::Tone::Warn, &format!("stepped away, holding the line up to {secs}s (Ctrl-C to stop)"), &n));
                     } else {
                         conn.waiting_rejoin = None; // open listener: keep going
                         let gid = v["id"].as_str().unwrap_or_default();
                         match gone {
-                            Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, "left — still listening", &n)),
-                            None => ui::say(&ui::paint(ui::Tone::Dim, "  peer left — still listening")),
+                            Some(n) => ui::say(&conn.roster(gid, "○", ui::Tone::Dim, "left, still listening", &n)),
+                            None => ui::say(&ui::paint(ui::Tone::Dim, "  peer left, still listening")),
                         }
                     }
                 }
@@ -6844,11 +6860,11 @@ async fn recv_cmd(
 
 /// P4 (GAP-5): outcome of the whole-file integrity check on completion.
 enum VerifyResult {
-    /// Received bytes hash to the sender's offered digest — accept + ack.
+    /// Received bytes hash to the sender's offered digest, accept + ack.
     Match,
     /// Hash didn't match. `restart_from_zero` distinguishes the two cases:
-    /// a SHORT file (received < size) is merely TRUNCATED — resume the tail;
-    /// a FULL-SIZE file with the wrong hash has a CORRUPT BODY — the partial is
+    /// a SHORT file (received < size) is merely TRUNCATED, resume the tail;
+    /// a FULL-SIZE file with the wrong hash has a CORRUPT BODY, the partial is
     /// poisoned, so re-fetch from 0.
     Mismatch { restart_from_zero: bool },
 }
@@ -6857,7 +6873,7 @@ enum VerifyResult {
 /// compare against the digest the sender offered (`inc.full`, guaranteed Some by
 /// the caller). Flushes first so every buffered byte is on disk. This is the
 /// CORE whole-file integrity guarantee the runner used to bolt on above the
-/// transport — now every `recv` gets it.
+/// transport, now every `recv` gets it.
 ///
 /// Test hook (the truncation/ack gate): `FILAMENT_TEST_CORRUPT_RECV=<id>` flips
 /// a byte of the on-disk `.part` for the matching transfer id right before the
@@ -6869,7 +6885,7 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
     let _ = inc.file.flush().await;
 
     // Test-only corruption injection (deterministic; gate proof). Compiled out
-    // entirely on default/release builds — the `corrupt_recv_target` twin returns
+    // entirely on default/release builds, the `corrupt_recv_target` twin returns
     // None there, so this whole block strips to nothing. The "fired once" latch is
     // an AtomicBool inside test_hooks (no unsafe env mutation).
     if let Some(target) = test_hooks::corrupt_recv_target() {
@@ -6880,7 +6896,7 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
             if target == inc.id && inc.received == inc.size && !(once && already) {
                 if let Ok(mut bytes) = std::fs::read(&inc.part_path) {
                     if let Some(b) = bytes.last_mut() {
-                        *b ^= 0xFF; // flip the final byte — same size, wrong hash
+                        *b ^= 0xFF; // flip the final byte, same size, wrong hash
                         let _ = std::fs::write(&inc.part_path, &bytes);
                         eprintln!("[test] CORRUPT-RECV: flipped the last byte of {} (id {})", inc.name, inc.id);
                         if once { test_hooks::corrupt_mark_fired(); }
@@ -6892,7 +6908,7 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
         let _ = &target;
     }
 
-    // A short file can't possibly match — it's truncated; resume the tail.
+    // A short file can't possibly match, it's truncated; resume the tail.
     if inc.received < inc.size {
         return VerifyResult::Mismatch { restart_from_zero: false };
     }
@@ -6908,7 +6924,7 @@ async fn verify_incoming(inc: &mut IncomingFile) -> VerifyResult {
 /// Finalize a fully-received incoming file: flush, rename `.part` → final,
 /// clean up the meta sidecar, and (in daemon mode) append to the upload log.
 /// Returns true if the file was placed (so the caller bumps `completed`).
-/// Shared by the file-end control-frame path and the G-k completion sweep —
+/// Shared by the file-end control-frame path and the G-k completion sweep,
 /// the two must not drift. `daemon`/`from_name` drive only the daemon log.
 async fn finalize_incoming(
     mut inc: IncomingFile,
@@ -6921,9 +6937,9 @@ async fn finalize_incoming(
     drop(inc.file);
     let final_path = unique_path(dir, rename_to.unwrap_or(&inc.name));
     if let Err(e) = tokio::fs::rename(&inc.part_path, &final_path).await {
-        // C23: a duplicate stream's partial may already be finalized — discard
+        // C23: a duplicate stream's partial may already be finalized, discard
         // quietly instead of dying.
-        ui::say(&ui::paint(ui::Tone::Dim, &format!("  (stream for {} already finalized — duplicate discarded: {e})", inc.name)));
+        ui::say(&ui::paint(ui::Tone::Dim, &format!("  (stream for {} already finalized, duplicate discarded: {e})", inc.name)));
         return Ok(false);
     }
     let _ = tokio::fs::remove_file(dir.join(format!("{}.part.meta", inc.name))).await;
@@ -6950,12 +6966,12 @@ async fn finalize_incoming(
 /// PeerConnection tears down first (observed under load). The bytes are whole
 /// (held in `inc.received`; `finalize_incoming` flushes the BufWriter before
 /// rename so the on-disk file is complete), but the stream is stranded in
-/// `by_sid` with no live link to ever deliver file-end — and that non-empty
+/// `by_sid` with no live link to ever deliver file-end, and that non-empty
 /// `by_sid` plus `completed == 0` blocks the quiet-exit while the dead link
 /// spins through the reconnect-retry loop to the 120s ceiling. Finalize any
 /// fully received stream whose link is gone. `received == size` is exactly the
 /// bar the file-end handler itself checks, so this can never claim a genuine
-/// partial (received < size stays parked for resume — gate 2) and never
+/// partial (received < size stays parked for resume, gate 2) and never
 /// touches the offer-stage corruption guard (gate 3). Called both at top-of-
 /// loop and right after a link is dropped in the Stuck/GraceExpired handlers,
 /// so the bail on `completed == 0` sees the finalized file.
@@ -6983,7 +6999,7 @@ async fn sweep_completed_streams(
                 continue;
             }
             let rename_to = if *completed == 0 { output.clone() } else { None };
-            ui::say(&ui::paint(ui::Tone::Dim, &format!("  ({} fully received — sender left before file-end; finalizing)", inc.name)));
+            ui::say(&ui::paint(ui::Tone::Dim, &format!("  ({} fully received, sender left before file-end; finalizing)", inc.name)));
             if finalize_incoming(inc, dir, rename_to.as_deref(), daemon, "").await? {
                 *completed += 1;
             }
@@ -7002,7 +7018,7 @@ async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     }
 }
 
-/// C22: cbreak-mode guard — single-keypress answers without losing line
+/// C22: cbreak-mode guard, single-keypress answers without losing line
 /// input. `stty` keeps us dependency-free; Drop restores the terminal (and
 /// the Interrupted path calls restore() explicitly since process::exit skips
 /// Drop).
@@ -7050,10 +7066,10 @@ fn consent_token() -> &'static str {
     T.get_or_init(fresh_secret)
 }
 
-/// C26: one-line colored peer status — static scrollback lines, the CLI's
+/// C26: one-line colored peer status, static scrollback lines, the CLI's
 /// equivalent of the web UI's amber 'away' tile.
 ///   ✓ deft-gibbon                    (connected)
-///   ● deft-gibbon  away — choosing a file
+///   ● deft-gibbon  away, choosing a file
 ///   ◌ deft-gibbon  reconnecting…
 fn peer_entry(name: &str, mark: &str, tone: ui::Tone, note: &str) -> String {
     let mut s = format!("{} {}", ui::paint(tone, mark), ui::paint(ui::Tone::Bold, name));
@@ -7067,7 +7083,7 @@ fn offer_question(sender: &str, name: &str, size: u64, paired: bool) -> String {
     let sender = if sender.is_empty() { "unknown peer" } else { sender };
     let hint = if paired { " [paired]" } else { "" };
     format!(
-        "  {}{} offers {} ({}) — accept? [y/N] ",
+        "  {}{} offers {} ({}), accept? [y/N] ",
         ui::paint(ui::Tone::Bold, sender),
         hint,
         name,
@@ -7103,7 +7119,7 @@ mod tests {
         )
         .unwrap();
 
-        // transfer is the L0 baseline — allowed even for empty caps.
+        // transfer is the L0 baseline, allowed even for empty caps.
         assert!(device_allows_at(&p, "empty", "transfer"), "transfer is the L0 baseline");
         assert!(device_allows_at(&p, "xfer", "transfer"));
         // A v1 record reads as caps:["transfer"] (back-compat, spec §8).
@@ -7116,7 +7132,7 @@ mod tests {
         // Only a device explicitly granted the cap (under K, at enrollment) is allowed.
         assert!(device_allows_at(&p, "execcap", "remote-exec"), "explicitly granted cap is allowed");
         // An unknown device grants no GATED cap (but transfer is the universal
-        // L0 baseline, so it is allowed regardless — never regresses send/recv).
+        // L0 baseline, so it is allowed regardless, never regresses send/recv).
         assert!(!device_allows_at(&p, "ghost", "remote-exec"));
         assert!(device_allows_at(&p, "ghost", "transfer"), "transfer baseline is universal");
 
@@ -7125,7 +7141,7 @@ mod tests {
 
     #[test]
     fn shell_policy_gates_auto_shell() {
-        // `up` default: NOTHING auto-shells — a device needs an explicit grant.
+        // `up` default: NOTHING auto-shells, a device needs an explicit grant.
         let g = ShellPolicy::Granted;
         assert!(!g.auto_allows("popos"));
         assert!(!g.enables_l2(), "default must not silently enable the L2 acceptor");
@@ -7145,7 +7161,7 @@ mod tests {
         // Regression: forgetting/pairing a device must NOT wipe the `shell`
         // (or any v2) caps of the OTHER devices. The old (name, secret) tuple
         // round-trip rewrote every survivor as bare {name, secret}, silently
-        // dropping their grants — a remembered device lost its shell on the
+        // dropping their grants, a remembered device lost its shell on the
         // next `forget`/`pair`.
         let dir = std::env::temp_dir().join(format!("fil-store-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7188,7 +7204,7 @@ mod tests {
         // The JS half of this byte-identity proof asserts the IDENTICAL vectors:
         // cli/tests/l1a/gate8_byte_identity.mjs (channelOf/proofFor).
         let want = "f98c3b6b7a70ebdf4b200680e83383881bdb1a11476283507359c55ef03a8474";
-        // deliberately unsorted inputs — proof_for must normalize
+        // deliberately unsorted inputs, proof_for must normalize
         assert_eq!(proof_for("s3cret", "u1", "u2", "u1", "FPB", "FPA"), want);
         assert_eq!(proof_for("s3cret", "u1", "u1", "u2", "FPA", "FPB"), want);
         // channel derivation, same cross-check (sha256 of "filament-pair:"+secret)
@@ -7264,8 +7280,8 @@ mod tests {
     #[test]
     fn full_hash_whole_file_integrity() {
         // P4 (GAP-5): full_hash digests the WHOLE file (not just the 256 KiB
-        // head), so a difference PAST the head — exactly the truncation/corrupt
-        // case the head-hash can't see — produces a different digest.
+        // head), so a difference PAST the head, exactly the truncation/corrupt
+        // case the head-hash can't see, produces a different digest.
         let dir = std::env::temp_dir().join(format!("filament-test-fh-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let a = dir.join("a.bin");
@@ -7300,7 +7316,7 @@ mod tests {
 
     #[test]
     fn route_address_classification() {
-        // C2: the badge means "bytes never leave your network" — an address
+        // C2: the badge means "bytes never leave your network", an address
         // property, not a candidate-type property.
         for a in ["127.0.0.1", "10.1.2.3", "192.168.1.9", "172.16.0.1", "169.254.1.1", "100.99.1.2", "::1", "fe80::1", "fd00::5"] {
             assert!(net::is_private_addr(a), "{a} should be private");
@@ -7324,7 +7340,7 @@ mod tests {
     #[test]
     fn recv_done_false_mid_transfer_protects_resume() {
         // by_sid NON-empty == a stream in flight (an in-progress reconnect or
-        // resume). Must NOT drop — gate 2 / gate 11c reconnect paths depend on
+        // resume). Must NOT drop, gate 2 / gate 11c reconnect paths depend on
         // this returning false so on_stuck re-establishes.
         assert!(!recv_transfer_done(0, false, false)); // nothing done, mid-stream
         assert!(!recv_transfer_done(1, false, false)); // file done but another in flight
@@ -7373,14 +7389,14 @@ mod tests {
     // 3-seg codes: both transfer (word-word-NNN) and pairing (word-word-NNNN)
     // share the shape now, so the pairing-vs-transfer HINT is by trailing-number
     // WIDTH. `looks_like_pake_code` (4-digit) is a strict SUBSET of
-    // `regex_lite_code` (3-seg word-word-DIGITS) by design — the hint is
+    // `regex_lite_code` (3-seg word-word-DIGITS) by design, the hint is
     // advisory, never an authenticator.
     #[test]
     fn transfer_and_pairing_codes_are_distinguishable() {
-        // minted transfer code: word-word-NNN (3-digit) — claimable, NOT pairing.
+        // minted transfer code: word-word-NNN (3-digit), claimable, NOT pairing.
         assert!(regex_lite_code("brave-otter-371"));
         assert!(!looks_like_pake_code("brave-otter-371"));
-        // minted pairing code: word-word-NNNN (4-digit) — claimable AND pairing.
+        // minted pairing code: word-word-NNNN (4-digit), claimable AND pairing.
         assert!(regex_lite_code("brave-otter-3141"));
         assert!(looks_like_pake_code("brave-otter-3141"));
         // The redirect predicates the commands actually use:
@@ -7406,10 +7422,10 @@ mod tests {
     // STEERING floor: --word must contain >= 2 word tokens (letter-runs >= 2).
     #[test]
     fn password_word_tokens_counts_real_words() {
-        // single word — too weak (refused).
+        // single word, too weak (refused).
         assert_eq!(password_word_tokens("cat"), 1);
         assert_eq!(password_word_tokens("gigantic"), 1);
-        // two+ words — ok.
+        // two+ words, ok.
         assert_eq!(password_word_tokens("gigantic-element"), 2);
         assert_eq!(password_word_tokens("brave-otter"), 2);
         assert_eq!(password_word_tokens("brave-strong-otter"), 3);

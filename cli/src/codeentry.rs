@@ -1,4 +1,4 @@
-// Interactive, steered, color-coded code entry — the CLI sibling of the
+// Interactive, steered, color-coded code entry, the CLI sibling of the
 // browser's CodeInput / CustomCodeEntry. When `pair`/`recv`/`send` run WITHOUT
 // a code (or with a malformed one) AND we're allowed to be interactive (see the
 // gate in main.rs), we drop into a browser-like live entry:
@@ -29,11 +29,11 @@ pub enum Mode {
 /// whether Enter is allowed to submit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
-    /// nothing typed yet — dim hint
+    /// nothing typed yet, dim hint
     Empty,
-    /// content, but not a submittable code — amber, keep steering
+    /// content, but not a submittable code, amber, keep steering
     Incomplete,
-    /// a complete, submittable code — green, Enter submits
+    /// a complete, submittable code, green, Enter submits
     Ready,
 }
 
@@ -55,7 +55,7 @@ pub struct Judgment {
 ///   * strip leading '-',
 ///   * KEEP only [a-z0-9-]; everything else is dropped (bad chars never enter).
 ///
-/// We intentionally do NOT strip a trailing '-' here — the user may be mid-type
+/// We intentionally do NOT strip a trailing '-' here, the user may be mid-type
 /// between words, and a visible trailing dash is correct feedback. `judge`
 /// tolerates it via the shared split.
 pub fn format_buffer(raw: &str) -> String {
@@ -84,11 +84,11 @@ fn is_nameplate(s: &str) -> bool {
     (3..=5).contains(&s.len()) && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Judge a buffer for the given mode. PURE — uses the shared pake split/normalize
+/// Judge a buffer for the given mode. PURE, uses the shared pake split/normalize
 /// and the crate strength floor, so it agrees with the browser and the real parse.
 ///
 /// `auto_nameplate` is the stable machine-minted number shown (dimmed) in the
-/// CREATE preview — mint it ONCE per session (like the browser's autoNpRef) and
+/// CREATE preview, mint it ONCE per session (like the browser's autoNpRef) and
 /// pass it in, so the preview doesn't reshuffle on every keystroke.
 pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
     let normalized = filament_pake::norm_code(buf);
@@ -116,12 +116,22 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
                     preview: Some(format!("{pw} · {np}")),
                 };
             }
-            // A bare number, no words (e.g. "3141"): split_code returns np=whole,
-            // pw empty.
+            // A single trailing group, no words (split_code returns np=whole, pw
+            // empty). Two shapes land here and need different nudges:
+            //   * a bare NUMBER (e.g. "3141"): the words are what's missing.
+            //   * a bare WORD (e.g. "brave"): split_code mistook the lone word for
+            //     a nameplate, so "add the words before the number" reads wrong;
+            //     nudge toward the full words-then-number shape instead.
             if !has_words {
+                let bare_is_number = np.bytes().all(|b| b.is_ascii_digit());
+                let steer = if bare_is_number {
+                    "add the words before the number".to_string()
+                } else {
+                    "keep going, a full code is words then a 3-5 digit number".to_string()
+                };
                 return Judgment {
                     level: Level::Incomplete,
-                    steer: "add the words before the number".to_string(),
+                    steer,
                     preview: None,
                 };
             }
@@ -160,10 +170,10 @@ pub enum Outcome {
     /// The user submitted a Ready buffer. For CREATE this is the words-only
     /// password (no nameplate); for CLAIM it's the normalized full code.
     Submitted(String),
-    /// The user pressed Enter on an EMPTY buffer (a deliberate "use the default"
-    /// — auto-mint for create, local-network for recv/send).
+    /// The user pressed Enter on an EMPTY buffer (a deliberate "use the default",
+    /// auto-mint for create, local-network for recv/send).
     Empty,
-    /// Esc / Ctrl-C — the user backed out entirely.
+    /// Esc / Ctrl-C, the user backed out entirely.
     Cancelled,
 }
 
@@ -174,7 +184,7 @@ pub enum Outcome {
 
 /// RAII guard: enables raw mode on construction and ALWAYS restores the terminal
 /// on drop (success, cancel, error, OR panic). This is the one thing we must
-/// never get wrong — a leaked raw mode wedges the user's shell.
+/// never get wrong, a leaked raw mode wedges the user's shell.
 struct RawGuard {
     active: bool,
 }
@@ -354,7 +364,7 @@ mod tests {
 
     #[test]
     fn format_keeps_trailing_dash_midtype() {
-        // mid-type between words — trailing dash is honest feedback
+        // mid-type between words, trailing dash is honest feedback
         assert_eq!(format_buffer("brave-"), "brave-");
     }
 
@@ -382,6 +392,17 @@ mod tests {
         let j = judge("3141", Mode::Claim, NP);
         assert_eq!(j.level, Level::Incomplete);
         assert!(j.steer.contains("add the words"));
+    }
+
+    #[test]
+    fn claim_lone_word_nudges_to_full_shape() {
+        // A single bare word (no number): split_code treats the lone group as the
+        // nameplate, so the old "add the words before the number" read wrong.
+        // It should now nudge toward the full words-then-number shape.
+        let j = judge("brave", Mode::Claim, NP);
+        assert_eq!(j.level, Level::Incomplete);
+        assert!(j.steer.contains("words then a 3-5 digit number"));
+        assert!(!j.steer.contains("add the words before the number"));
     }
 
     #[test]
