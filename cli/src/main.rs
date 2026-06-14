@@ -1076,6 +1076,35 @@ fn shell_argv(shell_user: Option<&str>) -> Vec<String> {
     }
 }
 
+/// #4: bridge ONE link's PTY stream to a persistent session. Inbound data frames
+/// (`rx`, the mux's per-sid pipe) become keystrokes; resize events (`rrx`, the
+/// mux resizer) become window-size changes. When the channel drops, `rx` closes
+/// and this pump exits, but it does NOT end the session: a drop is a DETACH (the
+/// PcState handler does that), so the shell keeps running for a reattach. Spawned
+/// fresh on every open/reattach against that open's sid.
+fn spawn_session_pumps(
+    sess: l2::PtySessionHandle,
+    mut rx: tokio::sync::mpsc::Receiver<Option<bytes::Bytes>>,
+    mut rrx: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
+) {
+    // input pump: PTY keystrokes for THIS attachment
+    let s_in = sess.clone();
+    tokio::spawn(async move {
+        while let Some(item) = rx.recv().await {
+            match item {
+                Some(bytes) => s_in.feed_input(bytes.to_vec()),
+                None => break, // clean FIN for this stream; channel-drop also lands here
+            }
+        }
+    });
+    // resize pump: SIGWINCH for THIS attachment
+    tokio::spawn(async move {
+        while let Some((c, r)) = rrx.recv().await {
+            sess.resize(c, r);
+        }
+    });
+}
+
 /// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
 /// may `filament ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
 /// always enforced separately, this is purely the capability side.
@@ -5501,6 +5530,15 @@ async fn recv_cmd(
     let l2_enabled = shell_policy.enables_l2()
         || std::env::var("FILAMENT_L2").map(|v| v == "1").unwrap_or(false);
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
+    // web-shell (#4): persistent PTY sessions, keyed by a stable browser-chosen
+    // session id, OUTLIVE the link that opened them. A dropped data channel
+    // DETACHES (does not kill) the shell; a reconnect with the same session id
+    // reattaches and replays buffered output. Process-wide for the whole loop.
+    let pty_sessions = l2::PtySessions::new();
+    // Per-link map of the PTY sids currently bound to a session on that link, so
+    // a link drop can DETACH exactly those sessions (and a clean l2-close ends
+    // the right one). pid -> (sid -> session_id).
+    let mut pty_bindings: HashMap<String, HashMap<u32, String>> = HashMap::new();
     // web-shell: per-sid resize senders are now owned by each Mux (l2.rs) so they
     // are freed on every teardown path (H-1: closes the prior pty_resizers leak).
     // Bug 5: surface the single-host mDNS wedge hint once after repeated stuck.
@@ -6434,10 +6472,39 @@ async fn recv_cmd(
                     }
                     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                     let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                    // #4: a stable, browser-chosen session id binds reconnects to
+                    // the same persistent PTY. Absent (older client) -> fall back
+                    // to a per-sid id, which simply never reattaches (old behavior).
+                    let session_id = v["session"]
+                        .as_str()
+                        .filter(|s| !s.is_empty() && s.len() <= 128)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("{pid}:{sid:#x}"));
                     let mux = l2_muxes
                         .entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();
+                    // #4 REATTACH: a live session for this id means a reconnect.
+                    // Rebind its output to THIS link+sid and replay its buffer; do
+                    // not spawn a new shell. Register the input pump + resizer for
+                    // the new sid so typing and SIGWINCH reach the surviving PTY.
+                    if let Some(sess) = pty_sessions.get_live(&session_id).await {
+                        if mux.at_stream_cap().await {
+                            ui::say("l2: pty reattach refused: too many streams on this link");
+                            let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
+                            continue;
+                        }
+                        let rx = mux.register_stream(sid).await;
+                        let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+                        mux.register_resizer(sid, rtx).await;
+                        let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
+                        sess.attach(t.clone(), sid);
+                        sess.resize(cols, rows);
+                        pty_bindings.entry(pid.clone()).or_default().insert(sid, session_id.clone());
+                        spawn_session_pumps(sess.clone(), rx, rrx);
+                        ui::say(&format!("l2: pty REATTACHED to '{}', {cols}x{rows}", dev.unwrap_or_default()));
+                        continue;
+                    }
                     // H-1 (DoS): refuse over the per-link stream cap or the global
                     // PTY cap BEFORE spawning a shell. A flaky/hostile paired
                     // device can otherwise flood `pty-open` and exhaust threads.
@@ -6454,18 +6521,65 @@ async fn recv_cmd(
                     let rx = mux.register_stream(sid).await; // before spawn (race fix)
                     let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
                     // Resizer is owned by the mux so it is freed on EVERY teardown
-                    // path (inbound l2-close, serve_pty exit, link death), H-1.
+                    // path (inbound l2-close, link death), H-1.
                     mux.register_resizer(sid, rtx).await;
-                    ui::say(&format!("l2: pty granted to '{}', {cols}x{rows}", dev.unwrap_or_default()));
                     let _ = t.send_control(&json!({ "type": "pty-open-ack", "sid": sid })).await;
-                    tokio::spawn(l2::serve_pty(mux.clone(), sid, cols, rows, shell_argv(shell_user.as_deref()), rx, rrx, pty_guard));
+                    // #4: spawn the PTY as a PERSISTENT session keyed by session_id,
+                    // not a link-bound serve_pty. It outlives this link; a drop
+                    // detaches it, a reconnect reattaches above.
+                    match l2::spawn_pty_session(
+                        pty_sessions.clone(),
+                        session_id.clone(),
+                        t.clone(),
+                        sid,
+                        cols,
+                        rows,
+                        shell_argv(shell_user.as_deref()),
+                        pty_guard,
+                    )
+                    .await
+                    {
+                        Some(sess) => {
+                            pty_bindings.entry(pid.clone()).or_default().insert(sid, session_id.clone());
+                            spawn_session_pumps(sess, rx, rrx);
+                            ui::say(&format!("l2: pty granted to '{}', {cols}x{rows}", dev.unwrap_or_default()));
+                        }
+                        None => {
+                            // spawn already sent an l2-close{err}; free the stream.
+                            mux.drop_pty(sid).await;
+                        }
+                    }
                 }
                 Some("pty-resize") if l2_enabled => {
                     let sid = v["sid"].as_u64().unwrap_or(0) as u32;
                     let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                     let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+                    // #4: resize the persistent session bound to this sid (not a
+                    // link-local serve_pty). Falls back to the mux resizer if the
+                    // sid isn't a known session binding (defensive).
+                    if let Some(sid_map) = pty_bindings.get(&pid) {
+                        if let Some(session_id) = sid_map.get(&sid) {
+                            if let Some(sess) = pty_sessions.get_live(session_id).await {
+                                sess.resize(cols, rows);
+                            }
+                        }
+                    }
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.resize_pty(sid, cols, rows).await;
+                    }
+                }
+                // #4: explicit end of a persistent PTY session (the ✕ / unmount).
+                // Distinct from a bare channel drop, which only DETACHES. Kills the
+                // shell and removes the session so a later open spawns fresh.
+                Some("pty-close") if l2_enabled => {
+                    if let Some(session_id) = v["session"].as_str() {
+                        if let Some(sess) = pty_sessions.get_live(session_id).await {
+                            sess.end(); // kill the shell now
+                        }
+                        pty_sessions.remove(session_id).await;
+                        if let Some(sid_map) = pty_bindings.get_mut(&pid) {
+                            sid_map.retain(|_, v| v != session_id);
+                        }
                     }
                 }
                 Some("brb") => {
@@ -7135,6 +7249,23 @@ async fn recv_cmd(
                 if l2_enabled && (s == "failed" || s == "closed" || s == "disconnected") {
                     if let Some(mux) = l2_muxes.remove(&pid) {
                         mux.shutdown_all().await;
+                    }
+                    // #4: a genuinely DEAD link (failed/closed) DETACHES its PTY
+                    // sessions, it does NOT kill them. The shell keeps running and
+                    // buffering output; a reconnect with the same session id
+                    // reattaches and replays. We deliberately skip `disconnected`:
+                    // that is usually a transient ICE blip the SAME data channel
+                    // rides out (no new pty-open follows), so detaching there would
+                    // wedge a still-working session. The detached-idle / lifetime
+                    // caps in the session task reap a session nobody returns to.
+                    if (s == "failed" || s == "closed") && !pty_bindings.is_empty() {
+                        if let Some(sid_map) = pty_bindings.remove(&pid) {
+                            for session_id in sid_map.values() {
+                                if let Some(sess) = pty_sessions.get_live(session_id).await {
+                                    sess.detach();
+                                }
+                            }
+                        }
                     }
                 }
                 conn.on_pc_state(&pid, &s).await;

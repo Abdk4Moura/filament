@@ -1237,5 +1237,16 @@ export function useFilament() {
     acceptPakeKeep, // L1-a: store the v2 device under the chosen name (local-only)
     declinePakeKeep, // L1-a: don't remember (K stays agreed)
     getLink: (pid) => linksRef.current.get(pid), // web-shell: the live PeerLink for a peer
+    // web-shell (#4): resolve the CURRENT link for a device by its STABLE uid. A
+    // reconnect supersedes the link under a new sid (the per-tab peer id changes),
+    // so a terminal session that remembers only the old id would lose its link.
+    // Looking up by uid finds the fresh link, letting WebTerminal reattach.
+    getLinkByUid: (uid) => {
+      if (!uid) return null
+      for (const l of linksRef.current.values()) {
+        if (l.peerUid === uid) return l
+      }
+      return null
+    },
   }
 }

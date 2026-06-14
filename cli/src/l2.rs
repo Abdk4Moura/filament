@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
@@ -74,13 +75,13 @@ pub const MAX_STREAMS_PER_LINK: usize = 8;
 /// links each stay under the per-link cap. Refused opens get an `l2-close`.
 pub const MAX_PTYS_GLOBAL: usize = 32;
 
-/// Process-wide live-PTY counter (incremented just before a `serve_pty` task is
+/// Process-wide live-PTY counter (incremented just before a PTY session task is
 /// spawned, decremented when it ends, see `PtyGuard`). The acceptor checks it
 /// against `MAX_PTYS_GLOBAL` before granting a `pty-open`.
 pub static LIVE_PTYS: AtomicUsize = AtomicUsize::new(0);
 
 /// RAII guard that decrements `LIVE_PTYS` on drop, so the global PTY count is
-/// freed on EVERY `serve_pty` exit path (shell exit, browser FIN, error return).
+/// freed on EVERY PTY session exit path (shell exit, browser FIN, error return).
 pub struct PtyGuard;
 impl PtyGuard {
     /// Reserve a global PTY slot if one is free. Returns `None` (and reserves
@@ -116,7 +117,7 @@ pub struct Mux {
     accepted: Mutex<HashMap<u32, ()>>,
     /// web-shell: per-sid PTY resize senders. H-1: owning these HERE (rather than
     /// in the main event loop) guarantees they are dropped on EVERY teardown path:
-    /// inbound `l2-close` (`on_close`), `serve_pty` exit (`drop_pty`), and
+    /// inbound `l2-close` (`on_close`), the session task exit (`drop_pty`), and
     /// link/mux death (`shutdown_all`), closing the resizer-map leak.
     resizers: Mutex<HashMap<u32, mpsc::UnboundedSender<(u16, u16)>>>,
 }
@@ -208,7 +209,7 @@ impl Mux {
         }
     }
 
-    /// Free a PTY's stream + resize sender on `serve_pty` exit (the teardown path
+    /// Free a PTY's stream + resize sender on a session task exit (the teardown path
     /// that does NOT come from an inbound `l2-close`). Idempotent.
     pub async fn drop_pty(&self, sid: u32) {
         self.resizers.lock().await.remove(&sid);
@@ -325,24 +326,148 @@ async fn serve_stream(
     }
 }
 
-/// web-shell acceptor: spawn a login shell in a PTY and bridge it to stream `sid`.
-/// PTY master output -> sid frames; inbound sid frames (`rx`) -> PTY input;
-/// `resize_rx` carries (cols, rows) from the browser. The blocking PTY fd reads/
-/// writes run on dedicated threads (portable-pty is sync) and funnel into this
-/// async task. The shell exiting (reader EOF) OR the browser closing tears it all
-/// down and sends a trailing l2-close.
-pub async fn serve_pty(
-    mux: Arc<Mux>,
+// ----------------------------------------------------- PERSISTENT PTY SESSIONS --
+//
+// Issue #4 (disconnects lose progress): a PTY must OUTLIVE the data channel that
+// opened it. A link-bound bridge would tie the shell's lifetime to one link, so a
+// dropped channel would kill the shell. The session model below decouples them:
+//
+//   * A `PtySession` owns the shell (child + master + reader/writer threads) and
+//     a long-lived task. It is keyed by a STABLE `session id` chosen by the
+//     browser, NOT by the per-link sid (which changes on every reconnect).
+//   * While ATTACHED, PTY output is framed to the current link's transport+sid
+//     AND mirrored into a bounded ring buffer. While DETACHED (channel dropped),
+//     output only accrues in the ring (capped: oldest bytes evicted).
+//   * On reconnect the browser re-opens with the SAME session id; the acceptor
+//     calls `attach`, which rebinds the new transport+sid and REPLAYS the ring,
+//     so the user sees the same shell and its missed output (tmux/mosh-style).
+//   * Caps: the ring is bounded (`SESSION_BUFFER_CAP`); a detached session is
+//     reaped after `SESSION_DETACHED_IDLE` with no reattach; ANY session is
+//     reaped after `SESSION_MAX_LIFETIME` regardless. The shell exiting always
+//     ends the session immediately.
+
+/// Bytes of recent PTY output retained while detached, for replay on reattach.
+/// 256 KiB covers a full-screen TUI redraw plus a scrollback's worth of context
+/// without letting an abandoned-but-not-reaped session hoard memory.
+pub const SESSION_BUFFER_CAP: usize = 256 * 1024;
+
+/// A detached session (channel dropped, nobody reattached) is reaped after this.
+/// Long enough to ride out a mobile network handoff / tab suspend, short enough
+/// that a closed laptop does not leave a root shell alive for hours.
+pub const SESSION_DETACHED_IDLE: Duration = Duration::from_secs(180);
+
+/// Hard lifetime cap on ANY persistent PTY session, attached or not. A backstop
+/// so a wedged or forgotten session cannot live forever.
+pub const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(8 * 3600);
+
+/// Where a session sends its PTY output right now: a link's transport + the sid
+/// the browser allocated for THIS attach. `None` = detached (buffer only).
+struct OutBind {
+    transport: Arc<dyn Transport>,
+    sid: u32,
+}
+
+/// Commands to a session's task: (re)bind output to a new link, detach, or end.
+enum SessionCmd {
+    Attach { transport: Arc<dyn Transport>, sid: u32 },
+    Detach,
+    End,
+}
+
+/// Handle to one persistent PTY session, stored in the `PtySessions` map. Cloning
+/// is cheap (channels + Arcs); the actual shell lives in the spawned task.
+#[derive(Clone)]
+pub struct PtySessionHandle {
+    /// Bytes typed by the user -> PTY master writer thread.
+    input_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    /// Window-size changes -> PTY master resize.
+    resize_tx: mpsc::UnboundedSender<(u16, u16)>,
+    /// Attach/detach control -> the session task.
+    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
+    /// Set once the task observes the shell exit OR a reap, so a stale handle in
+    /// the map is recognized as dead and replaced by a fresh spawn.
+    dead: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PtySessionHandle {
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Acquire)
+    }
+    pub fn feed_input(&self, bytes: Vec<u8>) {
+        let _ = self.input_tx.send(bytes);
+    }
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let _ = self.resize_tx.send((cols, rows));
+    }
+    /// Rebind output to a new link (transport + sid) and replay the buffer.
+    pub fn attach(&self, transport: Arc<dyn Transport>, sid: u32) {
+        let _ = self.cmd_tx.send(SessionCmd::Attach { transport, sid });
+    }
+    /// Drop the current binding; output accrues in the ring until the next attach
+    /// or the detached-idle reaper fires.
+    pub fn detach(&self) {
+        let _ = self.cmd_tx.send(SessionCmd::Detach);
+    }
+    /// End the session now: kill the shell and tear the task down (the explicit
+    /// `pty-close` / user-closed path, NOT a transient channel drop).
+    pub fn end(&self) {
+        let _ = self.cmd_tx.send(SessionCmd::End);
+    }
+}
+
+/// Process-wide store of persistent PTY sessions, keyed by the browser-chosen
+/// stable session id. Lives for the whole `up`/`recv` process so a session
+/// survives any number of link drops/reconnects.
+#[derive(Default)]
+pub struct PtySessions {
+    map: Mutex<HashMap<String, PtySessionHandle>>,
+}
+
+impl PtySessions {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Look up a LIVE session by id (a dead/exited one is treated as absent so a
+    /// re-open spawns fresh).
+    pub async fn get_live(&self, id: &str) -> Option<PtySessionHandle> {
+        let mut map = self.map.lock().await;
+        match map.get(id) {
+            Some(h) if !h.is_dead() => Some(h.clone()),
+            Some(_) => {
+                map.remove(id);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Insert a freshly spawned session under `id`.
+    pub async fn insert(&self, id: String, h: PtySessionHandle) {
+        self.map.lock().await.insert(id, h);
+    }
+
+    /// Remove a session by id (the reaper / shell-exit path calls this).
+    pub async fn remove(&self, id: &str) {
+        self.map.lock().await.remove(id);
+    }
+}
+
+/// Spawn a brand-new persistent PTY session bound to `(transport, sid)`. Returns
+/// a handle to store in `PtySessions`; the shell runs in a detached task that
+/// outlives the link. `pty_guard` holds the global PTY slot for the session's
+/// whole life. On any failure an `l2-close{err}` is sent on the opening link and
+/// `None` is returned (nothing to store).
+pub async fn spawn_pty_session(
+    sessions: Arc<PtySessions>,
+    session_id: String,
+    transport: Arc<dyn Transport>,
     sid: u32,
     cols: u16,
     rows: u16,
     argv: Vec<String>,
-    mut rx: mpsc::Receiver<PipeItem>,
-    mut resize_rx: mpsc::UnboundedReceiver<(u16, u16)>,
-    // H-1: holding the guard for the whole task lifetime frees the global PTY
-    // slot on EVERY exit path (early error returns + the normal teardown).
-    _pty_guard: PtyGuard,
-) {
+    pty_guard: PtyGuard,
+) -> Option<PtySessionHandle> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read as _, Write as _};
 
@@ -350,9 +475,8 @@ pub async fn serve_pty(
     let pair = match native_pty_system().openpty(size) {
         Ok(p) => p,
         Err(e) => {
-            mux.drop_pty(sid).await;
-            let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") })).await;
-            return;
+            let _ = transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("pty: {e}") })).await;
+            return None;
         }
     };
     let mut cmd = CommandBuilder::new(&argv[0]);
@@ -366,26 +490,19 @@ pub async fn serve_pty(
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(e) => {
-            mux.drop_pty(sid).await;
-            let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") })).await;
-            return;
+            let _ = transport.send_control(&json!({ "type": "l2-close", "sid": sid, "err": format!("spawn: {e}") })).await;
+            return None;
         }
     };
-    drop(pair.slave); // close our copy of the slave so the shell owns the only one
+    drop(pair.slave); // close our copy so the shell owns the only slave
     let master = pair.master;
     let mut reader = match master.try_clone_reader() {
         Ok(r) => r,
-        Err(_) => {
-            mux.drop_pty(sid).await;
-            return;
-        }
+        Err(_) => return None,
     };
     let mut writer = match master.take_writer() {
         Ok(w) => w,
-        Err(_) => {
-            mux.drop_pty(sid).await;
-            return;
-        }
+        Err(_) => return None,
     };
 
     // Blocking PTY-master reads -> async output channel.
@@ -404,7 +521,7 @@ pub async fn serve_pty(
         }
     });
     // Async input -> blocking PTY-master writes (dedicated thread).
-    let (wtx, wrx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (input_tx, wrx) = std::sync::mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         while let Ok(b) = wrx.recv() {
             if writer.write_all(&b).is_err() {
@@ -414,36 +531,123 @@ pub async fn serve_pty(
         }
     });
 
-    let cap = mux.transport.max_payload();
-    loop {
-        tokio::select! {
-            out = orx.recv() => match out {
-                Some(bytes) => {
-                    for chunk in bytes.chunks(cap) {
-                        if mux.transport.send_frame(sid, chunk).await.is_err() {
-                            break;
+    let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let handle = PtySessionHandle {
+        input_tx,
+        resize_tx,
+        cmd_tx,
+        dead: dead.clone(),
+    };
+
+    // The long-lived session task: it owns the PTY output, the current binding,
+    // the replay ring, and the lifetime/idle caps. It outlives every link.
+    let sessions_for_task = sessions.clone();
+    let session_id_for_task = session_id.clone();
+    tokio::spawn(async move {
+        let _guard = pty_guard; // freed when the task ends (any exit path)
+        let mut bind: Option<OutBind> = Some(OutBind { transport, sid });
+        let mut ring: VecDeque<u8> = VecDeque::new();
+        let started = Instant::now();
+        let mut detached_since: Option<Instant> = None;
+        // 5s tick to enforce the idle/lifetime caps without busy-waiting.
+        let mut reaper = tokio::time::interval(Duration::from_secs(5));
+        reaper.tick().await; // consume the immediate first tick
+
+        loop {
+            tokio::select! {
+                out = orx.recv() => match out {
+                    Some(bytes) => {
+                        push_ring(&mut ring, &bytes, SESSION_BUFFER_CAP);
+                        if let Some(b) = &bind {
+                            for chunk in bytes.chunks(b.transport.max_payload().max(1)) {
+                                if b.transport.send_frame(b.sid, chunk).await.is_err() {
+                                    // The link died under us; treat as a detach so
+                                    // output keeps buffering for a reattach.
+                                    detached_since = Some(Instant::now());
+                                    bind = None;
+                                    break;
+                                }
+                            }
                         }
                     }
+                    None => break, // shell exited
+                },
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(SessionCmd::Attach { transport, sid }) => {
+                        // Replay the buffered output to the freshly attached link
+                        // so the user sees the shell exactly as it stands now.
+                        let snapshot: Vec<u8> = ring.iter().copied().collect();
+                        let mp = transport.max_payload().max(1);
+                        let mut ok = true;
+                        for chunk in snapshot.chunks(mp) {
+                            if transport.send_frame(sid, chunk).await.is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if ok {
+                            bind = Some(OutBind { transport, sid });
+                            detached_since = None;
+                        } else {
+                            detached_since = Some(Instant::now());
+                            bind = None;
+                        }
+                    }
+                    Some(SessionCmd::Detach) => {
+                        bind = None;
+                        detached_since = Some(Instant::now());
+                    }
+                    Some(SessionCmd::End) => break, // explicit close: kill the shell
+                    None => break, // all handles dropped (store removed): tear down
+                },
+                rs = resize_rx.recv() => {
+                    if let Some((c, r)) = rs {
+                        let _ = master.resize(PtySize { rows: r.max(1), cols: c.max(1), pixel_width: 0, pixel_height: 0 });
+                    }
                 }
-                None => break, // shell exited
-            },
-            inp = rx.recv() => match inp {
-                Some(Some(bytes)) => { let _ = wtx.send(bytes.to_vec()); }
-                Some(None) | None => break, // browser FIN / pipe dropped
-            },
-            rs = resize_rx.recv() => {
-                if let Some((c, r)) = rs {
-                    let _ = master.resize(PtySize { rows: r.max(1), cols: c.max(1), pixel_width: 0, pixel_height: 0 });
+                _ = reaper.tick() => {
+                    let lifetime_up = started.elapsed() >= SESSION_MAX_LIFETIME;
+                    let idle_up = detached_since
+                        .map(|t| t.elapsed() >= SESSION_DETACHED_IDLE)
+                        .unwrap_or(false);
+                    if lifetime_up || idle_up {
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    drop(wtx); // stop the writer thread
-    let _ = child.kill(); // ensure the shell dies if the browser closed first
-    let _ = child.wait();
-    mux.drop_pty(sid).await; // H-1: free stream + resize sender on this exit path
-    let _ = mux.transport.send_control(&json!({ "type": "l2-close", "sid": sid })).await;
+        // Teardown (shell exit, reap, or store removal): kill the shell, tell the
+        // currently-attached link (if any) the session ended, drop from the store.
+        let _ = child.kill();
+        let _ = child.wait();
+        dead.store(true, Ordering::Release);
+        if let Some(b) = &bind {
+            let _ = b.transport.send_control(&json!({ "type": "l2-close", "sid": b.sid })).await;
+        }
+        sessions_for_task.remove(&session_id_for_task).await;
+    });
+
+    sessions.insert(session_id, handle.clone()).await;
+    Some(handle)
+}
+
+/// Append `bytes` to the replay ring, evicting from the front so it never exceeds
+/// `cap`. A single write larger than `cap` keeps only its trailing `cap` bytes
+/// (the most recent screen state is what matters for replay).
+fn push_ring(ring: &mut VecDeque<u8>, bytes: &[u8], cap: usize) {
+    if bytes.len() >= cap {
+        ring.clear();
+        ring.extend(&bytes[bytes.len() - cap..]);
+        return;
+    }
+    ring.extend(bytes);
+    while ring.len() > cap {
+        ring.pop_front();
+    }
 }
 
 // ------------------------------------------------------------- ACCEPTOR side --
@@ -1011,7 +1215,7 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 
 /// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
 /// process's stdio (the CLI sibling of the browser terminal). No local raw-mode
-/// or resize handling yet, primarily a test/diagnostic of the `serve_pty`
+/// or resize handling yet, primarily a test/diagnostic of the PTY session
 /// acceptor; the browser is the polished client.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
@@ -1280,19 +1484,19 @@ mod h1_tests {
             assert_eq!(mux.resizers.lock().await.len(), 1);
             // Inbound l2-close (browser closed).
             mux.on_close(sid, None).await;
-            drop(guard); // serve_pty task ending frees the global slot
+            drop(guard); // session task ending frees the global slot
             assert_eq!(mux.live_streams().await, 0, "stream not freed on l2-close");
             assert_eq!(mux.resizers.lock().await.len(), 0, "resizer leaked on l2-close");
         }
 
-        // Path B: serve_pty exit (drop_pty) frees stream + resizer.
+        // Path B: session task exit (drop_pty) frees stream + resizer.
         for i in 0..n {
             let sid = L2_SID_BASE | (2000 + i);
             let guard = PtyGuard::try_acquire().expect("slot free");
             let _rx = mux.register_stream(sid).await;
             let (tx, _rrx) = mpsc::unbounded_channel::<(u16, u16)>();
             mux.register_resizer(sid, tx).await;
-            mux.drop_pty(sid).await; // serve_pty's own exit path
+            mux.drop_pty(sid).await; // a session task own exit path
             drop(guard);
             assert_eq!(mux.live_streams().await, 0, "stream not freed on drop_pty");
             assert_eq!(mux.resizers.lock().await.len(), 0, "resizer leaked on drop_pty");
@@ -1362,5 +1566,130 @@ mod h1_tests {
         let before = held.len();
         drop(held);
         assert!(LIVE_PTYS.load(Ordering::SeqCst) <= MAX_PTYS_GLOBAL - before.min(1));
+    }
+
+    // ---- #4: persistent PTY session ----------------------------------------
+
+    /// A Transport that records every frame's payload (per sid) so a test can
+    /// observe what a session actually sent / replayed.
+    struct CapTransport {
+        frames: StdMutex<Vec<(u32, Vec<u8>)>>,
+        controls: StdMutex<Vec<Value>>,
+    }
+    impl CapTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(CapTransport { frames: StdMutex::new(Vec::new()), controls: StdMutex::new(Vec::new()) })
+        }
+        /// All bytes ever sent to `sid`, concatenated in order.
+        fn bytes_for(&self, sid: u32) -> Vec<u8> {
+            self.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _)| *s == sid)
+                .flat_map(|(_, b)| b.clone())
+                .collect()
+        }
+    }
+    #[async_trait]
+    impl Transport for CapTransport {
+        async fn send_control(&self, msg: &Value) -> Result<()> {
+            self.controls.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+        async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
+            self.frames.lock().unwrap().push((sid, payload.to_vec()));
+            Ok(())
+        }
+        async fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn max_payload(&self) -> usize {
+            1024
+        }
+    }
+
+    /// `push_ring` keeps the buffer bounded by `cap`, evicting the OLDEST bytes,
+    /// and a single oversized write keeps only its trailing `cap` bytes.
+    #[test]
+    fn ring_buffer_is_bounded_and_keeps_newest() {
+        let mut ring = VecDeque::new();
+        push_ring(&mut ring, b"hello", 8);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"hello");
+        // "helloworld!!" is 12 bytes; cap 8 keeps the trailing 8: "oworld!!".
+        push_ring(&mut ring, b"world!!", 8);
+        assert_eq!(ring.len(), 8);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"oworld!!");
+    }
+
+    /// A single write LARGER than the cap keeps only its trailing `cap` bytes.
+    #[test]
+    fn ring_buffer_oversized_write_keeps_tail() {
+        let mut ring = VecDeque::new();
+        push_ring(&mut ring, b"0123456789", 4);
+        assert_eq!(ring.iter().copied().collect::<Vec<u8>>(), b"6789");
+    }
+
+    /// End-to-end #4: a session spawned over link A, detached (link A drops),
+    /// then REATTACHED over link B with the same session id REPLAYS the buffered
+    /// output to link B AND the still-running shell keeps working. Uses `cat` as
+    /// the "shell" (it echoes stdin), so input typed after reattach comes back on
+    /// link B, proving the SAME process survived the reconnect.
+    #[tokio::test]
+    async fn session_survives_detach_and_reattaches_with_replay() {
+        // `cat` echoes its stdin: a deterministic stand-in for a live shell whose
+        // process identity we can verify survived the drop.
+        if !std::path::Path::new("/bin/cat").exists() {
+            return; // environment without /bin/cat: skip rather than fail
+        }
+        let sessions = PtySessions::new();
+        let ta = CapTransport::new();
+        let sid_a = L2_SID_BASE | 1;
+        let guard = PtyGuard::try_acquire().expect("slot");
+        let sess = spawn_pty_session(
+            sessions.clone(),
+            "sess-x".to_string(),
+            ta.clone(),
+            sid_a,
+            80,
+            24,
+            vec!["/bin/cat".to_string()],
+            guard,
+        )
+        .await
+        .expect("spawn");
+
+        // Type a line on link A; cat echoes it back to sid_a.
+        sess.feed_input(b"before-drop\n".to_vec());
+        // Give the PTY threads + task a moment to echo and buffer.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let a_out = String::from_utf8_lossy(&ta.bytes_for(sid_a)).to_string();
+        assert!(a_out.contains("before-drop"), "link A never saw the echo: {a_out:?}");
+
+        // Link A drops: detach (the shell MUST keep running).
+        sess.detach();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!sess.is_dead(), "detach must NOT kill the session");
+
+        // Reconnect: attach link B with the same session, new sid. The buffer
+        // (including "before-drop") replays to sid_b.
+        let tb = CapTransport::new();
+        let sid_b = L2_SID_BASE | 2;
+        let live = sessions.get_live("sess-x").await.expect("session still live for reattach");
+        live.attach(tb.clone(), sid_b);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let b_replay = String::from_utf8_lossy(&tb.bytes_for(sid_b)).to_string();
+        assert!(b_replay.contains("before-drop"), "reattach did not replay buffered output: {b_replay:?}");
+
+        // The SAME shell still works: type after reattach, see it on link B.
+        live.feed_input(b"after-reconnect\n".to_vec());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let b_out = String::from_utf8_lossy(&tb.bytes_for(sid_b)).to_string();
+        assert!(b_out.contains("after-reconnect"), "post-reattach input did not echo: {b_out:?}");
+
+        // Explicit end kills the shell and removes the session.
+        live.end();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(sessions.get_live("sess-x").await.is_none(), "ended session must leave the store");
     }
 }

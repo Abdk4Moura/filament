@@ -291,6 +291,7 @@ export class PeerLink {
     this.onCaps = onCaps || (() => {}) // peer announced capabilities (e.g. shell)
     this.peerShell = false // does the peer offer a web-shell? (set by a 'caps' msg)
     this._ptySid = null
+    this._ptySession = null // stable PTY session id, reused across reconnects (#4)
     this.route = null // 'local' | 'direct' | 'relayed'
 
     // Resume support: a stable per-tab identity for the remote peer, plus
@@ -790,9 +791,16 @@ export class PeerLink {
   // The browser allocates a HIGH-HALF sid (top bit set) so the CLI acceptor's
   // is_l2_sid router delivers our input frames to the PTY mux (the low range is
   // file transfer). Output rides the same sid; _onMessage routes it to onPtyData.
-  openPty(cols, rows) {
+  // web-shell: open (or REATTACH to) a PTY. `session` is a stable id chosen by
+  // the terminal that survives a reconnect; passing the same one after a dropped
+  // channel tells the CLI to rebind the still-running PTY and replay its buffered
+  // output instead of spawning a fresh shell (issue #4). Each open allocates a
+  // NEW per-link sid (the old link is gone), but the `session` is what binds the
+  // two opens to the same remote PTY.
+  openPty(cols, rows, session) {
     this._ptySid = (0x80000000 | (this._nextSid++)) >>> 0
-    this._control({ type: 'pty-open', sid: this._ptySid, cols, rows })
+    this._ptySession = session || null
+    this._control({ type: 'pty-open', sid: this._ptySid, cols, rows, session: this._ptySession })
     return this._ptySid
   }
   sendPtyInput(u8) {
@@ -805,10 +813,17 @@ export class PeerLink {
   resizePty(cols, rows) {
     if (this._ptySid != null) this._control({ type: 'pty-resize', sid: this._ptySid, cols, rows })
   }
+  // Explicitly END the remote PTY session (the ✕ / unmount). Carries the stable
+  // session id so the CLI kills the right persistent shell. Distinct from a bare
+  // channel drop, which the CLI treats as a DETACH (the shell keeps running for a
+  // reattach). Sending both the session-scoped close and the per-link l2-close
+  // covers a CLI that has the session AND frees the per-link stream bookkeeping.
   closePty() {
-    if (this._ptySid == null) return
-    this._control({ type: 'l2-close', sid: this._ptySid })
+    if (this._ptySid == null && this._ptySession == null) return
+    if (this._ptySession) this._control({ type: 'pty-close', session: this._ptySession })
+    if (this._ptySid != null) this._control({ type: 'l2-close', sid: this._ptySid })
     this._ptySid = null
+    this._ptySession = null
   }
 
   _onControl(msg) {

@@ -968,9 +968,18 @@ export default function Filament(props) {
         }}>
           {sessions.map((s) => {
             const visible = s.id === activeSessionId
-            // Keep peer metadata (name/route) fresh as the roster updates.
-            const peer = state.peers.find((p) => p.id === s.peer.id) || s.peer
-            const link = state.getLink ? state.getLink(peer.id) : null
+            // Keep peer metadata (name/route) fresh as the roster updates. Match
+            // by stable uid first (the sid changes across a reconnect), then id.
+            const peer =
+              (s.peer.uid && state.peers.find((p) => p.uid === s.peer.uid)) ||
+              state.peers.find((p) => p.id === s.peer.id) ||
+              s.peer
+            // #4: resolve the CURRENT link by stable uid so a reconnect (new sid)
+            // still hands WebTerminal a live link to reattach over; fall back to id.
+            const link =
+              (peer.uid && state.getLinkByUid && state.getLinkByUid(peer.uid)) ||
+              (state.getLink && state.getLink(peer.id)) ||
+              null
             return (
               <div key={s.id} data-testid="session-pane" data-session-pane-id={s.id}
                 style={{ position: 'absolute', inset: 0, display: visible ? 'block' : 'none' }}>
