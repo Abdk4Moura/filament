@@ -1,4 +1,4 @@
-// WebTermPreview — mounts the REAL WebTerminal against a MOCK PeerLink running a
+// WebTermPreview: mounts the REAL WebTerminal against a MOCK PeerLink running a
 // tiny in-browser shell (echo + a few commands), so the terminal UI, the mobile
 // accessory key bar, sticky modifiers, and keyboard handling can be felt and
 // verified live without a paired device. ?preview=webterm.
@@ -28,7 +28,7 @@ function makeMockLink() {
       setTimeout(() => {
         this.onPtyReady()
         this.onPtyData(enc.encode(
-          '\x1b[38;2;124;246;200m●\x1b[0m mock shell — this is the real WebTerminal UI\r\n' +
+          '\x1b[38;2;124;246;200m●\x1b[0m mock shell: this is the real WebTerminal UI\r\n' +
           '\x1b[90m  type, use the key bar, try `help` (no real device attached)\x1b[0m\r\n\r\n' + prompt,
         ))
       }, 60)
@@ -48,7 +48,7 @@ function makeMockLink() {
         } else if (ch === '\x03') { // Ctrl-C
           this.onPtyData(enc.encode('^C\r\n' + prompt)); line = ''
         } else if (ch === '\x1b' || ch.charCodeAt(0) < 0x20) {
-          // escape/control (arrows etc.) — echo a dim marker so taps are visible
+          // escape/control (arrows etc.), echo a dim marker so taps are visible
           this.onPtyData(enc.encode('\x1b[90m·\x1b[0m'))
         } else {
           line += ch; this.onPtyData(enc.encode(ch))
@@ -74,7 +74,7 @@ export default function WebTermPreview() {
   const T = T_DARK
   const accent = '#7CF6C8'
   const font = "'JetBrains Mono',ui-monospace,monospace"
-  if (closed) return <div style={{ position: 'fixed', inset: 0, background: T.bg, color: T.dim, display: 'grid', placeItems: 'center', fontFamily: font }}>closed — reload to reopen</div>
+  if (closed) return <div style={{ position: 'fixed', inset: 0, background: T.bg, color: T.dim, display: 'grid', placeItems: 'center', fontFamily: font }}>closed, reload to reopen</div>
   return (
     <div style={{ position: 'fixed', inset: 0, background: T.bg }}>
       <WebTerminal link={link} peerName="mock-device" route="direct" T={T} accent={accent} font={font} onClose={() => setClosed(true)} />

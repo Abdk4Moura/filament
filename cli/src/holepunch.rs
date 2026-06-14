@@ -1,8 +1,8 @@
 // Rung-2 UDP HOLE-PUNCHING (FILAMENT_HOLEPUNCH=1).
 //
 // Sits BETWEEN rung-1 (direct-dial QUIC, src/direct.rs) and rung-3 (WebRTC/relay)
-// on the transport ladder. When rung-1's host-candidate race fails — both peers
-// behind NAT, no directly-reachable candidate — we open the NATs with a
+// on the transport ladder. When rung-1's host-candidate race fails, both peers
+// behind NAT, no directly-reachable candidate, we open the NATs with a
 // simultaneous-open UDP punch and then run rung-1's UNCHANGED authenticated QUIC
 // handshake over the punched socket. Route label: `holepunched`.
 //
@@ -14,7 +14,7 @@
 // THE LOAD-BEARING CONSTRAINT (see docs/design-rung2-holepunch.md): a srflx
 // candidate belongs to ONE specific UDP socket's NAT mapping, and quinn takes
 // OWNERSHIP of the std socket it is built on. So rung-2 uses its OWN second raw
-// socket — bound + STUN'd at offer time, kept raw until the punch, then handed to
+// socket, bound + STUN'd at offer time, kept raw until the punch, then handed to
 // quinn. Rung-1's socket/endpoint is never touched ⇒ no regression.
 
 use anyhow::{anyhow, Context, Result};
@@ -32,7 +32,7 @@ pub fn holepunch_enabled() -> bool {
 }
 
 /// Total budget for the punch handshake before giving up (and stepping down to
-/// WebRTC). Symmetric NAT defeats the punch — this is how long we wait before
+/// WebRTC). Symmetric NAT defeats the punch, this is how long we wait before
 /// declaring that and falling through.
 pub const PUNCH_BUDGET: Duration = Duration::from_secs(3);
 /// Punch retransmit cadence. The OUTBOUND send opens our NAT mapping/filter; we
@@ -49,7 +49,7 @@ const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 
 /// Hand-rolled STUN Binding: send a Binding request from `sock`, read the
 /// response, return the XOR-MAPPED-ADDRESS (our public ip:port for THIS socket's
-/// NAT mapping). Discovery only — no auth, no symmetric detection (the punch
+/// NAT mapping). Discovery only, no auth, no symmetric detection (the punch
 /// failing IS the symmetric detection). std sockets only; no new dependency.
 ///
 /// `sock` MUST be the same socket we will punch + run QUIC on, or the srflx we
@@ -74,7 +74,7 @@ pub fn stun_srflx(sock: &UdpSocket, stun_server: SocketAddr) -> Result<SocketAdd
     sock.set_read_timeout(Some(Duration::from_millis(700)))
         .context("stun: set read timeout")?;
 
-    // A few attempts — UDP can drop the first request.
+    // A few attempts, UDP can drop the first request.
     let mut last_err = anyhow!("stun: no response");
     for _ in 0..4 {
         if let Err(e) = sock.send_to(&req, stun_server) {
@@ -190,7 +190,7 @@ pub fn bind_punch_socket() -> Result<UdpSocket> {
 /// magic every PUNCH_INTERVAL while reading inbound; succeeds once we have BOTH
 /// sent ≥1 and received ≥1 punch packet (bidirectional confirmation that both
 /// NAT mappings/filters are open). Times out at PUNCH_BUDGET → Err (the caller
-/// steps down to WebRTC — this is the symmetric-NAT outcome).
+/// steps down to WebRTC, this is the symmetric-NAT outcome).
 ///
 /// Runs on a blocking thread (it does blocking UDP I/O) so it doesn't stall the
 /// tokio reactor; the caller `spawn_blocking`s it and gets the socket back.
@@ -215,7 +215,7 @@ pub fn punch(sock: &UdpSocket, peer_srflx: SocketAddr) -> Result<()> {
         match sock.recv_from(&mut buf) {
             Ok((n, from)) => {
                 // Accept a punch from the peer's srflx ip (port may differ if its
-                // NAT remapped — for cone NAT it matches). A received punch
+                // NAT remapped, for cone NAT it matches). A received punch
                 // confirms the peer's filter is open for us.
                 if n >= PUNCH_MAGIC.len() && &buf[..PUNCH_MAGIC.len()] == PUNCH_MAGIC {
                     let _ = from;
@@ -238,14 +238,14 @@ pub fn punch(sock: &UdpSocket, peer_srflx: SocketAddr) -> Result<()> {
         }
     }
     Err(anyhow!(
-        "HOLEPUNCH-FAIL: no bidirectional punch in budget (sent={sent}, recvd={recvd}) — symmetric NAT?"
+        "HOLEPUNCH-FAIL: no bidirectional punch in budget (sent={sent}, recvd={recvd}), symmetric NAT?"
     ))
 }
 
 // ====================================================== quinn over the punch
 
 /// Build a quinn Endpoint on the already-punched (still UNCONNECTED) std socket.
-/// quinn sets it nonblocking and manages its own addressing — we do NOT connect()
+/// quinn sets it nonblocking and manages its own addressing, we do NOT connect()
 /// it. Server + client config are rung-1's, verbatim.
 pub fn endpoint_from_socket(sock: UdpSocket) -> Result<Endpoint> {
     let mut ep = Endpoint::new(
@@ -285,8 +285,8 @@ pub async fn connect(
         crate::ui::trace(&format!("filament: {e}"));
         return None; // step down to WebRTC
     }
-    // DEBUG — direct/hole-punch internal.
-    crate::ui::debug(&format!("filament: HOLEPUNCH ok — NAT open toward {peer_srflx}, starting QUIC"));
+    // DEBUG, direct/hole-punch internal.
+    crate::ui::debug(&format!("filament: HOLEPUNCH ok, NAT open toward {peer_srflx}, starting QUIC"));
 
     let endpoint = match endpoint_from_socket(punch_sock) {
         Ok(ep) => ep,

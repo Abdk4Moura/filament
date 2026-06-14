@@ -14,7 +14,7 @@
 //   sig.leave()
 //
 // Both implementations emit the SAME four inbound events and accept the same
-// join/signal/leave calls — that is the whole point of the abstraction.
+// join/signal/leave calls, that is the whole point of the abstraction.
 
 import { io } from 'socket.io-client'
 import { API_BASE } from './api.js'
@@ -87,9 +87,9 @@ class SocketIOSignaling extends Emitter {
   pairClaimV2(nameplate) {
     this.socket.emit('pair-claim', { nameplate, v: 2 })
   }
-  // C12: raise known-device presence channels (sha256 meeting points — the
+  // C12: raise known-device presence channels (sha256 meeting points; the
   // server never sees a secret). Idempotent; safe to re-send on reconnect.
-  // C28: onAck fires with the server's reply — callers verify the emit landed
+  // C28: onAck fires with the server's reply, callers verify the emit landed
   // (an unverified subscribe lost in a half-open socket = invisible devices).
   subscribe(channels, onAck) {
     if (channels?.length) this.socket.emit('subscribe', { channels }, (resp) => onAck?.(resp))
@@ -98,7 +98,7 @@ class SocketIOSignaling extends Emitter {
   // session state ({v, room, name, uid, channels}); the server ensures
   // membership + subscriptions + lease refresh and acks with its resulting
   // digest. Mirrors subscribe's ack shape. lib/session.js owns the loop that
-  // decides WHEN to call this — here we only carry the wire.
+  // decides WHEN to call this; here we only carry the wire.
   sync(state, onAck) {
     this.socket.emit('sync', state, (resp) => onAck?.(resp))
   }
@@ -171,7 +171,7 @@ class FirebaseSignaling extends Emitter {
       })
     })
   }
-  // C30: Firebase has no relay-side session to converge — presence and
+  // C30: Firebase has no relay-side session to converge; presence and
   // subscriptions are modeled directly in Firestore by join(). The convergent
   // sync is therefore a no-op that acks IMMEDIATELY: the session loop only
   // re-emits while confirmed stays unconfirmed, so an instant ack lets it go
@@ -180,7 +180,7 @@ class FirebaseSignaling extends Emitter {
   sync(_state, onAck) {
     onAck?.({ v: 1, ok: true, firebase: true })
   }
-  // Firebase's socket is always "up" once ready — there is no half-open relay
+  // Firebase's socket is always "up" once ready; there is no half-open relay
   // socket to gate against. Reported true so the (dormant) loop isn't blocked.
   get connected() {
     return true

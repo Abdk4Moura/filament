@@ -1,4 +1,4 @@
-/* Filament — polished "Terminal" presentation component.
+/* Filament: polished "Terminal" presentation component.
    Ported from the Claude Design handoff (Variant A · Terminal). Presentation
    only: driven by `state` + callbacks whose names match useFilament(). An
    optional `ui` prop carries display options (theme/accent/density/columns/font);
@@ -13,17 +13,17 @@ import { pakeReady, previewCustomCode } from '../lib/pairing.js'
 import { mintNameplate } from '../lib/words.js'
 
 // Relay honesty (transport-resilience P1, §3.5). Relay (TURN) is still
-// end-to-end encrypted but is NOT a direct link — the "no middleman on the wire"
+// end-to-end encrypted but is NOT a direct link; the "no middleman on the wire"
 // property is gone, so it must be LOUD and HONEST wherever it appears. The exact
-// words are chosen to neither over-claim ("insecure/exposed" — false, it's
-// encrypted) nor under-claim ("direct/private" — false, there IS a middleman on
+// words are chosen to neither over-claim ("insecure/exposed", false, it's
+// encrypted) nor under-claim ("direct/private", false, there IS a middleman on
 // the wire). Single source of truth so the tile, sheet and top bar all agree.
 const RELAY_EXPLAINER =
-  'On relay — routed through a TURN server, not a direct link. Still end-to-end encrypted; the relay forwards bytes it can’t read.'
+  'On relay: routed through a TURN server, not a direct link. Still end-to-end encrypted; the relay forwards bytes it can’t read.'
 
 // ---- data helpers (inlined from the handoff's data.js) --------------------
 function formatBytes(n) {
-  if (n == null) return '—'
+  if (n == null) return '-'
   if (n < 1024) return n + ' B'
   const u = ['KB', 'MB', 'GB', 'TB']
   let i = -1
@@ -47,7 +47,7 @@ const STATUS_LABEL = {
   declined: 'declined',
   failed: 'failed',
 }
-const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away — be right back' }
+const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away, be right back' }
 
 // ---- theme system ----------------------------------------------------------
 const MONOS = {
@@ -107,9 +107,9 @@ function StatusDot({ color, glow }) {
 }
 
 function routeMeta(route, T) {
-  if (route === 'local') return { label: 'LAN', color: T.ok, tip: 'Direct link — bytes go straight between you, no middleman.' }
-  if (route === 'direct') return { label: 'P2P', color: T.recv, tip: 'Direct link — bytes go straight between you, no middleman.' }
-  // relayed is the ONLY route with a middleman on the wire — it gets the loud
+  if (route === 'local') return { label: 'LAN', color: T.ok, tip: 'Direct link: bytes go straight between you, no middleman.' }
+  if (route === 'direct') return { label: 'P2P', color: T.recv, tip: 'Direct link: bytes go straight between you, no middleman.' }
+  // relayed is the ONLY route with a middleman on the wire; it gets the loud
   // amber ⚠ treatment + the honest explainer (it is still E2E-encrypted).
   if (route === 'relayed') return { label: 'RELAY', color: T.warn, relay: true, tip: RELAY_EXPLAINER }
   return null
@@ -152,9 +152,9 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
   const inp = useRef(null)
   const tileRef = useRef(null)
   // 'away' (C21): the peer announced a benign absence (e.g. it is choosing a
-  // file on a phone) — amber, calm, explicitly not an error.
+  // file on a phone), amber, calm, explicitly not an error.
   const sc = ready ? T.ok : peer.status === 'connecting' || peer.status === 'away' ? T.warn : T.bad
-  // C12: a remembered device — here because of the PAIRING, not the room.
+  // C12: a remembered device, here because of the PAIRING, not the room.
   // Dashed accent border + chip distinguish it; the hint line says why.
   const known = !!peer.known
   // Prefer OUR local petname for a remembered/verified device over the name the
@@ -162,7 +162,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
   // Strangers/unknown peers keep their announced name.
   const displayName = peer.known || peer.verified || peer.name
   // SHELL badge: this device ADVERTISED a terminal (peer.shell, from the CLI's
-  // `caps` message — `up --shell` / FILAMENT_L2). Pure presentation — it makes
+  // `caps` message: `up --shell` / FILAMENT_L2). Pure presentation; it makes
   // "this device is a machine" visible at rest. The actual Open-terminal action
   // lives in the DeviceSheet, gated server-side on top of this hint.
   const isMachine = !!peer.shell
@@ -176,7 +176,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
   // canSheet gates the sheet trigger (right-click / ⋯ / mobile tap) to remembered
   // devices, exactly as model H did with showMore.
   const canSheet = ready && known && onOpenSheet
-  // The hovered `›_` open-terminal chip — only when the device advertises a shell.
+  // The hovered `›_` open-terminal chip, only when the device advertises a shell.
   const canTerminal = ready && known && isMachine && onOpenTerminal
   // The model-H top-right ⋯ flex-item is gone on BOTH form factors: on mobile the
   // whole tile opens the sheet; on desktop the hover action bar's `⋯ more` chip
@@ -189,7 +189,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
     if (narrow && canSheet) { openSheet(); return }
     if (inp.current) inp.current.click()
   }
-  // Desktop hover bar replaces the hint line (swap, never stack) — see below.
+  // Desktop hover bar replaces the hint line (swap, never stack); see below.
   const showHoverBar = !narrow && hov && ready && (canTerminal || canSheet)
   return (
     <div
@@ -203,7 +203,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
       onDragOver={(e) => { if (ready) { e.preventDefault(); setOver(true) } }}
       onDragLeave={() => setOver(false)}
       onDrop={(e) => { e.preventDefault(); setOver(false); if (ready && e.dataTransfer.files.length) onSendFiles(peer.id, e.dataTransfer.files) }}
-      title={known ? 'Remembered device — you two reconnect automatically, in any room. No shared room or code needed.' : undefined}
+      title={known ? 'Remembered device: you two reconnect automatically, in any room. No shared room or code needed.' : undefined}
       style={{
         position: 'relative', aspectRatio: '1 / 1', minWidth: 0,
         background: over ? (T.mode === 'light' ? '#EAF7F1' : '#0E1A16') : T.panel,
@@ -224,8 +224,8 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
             keeps the dot + ⋯ flush-right when there's spare width. */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0, flexShrink: 1 }}>
           {/* Relay honesty: when a peer is on relay its ⚠ chip is the SINGLE
-              most important top-row marker — silent relay breaks the no-middleman
-              promise — so it renders FIRST and never flex-shrinks. On a narrow
+              most important top-row marker (silent relay breaks the no-middleman
+              promise) so it renders FIRST and never flex-shrinks. On a narrow
               tile REMEMBERED/SHELL clip before the safety-critical relay chip. */}
           {peer.route === 'relayed' && <RouteBadge route="relayed" T={T} />}
           {known && (
@@ -260,7 +260,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
           </span>
           <span style={{ flexShrink: 0 }}>{peer.lastSeen}</span>
         </div>
-        {/* Hint line OR (desktop hover) the inline action bar — a SWAP, never a
+        {/* Hint line OR (desktop hover) the inline action bar, a SWAP, never a
             stack: exactly one of the two renders in this slot, so the bar
             occupies the hint's space and there is no overlap (the historical
             layout bug came from stacking a second element over the hint). */}
@@ -297,7 +297,7 @@ function PeerTile({ peer, onSendFiles, onOpenSheet, onOpenTerminal, narrow, T, D
           <div style={{ fontSize: 10, color: ready ? (hov ? accent : T.faint) : T.faint, marginTop: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', transition: 'color .12s', minHeight: 15 }}>
             {ready
               ? (over ? 'release to send' : narrow ? (known ? 'tap → actions' : 'tap · drop to send') : hov ? '↳ drop or click to send' : known ? 'remembered · click to send' : 'click · drop to send')
-              : known ? 'remembered · reaches you in any room' : '—'}
+              : known ? 'remembered · reaches you in any room' : '-'}
           </div>
         )}
       </div>
@@ -345,7 +345,7 @@ function TransferRow({ t, onAccept, onDecline, onSave, onClear, T, D, accent }) 
         {recv && t.status === 'offered' && (<>{btn('accept', () => onAccept(t.id), T.ok)}{btn('decline', () => onDecline(t.id), T.bad)}</>)}
         {recv && t.status === 'complete' && btn('save', () => onSave(t.id), accent)}
         {!recv && t.status === 'offered' && <span style={{ fontSize: 11, color: T.dim }}>waiting for accept…</span>}
-        {t.status === 'paused' && <span style={{ fontSize: 11, color: T.dim }}>paused — resumes on reconnect</span>}
+        {t.status === 'paused' && <span style={{ fontSize: 11, color: T.dim }}>paused, resumes on reconnect</span>}
         {(t.status === 'complete' || t.status === 'declined' || t.status === 'failed' || t.status === 'paused') && btn('clear', () => onClear(t.id), T.dim)}
       </div>
     </div>
@@ -395,11 +395,11 @@ function LanChip({ localHelper, T }) {
 }
 
 // Cursor-safe auto-dash code field. The prior regression reformatted the whole
-// string on every keystroke and let React reset the caret to the END — so any
+// string on every keystroke and let React reset the caret to the END, so any
 // mid-string edit jumped to the tail. Here we (1) count the ALPHANUMERIC chars
 // before the caret in the raw input, (2) format, (3) re-find that same Nth
 // alphanumeric in the formatted string, and (4) restore the caret there in a
-// layout effect (before paint). Counting alphanumerics — not raw offset — makes
+// layout effect (before paint). Counting alphanumerics, not raw offset, makes
 // collapse/strip/paste/backspace all caret-stable regardless of length change.
 function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, placeholder, accent, T }) {
   const ref = useRef(null)
@@ -439,7 +439,7 @@ function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, pla
     }
     // If the char just before the raw caret was a separator (the user just typed
     // a space/dash to end a word), step PAST the dash it became, so the next
-    // word starts after the dash — not before it (which would shove the dash to
+    // word starts after the dash, not before it (which would shove the dash to
     // the tail). Conditional on the separator: a normal mid-word edit must NOT
     // skip, or the caret would jump over a real dash.
     if (sel > 0 && /[\s-]/.test(raw[sel - 1]) && formatted[pos] === '-') pos++
@@ -458,7 +458,7 @@ function CodeInput({ value, onChange, format, onSubmit, onCancel, autoFocus, pla
 // STEERING: "choose your own code" entry. The user types words (and optionally a
 // number); we show a LIVE normalized preview (the shared WASM normCode/splitCode,
 // so it matches what SPAKE2 hashes), auto-append a dimmed connect number when
-// they typed none, and gate Create on the >= 2-word strength floor — a gentle
+// they typed none, and gate Create on the >= 2-word strength floor, a gentle
 // nudge, never a hard block on typing. On Create we hand the RAW typed string to
 // onGenerateCode (the hook re-parses it with the same shared split).
 function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
@@ -503,7 +503,7 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
           {pv.autoAssigned && <span style={{ fontSize: 10.5, color: T.dim }}>  (number added for you)</span>}
         </div>
       )}
-      {/* Steering nudge: weak (single-word) input — typing stays allowed. */}
+      {/* Steering nudge: weak (single-word) input; typing stays allowed. */}
       {pv && typed.trim() && !pv.strongEnough && (
         <div data-testid="custom-nudge" style={{ fontSize: 11, lineHeight: 1.4, color: '#e0564f' }}>
           use at least two words, e.g. gigantic-element (easier to say, harder to guess)
@@ -543,7 +543,7 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
   const formatCode = (raw) => raw.toUpperCase().replace(/[\s-]+/g, '-').replace(/^-+/, '')
 
   // Keep the input open after submitting a code so the user sees the result
-  // (success/failure) and can correct a mistyped code in place — closing the
+  // (success/failure) and can correct a mistyped code in place; closing the
   // box on submit is why pairing failures used to vanish silently.
   const submitCode = () => { const c = code.trim(); if (c) onPairWithCode(c) }
 
@@ -601,8 +601,8 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
           <button onClick={() => fireCopy(onCopyRoomLink)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', whiteSpace: 'nowrap', background: 'transparent', color: accent, border: '1px solid ' + accent }}>{copied ? 'copied ✓' : 'copy link'}</button>
           <LanChip localHelper={state.localHelper} T={T} />
         </div>
-        {/* Codes work from ANY room — minting is additive (the claimer joins
-            THIS room) — so the affordance belongs here too, not just in auto. */}
+        {/* Codes work from ANY room (minting is additive: the claimer joins
+            THIS room) so the affordance belongs here too, not just in auto. */}
         {customizing ? (
           <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
         ) : entering ? (
@@ -686,7 +686,7 @@ function PakeKeepBanner({ k, onAcceptPakeKeep, onDeclinePakeKeep, T, D, accent }
   )
 }
 
-// Shell-surfacing Phase 2 — the SESSIONS strip (idea E). A slim bar that only
+// Shell-surfacing Phase 2: the SESSIONS strip (idea E). A slim bar that only
 // renders when ≥1 terminal session is open or backgrounded (free to the 90% who
 // never open a shell). One chip per session: click to switch/reopen, ✕ to close
 // (which tears down its PTY). Desktop: a thin bar atop the peers column; mobile:
@@ -770,7 +770,7 @@ export default function Filament(props) {
   const [narrow, setNarrow] = useState(!!ui.forceMobile)
   const [tab, setTab] = useState('peers')
   // Shell-surfacing Phase 2: a LIST of open terminal sessions (was a single
-  // shellPeer). Each session's WebTerminal stays MOUNTED for its lifetime —
+  // shellPeer). Each session's WebTerminal stays MOUNTED for its lifetime,
   // backgrounding only hides the overlay (activeSessionId = null), it does NOT
   // unmount (unmount → link.closePty() kills the PTY). Only an explicit close
   // unmounts a session, tearing down its PTY. Scrollback survives backgrounding
@@ -796,18 +796,18 @@ export default function Filament(props) {
     setActiveSessionId((cur) => (cur === id ? null : cur))
   }, [])
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null
-  // model H: the per-device actions sheet. { peer, rect } — rect anchors the
+  // model H: the per-device actions sheet. { peer, rect }: rect anchors the
   // desktop popover near the invoking tile (null = a sensible default position).
   const [sheet, setSheet] = useState(null)
   const openSheet = useCallback((peer, rect) => setSheet({ peer, rect }), [])
   const closeSheet = useCallback(() => setSheet(null), [])
-  // Idea C — the ⌘K / Ctrl+K command palette. A global hotkey toggles it; the
+  // Idea C: the ⌘K / Ctrl+K command palette. A global hotkey toggles it; the
   // overlay itself owns navigation/close. Opening the palette dismisses the
   // sheet so the two surfaces never stack.
   const [paletteOpen, setPaletteOpen] = useState(false)
   const openPalette = useCallback(() => { setSheet(null); setPaletteOpen(true) }, [])
   const closePalette = useCallback(() => setPaletteOpen(false), [])
-  // The palette's "Pair with code" has no inline field — it asks the always-
+  // The palette's "Pair with code" has no inline field; it asks the always-
   // visible DiscoveryBar to open ITS code input (which owns the cursor-safe
   // entry). A monotonic nonce is the signal; the bar opens on each new value.
   const [pairEntryNonce, setPairEntryNonce] = useState(0)
@@ -839,7 +839,7 @@ export default function Filament(props) {
     return () => ro.disconnect()
   }, [ui.forceMobile])
 
-  // ⌘K affordance — discoverable on mobile (no hardware shortcut) and a hint on
+  // ⌘K affordance: discoverable on mobile (no hardware shortcut) and a hint on
   // desktop. Opens the same palette the hotkey toggles.
   const paletteBtn = (
     <button
@@ -898,7 +898,7 @@ export default function Filament(props) {
       state.transfers.map((t) => <TransferRow key={t.id} t={t} onAccept={onAccept} onDecline={onDecline} onSave={onSave} onClear={onClear} T={T} D={D} accent={accent} />)
     )
 
-  // C27: remembering is a trust grant — surface each pair-keep offer as an
+  // C27: remembering is a trust grant; surface each pair-keep offer as an
   // explicit question; the answer flows back so a declined sender forgets too.
   const keepBanners = (state.pendingKeeps || []).map((k) => (
     <div key={k.peerId} style={{
@@ -906,7 +906,7 @@ export default function Filament(props) {
       marginBottom: 10, display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap',
     }}>
       <span style={{ fontSize: 12, color: T.text }}>
-        <b>{k.name}</b> asks to be remembered on this device — you'd reconnect automatically, no codes
+        <b>{k.name}</b> asks to be remembered on this device, you'd reconnect automatically, no codes
       </span>
       <span style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
         <button onClick={() => onAcceptKeep?.(k.peerId)} style={{ font: 'inherit', fontSize: 11, padding: '7px 12px', cursor: 'pointer', background: accent, color: T.onAccent, border: '1px solid ' + accent }}>remember</button>
@@ -915,7 +915,7 @@ export default function Filament(props) {
     </div>
   ))
 
-  // L1-a: v2 PAKE pairings completed — K is agreed, now ask before remembering
+  // L1-a: v2 PAKE pairings completed: K is agreed, now ask before remembering
   // (with an editable name). Kept separate from v1 keepBanners on purpose.
   const pakeKeepBanners = (state.pendingPakeKeep || []).map((k) => (
     <PakeKeepBanner key={k.peerId} k={k} onAcceptPakeKeep={onAcceptPakeKeep} onDeclinePakeKeep={onDeclinePakeKeep} T={T} D={D} accent={accent} />
@@ -939,11 +939,11 @@ export default function Filament(props) {
 
   // web-shell: terminals render as a full-window overlay (portal to body) so it
   // works in both the desktop and mobile layouts from one place. Disclosure
-  // stays intact — a session only exists once a shell button is clicked.
+  // stays intact; a session only exists once a shell button is clicked.
   //
   // Shell-surfacing Phase 2: EVERY open session's WebTerminal is mounted here at
   // once; only the active one is visible (the rest are display:none). This is
-  // load-bearing — keeping a backgrounded session mounted preserves its live PTY
+  // load-bearing: keeping a backgrounded session mounted preserves its live PTY
   // (unmount calls link.closePty()) and its scrollback. The whole portal only
   // exists while ≥1 session is open; when none is active the overlay is hidden
   // (pointerEvents:none) but the sessions stay mounted underneath.
@@ -1001,7 +1001,7 @@ export default function Filament(props) {
     />
   )
 
-  // model H: the per-device actions sheet — a bottom sheet on mobile, an anchored
+  // model H: the per-device actions sheet, a bottom sheet on mobile, an anchored
   // popover on desktop. `Open terminal` here closes the sheet and opens the same
   // WebTerminal overlay as before (setShellPeer), so the terminal path is
   // unchanged. It itself portals to body, so render it from either layout.
@@ -1023,7 +1023,7 @@ export default function Filament(props) {
     />
   ) : null
 
-  // Idea C — the command palette overlay. Reuses the very handlers the tiles and
+  // Idea C: the command palette overlay. Reuses the very handlers the tiles and
   // discovery bar drive: a device row routes through openSheet/openSession; the
   // globals call the pairing actions. It portals to body, so render once.
   const commandPalette = (

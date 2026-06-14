@@ -1,4 +1,4 @@
-// WebTerminal — a real browser shell wired to a peer's PTY over the data channel.
+// WebTerminal: a real browser shell wired to a peer's PTY over the data channel.
 // Given a live PeerLink, it opens a pty (pty-open), bridges xterm <-> the PTY
 // byte stream, handles resize, and provides a mobile accessory key bar (the
 // missing-special-keys fix) with a sticky-toggle modifier model + an escape-
@@ -81,7 +81,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
 
     // bridge: PTY -> xterm
     link.onPtyData = (u8) => term.write(u8)
-    link.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m— session ended —\x1b[0m\r\n') }
+    link.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
     link.onPtyReady = () => setStatus('ready')
     // bridge: xterm -> PTY (with sticky modifiers)
     const dataSub = term.onData((d) => write(applyMods(d)))
@@ -118,7 +118,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   useEffect(() => { if (termRef.current) termRef.current.options.theme = xtermTheme(T, accent) }, [T, accent])
 
   // Sessions dock: when this instance is un-hidden (reopened from the background)
-  // its host had display:none, so xterm couldn't measure — refit + refocus now
+  // its host had display:none, so xterm couldn't measure: refit + refocus now
   // that it's visible again. The terminal was NEVER unmounted, so scrollback and
   // the live PTY are intact. requestAnimationFrame waits for the layout to apply.
   useEffect(() => {
@@ -176,7 +176,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
               instance stays mounted, reachable from the SESSIONS strip). */}
           {onBackground && (
             <span title="background (keep running)" onClick={onBackground}
-              style={{ cursor: 'pointer', fontSize: 12, letterSpacing: '.04em' }}>— hide</span>
+              style={{ cursor: 'pointer', fontSize: 12, letterSpacing: '.04em' }}>hide</span>
           )}
           <span title="close (end session)" onClick={onClose} style={{ cursor: 'pointer', fontSize: 15 }}>✕</span>
         </span>

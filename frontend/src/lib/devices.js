@@ -1,14 +1,14 @@
 // Known devices: the browser half of persistent pairing (C12/C20).
 //
 // A "known device" is a {name, secret} pair persisted in localStorage. The
-// secret is E2E — the server only ever sees sha256("filament-pair:"+secret),
+// secret is E2E: the server only ever sees sha256("filament-pair:"+secret),
 // the meeting-point channel two holders subscribe to. Mutual acknowledgement
 // is structural: presence lights up ONLY when both sides hold the secret and
 // raise the same channel; trust is asserted per-link with an HMAC proof bound
 // to the link's DTLS fingerprints, so neither the server nor a MITM can
 // impersonate a known device.
 //
-// This mirrors the CLI exactly (cli/src/main.rs channel_of / proof_for) — the
+// This mirrors the CLI exactly (cli/src/main.rs channel_of / proof_for); the
 // strings MUST stay byte-identical or browsers and CLIs stop recognizing
 // each other.
 import { log } from './log.js'
@@ -32,7 +32,7 @@ export function devicesStore(name, secret) {
     localStorage.setItem(KEY, JSON.stringify(list))
   } catch (e) {
     // Private Browsing / storage blocked: the device won't be remembered and
-    // auto-reconnect won't work — say so where a debugger will look.
+    // auto-reconnect won't work, say so where a debugger will look.
     dlog.warn('could not persist known device (private browsing?)', e)
   }
   return list
@@ -69,7 +69,7 @@ export function deviceAllows(name, capability) {
   return !!caps && caps.includes(capability)
 }
 
-/// Rename a device's LOCAL petname — pure client-side relabel. The `secret`
+/// Rename a device's LOCAL petname: pure client-side relabel. The `secret`
 /// (and thus the meeting-point channel + every proof) is untouched, so the
 /// reconnect identity is byte-stable; only the human-facing label changes.
 /// Renames the FIRST record matching `oldName`; a no-op if it isn't found or

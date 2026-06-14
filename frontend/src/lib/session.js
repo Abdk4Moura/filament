@@ -1,4 +1,4 @@
-// session.js — the convergent session (C30).
+// session.js: the convergent session (C30).
 //
 // The cure for the lost-emit disease class (docs/design-c30-convergent-session.md):
 // session state is no longer held in N edge-triggered belts (rejoin belt #14,
@@ -6,19 +6,19 @@
 // Instead ONE level-triggered loop keeps a single `desired` snapshot converged
 // with what the server has confirmed.
 //
-//   desired   = { room, name, uid, channels: Set<hex> }   — edited ONLY by app actions
-//   confirmed = { snapshot, at }                           — edited ONLY by sync acks
+//   desired   = { room, name, uid, channels: Set<hex> }   (edited ONLY by app actions)
+//   confirmed = { snapshot, at }                           (edited ONLY by sync acks)
 //
-// Every 5s (and on kick(): socket-up, tab-visible) — if the socket is up AND
-// (digest(desired) != digest(confirmed) OR confirmed is stale > 30s) — we emit
+// Every 5s (and on kick(): socket-up, tab-visible), if the socket is up AND
+// (digest(desired) != digest(confirmed) OR confirmed is stale > 30s), we emit
 // ONE idempotent `sync { full desired state }`. The server ensures membership,
 // subscriptions, and lease refresh, then acks with its resulting digest; the
-// ack stamps `confirmed`. No emit is load-bearing — only convergence is.
+// ack stamps `confirmed`. No emit is load-bearing, only convergence is.
 //
 // Loss shim (gate L): the module silently drops a configurable fraction of its
 // OWN emits so any code path that secretly depends on a single emit arriving
 // fails in CI by construction. Per the design doc the BROWSER reads this from a
-// query param (`?telLoss=0.3&telSeed=...`) — it cannot read process env at
+// query param (`?telLoss=0.3&telSeed=...`); it cannot read process env at
 // runtime the way the CLI does. (The pinned protocol names env vars
 // FILAMENT_TEST_EMIT_LOSS/FILAMENT_TEST_EMIT_SEED for the CLI flavor; the
 // browser-specific mechanism is the query param. See shared notes.)
@@ -27,7 +27,7 @@ const TICK_MS = 5000 // loop cadence
 const STALE_MS = 30000 // re-sync even if unchanged once confirmed is older than this
 const ACK_MS = 4000 // an ack not seen within this window counts as missed
 
-// Stable digest of a desired snapshot. Channels are SORTED before serializing —
+// Stable digest of a desired snapshot. Channels are SORTED before serializing:
 // a Set's iteration order is insertion order, so an unsorted digest would
 // spuriously differ across re-derivations of the same set.
 function digest(s) {
@@ -35,7 +35,7 @@ function digest(s) {
   return `${s.room || ''}|${s.name || ''}|${s.uid || ''}|${chans}`
 }
 
-// Seeded PRNG (mulberry32) — deterministic given telSeed, so a lossy run is
+// Seeded PRNG (mulberry32), deterministic given telSeed, so a lossy run is
 // reproducible. Returns floats in [0,1).
 function mulberry32(seed) {
   let a = seed >>> 0
@@ -65,7 +65,7 @@ function readLossConfig() {
 //
 // sig: signaling client. Must expose `sync(state, onAck)` and a `connected`
 //      getter (true when session-state emits can land).
-// tel: telemetry fn (ev, data) — kept LOW volume: we only emit when state
+// tel: telemetry fn (ev, data), kept LOW volume: we only emit when state
 //      actually changed or an ack was missed.
 export function createSession(sig, tel = () => {}, onDigest = null) {
   const desired = { room: null, name: null, uid: null, channels: new Set() }
@@ -73,7 +73,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
 
   // In-flight guard: 5s tick + kick(socket-up) + kick(visible) all funnel
   // through one emit. While a sync is outstanding (<ACK_MS, not yet acked) we
-  // must NOT fire a second — confirmed hasn't updated yet so the digest still
+  // must NOT fire a second: confirmed hasn't updated yet so the digest still
   // differs. This replaces the old debounce; the digest check kills the
   // boot-storm but only with this guard.
   let pendingSince = 0 // 0 = nothing outstanding
@@ -101,7 +101,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
     const stale = now - confirmed.at >= STALE_MS
     if (!changed && !stale) return
 
-    // Snapshot desired AT EMIT — channels sorted — and apply it on the ack.
+    // Snapshot desired AT EMIT (channels sorted) and apply it on the ack.
     // The ack callback must not read live `desired`; it may have mutated.
     const snapshot = {
       room: desired.room,
@@ -120,10 +120,10 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
     pendingSince = now
     pendingDigest = digest(snapshot)
     // Keep tel volume low (spec: only when state changed or an ack was missed).
-    // The 30s staleness re-sync is a heartbeat, neither — don't log it.
+    // The 30s staleness re-sync is a heartbeat, neither, don't log it.
     if (changed) tel('sync', { changed })
 
-    // Loss shim: drop our OWN emit silently — confirmed stays stale, the loop
+    // Loss shim: drop our OWN emit silently, confirmed stays stale, the loop
     // retries on the next tick, and the missed-ack path fires above.
     if (shouldDrop()) return
 
@@ -133,7 +133,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       confirmed = { snapshot, at: Date.now() }
       pendingSince = 0
       pendingDigest = null
-      // C30 phase 2: the digest may carry the server's roster — hand it to
+      // C30 phase 2: the digest may carry the server's roster, hand it to
       // the reconciler (ok:true only; error digests carry no roster).
       if (onDigest && resp && resp.ok === true && Array.isArray(resp.peers)) onDigest(resp.peers)
     })
@@ -148,13 +148,13 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
   const timer = setInterval(() => maybeSync(Date.now()), TICK_MS)
 
   return {
-    // Pure data edit — room membership. kick() to raise immediately.
+    // Pure data edit: room membership. kick() to raise immediately.
     setRoom(room, name, uid) {
       desired.room = room
       desired.name = name
       desired.uid = uid
     },
-    // Pure data edit — known-device presence channels (64-hex strings).
+    // Pure data edit: known-device presence channels (64-hex strings).
     setChannels(hexArray) {
       desired.channels = new Set(hexArray || [])
     },
@@ -164,7 +164,7 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
     // server dropped from its room + subscriptions, so the old confirmation is
     // void. Callers invalidate on every socket-up (then kick): without this, a
     // reconnect within the 30s staleness window would find desired==confirmed
-    // and emit nothing — leaving the fresh sid a roomless ghost (#14) with
+    // and emit nothing, leaving the fresh sid a roomless ghost (#14) with
     // unraised channels (C28) until the staleness timer trips. This is exactly
     // the one re-assert per socket-up the old rejoin belt did.
     invalidate() {
@@ -172,11 +172,11 @@ export function createSession(sig, tel = () => {}, onDigest = null) {
       pendingSince = 0
       pendingDigest = null
     },
-    // Teardown — clears the loop timer (HMR/unmount leak otherwise).
+    // Teardown: clears the loop timer (HMR/unmount leak otherwise).
     stop() {
       clearInterval(timer)
     },
-    // Exposed for tests/inspection — do not mutate directly.
+    // Exposed for tests/inspection: do not mutate directly.
     desired,
   }
 }

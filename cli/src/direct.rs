@@ -1,6 +1,6 @@
 // Rung-1 DIRECT CLI<->CLI transport over QUIC (quinn).
 //
-// Why this exists: WebRTC/ICE/STUN/TURN is browser machinery — two CLIs are
+// Why this exists: WebRTC/ICE/STUN/TURN is browser machinery, two CLIs are
 // full network stacks and, when either end is directly reachable, should dial
 // each other with no relay tax. See docs/design-direct-cli-transport.md (the
 // doc proposes Noise-over-TCP; we use QUIC instead: TLS encryption + multiplexed
@@ -14,7 +14,7 @@
 // hands back an `Arc<dyn Transport>` the caller injects as `Ev::ChannelReady`,
 // exactly like the DataChannel path.
 //
-// Security (NON-NEGOTIABLE, must match DTLS — see the module's auth section):
+// Security (NON-NEGOTIABLE, must match DTLS, see the module's auth section):
 // self-signed certs give an encrypted pipe but ZERO authentication. Trust is
 // bound to the PAIR SECRET via an RFC-5705 TLS keying-material exporter: both
 // peers derive the same session-unique value, HKDF the pair secret into an
@@ -45,7 +45,7 @@ use crate::net::Transport;
 /// reliable CLI<->CLI and WebRTC is too flaky cross-machine (it gets "stuck
 /// while connecting" even over TURN), while direct-QUIC to a reachable peer is
 /// rock-solid. A plain `up`/`send` WITHOUT FILAMENT_L2 keeps the WebRTC default
-/// byte-for-byte unchanged — the file-transfer hard rule.
+/// byte-for-byte unchanged, the file-transfer hard rule.
 pub fn direct_enabled() -> bool {
     let on = |k: &str| std::env::var(k).map(|v| v == "1").unwrap_or(false);
     on("FILAMENT_DIRECT") || on("FILAMENT_L2")
@@ -53,24 +53,24 @@ pub fn direct_enabled() -> bool {
 
 /// Test-only: force the direct race to fail (simulate a blocked direct path)
 /// so the fallback gate can assert WebRTC still completes WITH the flag ON.
-/// Not a product knob — only the fallback gate sets it.
+/// Not a product knob, only the fallback gate sets it.
 fn test_block() -> bool {
     std::env::var("FILAMENT_DIRECT_TEST_BLOCK").map(|v| v == "1").unwrap_or(false)
 }
 
 /// P0 stall-detector PROOF hook (test-only): `FILAMENT_TEST_FREEZE_AFTER_BYTES=N`
 /// makes the FIRST direct transport's data path go silently dark after it has
-/// written ~N bytes of *file data* — `send_frame` parks forever while the QUIC
+/// written ~N bytes of *file data*, `send_frame` parks forever while the QUIC
 /// connection stays UP and CONTROL frames keep flowing. That is the exact
 /// "open channel, zero data bytes" black-hole (the Pixel-at-0% hang / a NAT
 /// rebind that strands only the data 5-tuple), reproduced deterministically.
 ///
 /// It is ONE-SHOT across the process (a process-global latch): once one
 /// transport has frozen, a *fresh* transport built by the correction ladder's
-/// in-place repair (rung c) is NOT frozen — so the test proves the stall is
+/// in-place repair (rung c) is NOT frozen, so the test proves the stall is
 /// both DETECTED and AUTO-RECOVERED on the re-dialled path, not merely detected.
 /// Never a product knob; only the data-path-freeze sim sets it. Compiled in ONLY
-/// under `--features test-hooks` — stripped from default/release builds.
+/// under `--features test-hooks`, stripped from default/release builds.
 #[cfg(feature = "test-hooks")]
 fn freeze_after_bytes() -> Option<u64> {
     std::env::var("FILAMENT_TEST_FREEZE_AFTER_BYTES")
@@ -80,14 +80,14 @@ fn freeze_after_bytes() -> Option<u64> {
 }
 
 /// P1 relay-fallback PROOF hook (test-only): `FILAMENT_TEST_FREEZE_PERSIST=1`
-/// makes the data-path freeze PERSISTENT instead of one-shot — EVERY fresh direct
+/// makes the data-path freeze PERSISTENT instead of one-shot, EVERY fresh direct
 /// transport (including the correction ladder's rung-c re-dials) freezes after the
 /// byte threshold. So the direct/in-place-repair ladder can never recover; it
 /// EXHAUSTS, and the only way the transfer completes is the rung-(d) escalation
 /// to the TURN relay (a WebRTC path that doesn't ride this direct-QUIC freeze).
 /// This is how the relay-fallback gate forces the exact "direct can't, relay can"
 /// condition deterministically. Only that sim sets it. Compiled in ONLY under
-/// `--features test-hooks` — stripped from default/release builds.
+/// `--features test-hooks`, stripped from default/release builds.
 #[cfg(feature = "test-hooks")]
 fn freeze_persist() -> bool {
     std::env::var("FILAMENT_TEST_FREEZE_PERSIST").map(|v| v == "1").unwrap_or(false)
@@ -96,11 +96,11 @@ fn freeze_persist() -> bool {
 /// P5 (GAP-6) relay->direct UPGRADE PROOF hook (test-only):
 /// `FILAMENT_TEST_DIRECT_UNBLOCK_MS=N` LIFTS the persistent direct freeze for any
 /// transport born after N ms of process uptime. So the timeline is: early direct
-/// transports freeze (the peer falls to relay, rung d), then — once the prober
-/// dials a FRESH direct standby after the unblock moment — that late transport is
+/// transports freeze (the peer falls to relay, rung d), then, once the prober
+/// dials a FRESH direct standby after the unblock moment, that late transport is
 /// NOT frozen and carries data, letting the prober VERIFY + UPGRADE back to
 /// direct. Unset ⇒ no lift (the freeze persists forever, as P1's gate needs).
-/// Compiled in ONLY under `--features test-hooks` — stripped from release.
+/// Compiled in ONLY under `--features test-hooks`, stripped from release.
 #[cfg(feature = "test-hooks")]
 fn direct_unblock_after_ms() -> Option<u64> {
     std::env::var("FILAMENT_TEST_DIRECT_UNBLOCK_MS")
@@ -111,12 +111,12 @@ fn direct_unblock_after_ms() -> Option<u64> {
 
 /// P5 (GAP-6) NO-FLAP PROOF hook (test-only): `FILAMENT_TEST_DIRECT_FLAKY=1`
 /// makes a post-unblock direct standby CONNECT and move a little data, then
-/// RE-FREEZE almost immediately — modelling a flaky direct path that comes up but
+/// RE-FREEZE almost immediately, modelling a flaky direct path that comes up but
 /// won't hold. The verify-before-upgrade guard must catch this and DISCARD the
 /// standby (stay on relay), never flapping relayed<->direct. With this set, the
 /// unblock lift is GRANTED for connection (so the standby forms) but the transport
 /// re-freezes after a tiny byte threshold. Compiled in ONLY under
-/// `--features test-hooks` — stripped from release.
+/// `--features test-hooks`, stripped from release.
 #[cfg(feature = "test-hooks")]
 fn direct_flaky_upgrade() -> bool {
     std::env::var("FILAMENT_TEST_DIRECT_FLAKY").map(|v| v == "1").unwrap_or(false)
@@ -131,14 +131,14 @@ const FLAKY_REFREEZE_BYTES: u64 = 4_096;
 /// Process-global "a transport has already frozen once" latch (see
 /// `freeze_after_bytes`). `false` until the first transport freezes; once `true`
 /// every later transport streams normally, so rung-c's fresh dial recovers.
-/// Test-only — stripped from default/release builds.
+/// Test-only, stripped from default/release builds.
 #[cfg(feature = "test-hooks")]
 static FROZE_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Total budget for the whole direct attempt before falling back to WebRTC.
 pub const DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// ALPN — distinguishes our QUIC app; both ends must agree.
+/// ALPN, distinguishes our QUIC app; both ends must agree.
 const ALPN: &[u8] = b"filament-direct/1";
 
 /// Max app payload per send_frame. QUIC streams are byte-streams with no
@@ -204,7 +204,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Every local non-loopback interface IP (v4+v6). Std-only: enumerate by
 /// "connecting" UDP sockets to public anchors and reading the chosen local
 /// addr (no packets sent). This yields the primary routable v4 and v6 source
-/// addresses — the ones a peer on the same LAN / overlay can actually reach.
+/// addresses, the ones a peer on the same LAN / overlay can actually reach.
 fn local_ips() -> Vec<IpAddr> {
     let mut out = Vec::new();
     // v4 default route source
@@ -237,11 +237,11 @@ fn local_ips() -> Vec<IpAddr> {
 }
 
 /// P5 (GAP-6): a stable, sorted snapshot of the local ROUTABLE source addresses
-/// (loopback excluded — it never changes and would mask a real handoff). The
+/// (loopback excluded, it never changes and would mask a real handoff). The
 /// relay->direct prober polls this each tick: a change (new/removed interface,
 /// wifi<->cellular handoff, default-route move) is the strongest portable "a new
 /// direct path may exist NOW" signal, and triggers an immediate re-probe. Cheap
-/// (two UDP `connect`s, no packets) and dependency-free — no platform netlink.
+/// (two UDP `connect`s, no packets) and dependency-free, no platform netlink.
 pub fn local_ip_snapshot() -> Vec<String> {
     let mut v: Vec<String> = local_ips()
         .into_iter()
@@ -255,7 +255,7 @@ pub fn local_ip_snapshot() -> Vec<String> {
 
 /// Public IP for cross-NAT reachability: `FILAMENT_PUBLIC_IP` override wins,
 /// else a one-line `GET /api/whoami` echo of CF-Connecting-IP (the droplet is
-/// behind Cloudflare; the backend reads that header). Best-effort — failure
+/// behind Cloudflare; the backend reads that header). Best-effort, failure
 /// just means we advertise no public candidate.
 async fn public_ip(server: &str) -> Option<IpAddr> {
     if let Ok(v) = std::env::var("FILAMENT_PUBLIC_IP") {
@@ -282,13 +282,13 @@ fn cand_str(ip: IpAddr, port: u16) -> String {
 }
 
 /// Test-only: suppress rung-1's public (`whoami`) candidate. `/api/whoami`
-/// returns IP only, NO port — so rung-1 advertises `public_ip:local_port`, which
+/// returns IP only, NO port, so rung-1 advertises `public_ip:local_port`, which
 /// is correct ONLY when the NAT preserves the source port (Linux MASQUERADE in
 /// the lab happens to). On the very common NAT that does NOT preserve the port,
-/// that guessed candidate is wrong and rung-1's public path fails — which is
+/// that guessed candidate is wrong and rung-1's public path fails, which is
 /// exactly the class rung-2's STUN-learned srflx (real external port) exists to
 /// catch. This knob models that NAT class so the cone gate can exercise rung-2 in
-/// isolation. NOT a product knob — only the hole-punch gate sets it.
+/// isolation. NOT a product knob, only the hole-punch gate sets it.
 fn suppress_public() -> bool {
     std::env::var("FILAMENT_DIRECT_NO_PUBLIC").map(|v| v == "1").unwrap_or(false)
 }
@@ -298,8 +298,8 @@ fn suppress_public() -> bool {
 /// local candidates; the simultaneous-open race can then pick a pair that can't
 /// actually carry data, so even a CLEAN same-host transfer is flaky. This knob
 /// makes same-host gates deterministic by advertising ONLY loopback. NOT a
-/// product knob — only the local sim gates set it.
-/// Test-only — compiled in ONLY under `--features test-hooks`; the production
+/// product knob, only the local sim gates set it.
+/// Test-only, compiled in ONLY under `--features test-hooks`; the production
 /// twin returns `false` so a default/release build never reads the env and
 /// advertises the real candidate set.
 #[cfg(feature = "test-hooks")]
@@ -333,7 +333,7 @@ pub async fn gather_candidates(server: &str, port: u16) -> Vec<String> {
 // =============================================================== TLS configs ==
 
 /// Client verifier that accepts ANY server cert. This is SAFE here and ONLY
-/// here: authentication does NOT come from the PKI — it comes from the
+/// here: authentication does NOT come from the PKI, it comes from the
 /// keying-material MAC bound to the pair secret (below). A wrong/forged cert
 /// still produces a valid encrypted pipe, but the post-handshake MAC fails
 /// unless the peer holds the secret. We deliberately skip CA validation.
@@ -385,14 +385,14 @@ impl ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-/// Explicit ring provider — we never rely on a process-default crypto provider
+/// Explicit ring provider, we never rely on a process-default crypto provider
 /// (webrtc + reqwest both pull rustls into the tree; the default is ambiguous).
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// rung-2 reuses these QUIC configs verbatim — same ALPN, same accept-any-cert +
-/// keying-material auth — only the underlying socket differs (a punched one).
+/// rung-2 reuses these QUIC configs verbatim, same ALPN, same accept-any-cert +
+/// keying-material auth, only the underlying socket differs (a punched one).
 pub(crate) fn server_config() -> Result<quinn::ServerConfig> {
     let ck = rcgen::generate_simple_self_signed(vec!["filament-direct".to_string()])
         .context("self-signed cert")?;
@@ -438,7 +438,7 @@ pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
 
 // ====================================================== authenticated handshake
 
-/// 32-byte RFC-5705 exporter value — the session-unique channel binding. A
+/// 32-byte RFC-5705 exporter value, the session-unique channel binding. A
 /// MITM relay terminating TLS on each leg gets a DIFFERENT value, so the MAC it
 /// would have to forward cannot validate against its own peer's binding.
 fn keying_material(conn: &quinn::Connection) -> Result<[u8; 32]> {
@@ -488,7 +488,7 @@ async fn authenticate(
 
     if !ct_eq(&peer_tag, &their_expected) {
         // Don't leak which byte differed; the log marker is for the gates.
-        bail!("DIRECT-AUTH-FAIL: pair-secret MAC mismatch — rejecting peer");
+        bail!("DIRECT-AUTH-FAIL: pair-secret MAC mismatch, rejecting peer");
     }
     Ok((send, recv))
 }
@@ -514,14 +514,14 @@ pub struct DirectTransport {
     sent_data: std::sync::atomic::AtomicU64,
     /// PROOF hook: set once THIS transport's data path has gone dark, so EVERY
     /// subsequent `send_frame` on it parks too (a black-holed path stays dark,
-    /// not just the one stream that tripped it) — faithful to a NAT-rebind that
+    /// not just the one stream that tripped it), faithful to a NAT-rebind that
     /// strands the data 5-tuple. A fresh transport (rung c) has this clear.
     /// Compiled out entirely unless `--features test-hooks` is set.
     #[cfg(feature = "test-hooks")]
     frozen: std::sync::atomic::AtomicBool,
     /// P5 (GAP-6) PROOF hook: process-uptime (ms) at which THIS transport was
     /// born. The relay->direct upgrade gate uses `FILAMENT_TEST_DIRECT_UNBLOCK_MS`
-    /// to LIFT the persistent freeze for transports born AFTER that moment — so the
+    /// to LIFT the persistent freeze for transports born AFTER that moment, so the
     /// peer first falls to relay (early transports freeze) and then the prober's
     /// DIRECT standby (a late transport) actually carries data, proving the
     /// detect->verify->UPGRADE path. Compiled out unless `--features test-hooks`.
@@ -549,7 +549,7 @@ impl DirectTransport {
         hdr[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
         let mut s = self.send.lock().await;
         // QUIC streams apply flow control internally; write_all parks on the
-        // peer's receive window — that IS the backpressure (no manual high-water
+        // peer's receive window, that IS the backpressure (no manual high-water
         // loop needed). A frozen receiver stalls here, so last_activity stops
         // advancing exactly like the DataChannel path's #28 guard.
         if let Err(e) = s.write_all(&hdr).await {
@@ -573,10 +573,10 @@ impl Transport for DirectTransport {
 
     async fn send_frame(&self, sid: u32, payload: &[u8]) -> Result<()> {
         // P5 (GAP-6): the relay->direct UPGRADE lift. A transport born AFTER the
-        // unblock moment is the prober's DIRECT standby — let it carry data so the
+        // unblock moment is the prober's DIRECT standby, let it carry data so the
         // verify-before-upgrade can confirm + cut over. In FLAKY mode the lift is
         // granted only for the first few KB (it connects + looks alive for a beat),
-        // then it re-freezes — exercising the no-flap guard (verify must DISCARD it).
+        // then it re-freezes, exercising the no-flap guard (verify must DISCARD it).
         #[cfg(feature = "test-hooks")]
         let unblocked = match direct_unblock_after_ms() {
             Some(after) => self.born_ms >= after,
@@ -600,7 +600,7 @@ impl Transport for DirectTransport {
                 .fetch_add(payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
             if prior + (payload.len() as u64) >= FLAKY_REFREEZE_BYTES {
                 self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("[test] FLAKY direct standby re-froze at {prior} bytes — verify must discard it");
+                eprintln!("[test] FLAKY direct standby re-froze at {prior} bytes, verify must discard it");
                 loop {
                     if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err(anyhow!("direct connection closed (flaky standby discarded)"));
@@ -616,7 +616,7 @@ impl Transport for DirectTransport {
             return Ok(());
         }
         // P0 PROOF hook: black-hole the data path after N bytes on the FIRST
-        // transport. We DON'T write and DON'T stamp last_activity — so this
+        // transport. We DON'T write and DON'T stamp last_activity, so this
         // transport's idle_ms() climbs while the connection stays up and control
         // frames keep flowing, exactly the stall the bytes-moved watchdog must
         // catch. Parking here (not erroring) mimics a wire that silently drops
@@ -635,8 +635,8 @@ impl Transport for DirectTransport {
                     // transport freezes. The FIRST one freezes after `limit` bytes
                     // (so the receiver builds a real .part to resume from); once
                     // that first freeze has happened (FROZE_ONCE latched), every
-                    // SUBSEQUENT fresh direct transport — the ladder's rung-c
-                    // re-dials — freezes IMMEDIATELY (at byte 0), making zero
+                    // SUBSEQUENT fresh direct transport, the ladder's rung-c
+                    // re-dials, freezes IMMEDIATELY (at byte 0), making zero
                     // progress. So direct can NEVER carry the file forward and the
                     // ladder must exhaust → escalate to relay (rung d). Without the
                     // immediate-freeze, each re-dial would ship another `limit`
@@ -647,7 +647,7 @@ impl Transport for DirectTransport {
                     if already_froze || cross {
                         FROZE_ONCE.store(true, std::sync::atomic::Ordering::SeqCst);
                         self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
-                        eprintln!("[test] data-path FREEZE engaged at {} bytes — black-holing this transport", prior);
+                        eprintln!("[test] data-path FREEZE engaged at {} bytes, black-holing this transport", prior);
                     }
                 } else if prior + (payload.len() as u64) >= limit
                     && !FROZE_ONCE.swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -655,10 +655,10 @@ impl Transport for DirectTransport {
                     // One-shot (P0): only the FIRST transport freezes; rung-c's
                     // fresh re-dial streams normally and recovers.
                     self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("[test] data-path FREEZE engaged at {} bytes — black-holing this transport", prior);
+                    eprintln!("[test] data-path FREEZE engaged at {} bytes, black-holing this transport", prior);
                 }
             }
-            // Once dark, EVERY send_frame on this transport parks — the path
+            // Once dark, EVERY send_frame on this transport parks, the path
             // stays black-holed until the ladder tears it down (rung c).
             if self.frozen.load(std::sync::atomic::Ordering::Relaxed) {
                 loop {
@@ -680,7 +680,7 @@ impl Transport for DirectTransport {
     async fn flush(&self) -> Result<()> {
         // Per-file flush (called after every `file-end`). QUIC is ordered and
         // reliable, so file N's buffered tail is delivered before file N+1's
-        // bytes with no app-layer action — and we MUST NOT `finish()` here or a
+        // bytes with no app-layer action, and we MUST NOT `finish()` here or a
         // multi-file send dies after the first file. The real delivery barrier
         // is in `drain_finish()`, run once at teardown.
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
@@ -692,14 +692,14 @@ impl Transport for DirectTransport {
     async fn drain_finish(&self) -> Result<()> {
         // THE cross-machine fix. `write_all` only commits bytes to quinn's send
         // buffer; dropping the connection (process exit after `send`) sends
-        // CONNECTION_CLOSE immediately and discards anything not yet acked — on a
+        // CONNECTION_CLOSE immediately and discards anything not yet acked, on a
         // real WAN that truncates the last file's tail (loopback hid it: the
         // buffer drains before close). quinn's documented barrier: `finish()` the
         // stream (this runs ONLY at final teardown, so ending the send half is
         // correct), then await `stopped()`, which resolves `Ok(None)` once the
         // peer has acknowledged receipt of every byte incl. the FIN.
         if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(()); // connection already gone — nothing left to drain
+            return Ok(()); // connection already gone, nothing left to drain
         }
         let stopped = {
             let mut s = self.send.lock().await;
@@ -818,7 +818,7 @@ fn make_transport(
 ///
 /// `endpoint` is the already-bound shared endpoint (so the advertised port is
 /// the one we actually listen on). `peer_cands` are the peer's advertised
-/// `ip:port` strings. `secret` is the pair secret (known-device only — rung 1).
+/// `ip:port` strings. `secret` is the pair secret (known-device only, rung 1).
 pub async fn race_connect(
     endpoint: Endpoint,
     peer_cands: Vec<String>,
@@ -841,12 +841,12 @@ pub async fn race_connect_labeled(
     route: &str,
 ) -> Option<Arc<dyn Transport>> {
     // The test-block knob only simulates a blocked rung-1 (direct-quic) path so
-    // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2 — a
+    // the WebRTC fallback gate can assert. It must NOT short-circuit rung-2, a
     // hole-punch race carries a distinct label.
     if route == "direct-quic" && test_block() {
         // Fallback gate: pretend the direct path is unreachable. Drop the
         // endpoint and let the budget expire so WebRTC takes over.
-        eprintln!("filament: DIRECT-BLOCKED (test) — forcing WebRTC fallback");
+        eprintln!("filament: DIRECT-BLOCKED (test), forcing WebRTC fallback");
         tokio::time::sleep(DIRECT_BUDGET).await;
         endpoint.close(0u32.into(), b"test-block");
         return None;
@@ -898,7 +898,7 @@ pub async fn race_connect_labeled(
             match res {
                 Ok((conn, send, recv)) => return Some((conn, send, recv)),
                 Err(e) => {
-                    // Auth failures are the negative-gate signal — make them
+                    // Auth failures are the negative-gate signal, make them
                     // greppable. Dial failures (unreachable candidate) are noise.
                     let s = e.to_string();
                     if s.contains("DIRECT-AUTH-FAIL") {
@@ -920,7 +920,7 @@ pub async fn race_connect_labeled(
     };
 
     let (conn, send, recv) = winner;
-    // DEBUG — direct-connect diagnostic (the user-facing route label is the
+    // DEBUG, direct-connect diagnostic (the user-facing route label is the
     // `route:` line emitted in main.rs; this is the internal detail).
     crate::ui::debug(&format!(
         "filament: DIRECT-CONNECT ok (route: {}) peer={} remote={}",

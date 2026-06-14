@@ -1,13 +1,13 @@
-// L2 — ssh / raw TCP tunnelled over the Filament WebRTC data channel.
+// L2, ssh / raw TCP tunnelled over the Filament WebRTC data channel.
 //
 // Productionizes docs/L2-tunnel-design.md (spike: cli/spike/l2spike.rs). L2
 // multiplexes logical TCP streams over the SAME data channel that moves files
-// today, reusing the `Transport` trait verbatim — no transport changes.
+// today, reusing the `Transport` trait verbatim, no transport changes.
 //
 // SCOPE: single-stream (ssh / one forward at a time is the supported case and
 // what ships first). Multiple *concurrent heavy* streams over one link need
 // per-stream credit flow control (design §4) to stay deadlock-free; that is a
-// follow-up — see TODO(credits) below. l2-open-ack is mandatory here (it closes
+// follow-up, see TODO(credits) below. l2-open-ack is mandatory here (it closes
 // the early-frame-drop race and the open/deny ambiguity); the `credit` field it
 // will eventually carry is the only piece deferred.
 //
@@ -49,7 +49,7 @@ pub fn is_l2_sid(sid: u32) -> bool {
 
 /// Per-stream pipe item: `Some(bytes)` = data; `None` = clean half-close/EOF
 /// (an empty 4-byte data frame). A RST/abort is signalled out-of-band by
-/// dropping the whole stream entry (writer wakes on a closed channel) — distinct
+/// dropping the whole stream entry (writer wakes on a closed channel), distinct
 /// from `None` so a reset is never mistaken for an orderly EOF.
 type PipeItem = Option<Bytes>;
 type StreamTx = mpsc::Sender<PipeItem>;
@@ -65,7 +65,7 @@ struct StreamHandle {
 
 /// H-1 (DoS): per-link cap on concurrently live streams (file + L2 + PTY share
 /// the `streams` table). Beyond this an `l2-open`/`pty-open` is refused. A
-/// generous bound — interactive use needs only a handful — that still stops a
+/// generous bound, interactive use needs only a handful, that still stops a
 /// flaky/hostile paired device from spawning unbounded threads/sockets.
 pub const MAX_STREAMS_PER_LINK: usize = 8;
 
@@ -75,7 +75,7 @@ pub const MAX_STREAMS_PER_LINK: usize = 8;
 pub const MAX_PTYS_GLOBAL: usize = 32;
 
 /// Process-wide live-PTY counter (incremented just before a `serve_pty` task is
-/// spawned, decremented when it ends — see `PtyGuard`). The acceptor checks it
+/// spawned, decremented when it ends, see `PtyGuard`). The acceptor checks it
 /// against `MAX_PTYS_GLOBAL` before granting a `pty-open`.
 pub static LIVE_PTYS: AtomicUsize = AtomicUsize::new(0);
 
@@ -106,7 +106,7 @@ impl Drop for PtyGuard {
 }
 
 /// The multiplexer: routes inbound control/data frames to per-stream pipes and
-/// owns stream-id allocation. Transport-agnostic — it rides above the trait.
+/// owns stream-id allocation. Transport-agnostic, it rides above the trait.
 pub struct Mux {
     transport: Arc<dyn Transport>,
     streams: Mutex<HashMap<u32, StreamHandle>>,
@@ -115,9 +115,9 @@ pub struct Mux {
     /// duplicate open is ignored. (Initiator allocates, so it can't double-open.)
     accepted: Mutex<HashMap<u32, ()>>,
     /// web-shell: per-sid PTY resize senders. H-1: owning these HERE (rather than
-    /// in the main event loop) guarantees they are dropped on EVERY teardown path
-    /// — inbound `l2-close` (`on_close`), `serve_pty` exit (`drop_pty`), and
-    /// link/mux death (`shutdown_all`) — closing the resizer-map leak.
+    /// in the main event loop) guarantees they are dropped on EVERY teardown path:
+    /// inbound `l2-close` (`on_close`), `serve_pty` exit (`drop_pty`), and
+    /// link/mux death (`shutdown_all`), closing the resizer-map leak.
     resizers: Mutex<HashMap<u32, mpsc::UnboundedSender<(u16, u16)>>>,
 }
 
@@ -158,13 +158,13 @@ impl Mux {
         if let Some(s) = self.streams.lock().await.get_mut(&sid) {
             s.read_pump = Some(h);
         } else {
-            // Stream already gone (raced with teardown) — kill the orphan pump.
+            // Stream already gone (raced with teardown), kill the orphan pump.
             h.abort();
         }
     }
 
     /// Register a stream's inbound pipe (public, for the PTY acceptor which
-    /// registers BEFORE spawning the shell — same pre-registration race fix as
+    /// registers BEFORE spawning the shell, same pre-registration race fix as
     /// l2-open's dial path).
     pub async fn register_stream(&self, sid: u32) -> mpsc::Receiver<PipeItem> {
         self.register(sid).await
@@ -196,7 +196,7 @@ impl Mux {
     }
 
     /// Register a PTY's resize sender (acceptor). Stored in the mux so it is freed
-    /// on every teardown path with the stream — see `resizers`.
+    /// on every teardown path with the stream, see `resizers`.
     pub async fn register_resizer(&self, sid: u32, tx: mpsc::UnboundedSender<(u16, u16)>) {
         self.resizers.lock().await.insert(sid, tx);
     }
@@ -225,7 +225,7 @@ impl Mux {
     }
 
     /// Inbound l2-close. `err` set = RST/abort (drop, do NOT deliver clean EOF);
-    /// no `err` = the peer is done — also a drop (its data direction already
+    /// no `err` = the peer is done, also a drop (its data direction already
     /// EOF'd via the empty frame). Either way: abort pumps, close the socket.
     async fn on_close(&self, sid: u32, _err: Option<&str>) {
         self.drop_stream(sid).await;
@@ -449,7 +449,7 @@ pub async fn serve_pty(
 // ------------------------------------------------------------- ACCEPTOR side --
 
 /// Decision for an inbound `l2-open`, made synchronously in the event loop
-/// BEFORE any await — so the pipe is registered before a data frame for this sid
+/// BEFORE any await, so the pipe is registered before a data frame for this sid
 /// can be processed (closes the early-frame-drop race, design §3.4).
 pub enum OpenVerdict {
     /// Accepted: dial this localhost target and relay. Carries the pre-registered
@@ -457,7 +457,7 @@ pub enum OpenVerdict {
     Accept { sid: u32, host: String, port: u16, rx: mpsc::Receiver<PipeItem> },
     /// Refused: send l2-close{err} and forget it.
     Deny { sid: u32, err: &'static str },
-    /// Not an l2-open / malformed — ignore.
+    /// Not an l2-open / malformed, ignore.
     Ignore,
 }
 
@@ -474,7 +474,7 @@ impl Mux {
                     return OpenVerdict::Ignore;
                 };
                 if !is_l2_sid(sid) {
-                    return OpenVerdict::Ignore; // not in the high half — not ours
+                    return OpenVerdict::Ignore; // not in the high half, not ours
                 }
                 // Idempotency: a duplicate open for a live sid is ignored.
                 {
@@ -561,7 +561,7 @@ impl Mux {
 
 /// True if `host` is a loopback address/name. We accept the literal "localhost"
 /// and any address that parses to a loopback IP. (DNS for arbitrary names is
-/// deliberately NOT performed here — the default contract is localhost-only and
+/// deliberately NOT performed here, the default contract is localhost-only and
 /// a name that isn't "localhost" is treated as non-loopback.)
 fn host_is_loopback(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
@@ -577,7 +577,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// `forget()` to keep the link alive for the process lifetime (byte-identical to
 /// the old `std::mem::forget`). A short-lived consumer (the shell bootstrap)
 /// calls `close().await` to TEAR THE LINK DOWN before opening a second link to
-/// the same device — otherwise the acceptor sees two same-device peers at once
+/// the same device, otherwise the acceptor sees two same-device peers at once
 /// and its C6 supersede/adopt logic churns (one link gets dropped mid-use).
 pub struct LinkGuard {
     sio: Option<rust_socketio::asynchronous::Client>,
@@ -611,7 +611,7 @@ impl LinkGuard {
 /// Minimal identity-mode link bring-up to a *known* device, mirroring the
 /// production send/recv path but stripped to exactly what L2 needs: join a solo
 /// room, subscribe to the device's presence channel, dial it when it appears,
-/// and prove our identity (pair-proof) so its `up`/`recv` marks us trusted —
+/// and prove our identity (pair-proof) so its `up`/`recv` marks us trusted,
 /// which is what unlocks the acceptor's capability gate. Returns the ready
 /// Transport, the event receiver, and a `LinkGuard` the caller must either
 /// `forget()` (keep alive) or `close().await` (tear down).
@@ -624,7 +624,7 @@ async fn bring_up_to_known(
         .into_iter()
         .find(|(n, _)| n.eq_ignore_ascii_case(peer_name))
         .map(|(_, s)| s)
-        .ok_or_else(|| anyhow!("no known device named '{peer_name}' — run `filament pair` first (see `filament devices`)"))?;
+        .ok_or_else(|| anyhow!("no known device named '{peer_name}', run `filament pair` first (see `filament devices`)"))?;
     let channel = crate::channel_of(&secret);
 
     let cfg = net::fetch_config(server).await?;
@@ -638,7 +638,7 @@ async fn bring_up_to_known(
     sio.emit("join", json!({ "room": solo, "uid": my_uid, "name": crate::display_name() }))
         .await
         .ok();
-    // NOTE: subscribe is emitted on Ev::Welcome (below), not here — `welcome` is
+    // NOTE: subscribe is emitted on Ev::Welcome (below), not here, `welcome` is
     // the proof the socket.io connection is fully established, so the subscribe
     // can't be lost in the connect->emit race that intermittently left the client
     // unsubscribed and "waiting for known device" forever (harness finding).
@@ -651,7 +651,7 @@ async fn bring_up_to_known(
     // lingers until the server's ping-timeout) and WRONG peers (our own up
     // subscribes the same pair channel). Locking onto the first known-peer
     // forever was the dominant stall. Instead: one candidate AT A TIME (a
-    // parallel race glares — proven, see multicandidate-attempt.patch), a
+    // parallel race glares, proven, see multicandidate-attempt.patch), a
     // short per-candidate timer, and rotation through everything seen.
     let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
     const CANDIDATE_SECS: u64 = 7;
@@ -659,13 +659,13 @@ async fn bring_up_to_known(
     // KnownPeer we bind a quinn endpoint + advertise our candidates (mirrors
     // `start_direct` in main.rs); when the peer's transport-offer arrives we
     // consume this endpoint into the race. UNCONDITIONAL here: `bring_up_to_known`
-    // only ever serves L2 (netcat/ssh/forward), which always wants direct — and
+    // only ever serves L2 (netcat/ssh/forward), which always wants direct, and
     // `filament ssh`/`netcat` do NOT set FILAMENT_L2 in their own env, so gating
     // on `direct_enabled()` would kill the direct dial on the live path. main.rs
     // gates because it ALSO serves file transfer; this function never does.
     let mut endpoint: Option<quinn::Endpoint> = None;
     // Candidates gathered once at first bind; re-advertised to each new
-    // candidate peer we rotate to (the endpoint accepts from any of them —
+    // candidate peer we rotate to (the endpoint accepts from any of them,
     // the QUIC race is pair-secret-authenticated either way).
     let mut direct_cands: Option<Vec<String>> = None;
     // The acceptor re-sends its transport-offer (a late initiator can miss the
@@ -709,11 +709,11 @@ async fn bring_up_to_known(
                                 direct_cands =
                                     Some(crate::direct::gather_candidates(server, port).await);
                                 endpoint = Some(ep);
-                                // TRACE — direct-offer detail.
-                                crate::ui::trace(&format!("filament: DIRECT-OFFER sent to '{peer_name}' — port {port}"));
+                                // TRACE, direct-offer detail.
+                                crate::ui::trace(&format!("filament: DIRECT-OFFER sent to '{peer_name}', port {port}"));
                             }
                             Err(e) => {
-                                crate::ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e}) — WebRTC only"));
+                                crate::ui::trace(&format!("filament: direct disabled (endpoint bind failed: {e}), WebRTC only"));
                             }
                         }
                     }
@@ -752,7 +752,7 @@ async fn bring_up_to_known(
                 // #9: never dial our OWN install (the up subscribes this pair
                 // channel too). Pair secrets are symmetric, so a self-connect
                 // can pass the pair-proof and tunnel into the WRONG host's
-                // sshd — the local daemon answering as the remote device.
+                // sshd, the local daemon answering as the remote device.
                 if crate::is_self_uid(&my_uid, v["uid"].as_str()) {
                     continue;
                 }
@@ -792,9 +792,9 @@ async fn bring_up_to_known(
                             .as_array()
                             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                             .unwrap_or_default();
-                        // DEBUG — resilience/direct internal (racing a direct path).
+                        // DEBUG, resilience/direct internal (racing a direct path).
                         crate::ui::debug(&format!(
-                            "filament: got transport-offer ({} cand) — racing direct-quic",
+                            "filament: got transport-offer ({} cand), racing direct-quic",
                             peer_cands.len()
                         ));
                         let secret = secret.clone();
@@ -814,7 +814,7 @@ async fn bring_up_to_known(
                     continue;
                 }
                 // Route by sender: the channel is multi-party (our own up
-                // subscribes it too, plus lingering dead sids) — a stray offer
+                // subscribes it too, plus lingering dead sids), a stray offer
                 // applied to the current pc was a reliable glare generator.
                 let from = v["from"].as_str().unwrap_or_default();
                 let Some(p) = &peer else { continue };
@@ -848,35 +848,35 @@ async fn bring_up_to_known(
             Ev::DirectReady(_pid, t, route) => {
                 // Item 3: the DIRECT-QUIC race won before WebRTC. The acceptor's
                 // `adopt_direct` (main.rs) is born `trusted: true` + identity-bound
-                // `verified_name` — its pair-secret MAC already proved who we are —
+                // `verified_name`, its pair-secret MAC already proved who we are,
                 // so the cap gate is satisfied WITHOUT a pair-proof. We deliberately
                 // do NOT replicate the ChannelReady proof here: that MAC is built
                 // from the WebRTC DTLS fingerprints, which a direct QUIC link does
                 // not have, and the acceptor's direct link (`peer: None`) has none
                 // to verify against. (design-l2-direct-ladder.md §NOTE: pre-trust
-                // OR pair-proof — we confirmed pre-trust holds for the L2 acceptor.)
-                // INFO — tunnel established (with its route label).
+                // OR pair-proof, we confirmed pre-trust holds for the L2 acceptor.)
+                // INFO, tunnel established (with its route label).
                 crate::ui::say(&format!("filament: tunnel up to '{peer_name}' (route: {route})"));
                 // The WebRTC `peer` is now superfluous; the guard owns it (its
-                // teardown/forget semantics are unchanged — no extra teardown).
+                // teardown/forget semantics are unchanged, no extra teardown).
                 let guard = LinkGuard { sio: Some(sio), peer: peer.take() };
                 return Ok((t, rx, guard));
             }
             Ev::Stuck(pid, g) => {
                 // Per-candidate timer (or the 15s watchdog) fired for the
                 // CURRENT attempt: drop it and rotate. The sid goes to the
-                // back of the queue — a slow-but-real peer gets retried, a
+                // back of the queue, a slow-but-real peer gets retried, a
                 // ghost just cycles until the server evicts it.
                 if g == generation && peer.as_ref().is_some_and(|p| p.id == pid) {
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
-                    crate::ui::debug("filament: candidate unresponsive — rotating");
+                    crate::ui::debug("filament: candidate unresponsive, rotating");
                     queue.push_back((pid, peer_uid.take()));
                 }
             }
             Ev::ChannelReady(pid, t) if peer.as_ref().is_some_and(|p| p.id == pid) => {
-                // Prove identity so the peer's up/recv marks this link trusted —
+                // Prove identity so the peer's up/recv marks this link trusted,
                 // the acceptor's capability gate keys on exactly that.
                 if let Some(p) = &peer {
                     if let Some((my_fp, their_fp)) = p.fingerprints().await {
@@ -895,13 +895,13 @@ async fn bring_up_to_known(
                 return Ok((t, rx, guard));
             }
             Ev::PcState(pid, s) if s == "failed" || s == "closed" => {
-                // Was fatal; now just rotate — the overall command timeout
+                // Was fatal; now just rotate, the overall command timeout
                 // (or the user) bounds how long we keep trying.
                 if peer.as_ref().is_some_and(|p| p.id == pid) {
                     let p = peer.take().unwrap();
                     p.mark_closed();
                     tokio::spawn(async move { p.close().await });
-                    crate::ui::debug(&format!("filament: connection {s} — rotating"));
+                    crate::ui::debug(&format!("filament: connection {s}, rotating"));
                     queue.push_back((pid, peer_uid.take()));
                 }
             }
@@ -931,7 +931,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
                 mux.on_frame(sid, data).await;
             }
             Ev::PcState(_, s) if s == "failed" || s == "closed" || s == "disconnected" => {
-                crate::ui::debug(&format!("filament: tunnel {s} — closing streams"));
+                crate::ui::debug(&format!("filament: tunnel {s}, closing streams"));
                 mux.shutdown_all().await;
             }
             _ => {}
@@ -961,7 +961,7 @@ async fn open_stream(mux: &Arc<Mux>, rport: u16) -> Result<(u32, mpsc::Receiver<
 /// This is the ssh ProxyCommand primitive.
 pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Result<()> {
     let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
-    guard.forget(); // long-lived tunnel — keep the link alive for the process
+    guard.forget(); // long-lived tunnel, keep the link alive for the process
     let mux = Mux::new(t);
     let pump = tokio::spawn(pump_initiator(rx, mux.clone()));
 
@@ -1011,7 +1011,7 @@ pub async fn netcat_cmd(server: &str, peer: &str, rport: u16, relay: bool) -> Re
 
 /// `filament pty <peer>`: open a PTY shell on the peer and bridge it to this
 /// process's stdio (the CLI sibling of the browser terminal). No local raw-mode
-/// or resize handling yet — primarily a test/diagnostic of the `serve_pty`
+/// or resize handling yet, primarily a test/diagnostic of the `serve_pty`
 /// acceptor; the browser is the polished client.
 pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
     let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
@@ -1070,7 +1070,7 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool) -> Result<()> {
 /// connection opens a fresh L2 stream to `peer:127.0.0.1:rport`.
 pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay: bool) -> Result<()> {
     let (t, rx, guard) = bring_up_to_known(server, peer, relay).await?;
-    guard.forget(); // long-lived listener — keep the link alive for the process
+    guard.forget(); // long-lived listener, keep the link alive for the process
     let mux = Mux::new(t);
     tokio::spawn(pump_initiator(rx, mux.clone()));
 
@@ -1095,26 +1095,26 @@ pub async fn forward_cmd(server: &str, lport: u16, peer: &str, rport: u16, relay
 ///
 /// Returns `Ok(hostkeys)` on grant (the acceptor installed our key); the caller
 /// pins the host keys and spawns ssh. Returns `Err` if the acceptor DENIES (the
-/// device lacks the `shell` cap) or times out — in which case the caller MUST NOT
+/// device lacks the `shell` cap) or times out, in which case the caller MUST NOT
 /// fall through to a key-less ssh attempt (that would be a muddy auth failure
 /// instead of a clear "zero shell" denial).
 async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<String>, Option<String>)> {
-    // Managed keypair lives under the filament config dir — NEVER ~/.ssh.
+    // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
     let pubkey = crate::sshkeys::ensure_managed_key()?;
 
     let (t, mut rx, guard) = bring_up_to_known(server, peer, relay).await?;
     t.send_control(&json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey })).await?;
 
-    // Await the verdict (bounded — a daemon without FILAMENT_L2 / without the cap
+    // Await the verdict (bounded, a daemon without FILAMENT_L2 / without the cap
     // must not hang us forever). Capture it, then ALWAYS tear this link down
     // BEFORE returning, so the ssh data link (netcat ProxyCommand) is the only
-    // boxA peer the acceptor sees — no concurrent same-device supersede churn.
+    // boxA peer the acceptor sees, no concurrent same-device supersede churn.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     let verdict: Result<(Vec<String>, Option<String>)> = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break Err(anyhow!(
-                "shell bootstrap timed out — is '{peer}' running `filament up` with shell access granted?"
+                "shell bootstrap timed out, is '{peer}' running `filament up` with shell access granted?"
             ));
         }
         match tokio::time::timeout(remaining, rx.recv()).await {
@@ -1124,8 +1124,8 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
                         .as_array()
                         .map(|a| a.iter().filter_map(|k| k.as_str().map(String::from)).collect())
                         .unwrap_or_default();
-                    // The acceptor reports the account it installed our key into
-                    // — authoritative for the ssh login (see ssh_cmd).
+                    // The acceptor reports the account it installed our key into,
+                    // authoritative for the ssh login (see ssh_cmd).
                     let user = v["user"].as_str().map(String::from);
                     break Ok((hostkeys, user));
                 }
@@ -1137,9 +1137,9 @@ async fn shell_bootstrap(server: &str, peer: &str, relay: bool) -> Result<(Vec<S
                 }
                 _ => continue,
             },
-            Ok(Some(_)) => continue, // other events on this link — ignore
+            Ok(Some(_)) => continue, // other events on this link, ignore
             Ok(None) => break Err(anyhow!("channel closed before shell bootstrap completed")),
-            Err(_) => continue, // timeout sliver — loop re-checks the deadline
+            Err(_) => continue, // timeout sliver, loop re-checks the deadline
         }
     };
 
@@ -1167,7 +1167,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     crate::sshkeys::pin_host_keys(&host, &hostkeys)?;
 
     // The login account is the one the ACCEPTOR actually installed our key into
-    // (reported in the bootstrap-ack) — authoritative over a guess from our local
+    // (reported in the bootstrap-ack), authoritative over a guess from our local
     // $USER, which is usually wrong cross-machine (agboola@laptop vs root@server).
     // A killed earlier session left "agboola@filament-dovm: Permission denied
     // (publickey)" precisely because of that mismatch. FILAMENT_SSH_USER still
@@ -1203,7 +1203,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
         .arg("-o").arg("StrictHostKeyChecking=accept-new");
     // Split passthrough args into ssh OPTIONS (leading `-…` flags) and the remote
     // COMMAND (everything from the first non-flag token on). The destination is
-    // ALWAYS our managed token — in the seamless model `<peer>` IS the host — so
+    // ALWAYS our managed token, in the seamless model `<peer>` IS the host, so
     // the destination must be inserted BETWEEN the options and the command, or
     // ssh would mistake the command (e.g. `hostname`) for the host.
     let mut split = extra.len();

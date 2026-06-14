@@ -1,7 +1,7 @@
-// Leveled console logger — the user-facing console tier of the logging-parity
+// Leveled console logger: the user-facing console tier of the logging-parity
 // work. The UI's ONLY connection surface is the value proposition (DIRECT vs
 // RELAY: the route badge + amber relay chip + global "N on relay"). EVERYTHING
-// below that tier — the lifecycle firehose tel.js already beacons to ops —
+// below that tier (the lifecycle firehose tel.js already beacons to ops)
 // lives HERE, in the browser console, gated by a level that is QUIET BY
 // DEFAULT. A normal user (even with devtools open) sees only warn+/error; a
 // power user raises the level to watch the stream.
@@ -9,9 +9,9 @@
 // Raising the level, three ways (query wins, then persists):
 //   - ?log=debug   in the URL              (also accepts a number, e.g. ?log=3)
 //   - localStorage.setItem('filamentLog','debug')
-//   - window.__filamentLog.setLevel('trace')   — live, from devtools
+//   - window.__filamentLog.setLevel('trace')   (live, from devtools)
 //
-// tel.js is UNCHANGED — it still beacons lifecycle to /api/telemetry for ops.
+// tel.js is UNCHANGED, it still beacons lifecycle to /api/telemetry for ops.
 // log.js is purely the console tier; the two are independent.
 
 const LEVELS = { error: 0, warn: 1, info: 2, debug: 3, trace: 4 }

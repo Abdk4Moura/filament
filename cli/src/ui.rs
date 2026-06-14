@@ -1,4 +1,4 @@
-// The output layer — every styled byte goes through here, nowhere else.
+// The output layer, every styled byte goes through here, nowhere else.
 //
 // Capability detection happens ONCE; everything degrades in order:
 //   truecolor -> ansi-256 -> mono;  unicode -> ascii;  tty -> plain pipe mode
@@ -16,10 +16,10 @@ use std::time::Instant;
 // gated, and the value-prop lines (route label, relay banner, P1 fall-to-relay,
 // P5 upgrade, fatals) are `critical` so they survive even `-q`.
 //
-//   critical(0) — always shown, even under -q. The value-prop + must-see.
-//   info(1)     — DEFAULT. The normal useful lines (connection, ✓, transfer).
-//   debug(2)    — resilience internals (stall/repair/reconnect/cutover/probe).
-//   trace(3)    — ICE candidates, per-frame, signaling/direct-offer detail.
+//   critical(0), always shown, even under -q. The value-prop + must-see.
+//   info(1)    : DEFAULT. The normal useful lines (connection, ✓, transfer).
+//   debug(2)   : resilience internals (stall/repair/reconnect/cutover/probe).
+//   trace(3)   : ICE candidates, per-frame, signaling/direct-offer detail.
 
 /// Output verbosity levels. Lower = more important / always shown.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -35,7 +35,7 @@ pub enum Level {
 static VERBOSITY: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 /// Resolve and install the global verbosity ONCE, at startup. Precedence:
-///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env — OVERRIDES the flags.
+///   1. `FILAMENT_LOG=<critical|info|debug|trace>` env, OVERRIDES the flags.
 ///   2. otherwise the clap flags: `-q/--quiet` → critical; repeated `-v` raises
 ///      info → debug → trace (count saturates at trace).
 /// Call this from `main` right after parsing, before any worker spawns.
@@ -198,7 +198,7 @@ fn clear_live() {
 }
 
 // Sticky status (C22): an open question or countdown survives interleaved
-// say() lines — async events (route detection, peer chatter) print ABOVE it
+// say() lines, async events (route detection, peer chatter) print ABOVE it
 // and the sticky line is repainted, instead of clobbering a half-typed
 // prompt (observed live: "accept? [y/N]     route: direct").
 static STICKY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -211,7 +211,7 @@ fn paint_live(line: &str) {
 }
 
 /// Permanent line (survives in scrollback); repaints any sticky line below.
-/// The raw emitter — every leveled helper funnels through here once it has
+/// The raw emitter, every leveled helper funnels through here once it has
 /// decided the line is in-budget. Use the leveled helpers (`critical`/`say`/
 /// `debug`/`trace`) at call sites so the verbosity gate is applied.
 fn emit(line: &str) {
@@ -226,7 +226,7 @@ fn emit(line: &str) {
     }
 }
 
-/// INFO level (the default): the normal useful lines — connection established,
+/// INFO level (the default): the normal useful lines, connection established,
 /// ✓ peer / route, transfer started/complete, pairing success. Printed at the
 /// default verbosity and above; suppressed under `-q`.
 pub fn say(line: &str) {
@@ -235,7 +235,7 @@ pub fn say(line: &str) {
     }
 }
 
-/// CRITICAL level: the value-prop + must-see lines — the route label, the relay
+/// CRITICAL level: the value-prop + must-see lines, the route label, the relay
 /// banner, P1's fall-to-relay, P5's upgrade/relay-released, and fatal errors.
 /// ALWAYS printed, even under `-q` (critical is level 0).
 pub fn critical(line: &str) {
@@ -244,7 +244,7 @@ pub fn critical(line: &str) {
     }
 }
 
-/// DEBUG level (`-v`): resilience internals — stall detected, resuming, in-place
+/// DEBUG level (`-v`): resilience internals, stall detected, resuming, in-place
 /// repair, signaling reconnecting/reconnected, warm cutover, upgrade-probe
 /// attempts. No-op at the default level.
 pub fn debug(line: &str) {
@@ -263,7 +263,7 @@ pub fn trace(line: &str) {
 
 /// Transient line: replaced by the next say()/status()/bar tick. No-op noise
 /// on pipes (suppressed entirely). An open STICKY (a question awaiting its
-/// keypress) outranks transients — progress bars wait their turn rather than
+/// keypress) outranks transients, progress bars wait their turn rather than
 /// hiding the question (C23: users answered questions they couldn't see).
 pub fn status(line: &str) {
     if !caps().tty {
@@ -284,7 +284,7 @@ pub fn answer_echo(c: char) {
     eprintln!("  {} {}", paint(Tone::Dim, "↳"), paint(Tone::Bold, &c.to_string()));
 }
 
-/// A status line that survives interleaved say()s until cleared — for open
+/// A status line that survives interleaved say()s until cleared, for open
 /// questions and countdowns.
 pub fn sticky(line: &str) {
     if let Ok(mut s) = STICKY.lock() {

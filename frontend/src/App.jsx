@@ -1,4 +1,4 @@
-// App — wires the real useFilament() networking to the Filament UI.
+// App: wires the real useFilament() networking to the Filament UI.
 // The presentation lives in ui/Filament.jsx (ported from the Claude Design
 // handoff); here we map its callback props to the hook's actions and carry a
 // small, persisted `ui` preference set (theme/accent/density/columns/font).

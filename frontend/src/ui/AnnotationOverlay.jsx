@@ -1,4 +1,4 @@
-// AnnotationOverlay — a dev-only "draw arrows on the live UI and send it to Claude"
+// AnnotationOverlay: a dev-only "draw arrows on the live UI and send it to Claude"
 // tool. Toggle with the floating ✎ button (or Shift+A). Draw arrows / boxes /
 // freehand + a note, hit Send → it screenshots the page (html2canvas), composites
 // your strokes, and POSTs to the Vite dev endpoint /__annotate, which drops a PNG

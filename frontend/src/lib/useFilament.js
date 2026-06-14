@@ -1,9 +1,9 @@
-// useFilament — the single hook the UI consumes.
+// useFilament: the single hook the UI consumes.
 //
 // It owns all the networking (config fetch, signaling, a PeerLink per peer) and
 // exposes a flat, render-friendly snapshot plus a handful of actions. The shape
 // returned here IS the contract documented in CONTRACT.md and handed to Claude
-// Design. The visual layer should depend only on this shape — never on the
+// Design. The visual layer should depend only on this shape, never on the
 // socket, the RTCPeerConnection, or anything below.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -18,10 +18,10 @@ import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
 import { pakeReady, PakePairing, parseSpokenCode, splitChosenCode, PAIR_V2_CAPS } from './pairing.js'
 
 // Peer display names draw from the same 64x64 vocabulary as the pairing
-// wordlists — imported from words.js (ADJ/ANIMAL) so there is a single source
+// wordlists, imported from words.js (ADJ/ANIMAL) so there is a single source
 // of truth (was duplicated here). 4,096 combinations picked via
 // crypto.getRandomValues, persisted per tab: a device KEEPS its name on purpose
-// (stable identity, like the uid below) — recurrence across visits is
+// (stable identity, like the uid below): recurrence across visits is
 // sessionStorage, not a small or biased RNG. See the variance analysis repo for
 // the entropy/birthday math.
 
@@ -88,7 +88,7 @@ export function useFilament() {
   const [localHelper, setLocalHelper] = useState({ available: false, peers: [] }) // Part C
 
   const sigRef = useRef(null)
-  const sessionRef = useRef(null) // C30 convergent session — owns the repair loop
+  const sessionRef = useRef(null) // C30 convergent session, owns the repair loop
   // Live socket truth for non-render code paths (state in closures goes
   // stale). Set everywhere setConnected is.
   const connectedRef = useRef(false)
@@ -98,7 +98,7 @@ export function useFilament() {
   const myNameRef = useRef(null)
   const myIdRef = useRef(null) // our current socket id, for the politeness tiebreaker (#1)
   const uidRef = useRef(tabUid()) // stable per-tab identity (resume)
-  // Resume stores — deliberately OUTLIVE individual PeerLinks (see docs/resilience.md):
+  // Resume stores, deliberately OUTLIVE individual PeerLinks (see docs/resilience.md):
   const partialsRef = useRef(new Map()) // transferId -> { received, buffers, size, mime, name }
   const outgoingRef = useRef(new Map()) // transferId -> { file, name, size, mime, peerUid }
   const transferStatusRef = useRef(new Map()) // transferId -> latest status
@@ -112,7 +112,7 @@ export function useFilament() {
     setPeers((prev) => (prev.some((x) => x.id === p.id) ? prev : [...prev, p]))
   }, [])
 
-  // Update an EXISTING peer only — never re-adds (#3). A late callback from a
+  // Update an EXISTING peer only, never re-adds (#3). A late callback from a
   // closed PeerLink must not resurrect a tile we already removed.
   const updatePeer = useCallback((id, patch) => {
     if (patch.status) {
@@ -163,7 +163,7 @@ export function useFilament() {
   // ---- known devices (C12/C20 browser half) ---------------------------------
   // Mutual acknowledgement is structural: presence only lights up when BOTH
   // sides hold the pair secret and raise the same sha256 meeting-point
-  // channel. This is the half the browser was missing — it received pair-keep
+  // channel. This is the half the browser was missing: it received pair-keep
   // secrets and dropped them, leaving the CLI waving at a rendezvous nobody
   // else knew about (one-sided acknowledgement, observed live 2026-06-07).
   const [knownDevices, setKnownDevices] = useState(() => devicesLoad())
@@ -172,7 +172,7 @@ export function useFilament() {
   const digestAbsentRef = useRef(new Map()) // peerId -> consecutive digests it was absent from (C30 ph2)
 
   /// (Re)derive our known-device channels and hand them to the convergent
-  /// session (C30). The session's level-triggered loop owns the repair — the
+  /// session (C30). The session's level-triggered loop owns the repair: the
   /// old C28 belt (acked subscribe + 4s retry ×3 + 1.5s debounce + 45s
   /// reconcile) DISSOLVES into `desired.channels`: every sync re-asserts them
   /// idempotently, so a fresh sid / frozen tab / lost emit self-heals within
@@ -187,7 +187,7 @@ export function useFilament() {
       sessionRef.current?.setChannels(entries.map(([ch]) => ch))
       sessionRef.current?.kick() // raise immediately; the loop owns the repair
     } catch {
-      /* crypto.subtle unavailable (insecure origin) — known devices dormant */
+      /* crypto.subtle unavailable (insecure origin): known devices dormant */
     }
   }, [])
 
@@ -196,7 +196,7 @@ export function useFilament() {
   }, [])
 
   // Rename a remembered device's LOCAL petname (no backend, no wire). The secret
-  // is unchanged, so the meeting-point channel and every proof stay byte-stable —
+  // is unchanged, so the meeting-point channel and every proof stay byte-stable,
   // this is purely the human-facing label. We (1) persist via devicesRename,
   // (2) re-derive channels so channelMapRef/expectedSecretRef carry the new name
   // (their `dev.name` is what lights up a tile's `known`), and (3) patch any live
@@ -219,7 +219,7 @@ export function useFilament() {
   }, [subscribeKnown])
 
   // C27: remembering is a TRUST GRANT (the holder can find and auto-connect
-  // to this browser forever) — so the human decides, never the protocol.
+  // to this browser forever), so the human decides, never the protocol.
   // pair-keep offers queue here until answered; the answer goes back as
   // pair-keep-ack so a declined sender discards its half too (a kept-but-
   // unreciprocated secret is exactly the one-sided dead weight C12 cured).
@@ -243,7 +243,7 @@ export function useFilament() {
   const drivePakeRef = useRef(() => {})
 
   // L1-a: the human chose to remember this v2-paired device. v2 keeps are
-  // LOCAL-ONLY — both sides hold K independently, so there's no wire ack and no
+  // LOCAL-ONLY: both sides hold K independently, so there's no wire ack and no
   // half to discard (unlike v1's sendPairKeepAck). Store under the chosen name.
   const acceptPakeKeep = useCallback((peerId, chosenName) => {
     setPendingPakeKeep((prev) => {
@@ -258,7 +258,7 @@ export function useFilament() {
     })
   }, [subscribeKnown])
 
-  // L1-a: declined remembering. K stays agreed (fine — the device just isn't
+  // L1-a: declined remembering. K stays agreed (fine, the device just isn't
   // remembered); nothing to undo locally, just drop the prompt.
   const declinePakeKeep = useCallback((peerId) => {
     setPendingPakeKeep((prev) => {
@@ -296,7 +296,7 @@ export function useFilament() {
       if (linksRef.current.has(id)) return linksRef.current.get(id)
       // Supersede (#10): a tab has exactly ONE live connection. If we already
       // show a tile for this uid under an older sid (zombie registry entry, or
-      // peer-joined arriving before peer-left during a reconnect), replace it —
+      // peer-joined arriving before peer-left during a reconnect), replace it,
       // never show the same device twice.
       if (uid) {
         for (const [oldId, oldLink] of [...linksRef.current]) {
@@ -319,7 +319,7 @@ export function useFilament() {
         name,
         iceServers: cfgRef.current.iceServers,
         // P1 (GAP-4): force this link's ICE through the TURN relay when we're
-        // rebuilding after a persistent stall — see onStall below.
+        // rebuilding after a persistent stall (see onStall below).
         relayOnly: !!relayOnly,
         chunkSize: cfgRef.current.chunkSize,
         polite,
@@ -329,21 +329,21 @@ export function useFilament() {
         onStatus: (status) => updatePeer(id, { status }),
         onTransfer: (t) => upsertTransfer(t),
         onRoute: (route) => updatePeer(id, { route }),
-        // web-shell: the peer announced whether it offers a terminal — surfaces
+        // web-shell: the peer announced whether it offers a terminal, surfaces
         // the per-device shell button only for shell-enabled devices.
         onCaps: (caps) => updatePeer(id, { shell: !!caps.shell }),
         // Resume: once the channel is open, re-offer any paused sends that were
         // headed to this same device (matched by its stable uid).
         onChannelOpen: () => {
-          attemptsRef.current.delete(id) // established — reset watchdog retries
-          // L1-a: a v2 pairing is in flight for this peer — now that SDP (and
+          attemptsRef.current.delete(id) // established, reset watchdog retries
+          // L1-a: a v2 pairing is in flight for this peer; now that SDP (and
           // thus the DTLS fingerprints) is exchanged, run the SPAKE2 ceremony.
           if (pendingPakeRef.current) {
             ensurePakePairing(id)
             drivePake()
           }
           // C20: if this peer was introduced via a known-device channel, prove
-          // we hold the secret — bound to THIS link's DTLS fingerprints. Both
+          // we hold the secret, bound to THIS link's DTLS fingerprints. Both
           // sides do this (mutual acknowledgement), each verifies the other.
           const exp = expectedSecretRef.current.get(id)
           if (exp && uid) {
@@ -361,24 +361,24 @@ export function useFilament() {
           for (const [tid, entry] of outgoingRef.current) {
             // 'paused' = dropped mid-transfer; 'offered' = the offer fired
             // into a dead link (#12: file picked while the tab was suspended)
-            // — both must re-offer on the fresh channel.
+            // both must re-offer on the fresh channel.
             const st = transferStatusRef.current.get(tid)
             if (entry.peerUid === uid && (st === 'paused' || st === 'offered')) {
               link.resumeSend(tid)
             }
           }
         },
-        // C12/C27: the peer asked to be remembered. That's a trust grant —
+        // C12/C27: the peer asked to be remembered. That's a trust grant,
         // queue it for the HUMAN; the banner answers with pair-keep-ack.
         // L1-a downgrade-refusal (spec §6.1): if WE are mid v2 pairing, a
-        // pair-keep means the peer is a legacy v1 client. Refuse — secure
+        // pair-keep means the peer is a legacy v1 client. Refuse: secure
         // first-pairing requires v2 on both ends. We NEVER store a
         // server-readable secret on the v2 path, so a server stripping v:2
         // cannot force this downgrade.
         onPairKeep: (secret) => {
           if (pendingPakeRef.current) {
             tel('pake-refuse-v1-peer', { peer: id.slice(-6) })
-            setPairStatus('the other device uses an older version and cannot pair securely — update it. Nothing was stored.')
+            setPairStatus('the other device uses an older version and cannot pair securely. Update it. Nothing was stored.')
             link.sendPairKeepAck(false)
             return
           }
@@ -386,11 +386,11 @@ export function useFilament() {
           setPendingKeeps((prev) => (prev.some((k) => k.peerId === id) ? prev : [...prev, { peerId: id, name, secret }]))
         },
         // C27: our own remember offer was answered (browser-initiated
-        // remembering is Phase B — handled for protocol completeness).
+        // remembering is Phase B, handled for protocol completeness).
         onPairKeepAck: (ok) => {
           tel(ok ? 'keep-ack-ok' : 'keep-ack-declined', { peer: id.slice(-6) })
         },
-        // C20: the peer claims to be a known device — verify against every
+        // C20: the peer claims to be a known device: verify against every
         // stored secret, bound to this link's fingerprints. C27: ANSWER
         // either way, so a stale prover learns we never met and stops trying.
         onPairProof: async (mac) => {
@@ -415,7 +415,7 @@ export function useFilament() {
         onPeerStateDiverged: (kind) => {
           tel('state-diverged', { kind, peer: id.slice(-6) })
           // trust divergence: they don't recognize us but we hold a secret
-          // for them — re-prove ONCE per link (webrtc re-offers transfers
+          // for them, re-prove ONCE per link (webrtc re-offers transfers
           // itself; trust needs the hook, which owns secrets + uids).
           if (kind === 'trust' && !link._reproved) {
             link._reproved = true
@@ -429,7 +429,7 @@ export function useFilament() {
           }
         },
         // C27: they answered OUR proof. false = "never met a fella like you"
-        // — drop the expectation so we stop claiming acquaintance.
+        // drop the expectation so we stop claiming acquaintance.
         onPairProofAck: (ok) => {
           if (!ok) {
             expectedSecretRef.current.delete(id)
@@ -442,30 +442,30 @@ export function useFilament() {
         // and retry with a fresh link + fresh ICE config; then fail honestly.
         watchdogMs: 15000,
         // P1 (GAP-4): the in-flight stall ladder (P0 rungs a+b) is exhausted on
-        // this link — a chronically stalled direct/STUN path. Rebuild the link
+        // this link, a chronically stalled direct/STUN path. Rebuild the link
         // RELAY-PREFERRED (iceTransportPolicy:'relay'), mirroring the Rust
         // client's auto-relay at ladder exhaustion. The amber RELAY UI lights
         // itself via the normal _detectRoute()→onRoute('relayed') path; the
         // hook-owned partials/outgoing stores outlive the link, so the re-offer
         // -on-channel-open path RESUMES the in-flight transfer (not restart).
-        // Bounded: a peer is escalated to relay at most ONCE — a relay link that
+        // Bounded: a peer is escalated to relay at most ONCE; a relay link that
         // itself stalls falls through to P0's terminal _failActive, never an
         // infinite relay-rebuild loop.
         onStall: ({ reason }) => {
           if (reason !== 'persistent') return
           if (relayOnly) {
-            // We're already on the relay and it stalled too — don't re-escalate.
+            // We're already on the relay and it stalled too, don't re-escalate.
             // Let P0's terminal _failActive own it (partials preserved).
-            log.debug('rtc: relay link still stalled — leaving terminal failure to P0', id.slice(-6))
+            log.debug('rtc: relay link still stalled, leaving terminal failure to P0', id.slice(-6))
             return
           }
           const r = relayedRef.current.get(id) || 0
           if (r >= 1) {
-            log.debug('rtc: persistent stall but relay-preferred already spent — not re-escalating', id.slice(-6))
+            log.debug('rtc: persistent stall but relay-preferred already spent, not re-escalating', id.slice(-6))
             return
           }
           relayedRef.current.set(id, r + 1)
-          log.info('rtc: persistent stall — rebuilding relay-preferred (auto-relay fallback)', id.slice(-6))
+          log.info('rtc: persistent stall, rebuilding relay-preferred (auto-relay fallback)', id.slice(-6))
           linksRef.current.delete(id)
           link.close()
           makeLinkRef.current?.({ id, name, uid, relayOnly: true })
@@ -482,7 +482,7 @@ export function useFilament() {
             // #13 second wind (measured: refocus-time revival ran while the
             // links still read healthy; they decayed to failed seconds later
             // with nothing left to catch them). If we're VISIBLE when a peer
-            // finally fails, grant ONE delayed fresh start — covers the
+            // finally fails, grant ONE delayed fresh start, covers the
             // "both tabs finally awake but budgets exhausted" rendezvous.
             if (document.visibilityState === 'visible' && !attemptsRef.current.get(id + ':sw')) {
               attemptsRef.current.set(id + ':sw', 1)
@@ -538,12 +538,12 @@ export function useFilament() {
       myNameRef.current = myName
 
       // C30: the convergent session. Its level-triggered loop owns session-state
-      // repair (room membership + channel subscriptions + lease) — replacing the
+      // repair (room membership + channel subscriptions + lease), replacing the
       // rejoin belt (#14), subscribeKnown's ack-retry/45s-reconcile, and the
       // pair-create lease refresh. The explicit sig.join below stays for instant
       // welcome UX; the loop is the guarantee underneath.
       const session = createSession(sig, tel, (digestPeers) => {
-        // C30 phase 2: the server's roster rode in on the sync digest — a
+        // C30 phase 2: the server's roster rode in on the sync digest, a
         // missed peer-joined/left self-corrects here. Channel-introduced
         // links are exempt (room-independent); absence must hold for TWO
         // consecutive digests (one can race a join in flight).
@@ -575,16 +575,16 @@ export function useFilament() {
       sessionRef.current = session
 
       sig.on('welcome', ({ id, peers: existing }) => {
-        // Idempotent — also fires on every reconnect AND every room switch
+        // Idempotent: also fires on every reconnect AND every room switch
         // (and the rejoin belt adds a second one). Tear down stale ROOM links
-        // and rebuild from the fresh roster — but keep channel-introduced
+        // and rebuild from the fresh roster, but keep channel-introduced
         // known devices: they're in no room roster, so wiping them here made
         // the tile flash in (subscribe → known-peer) and out (next welcome),
         // observed live ("connecting and then gotcha… it disappears").
         myIdRef.current = id // set before makeLink so politeness can be computed (#1)
         for (const [pid, l] of [...linksRef.current]) {
-          if (expectedSecretRef.current.has(pid)) continue // known device — room-independent
-          // G-i: a signaling reconnect (our OWN socket blipped — welcome
+          if (expectedSecretRef.current.has(pid)) continue // known device, room-independent
+          // G-i: a signaling reconnect (our OWN socket blipped, welcome
           // re-fires) must NOT tear down a HEALTHY P2P link. The data channel
           // is peer-to-peer and independent of the signaling socket; nuking it
           // here interrupts an in-flight transfer for no reason (the gate-6
@@ -612,7 +612,7 @@ export function useFilament() {
         setPendingKeeps((prev) => prev.filter((k) => k.peerId !== id)) // moot now (C27)
       })
       // C12: a known device came online (matched one of our secret-derived
-      // channels) — link to it regardless of rooms. Both sides receive this;
+      // channels): link to it regardless of rooms. Both sides receive this;
       // the polite/impolite roles sort out who offers.
       sig.on('known-peer', ({ id, name, uid, channel }) => {
         if (!id || uid === uidRef.current) return // our own other session
@@ -621,7 +621,7 @@ export function useFilament() {
         expectedSecretRef.current.set(id, dev)
         tel('known-peer', { peer: id.slice(-6) })
         if (!linksRef.current.has(id)) makeLink({ id, name: name || dev.name, uid })
-        // Mark the tile as a remembered device — the UI renders it distinctly
+        // Mark the tile as a remembered device: the UI renders it distinctly
         // (room-independent: it's here because of the pairing, not the room).
         updatePeer(id, { known: dev.name })
       })
@@ -637,7 +637,7 @@ export function useFilament() {
       sig.on('signal', ({ from, data }) => {
         // L1-a: PAKE messages ride the opaque `signal` relay. If we have a
         // pending v2 pairing, route pake-msg/pake-confirm into the PAKE machine
-        // (creating the PakePairing on first contact) — OUT of the WebRTC path.
+        // (creating the PakePairing on first contact), OUT of the WebRTC path.
         if (data?.type === 'pake-msg' || data?.type === 'pake-confirm') {
           ensurePakePairing(from)
           if (pakeRef.current && pakePeerRef.current === from) {
@@ -648,7 +648,7 @@ export function useFilament() {
         }
         let link = linksRef.current.get(from)
         if (!link) {
-          // Only an incoming offer may create a new link — ignore stray answers/
+          // Only an incoming offer may create a new link; ignore stray answers/
           // candidates from peers we don't know about (#7).
           if (data?.type === 'description' && data.description?.type === 'offer') {
             link = makeLink({ id: from, name: from })
@@ -659,9 +659,9 @@ export function useFilament() {
         link.enqueueSignal(data) // ordered per-peer dispatch (#2)
       })
       // One-time pairing (#11): the server matched us with the code's other
-      // party — the code is burned; move both into the private room.
+      // party; the code is burned; move both into the private room.
       sig.on('pair-matched', ({ room }) => {
-        log.debug('pair matched — joining room')
+        log.debug('pair matched, joining room')
         setRoomCode(null)
         rejoinRef.current?.(room, 'pair')
       })
@@ -678,25 +678,25 @@ export function useFilament() {
         // own retry and must not flash an error here.
         if (error === 'invalid') {
           if (why === 'bad-nameplate') {
-            setPairStatus('that code is not valid — check it and re-enter it (a full code looks like brave-otter-ruby-3141)')
+            setPairStatus('that code is not valid. Check it and re-enter it (a full code looks like brave-otter-ruby-3141)')
           } else if (why === 'sender-gone') {
-            setPairStatus('the other device left before you paired — ask them to create a fresh code, then try again')
+            setPairStatus('the other device left before you paired. Ask them to create a fresh code, then try again')
           } else {
             // 'unknown': never existed / expired / already used.
-            setPairStatus('that code did not work — it may be mistyped, expired, or already used. Ask for a fresh code and try again.')
+            setPairStatus('that code did not work. It may be mistyped, expired, or already used. Ask for a fresh code and try again.')
           }
         } else if (error === 'slow-down') {
-          setPairStatus('too many attempts — wait a moment and try again')
+          setPairStatus('too many attempts. Wait a moment and try again')
         }
         setRoomCode(null)
         setRoomScope((s) => (s === 'code' ? prevScopeRef.current || 'auto' : s))
       })
 
       // Reflect transport up/down in the UI (the rejoin itself is automatic),
-      // and refresh ICE config on reconnect — TURN creds are time-limited (#9).
+      // and refresh ICE config on reconnect (TURN creds are time-limited, #9).
       sig.on('status', ({ connected: up }) => {
         tel(up ? 'socket-up' : 'socket-down', {})
-        // info = socket connected (a lifecycle landmark); a drop is debug —
+        // info = socket connected (a lifecycle landmark); a drop is debug,
         // the rejoin is automatic, so it's not a user-actionable warning.
         if (up) log.info('socket connected')
         else log.debug('socket disconnected (auto-reconnecting)')
@@ -707,7 +707,7 @@ export function useFilament() {
           fetch(api('/api/config')).then((r) => r.json()).then((c) => { cfgRef.current = c }).catch(() => {})
           // C30: a reconnect gives us a fresh sid that the server dropped from
           // its room + subscriptions (#14 roomless ghost; C12 lost channels).
-          // The convergent session re-ensures BOTH on socket-up — room and
+          // The convergent session re-ensures BOTH on socket-up: room and
           // channels are both in `desired`, one idempotent sync repairs them.
           // No bespoke rejoin belt, no separate re-subscribe. invalidate()
           // first: the fresh sid voids the last confirmation, so the kick emits
@@ -797,7 +797,7 @@ export function useFilament() {
   // pair-matched to BOTH parties and the code is burned forever.
   const rejoinRef = useRef(null)
 
-  // L1-a: finalize a completed PakePairing — store the device under K-derived
+  // L1-a: finalize a completed PakePairing, store the device under K-derived
   // secret with its agreed caps, or surface the refusal. Idempotent.
   const finalizePake = useCallback(() => {
     const p = pakeRef.current
@@ -805,7 +805,7 @@ export function useFilament() {
     if (p.secret) {
       const peerId = pakePeerRef.current
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
-      // K is agreed — pairing crypto succeeded. But remembering is a separate
+      // K is agreed, pairing crypto succeeded. But remembering is a separate
       // trust grant (C27): queue a consent prompt instead of storing silently.
       // Capture secret/caps/name NOW, before we null pakeRef below. Dedup by
       // peerId so the per-tick drivePake doesn't enqueue twice.
@@ -863,7 +863,7 @@ export function useFilament() {
     await pakeReady()
     pakeReadyRef.current = true
     // Parse with the SHARED WASM normCode/splitCode (via parseSpokenCode) so the
-    // browser's view of {nameplate, password} is byte-identical to the CLI's —
+    // browser's view of {nameplate, password} is byte-identical to the CLI's:
     // SPAKE2 hashes exactly this `password`, so any drift between an inline
     // validator and the real split would silently break key agreement. A valid
     // PAKE code is `words…-NNNN`: a numeric trailing nameplate (3-5 digits,
@@ -874,14 +874,14 @@ export function useFilament() {
     const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
     if (!numericNameplate) {
       // The shared split's trailing group isn't a numeric nameplate (no number
-      // at all, or a partial/typo'd code) — there is nothing for the server to
+      // at all, or a partial/typo'd code): there is nothing for the server to
       // route on.
-      setPairStatus('that code is missing its number — a full code ends in a 3-5 digit number, e.g. brave-otter-3141')
+      setPairStatus('that code is missing its number. A full code ends in a 3-5 digit number, e.g. brave-otter-3141')
       return
     }
     if (!password) {
-      // A bare number with no words before it — nothing for SPAKE2 to hash.
-      setPairStatus('that does not look like a full code — type the whole thing, e.g. brave-otter-3141')
+      // A bare number with no words before it: nothing for SPAKE2 to hash.
+      setPairStatus('that does not look like a full code. Type the whole thing, e.g. brave-otter-3141')
       return
     }
     pendingPakeRef.current = { nameplate, password }
@@ -898,7 +898,7 @@ export function useFilament() {
     const t0 = Date.now()
     tel('pair-create-click', { up: connectedRef.current })
     // C24 zombie fix, measured live: a hidden mobile tab's socket dies ~5s
-    // after hiding and takes ~4.3s to recover after refocus — exactly when
+    // after hiding and takes ~4.3s to recover after refocus, exactly when
     // people tap CREATE CODE. So: if the socket is known-dead, reconnect and
     // wait for it first; and if the mint gets no answer in 5s anyway (stale
     // 'connected' flag after a freeze), reconnect and retry ONCE.
@@ -993,7 +993,7 @@ export function useFilament() {
             finish(null)
           }
         }, 5000)
-      // Collision: the server says our nameplate is taken — re-mint and retry.
+      // Collision: the server says our nameplate is taken, re-mint and retry.
       // If the user had CHOSEN that number, tell them which fresh one we used.
       function onError({ error }) {
         if (error !== 'taken') return
@@ -1001,12 +1001,12 @@ export function useFilament() {
         mintAndCreate()
         const used = pendingPakeRef.current?.nameplate
         if (asked && used && asked !== used) {
-          setPairStatus(`that number (${asked}) was busy — we used ${used}`)
+          setPairStatus(`that number (${asked}) was busy, we used ${used}`)
         }
       }
       // DOWNGRADE GUARD: a v1-only / out-of-date server answers our v2
       // pair-create with `pair-code` (it minted the whole code) instead of
-      // `pair-ok`. We can't pair securely against it — say so loudly instead of
+      // `pair-ok`. We can't pair securely against it, say so loudly instead of
       // waiting forever (this was the silent "create code does nothing" against
       // a stale backend).
       function onDowngrade() {
@@ -1056,7 +1056,7 @@ export function useFilament() {
   // ---- resilience: nudge a reconnect when a suspended tab resumes ----------
   // Mobile browsers freeze background tabs and throttle timers, so socket.io's
   // auto-reconnect can stall. When the page becomes visible again, kick it.
-  // C21 (brb): going hidden — opening a file picker hides the tab on mobile —
+  // C21 (brb): going hidden (opening a file picker hides the tab on mobile)
   // tells every connected peer we'll be right back, so they hold the line for
   // the declared window instead of guessing; coming back says so.
   useEffect(() => {
@@ -1073,11 +1073,11 @@ export function useFilament() {
         sigRef.current?.reconnect?.()
         sessionRef.current?.kick() // C30: re-ensure room + channels the freeze may have eaten
         subscribeKnown() // re-derive channels in case a secret was stored while hidden
-        nudgeUpgradeProbes() // P5: refocus may follow a network change — re-probe relayed links
+        nudgeUpgradeProbes() // P5: refocus may follow a network change, re-probe relayed links
         for (const link of linksRef.current.values()) link.sendBack?.()
         // #13 (measured live): two mobile tabs rarely negotiate while both
-        // awake — links that failed while WE were frozen stay failed forever.
-        // On refocus: reset retry budgets (incl. second-wind markers — they
+        // awake, links that failed while WE were frozen stay failed forever.
+        // On refocus: reset retry budgets (incl. second-wind markers, they
         // share this map) and rebuild every dead link.
         attemptsRef.current.clear()
         for (const [id, link] of [...linksRef.current.entries()]) {
@@ -1097,7 +1097,7 @@ export function useFilament() {
     document.addEventListener('visibilitychange', onVisibility)
     window.addEventListener('focus', onVisibility)
     // P5: re-probe relayed links the instant connectivity returns or the active
-    // network interface changes — both mean a fresh direct path may now exist.
+    // network interface changes, both mean a fresh direct path may now exist.
     window.addEventListener('online', nudgeUpgradeProbes)
     const conn = typeof navigator !== 'undefined' && navigator.connection
     conn?.addEventListener?.('change', nudgeUpgradeProbes)
@@ -1119,11 +1119,11 @@ export function useFilament() {
     let t = null
     const HELPER = 'http://127.0.0.1:53317/peers'
     // The helper is OPTIONAL and absent on a normal user's machine. A single
-    // refused fetch floods the console (net::ERR_CONNECTION_REFUSED) — so we
+    // refused fetch floods the console (net::ERR_CONNECTION_REFUSED), so we
     // probe ONCE, and only start the steady 3s poll if that first probe SUCCEEDS
     // (helper present). On failure we go silent: no interval, no retries, no
     // console spam. Worst case the helper started after page-load and isn't
-    // picked up until reload — an acceptable trade for a quiet console.
+    // picked up until reload, an acceptable trade for a quiet console.
     const poll = async () => {
       try {
         const res = await fetch(HELPER, { signal: AbortSignal.timeout(800) })
@@ -1159,10 +1159,10 @@ export function useFilament() {
     roomUrl,
     roomScope, // 'auto' | 'code' | 'link'
     roomCode, // the 6-char code when in a code room, else null
-    network, // 'ipv4' | 'ipv6' | 'raw' — how the auto room was grouped
+    network, // 'ipv4' | 'ipv6' | 'raw': how the auto room was grouped
     signalingKind,
     connected,
-    localHelper, // { available, peers } — Part C native LAN discovery
+    localHelper, // { available, peers }: Part C native LAN discovery
     sendFiles,
     acceptTransfer,
     declineTransfer,
@@ -1172,13 +1172,13 @@ export function useFilament() {
     pairWithCode, // join a code room to pair across networks
     generateCode, // mint a fresh code and switch to it; returns the code
     useAutoRoom, // go back to the 'people near you' auto room
-    knownDevices, // C12: [{name, secret, addedAt}] — remembered devices
+    knownDevices, // C12: [{name, secret, addedAt}], remembered devices
     forgetDevice, // C12: drop a remembered device by name
     renameDevice, // edit a remembered device's local petname (no backend)
-    pendingKeeps, // C27: [{peerId, name}] — peers asking to be remembered
+    pendingKeeps, // C27: [{peerId, name}], peers asking to be remembered
     acceptKeep, // C27: store the secret + ack; auto-connect from now on
     declineKeep, // C27: refuse; the sender discards its half too
-    pendingPakeKeep, // L1-a: [{peerId, name, secret, caps}] — v2 pairings awaiting remember-consent
+    pendingPakeKeep, // L1-a: [{peerId, name, secret, caps}], v2 pairings awaiting remember-consent
     acceptPakeKeep, // L1-a: store the v2 device under the chosen name (local-only)
     declinePakeKeep, // L1-a: don't remember (K stays agreed)
     getLink: (pid) => linksRef.current.get(pid), // web-shell: the live PeerLink for a peer

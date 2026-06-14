@@ -1,10 +1,10 @@
-/* DeviceSheet — the per-device actions surface (design model H).
+/* DeviceSheet: the per-device actions surface (design model H).
    A tile stays a file-send target (tap/click still sends); the secondary
    triggers (a tile `⋯` button and desktop right-click) open this sheet, which
    is the home for the per-device intents: Open terminal, Send files, Forget.
 
    Responsive, one component:
-     - MOBILE: a bottom sheet — full-width, anchored to the bottom, with a scrim
+     - MOBILE: a bottom sheet, full-width, anchored to the bottom, with a scrim
        backdrop. Dismiss on backdrop tap, swipe-down, or Esc.
      - DESKTOP: an anchored popover positioned near the invoking tile. Dismiss on
        outside-click or Esc.
@@ -22,7 +22,7 @@ import { createPortal } from 'react-dom'
 function routeMeta(route, T) {
   if (route === 'local') return { label: 'LAN', color: T.ok }
   if (route === 'direct') return { label: 'P2P', color: T.recv }
-  // relayed is the only route with a middleman on the wire — loud amber ⚠ + the
+  // relayed is the only route with a middleman on the wire: loud amber ⚠ + the
   // honest explainer (still E2E-encrypted). Wording mirrors Filament.jsx §3.5.
   if (route === 'relayed') return { label: '⚠ RELAY', color: T.warn, relay: true }
   return null
@@ -33,7 +33,7 @@ function routeMeta(route, T) {
 const RELAY_EXPLAINER =
   'Routed through a TURN server, not a direct link. Still end-to-end encrypted; the relay forwards bytes it can’t read.'
 
-const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away — be right back' }
+const PEER_STATUS_LABEL = { ready: 'ready', connecting: 'connecting', failed: 'unreachable', away: 'away, be right back' }
 
 // A single tappable action row. ≥44px tall for touch; accent only when primary.
 function ActionRow({ glyph, label, hint, onClick, tone, accent, T, danger, autoFocus }) {
@@ -87,7 +87,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
   const displayName = peer.known || peer.verified || peer.name
   const showShell = ready && known && peer.shell && onOpenShell
   const canForget = !!peer.known && !!onForget // forget is keyed by the stored petname
-  // Rename edits the stored petname — keyed by peer.known (the current label),
+  // Rename edits the stored petname, keyed by peer.known (the current label),
   // so it's offered only for a remembered device with a rename handler wired.
   const canRename = !!peer.known && !!onRename
   const [editing, setEditing] = useState(false)
@@ -138,7 +138,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
     <div style={{ padding: '10px 13px', borderTop: '1px solid ' + T.lineSoft, display: 'flex', flexDirection: 'column', gap: 5 }}>
       <div style={{ fontSize: 9, letterSpacing: '.14em', color: T.faint, marginBottom: 3 }}>INFO</div>
       {rm && <InfoLine label="route" value={rm.label} color={rm.color} T={T} />}
-      {/* Relay honesty: the route line alone is terse — when relayed, spell out
+      {/* Relay honesty: the route line alone is terse; when relayed, spell out
           the no-middleman caveat in plain language right under it (still E2E). */}
       {rm && rm.relay && (
         <div data-testid="sheet-relay-explainer" style={{
@@ -162,7 +162,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
       <input ref={inp} type="file" multiple style={{ display: 'none' }}
         onChange={(e) => { if (e.target.files.length) { onSendFiles(peer.id, e.target.files); onClose() } e.target.value = '' }} />
       {/* Row order is context-driven (tile-interaction-v2 §5): when the sheet is
-          the PRIMARY surface (mobile, sendFirst) Send must lead — first, accent,
+          the PRIMARY surface (mobile, sendFirst) Send must lead: first, accent,
           auto-focused so the second tap is immediate. Otherwise (desktop, where a
           tile click already sends) keep terminal-first, the action you came for. */}
       {sendFirst ? (
@@ -194,7 +194,7 @@ export default function DeviceSheet({ peer, anchorRect, narrow, sendFirst, T, D,
               onKeyDown={(e) => {
                 if (e.key === 'Enter') { e.preventDefault(); commitRename() }
                 // swallow Esc so the sheet's document-level listener doesn't close
-                // the whole sheet — Esc just cancels the rename.
+                // the whole sheet; Esc just cancels the rename.
                 if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setDraft(displayName); setEditing(false) }
               }}
               placeholder="device name"

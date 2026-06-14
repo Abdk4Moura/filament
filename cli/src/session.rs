@@ -1,11 +1,11 @@
-//! C30: the convergent session — the CLI's half of "no emit is ever
+//! C30: the convergent session, the CLI's half of "no emit is ever
 //! load-bearing; only convergence is" (docs/design-c30-convergent-session.md).
 //!
 //! Each command loop owns a `Session` describing the DESIRED signaling state
 //! (room, identity, presence channels) and calls `tick()` every loop
 //! iteration (the loops already tick every ≤2 s). The session re-emits one
 //! idempotent `sync` whenever the server's last-confirmed digest disagrees
-//! with desire or has gone stale — so a join or subscribe that died in a
+//! with desire or has gone stale, so a join or subscribe that died in a
 //! half-open socket is repaired within a tick instead of becoming a roomless
 //! ghost / invisible device / zombie lease (the C24/C28/#14 disease class).
 //!
@@ -80,10 +80,10 @@ impl Session {
         format!("{}|{}", self.room.as_deref().unwrap_or(""), chans.join(","))
     }
 
-    /// The server confirmed our state (Ev::Synced) — record its digest.
+    /// The server confirmed our state (Ev::Synced), record its digest.
     /// The digest we store is OUR desire at confirm time: the server applies
     /// what we sent, so a later desire change diffs against it correctly.
-    /// Phase 2: the digest may carry the server's roster (`peers`) — the
+    /// Phase 2: the digest may carry the server's roster (`peers`), the
     /// loops reconcile against it (missed peer-joined/left self-correct).
     pub fn on_synced(&mut self, v: &Value) -> Option<Vec<Value>> {
         if v["ok"].as_bool() != Some(true) {
@@ -100,16 +100,16 @@ impl Session {
     }
 
     /// A fresh sid (welcome after reconnect) voids everything the server held
-    /// for the old one — even if desire is unchanged, it must be re-asserted.
+    /// for the old one, even if desire is unchanged, it must be re-asserted.
     /// (Without this, a fast reconnect inside CONFIRM_TTL looks "confirmed"
-    /// while the new sid is roomless and unsubscribed — the browser track hit
+    /// while the new sid is roomless and unsubscribed, the browser track hit
     /// the identical hole.)
     pub fn invalidate(&mut self) {
         self.confirmed = None;
         self.last_attempt = None;
     }
 
-    /// xorshift64* — deterministic, no rand crate; gate L replays by seed.
+    /// xorshift64*, deterministic, no rand crate; gate L replays by seed.
     fn roll(&mut self) -> f64 {
         let mut x = self.rng;
         x ^= x >> 12;
@@ -119,7 +119,7 @@ impl Session {
         (x.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// All session-state emits go through here so the loss shim covers them —
+    /// All session-state emits go through here so the loss shim covers them,
     /// including the commands' INITIAL join/subscribe fast-path emits (public
     /// for that reason). Under gate L the shim drops a deterministic fraction;
     /// the tick loop is what must repair the damage.
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn loss_shim_deterministic() {
-        // (no env manipulation — edition 2024 makes set/remove_var unsafe;
+        // (no env manipulation, edition 2024 makes set/remove_var unsafe;
         // the default seed path is what's under test)
         let mut a = Session::new("n", "u");
         let mut b = Session::new("n", "u");

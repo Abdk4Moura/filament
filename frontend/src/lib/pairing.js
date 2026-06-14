@@ -1,10 +1,10 @@
-// L1-a (PAKE v2) — the browser half of secure first-pairing.
+// L1-a (PAKE v2): the browser half of secure first-pairing.
 //
 // Mirrors the CLI `pair_cmd` exactly, using the SHARED Rust→WASM SPAKE2 core
 // (src/pake). The server only ever sees the numeric nameplate; the password
 // (words) is minted/typed CLIENT-SIDE and never transmitted. A strong key K is
 // agreed over the opaque `signal` relay BEFORE the pinned secret exists; the
-// 32-byte device secret is HKDF(K) — agreed, never sent. A key-confirmation MAC
+// 32-byte device secret is HKDF(K), agreed, never sent. A key-confirmation MAC
 // folds the SORTED DTLS fingerprints + caps so a server that substitutes a DTLS
 // cert (or rewrites caps) is detected and the pairing aborts.
 //
@@ -70,7 +70,7 @@ export class PakePairing {
     if (!mac) return
     this.sendSignal({ type: 'pake-confirm', v: 2, mac: b64(mac), caps: this.caps })
     this.sentConfirm = true
-    // A confirm from the peer may have arrived first — process it now.
+    // A confirm from the peer may have arrived first; process it now.
     if (this._pendingConfirmMac) this._verify(this._pendingConfirmMac)
   }
 
@@ -92,8 +92,8 @@ export class PakePairing {
     if (data?.type === 'pake-confirm') {
       const mac = b64d(data.mac)
       if (!this.haveK) {
-        // Out-of-order: stash until K is derived (shouldn't happen — msg
-        // precedes confirm by per-sender ordering — but be safe).
+        // Out-of-order: stash until K is derived (shouldn't happen, msg
+        // precedes confirm by per-sender ordering, but be safe).
         this._pendingConfirmMac = mac
         return true
       }
@@ -111,7 +111,7 @@ export class PakePairing {
       return
     }
     if (this.session.verifyPeerConfirm(fps.mine, fps.theirs, this.capsCanon, mac)) {
-      // CONFIRMED. Derive the pinned secret from K — agreed, never transmitted.
+      // CONFIRMED. Derive the pinned secret from K (agreed, never transmitted).
       this.secret = this.session.secret()
     } else {
       this.aborted = 'key confirmation failed: wrong code or tampering (a server cannot forge this)'
@@ -140,7 +140,7 @@ export function parseSpokenCode(typed) {
   return { nameplate, password, normalized }
 }
 
-/// STEERING: count word tokens (letter-runs of >= 2 chars) in a password —
+/// STEERING: count word tokens (letter-runs of >= 2 chars) in a password,
 /// mirrors the CLI `password_word_tokens`. A user-chosen pairing password must
 /// contain >= 2 of these (a 1-word code is ~12 bits, below the floor the
 /// burn + 5/min rate-limit relies on). Digits / 1-letter fragments don't count.
@@ -151,7 +151,7 @@ export function passwordWordTokens(password) {
 
 /// STEERING preview for the browser "choose your own code" entry. Returns the
 /// shared-normalized {nameplate, password}, the >= 2-token strength verdict, and
-/// the FINAL code we'd create — exactly what SPAKE2 will hash. The nameplate is
+/// the FINAL code we'd create, exactly what SPAKE2 will hash. The nameplate is
 /// machine-assigned (`autoNameplate`) when the user typed none, shown dimmed in
 /// the UI; a typed nameplate is honored on the first create (server may bump it
 /// on collision). `pakeReady()` MUST have resolved before calling (uses WASM).
@@ -175,11 +175,11 @@ export function previewCustomCode(typed, autoNameplate) {
 /// Split a USER-CHOSEN code into {password, nameplate}. Unlike splitCode (which
 /// always strips the trailing group as the nameplate), here the trailing group
 /// is the nameplate ONLY if it is numeric (3-5 digits, the server's
-/// _NAMEPLATE_RE) — otherwise it is part of the words. So `gigantic-element`
+/// _NAMEPLATE_RE), otherwise it is part of the words. So `gigantic-element`
 /// keeps BOTH words as the password (nameplate machine-assigned), while
 /// `gigantic-element-9641` honors the typed number. Delegates to the SHARED
 /// Rust→WASM `splitChosenCode` so the browser is byte-identical to the CLI by
-/// construction (`pakeReady()` MUST have resolved first — uses WASM).
+/// construction (`pakeReady()` MUST have resolved first; uses WASM).
 export function splitChosenCode(typed) {
   const normalized = normCode(typed)
   const [password, nameplate] = wasmSplitChosenCode(normalized)

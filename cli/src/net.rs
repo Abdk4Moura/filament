@@ -45,8 +45,8 @@ const LOW_WATER: usize = 1024 * 1024;
 pub const WATCHDOG_SECS: u64 = 15;
 
 /// P0 (GAP-1): default no-progress threshold (ms) for the bytes-moved stall
-/// watchdog. An in-flight transfer whose link's `idle_ms()` exceeds this — while
-/// the control channel is still alive — is declared STALLED (the 0% hang). 6 s
+/// watchdog. An in-flight transfer whose link's `idle_ms()` exceeds this, while
+/// the control channel is still alive, is declared STALLED (the 0% hang). 6 s
 /// sits well above a slow-but-moving link's inter-chunk gap on a bad mobile
 /// uplink (the threshold is on *time since the last byte*, never on throughput,
 /// so a slow link that still advances resets it) and well below human patience.
@@ -90,7 +90,7 @@ pub fn signaling_silence_ms() -> u64 {
 /// the direct-repair rungs (a)/(c). It costs a second live path, so it is
 /// SELECTIVE: ON only for long-lived / interactive sessions (PTY, L2 tunnels,
 /// `up --shell` acceptors), OFF for one-shot file `send` (the P0/P1 ladder is
-/// already fine there — the on-disk partial + resume make a cold repair correct
+/// already fine there, the on-disk partial + resume make a cold repair correct
 /// and bounded, and a warm standby isn't worth a second socket for a single
 /// transfer).
 ///
@@ -120,9 +120,9 @@ pub fn warm_standby_override() -> Option<bool> {
 // becomes a way-station, not a destination.
 
 /// Is the relay->direct upgrade prober ENABLED? (`FILAMENT_UPGRADE_PROBE=0`
-/// disables it — the kill switch the resilience plan calls for. Default ON.)
+/// disables it, the kill switch the resilience plan calls for. Default ON.)
 /// A no-op under `--no-relay` (that path never reaches relay) regardless of
-/// this knob — the caller also gates on `relay_forbidden()`.
+/// this knob, the caller also gates on `relay_forbidden()`.
 pub fn upgrade_prober_enabled() -> bool {
     match std::env::var("FILAMENT_UPGRADE_PROBE").ok().as_deref() {
         Some("0") | Some("false") | Some("off") => false,
@@ -193,7 +193,7 @@ pub enum Ev {
     Signal(Value),
     PairCode(Value),
     /// L1-a: v2 nameplate-allocation ack (server allocated our nameplate; it
-    /// echoes NO words — the creator displays its own locally-minted code).
+    /// echoes NO words, the creator displays its own locally-minted code).
     PairOk(Value),
     PairMatched(Value),
     #[allow(dead_code)] // payload is {code}; senders only need the wake-up
@@ -205,16 +205,16 @@ pub enum Ev {
     KnownPeerLeft(Value),
     /// C30: the server's session digest (mirror of the sync ack)
     Synced(Value),
-    /// (peer sid, ...) — every channel event is attributed to its link so
+    /// (peer sid, ...), every channel event is attributed to its link so
     /// the loops can hold many links at once (C18 multi-link).
     ChannelReady(String, Arc<dyn Transport>),
     /// rung-1 direct path (FILAMENT_DIRECT): an AUTHENTICATED QUIC transport for
     /// (peer sid) won the simultaneous-open race and passed the pair-secret MAC.
     /// Handled like ChannelReady but the link is pre-trusted (the MAC already
-    /// proved the secret — stronger than the post-DC pair-proof), so the
+    /// proved the secret, stronger than the post-DC pair-proof), so the
     /// DTLS-bound pair-proof dance is skipped.
     /// (peer sid, transport, route label). The route label is `direct-quic`
-    /// (rung-1) or `holepunched` (rung-2) — a direct link has no WebRTC
+    /// (rung-1) or `holepunched` (rung-2), a direct link has no WebRTC
     /// `route()` to query, so the winning rung tells us which path it used.
     DirectReady(String, Arc<dyn Transport>, &'static str),
     /// P5 (GAP-6): a relay->direct UPGRADE probe's fresh authenticated direct
@@ -238,18 +238,18 @@ pub enum Ev {
     /// C3: the establishment watchdog fired for (peer sid, attempt generation).
     Stuck(String, u32),
     /// P0 (GAP-1): the bytes-moved watchdog declared an in-flight transfer
-    /// STALLED — the link is open and its control channel is alive (liveness
+    /// STALLED, the link is open and its control channel is alive (liveness
     /// probe passed) but `idle_ms()` crossed the stall threshold, i.e. the data
     /// path is moving zero bytes (the "stuck at 0%" hang). Carries (peer sid,
     /// link_idle_ms) and drives the least-disruptive correction ladder in the
-    /// main loop — never the establishment retry path. Distinct from `Stuck`
+    /// main loop, never the establishment retry path. Distinct from `Stuck`
     /// (establishment never completed) and `GraceExpired` (the link itself died).
     TransferStalled(String, u64),
     /// C4: the 6s disconnected-grace timer expired for (peer sid, generation).
     GraceExpired(String, u32),
     /// P2 (GAP-2): the signaling socket reported a clean close/error (the
     /// socket.io `close`/`error` callbacks). A FAST-PATH hint that the link is
-    /// gone — the long-lived acceptor's outer reconnect loop re-dials signaling
+    /// gone, the long-lived acceptor's outer reconnect loop re-dials signaling
     /// and re-announces. NOTE this fires only on a server-sent disconnect or a
     /// protocol error; a hard TCP sever (the flaky-proxy case) produces NO
     /// callback at all, so the silence watchdog (`signaling_silence_ms`) is the
@@ -280,7 +280,7 @@ pub trait Transport: Send + Sync {
     /// FINAL-teardown drain: block until the peer has acknowledged *all* written
     /// bytes, then end the send direction. Distinct from `flush()`, which is
     /// called per-file (after each `file-end`) and must NOT end the stream.
-    /// Default delegates to `flush()` — correct for the DataChannel transport,
+    /// Default delegates to `flush()`, correct for the DataChannel transport,
     /// whose `flush()` already polls `buffered_amount` to zero before exit. The
     /// direct-QUIC transport overrides this: dropping a quinn connection discards
     /// un-acked send-buffer bytes, so a no-op here truncates the tail of the last
@@ -290,7 +290,7 @@ pub trait Transport: Send + Sync {
     }
     fn max_payload(&self) -> usize;
     /// Milliseconds since this link last moved a byte. `u64::MAX` means "no
-    /// activity tracked / idle forever" — the safe default, so an untracked
+    /// activity tracked / idle forever", the safe default, so an untracked
     /// transport never blocks a supersede. Backs the #28 data-flow guard.
     fn idle_ms(&self) -> u64 {
         u64::MAX
@@ -307,7 +307,7 @@ const READ_BUF: usize = 1 << 20;
 /// Milliseconds since a process-wide monotonic epoch. Backs data-flow recency:
 /// it lets `maybe_adopt`/`on_peer_left` tell an actively-transferring link from
 /// a frozen-alive one (gate 11's SIGSTOP'd receiver vs #28's live reconnect).
-/// Monotonic on purpose — an NTP wall-clock step must not flip a recency check.
+/// Monotonic on purpose, an NTP wall-clock step must not flip a recency check.
 fn now_ms() -> u64 {
     use std::sync::OnceLock;
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -323,8 +323,8 @@ pub struct DataChannelTransport {
     dead: Arc<std::sync::atomic::AtomicBool>, // set by the read loop on EOF/error
     // Monotonic ms-stamp of the last byte that actually moved (send_frame write
     // returned Ok, or the read loop delivered a frame). #28: a same-uid
-    // signaling reconnect must not supersede a link whose data channel — which
-    // is independent of the socket — is still flowing.
+    // signaling reconnect must not supersede a link whose data channel, which
+    // is independent of the socket, is still flowing.
     last_activity: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -372,7 +372,7 @@ impl Transport for DataChannelTransport {
             .await?;
         // Stamp at the unambiguous "bytes moved" point: the write returned Ok.
         // A frozen receiver (gate 11) stalls send_frame in the backpressure park
-        // above, so this never fires and the link goes idle — exactly the signal
+        // above, so this never fires and the link goes idle, exactly the signal
         // that lets the supersede proceed for frozen-alive but not for flowing.
         self.last_activity
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -395,7 +395,7 @@ impl Transport for DataChannelTransport {
     }
 
     fn idle_ms(&self) -> u64 {
-        // A dead channel has been idle forever — never let a recent-but-now-dead
+        // A dead channel has been idle forever, never let a recent-but-now-dead
         // stamp keep a link reading as "flowing". Without this, a same-uid
         // supersede could be skipped for an old link that just died (its last
         // stamp still fresh), keeping a dead link instead of swapping to the new
@@ -427,7 +427,7 @@ pub fn is_stun_only(s: &RTCIceServer) -> bool {
         })
 }
 
-/// C5: callers fetch this fresh before EVERY peer connection — TURN
+/// C5: callers fetch this fresh before EVERY peer connection, TURN
 /// credentials are expiry-stamped HMACs and go stale in long-lived processes.
 pub async fn fetch_config(server: &str) -> Result<ServerConfig> {
     let body: Value = http_get_json(&format!("{server}/api/config")).await?;
@@ -474,7 +474,7 @@ async fn http_get_json(url: &str) -> Result<Value> {
             tokio::time::sleep(std::time::Duration::from_millis(700)).await;
         }
         // Explicit timeout: reqwest has none by default, and this is awaited
-        // from the event loop — a hung GET must not freeze the process.
+        // from the event loop, a hung GET must not freeze the process.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build();
@@ -512,7 +512,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
 
     // P2 (GAP-2): forward socket.io's close/error to the event loop as
     // Ev::SignalingDown. `down` carries a reason string but the loop only needs
-    // the wake-up — the outer reconnect re-dials regardless of cause.
+    // the wake-up, the outer reconnect re-dials regardless of cause.
     let down = {
         let tx = tx.clone();
         move |reason: &'static str| {
@@ -535,7 +535,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
     // presence through the C30 session module on a fresh `welcome`, integrating
     // with the existing machinery rather than racing it. The triggers are the
     // close/error callbacks below (fast path) PLUS the silence watchdog in the
-    // acceptor loop (the authoritative path — a hard TCP sever fires no callback).
+    // acceptor loop (the authoritative path, a hard TCP sever fires no callback).
     let sio = ClientBuilder::new(server)
         .reconnect(false)
         .on(SioEvent::Connect, |_p: Payload, _c: Client| async {}.boxed())
@@ -560,7 +560,7 @@ pub async fn connect_signaling(server: &str, tx: mpsc::UnboundedSender<Ev>) -> R
 }
 
 /// P2 (GAP-2): re-dial signaling for a long-lived acceptor whose socket died.
-/// A fresh `connect_signaling` with the SAME event sender — so the new client
+/// A fresh `connect_signaling` with the SAME event sender, so the new client
 /// emits into the same loop, gets a fresh `welcome`/sid, and the C30 session
 /// module re-asserts room + channel subscriptions on the next tick. Returns the
 /// new `Client` to swap into the loop's `conn.sio` / `sess` emit target. The
@@ -587,7 +587,7 @@ pub struct Peer {
     sio: Client,
     closed: Arc<std::sync::atomic::AtomicBool>,
     /// C20: DTLS cert fingerprints (ours, theirs) parsed from the SDP we
-    /// exchange — pair-proofs are bound to them so a MITM'd channel (even by
+    /// exchange, pair-proofs are bound to them so a MITM'd channel (even by
     /// the signaling server) fails verification.
     fps: Mutex<(Option<String>, Option<String>)>,
 }
@@ -616,7 +616,7 @@ pub enum SignalOutcome {
 
 impl Peer {
     /// Build the RTCPeerConnection, wire callbacks into `tx`, and (if impolite)
-    /// create the data channel + offer — exactly the browser's PeerLink dance.
+    /// create the data channel + offer, exactly the browser's PeerLink dance.
     /// `generation` tags watchdog events so stale timers from torn-down attempts are
     /// ignored by the main loop (C3).
     pub async fn connect(
@@ -785,7 +785,7 @@ impl Peer {
         self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Tear down. May block on network teardown against an unreachable peer —
+    /// Tear down. May block on network teardown against an unreachable peer,
     /// callers in the event loop must mark_closed() and spawn this, never
     /// await it inline (gate 11 deadlock).
     pub async fn close(&self) {
@@ -800,7 +800,7 @@ impl Peer {
     /// the impolite side IGNORES a colliding offer (its own offer stands; the
     /// polite peer answers it), the polite side yields. webrtc-rs 0.17 cannot
     /// SetLocal(rollback) out of have-local-offer (the transition table has no
-    /// arm for it), so the polite side can't recover in-place — it returns
+    /// arm for it), so the polite side can't recover in-place, it returns
     /// `Glare(offer)` and the OWNER of this Peer must rebuild the link as a
     /// pure responder and re-apply that offer.
     pub async fn handle_signal(&self, data: Value) -> Result<SignalOutcome> {
@@ -899,7 +899,7 @@ impl Peer {
 
     /// Which physical path did ICE pick? Same taxonomy as the browser badge.
     /// C2 fix: read the agent's actual selected pair, and classify
-    /// local-vs-direct by ADDRESS rather than candidate type — the answering
+    /// local-vs-direct by ADDRESS rather than candidate type, the answering
     /// side often sees its peer as prflx even on the same LAN, and what the
     /// badge promises is "bytes never leave your network", which is an
     /// address property.
@@ -917,7 +917,7 @@ impl Peer {
             return Some("relayed");
         }
         // Same address on both ends = same machine (loopback via any of its
-        // IPs, public included) — bytes never leave the host.
+        // IPs, public included), bytes never leave the host.
         // "local" when bytes can't leave the machine/network: identical
         // addresses, the remote address being one of THIS host's own
         // addresses (multi-homed same-host pairs select different interfaces
@@ -930,7 +930,7 @@ impl Peer {
 }
 
 /// C1: webrtc-rs never writes `a=max-message-size` into its SDP, so browsers
-/// assume the RFC 8841 default of 64K (65536) — and the browser's frame is
+/// assume the RFC 8841 default of 64K (65536), and the browser's frame is
 /// 64 KiB payload + 4-byte header = 65540, four bytes over, making Chrome's
 /// send() throw against a CLI peer. Advertise a roomy limit in the
 /// application m-section of every description we relay; datachannel-only SDP
@@ -967,7 +967,7 @@ pub fn is_own_addr(addr: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// RFC1918/4193 + loopback + link-local — "on your network" for the route badge.
+/// RFC1918/4193 + loopback + link-local, "on your network" for the route badge.
 pub fn is_private_addr(addr: &str) -> bool {
     match addr.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => {
@@ -975,7 +975,7 @@ pub fn is_private_addr(addr: &str) -> bool {
                 || v4.is_private()
                 || v4.is_link_local()
                 // 100.64/10 (RFC6598 shared/CGNAT): in practice these are
-                // overlay networks like Tailscale — bytes stay on your wire.
+                // overlay networks like Tailscale, bytes stay on your wire.
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
         }
         Ok(std::net::IpAddr::V6(v6)) => {
@@ -994,7 +994,7 @@ async fn wire_channel(
     closed: Arc<std::sync::atomic::AtomicBool>,
 ) {
     // With detach_data_channels(), on_open still fires but webrtc-rs's
-    // managed (65535-byte-buffer) read loop never starts — we detach and run
+    // managed (65535-byte-buffer) read loop never starts, we detach and run
     // our own with a buffer matching the max-message-size we advertise (C1).
     let dc2 = dc.clone();
     dc.on_open(Box::new(move || {
@@ -1056,7 +1056,7 @@ async fn wire_channel(
                             Ok((n, false)) => {
                                 if n >= 4 && !closed.load(std::sync::atomic::Ordering::Relaxed) {
                                     // Inbound transfer bytes = link is flowing (#28
-                                    // guard). Only data frames count, not control —
+                                    // guard). Only data frames count, not control,
                                     // periodic acks/state pings must not keep an
                                     // otherwise-idle link looking active.
                                     last_activity

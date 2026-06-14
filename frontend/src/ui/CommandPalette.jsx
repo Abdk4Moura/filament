@@ -1,6 +1,6 @@
-/* CommandPalette — the ⌘K / Ctrl+K quick-launcher (shell-surfacing idea C,
+/* CommandPalette: the ⌘K / Ctrl+K quick-launcher (shell-surfacing idea C,
    Phase 3). A keyboard-first overlay over the running app: a search input plus a
-   filtered, arrow-navigable list of actions. It owns NO peer/session state — it's
+   filtered, arrow-navigable list of actions. It owns NO peer/session state; it's
    handed the live peers and the same handlers the DeviceSheet/DiscoveryBar use
    (onOpenShell, onSendFiles, onOpenSheet, onPairWithCode, onGenerateCode), so a
    selection runs exactly the same code path as clicking the equivalent affordance.
@@ -18,7 +18,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
 // Build the flat command list from the live roster + globals. Each item:
-//   { key, glyph, label, sub, search, run }  — run() performs the action and
+//   { key, glyph, label, sub, search, run }: run() performs the action and
 // returns true to keep the palette open (default: close).
 function buildItems({ peers, onOpenShell, onSendFiles, onOpenSheet, onPairWithCode, onGenerateCode }) {
   const items = []
@@ -26,21 +26,21 @@ function buildItems({ peers, onOpenShell, onSendFiles, onOpenSheet, onPairWithCo
     const ready = p.status === 'ready'
     const known = !!p.known
     const name = p.known || p.verified || p.name
-    // Open terminal — same gate as the DeviceSheet's primary action.
+    // Open terminal: same gate as the DeviceSheet's primary action.
     if (ready && known && p.shell && onOpenShell) {
       items.push({
         key: 'shell:' + p.id, glyph: '›_', label: 'Open terminal', sub: name,
         search: 'open terminal shell ' + name, run: () => onOpenShell(p),
       })
     }
-    // Send files — to any ready device.
+    // Send files, to any ready device.
     if (ready && onSendFiles) {
       items.push({
         key: 'send:' + p.id, glyph: '⇪', label: 'Send files', sub: name,
         search: 'send files ' + name, run: () => onOpenSheet && onOpenSheet(p, null),
       })
     }
-    // Device actions — opens the full per-device sheet (rename/info/forget…).
+    // Device actions: opens the full per-device sheet (rename/info/forget…).
     if (onOpenSheet) {
       items.push({
         key: 'sheet:' + p.id, glyph: '⋯', label: 'Device actions', sub: name,

@@ -1,4 +1,4 @@
-/* Filament — global shell styles (ported from the design handoff host).
+/* Filament: global shell styles (ported from the design handoff host).
    The UI itself is inline-styled in ui/Filament.jsx; this file only carries the
    page reset, the keyframes the component references, and scrollbars. */
 

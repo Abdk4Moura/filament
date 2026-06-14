@@ -1,7 +1,7 @@
 // PeerLink: one live connection to one remote peer.
 //
 // Owns an RTCPeerConnection + a single RTCDataChannel and moves files across it
-// in chunks. The server never sees a byte — it only relayed the SDP/ICE that
+// in chunks. The server never sees a byte, it only relayed the SDP/ICE that
 // got us here. Control messages are JSON strings; file chunks are ArrayBuffers.
 //
 // Transfer lifecycle (both directions surfaced to the UI via onTransfer):
@@ -21,12 +21,12 @@ const CTRL = {
   END: 'file-end',
   BRB: 'brb', // C21: "I'm stepping away (file picker / tab hidden), hold the line"
   BACK: 'back',
-  PAIR_KEEP: 'pair-keep', // C12: here's a secret — remember me as a known device
-  PAIR_KEEP_ACK: 'pair-keep-ack', // C27: the human's answer — sender keeps only confirmed secrets
+  PAIR_KEEP: 'pair-keep', // C12: here's a secret, remember me as a known device
+  PAIR_KEEP_ACK: 'pair-keep-ack', // C27: the human's answer, sender keeps only confirmed secrets
   PAIR_PROOF: 'pair-proof', // C20: HMAC proof I hold a secret you remembered
-  PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict — a rejected prover stops claiming acquaintance
-  STATE: 'state', // C30 ph3: periodic link truth {transfers, trusted, away} — divergence repair
-  DELIVERY_ACK: 'delivery-ack', // P4: receiver verified the WHOLE file (sha256 matched) — sender marks done only on this
+  PAIR_PROOF_ACK: 'pair-proof-ack', // C27: verifier's verdict, a rejected prover stops claiming acquaintance
+  STATE: 'state', // C30 ph3: periodic link truth {transfers, trusted, away}, divergence repair
+  DELIVERY_ACK: 'delivery-ack', // P4: receiver verified the WHOLE file (sha256 matched), sender marks done only on this
 }
 
 // P4: bound the whole-file re-fetch so a genuinely-corrupt payload fails CLEANLY
@@ -36,7 +36,7 @@ const MAX_VERIFY_FAILS = 2
 // this window so a send never hangs against an ack-less receiver (interop).
 const ACK_FALLBACK_MS = 30000
 
-// P4 test shims — INERT unless a `?test=` query flag (persisted to localStorage)
+// P4 test shims, INERT unless a `?test=` query flag (persisted to localStorage)
 // is set, so they ship in the bundle with zero effect on real users. They exist
 // only to drive the deterministic browser↔CLI integrity e2e:
 //   ?test=fixedid    -> mint a deterministic transfer id so the CLI's
@@ -46,12 +46,12 @@ const ACK_FALLBACK_MS = 30000
 //                       whole-file verify + re-request path is exercised live.
 //   ?test=freeze     -> P0: after FREEZE_AFTER_BYTES on a transfer, make
 //                       _streamFile's channel.send a no-op for THAT transfer
-//                       once (one-shot) while the channel stays open — a
+//                       once (one-shot) while the channel stays open, a
 //                       faithful NAT-rebind black-hole that drives the in-flight
 //                       stall watchdog + correction ladder. Mirrors the Rust
 //                       client's FILAMENT_TEST_FREEZE_AFTER_BYTES. Inert for
 //                       real users (TEST.freeze is false).
-//   ?test=freezepersist -> P5: like ?test=freeze but PERSISTENT — EVERY
+//   ?test=freezepersist -> P5: like ?test=freeze but PERSISTENT, EVERY
 //                       _streamFile run (not just the first) black-holes after
 //                       FREEZE_AFTER_BYTES, so a relayOnly link rebuilt on stall
 //                       (P1) STAYS the carrying path: the relay is a one-way
@@ -129,14 +129,14 @@ const STALL_MS = (() => {
   }
 })()
 // Ladder ceiling (mirror Rust STALL_MAX_REPAIRS' intent): rungs a→c, then fail
-// clean through _failActive (paused/resumable — never silently dead).
+// clean through _failActive (paused/resumable, never silently dead).
 const MAX_STALL_ATTEMPTS = 3
 
 // P5 (GAP-6): the relay→direct UPGRADE prober. P1 makes a stalled direct path
-// fall to the TURN relay — but that's a ONE-WAY TRAPDOOR: once on relay the link
+// fall to the TURN relay, but that's a ONE-WAY TRAPDOOR: once on relay the link
 // STAYS on relay even after the network heals and direct would work again. P5
 // fixes that: while serving on relay, periodically restartIce() on the SAME PC
-// (the data channel SURVIVES an ICE restart — non-disruptive) and re-detect the
+// (the data channel SURVIVES an ICE restart, non-disruptive) and re-detect the
 // route; if a direct candidate-pair wins re-nomination AND holds (verify-before-
 // commit), commit to direct and release the relay. "Relay is a way-station, not
 // a destination." Mirrors the Rust upgrade prober (cli/src/net.rs).
@@ -195,12 +195,12 @@ async function headHash(file) {
 
 // P4 (whole-file integrity): hex sha256 over the WHOLE file, carried in the
 // file-offer alongside `head`. The receiver recomputes it over every byte it
-// received and only declares the transfer done — and acks it — on a match, so a
+// received and only declares the transfer done (and acks it) on a match, so a
 // silently-truncated/corrupt receive (the 7 KB stub class) is caught. Wire-
 // compatible with the Rust client's offer `full` field. Web Crypto has no
 // incremental digest, so we hash the whole buffer for the common case and fall
 // back to slice-accumulation above a threshold to bound peak memory. Returns
-// null where crypto.subtle is unavailable (insecure origin) — receivers then
+// null where crypto.subtle is unavailable (insecure origin), receivers then
 // degrade to size-only acceptance, exactly like headHash.
 const FULL_DIRECT_MAX = 64 * 1024 * 1024 // hash in one shot below this
 const FULL_SLICE = 8 * 1024 * 1024 // slice size above it
@@ -212,7 +212,7 @@ async function fullHash(file) {
       bytes = new Uint8Array(await file.arrayBuffer())
     } else {
       // Web Crypto can't update incrementally; concatenate slices into one
-      // buffer (bounded read pressure — we never hold two full copies of a
+      // buffer (bounded read pressure, we never hold two full copies of a
       // slice). Peak is the file size in one contiguous buffer, which the
       // single-shot path would also need, so this only caps per-read memory.
       bytes = new Uint8Array(file.size)
@@ -244,7 +244,7 @@ async function blobHash(blob) {
 }
 
 // Deterministic negotiation roles (#1, hardened in #8/#10): prefer the stable
-// per-tab uid — it survives reconnects, so both sides always compare the SAME
+// per-tab uid, it survives reconnects, so both sides always compare the SAME
 // pair even when one of them holds a stale sid. Fall back to sids, then to
 // polite (wait for the offer) when we know nothing yet.
 export function politeRole({ myUid, peerUid, myId, peerId }) {
@@ -277,7 +277,7 @@ export class PeerLink {
     // P0: escalation hook fired at rung (c) when an in-flight stall persists past
     // the in-place repair ladder. P1 wires this to the relay-preferred rebuild +
     // the amber UI; until then it's a no-op (the ladder still fails clean via
-    // _failActive on exhaustion — partials preserved).
+    // _failActive on exhaustion, partials preserved).
     this.onStall = onStall || (() => {})
     this.onPairKeep = onPairKeep || (() => {}) // C12: peer handed us a pair secret
     this.onPairKeepAck = onPairKeepAck || (() => {}) // C27: peer answered our remember offer
@@ -294,7 +294,7 @@ export class PeerLink {
     this.route = null // 'local' | 'direct' | 'relayed'
 
     // Resume support: a stable per-tab identity for the remote peer, plus
-    // hook-owned stores that OUTLIVE this link — partial receive buffers and
+    // hook-owned stores that OUTLIVE this link, partial receive buffers and
     // unfinished outgoing files survive a drop and resume on the next link.
     this.peerUid = peerUid || null
     this.stores = stores || { partials: new Map(), outgoing: new Map() }
@@ -316,7 +316,7 @@ export class PeerLink {
     this._dcTimer = null // grace timer for transient 'disconnected' (#6)
 
     // P0 (GAP-1): in-flight bytes-moved liveness. `_bytesMoved` counts FILE
-    // bytes sent + received on this link (PTY bytes excluded — file-transfer
+    // bytes sent + received on this link (PTY bytes excluded, file-transfer
     // liveness only). The watchdog compares it (and the SCTP send buffer level)
     // against the last tick's snapshot to tell "data wedged, link alive" (→ the
     // correction ladder) from a slow-but-moving link (→ no action).
@@ -338,7 +338,7 @@ export class PeerLink {
 
     // P1 (GAP-4): when this link is rebuilt relay-preferred after a chronically
     // stalled direct/STUN path, force EVERY ICE candidate through the TURN relay
-    // (`iceTransportPolicy:'relay'`) — the same auto-relay the Rust client takes
+    // (`iceTransportPolicy:'relay'`), the same auto-relay the Rust client takes
     // at ladder exhaustion. The amber RELAY UI then lights itself off the normal
     // `_detectRoute()`→onRoute('relayed') path; P5 later upgrades back to direct.
     this.relayOnly = !!relayOnly
@@ -352,7 +352,7 @@ export class PeerLink {
         this.sendSignal({ type: 'candidate', candidate: e.candidate })
       }
     }
-    // All (re)negotiation funnels through here — we never hand-roll offers.
+    // All (re)negotiation funnels through here, we never hand-roll offers.
     // Explicit createOffer (not the no-arg setLocalDescription()) for older
     // Safari, where the implicit form throws and silently kills the handshake.
     this.pc.onnegotiationneeded = async () => {
@@ -373,11 +373,11 @@ export class PeerLink {
       rlog.trace('connectionState', this.id.slice(-6), s)
       if (s === 'connected') {
         clearTimeout(this._dcTimer)
-        clearTimeout(this._watchdog) // established — watchdog stands down (#8)
+        clearTimeout(this._watchdog) // established, watchdog stands down (#8)
         this.onStatus('ready')
         this._detectRoute() // which physical path did ICE actually pick?
       } else if (s === 'disconnected') {
-        rlog.debug('peer disconnected — attempting recovery', this.id.slice(-6))
+        rlog.debug('peer disconnected, attempting recovery', this.id.slice(-6))
         // Usually a transient blip (#6): show 'connecting' (or keep 'away' if
         // they announced the absence), nudge an ICE restart from the impolite
         // side, and only fail if it doesn't recover in time.
@@ -416,7 +416,7 @@ export class PeerLink {
 
     // Establishment watchdog (#8): if signaling is lost (offer to a dead sid,
     // peer suspended, swallowed SDP error), the connection would otherwise sit
-    // at 'connecting' FOREVER — ICE only times out once descriptions exchange.
+    // at 'connecting' FOREVER, ICE only times out once descriptions exchange.
     // Let the hook tear down and retry instead of hanging.
     this.onStuck = onStuck || null
     this._watchdog = setTimeout(() => {
@@ -476,15 +476,15 @@ export class PeerLink {
   }
 
   // Inspect the ICE stats to learn which path the connection actually took:
-  //   local   — host↔host, i.e. straight across the LAN (never hit the internet)
-  //   direct  — peer-to-peer over the internet (NAT-traversed, no relay)
-  //   relayed — falling back through a TURN relay
+  //   local   (host↔host, i.e. straight across the LAN, never hit the internet)
+  //   direct  (peer-to-peer over the internet, NAT-traversed, no relay)
+  //   relayed (falling back through a TURN relay)
   // ICE renominates occasionally, so we poll a few times after connecting.
   // PURE read of the currently-selected candidate-pair route (no commit, no UI,
   // no prober side-effects). Returns 'local'|'direct'|'relayed', or null when no
   // pair is selected yet / getStats is unsupported. Shared by _detectRoute (the
   // committing path) and the P5 prober's verify (which must NOT commit until the
-  // path is verified — see _beginUpgradeVerify).
+  // path is verified, see _beginUpgradeVerify).
   async _measureRoute() {
     if (this._closed) return null
     try {
@@ -535,11 +535,11 @@ export class PeerLink {
 
   // ---------------------------------------------------- P5 relay→direct upgrade
   // Begin probing for a direct path while serving on relay. Idempotent. The
-  // schedule is: first probe at UPGRADE_FIRST_MS (eager — the cause is often a
+  // schedule is: first probe at UPGRADE_FIRST_MS (eager, the cause is often a
   // transient hiccup), then each failed probe doubles toward UPGRADE_STEADY_MS.
   _armUpgradeProber() {
     if (this._closed || this._upgradeTimer) return
-    rlog.debug('upgrade prober armed (on relay — probing for a direct path)', this.id.slice(-6))
+    rlog.debug('upgrade prober armed (on relay, probing for a direct path)', this.id.slice(-6))
     this._upgradeDelay = UPGRADE_FIRST_MS
     this._scheduleUpgradeProbe(this._upgradeDelay)
   }
@@ -561,11 +561,11 @@ export class PeerLink {
   }
 
   // Re-probe NOW: collapse the backoff so the next probe fires immediately. The
-  // hook calls this from its visibility/online effect on a network change — the
+  // hook calls this from its visibility/online effect on a network change, the
   // browser analog of the Rust client's iface-change re-probe trigger.
   probeUpgradeNow() {
     if (this._closed || this.route !== 'relayed') return
-    this._upgradeDelay = UPGRADE_FIRST_MS // a fresh path may exist — reset the cadence
+    this._upgradeDelay = UPGRADE_FIRST_MS // a fresh path may exist, reset the cadence
     if (this._upgrading) return // a probe is already in flight; let it run
     rlog.debug('upgrade re-probe now (network change)', this.id.slice(-6))
     this._scheduleUpgradeProbe(0)
@@ -582,7 +582,7 @@ export class PeerLink {
     // of the prober entirely. Leave the link on relay; never re-schedule.
     try {
       if (localStorage.getItem('filamentUpgradeProbe') === '0') {
-        rlog.debug('upgrade prober disabled (filamentUpgradeProbe=0) — staying on relay', this.id.slice(-6))
+        rlog.debug('upgrade prober disabled (filamentUpgradeProbe=0), staying on relay', this.id.slice(-6))
         return
       }
     } catch {}
@@ -594,15 +594,15 @@ export class PeerLink {
       return this._backoffUpgrade()
     }
     // Only the IMPOLITE side drives restartIce (consistent with C4 + the P0
-    // ladder rung a) — restarting from both sides glares.
+    // ladder rung a), restarting from both sides glares.
     this._upgrading = true
     if (!this.polite) {
       try {
-        rlog.debug('upgrade probe — restartIce to find a direct path', this.id.slice(-6))
+        rlog.debug('upgrade probe: restartIce to find a direct path', this.id.slice(-6))
         this.pc.restartIce()
       } catch {}
     } else {
-      rlog.debug('upgrade probe — re-detecting route (polite: no restartIce)', this.id.slice(-6))
+      rlog.debug('upgrade probe: re-detecting route (polite: no restartIce)', this.id.slice(-6))
     }
     // Give ICE a moment to re-nominate, then MEASURE (not commit) the route. We
     // deliberately use _measureRoute, not _detectRoute: a relay→direct flip must
@@ -626,9 +626,9 @@ export class PeerLink {
   // wins re-nomination must keep moving data for UPGRADE_VERIFY_MS before we cut
   // over. Reuses the P0 _bytesMoved counter as the "data path holds" signal. We
   // sample on a short heartbeat; if the route reverts to relay OR bytes stop
-  // before the window closes, DISCARD and back off — no flap.
+  // before the window closes, DISCARD and back off, no flap.
   _beginUpgradeVerify(route) {
-    rlog.debug('direct path detected — verifying it holds before committing', this.id.slice(-6))
+    rlog.debug('direct path detected, verifying it holds before committing', this.id.slice(-6))
     const start = Date.now()
     const verify = { route, bytesAt: this._bytesMoved, lastBytes: this._bytesMoved, lastSeen: start }
     this._upgradeVerify = verify
@@ -642,7 +642,7 @@ export class PeerLink {
     const tick = async () => {
       if (this._closed || this._upgradeVerify !== verify) return
       if (this.route !== 'relayed') return // someone else committed; stop
-      const re = await this._measureRoute() // MEASURE only — commit happens below
+      const re = await this._measureRoute() // MEASURE only, commit happens below
       if (this._closed || this._upgradeVerify !== verify) return
       const hasInflight = [...this.transfers.values()].some(
         (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
@@ -656,7 +656,7 @@ export class PeerLink {
       // have stalled past a tick-of-grace → discard, stay on relay, back off.
       const idleTooLong = hasInflight && Date.now() - verify.lastSeen >= UPGRADE_VERIFY_MS
       if ((re && re === 'relayed') || idleTooLong) {
-        rlog.debug('direct path connected but did not hold — staying on relay (no flap)', this.id.slice(-6))
+        rlog.debug('direct path connected but did not hold, staying on relay (no flap)', this.id.slice(-6))
         this._upgradeVerify = null
         this._backoffUpgrade()
         return
@@ -672,13 +672,13 @@ export class PeerLink {
   }
 
   // Commit the upgrade: the direct path held. Set the route, fire onRoute (which
-  // AUTO-CLEARS the amber RELAY UI — no new UI needed), log the one value-prop
+  // AUTO-CLEARS the amber RELAY UI, no new UI needed), log the one value-prop
   // line, and disarm the prober (we're a destination now, not a way-station).
   _commitUpgrade(route) {
     if (this._closed) return
     this.route = route
     this.onRoute(route)
-    rlog.info('upgraded to direct — relay released', this.id.slice(-6), route)
+    rlog.info('upgraded to direct, relay released', this.id.slice(-6), route)
     this._disarmUpgradeProber()
   }
 
@@ -697,10 +697,10 @@ export class PeerLink {
     channel.binaryType = 'arraybuffer'
     channel.bufferedAmountLowThreshold = this.chunkSize
     channel.onopen = () => {
-      clearTimeout(this._watchdog) // established — watchdog stands down (#8)
+      clearTimeout(this._watchdog) // established, watchdog stands down (#8)
       this.onStatus('ready')
       this.onChannelOpen() // the hook re-offers any paused sends to this peer
-      // C30 ph3: tell this peer our truth every ~10s — transfers we hold,
+      // C30 ph3: tell this peer our truth every ~10s, transfers we hold,
       // whether we verified them, whether our tab is hidden. One-sided
       // beliefs (lost END, lost proof, stale away) self-correct.
       clearInterval(this._stateTimer)
@@ -718,7 +718,7 @@ export class PeerLink {
       this._stallTimer = setInterval(() => this._checkStall(), STALL_TICK_MS)
     }
     channel.onmessage = (e) => this._onMessage(e.data)
-    // One persistent drain handler feeds ALL concurrent senders — never
+    // One persistent drain handler feeds ALL concurrent senders, never
     // clobbered by a per-transfer assignment (#4).
     channel.onbufferedamountlow = () => {
       const waiters = this._drainWaiters
@@ -745,11 +745,11 @@ export class PeerLink {
     const payload = data.slice(4)
     entry.buffers.push(payload)
     entry.received += payload.byteLength
-    this._bytesMoved += payload.byteLength // P0: inbound file bytes = data path alive (PTY excluded — handled above)
+    this._bytesMoved += payload.byteLength // P0: inbound file bytes = data path alive (PTY excluded, handled above)
     this._update(this.transfers.get(id), { progress: entry.size ? entry.received / entry.size : 0 })
   }
 
-  // C21: declared absences make waits informed — the peer holds the line for
+  // C21: declared absences make waits informed: the peer holds the line for
   // the announced ttl instead of failing on the picker-induced disconnect.
   sendBrb(ttl = 120) {
     this._control({ type: CTRL.BRB, ttl })
@@ -764,18 +764,18 @@ export class PeerLink {
     this._control({ type: CTRL.PAIR_PROOF, mac })
   }
 
-  // C27: answer a remember offer — the sender discards its half on false.
+  // C27: answer a remember offer, the sender discards its half on false.
   sendPairKeepAck(ok) {
     this._control({ type: CTRL.PAIR_KEEP_ACK, ok: !!ok })
   }
 
-  // C27: judge a received proof — false tells a stale prover we never met.
+  // C27: judge a received proof: false tells a stale prover we never met.
   sendPairProofAck(ok) {
     this._control({ type: CTRL.PAIR_PROOF_ACK, ok: !!ok })
   }
 
   /// Both DTLS fingerprints of THIS link, parsed like the CLI does
-  /// (a=fingerprint: value, trimmed, uppercased) — the proof binds to them.
+  /// (a=fingerprint: value, trimmed, uppercased), the proof binds to them.
   fingerprints() {
     const grab = (desc) => {
       const line = (desc?.sdp || '').split(/\r?\n/).find((l) => l.startsWith('a=fingerprint:'))
@@ -848,7 +848,7 @@ export class PeerLink {
         // copy it onto the partial; verified at file-end.
         t._full = msg.full || null
         // Resume: if we already hold partial bytes for this transfer (the link
-        // dropped mid-receive), accept automatically from where we left off —
+        // dropped mid-receive), accept automatically from where we left off,
         // the user already said yes once.
         const partial = msg.resume && this.stores.partials.get(msg.id)
         if (partial) {
@@ -886,7 +886,7 @@ export class PeerLink {
       }
       case CTRL.PAIR_KEEP:
         // C12: the peer minted a pair secret and asked us to remember them.
-        // C27: the hook asks the HUMAN before storing — never automatic.
+        // C27: the hook asks the HUMAN before storing, never automatic.
         if (typeof msg.secret === 'string' && /^[0-9a-f]{64}$/.test(msg.secret)) this.onPairKeep(msg.secret)
         break
       case CTRL.PAIR_KEEP_ACK:
@@ -899,12 +899,12 @@ export class PeerLink {
         this.onPairProofAck(!!msg.ok)
         break
       case CTRL.STATE: {
-        // (the first switch's default already cleared any away-mark — a
+        // (the first switch's default already cleared any away-mark, a
         // state ping is proof of life.) Corrections:
         const tr = msg.transfers || {}
         for (const [id, bytes] of Object.entries(tr)) {
           const t = this.transfers.get(id)
-          // I believe this send is COMPLETE; the peer holds fewer bytes —
+          // I believe this send is COMPLETE; the peer holds fewer bytes,
           // the tail/END was lost. Re-offer with resume.
           if (t && t.direction === 'send' && t.status === 'complete' && bytes < t.size) {
             this.onPeerStateDiverged('transfer')
@@ -912,7 +912,7 @@ export class PeerLink {
           }
         }
         // They say they don't recognize us; the hook may hold a secret for
-        // them — let it re-prove. Report ONCE per link: the re-prove is
+        // them, let it re-prove. Report ONCE per link: the re-prove is
         // one-shot, and a genuinely asymmetric peer (no secret for us) would
         // otherwise repeat trusted:false on every 10s ping forever (observed
         // live). Aligning the signal with the action keeps the monitor honest.
@@ -935,7 +935,7 @@ export class PeerLink {
         this._outgoingFiles.delete(msg.id)
         this.stores.outgoing.delete(msg.id)
         this._update(t, { status: 'complete', progress: 1 })
-        rlog.info('delivery-ack received — send verified + complete', msg.id)
+        rlog.info('delivery-ack received, send verified + complete', msg.id)
         break
       }
     }
@@ -948,7 +948,7 @@ export class PeerLink {
   //   re-request: a short receive (buffered < size) resumes from where we are;
   //   a full-size-but-wrong-hash receive (corrupt body) restarts from 0 (the
   //   buffers are poisoned). Bounded by MAX_VERIFY_FAILS, then fail CLEAN
-  //   (paused/resumable, partial kept) — never an infinite loop.
+  //   (paused/resumable, partial kept), never an infinite loop.
   async _finishReceive(id, entry, sid) {
     const t = this.transfers.get(id)
     const finalize = (blob) => {
@@ -957,7 +957,7 @@ export class PeerLink {
       this._update(t, { status: 'complete', progress: 1, blob, url: URL.createObjectURL(blob) })
     }
     if (!entry.full) {
-      // Legacy: no whole-file digest offered — accept on size, no ack.
+      // Legacy: no whole-file digest offered, accept on size, no ack.
       finalize(new Blob(entry.buffers, { type: entry.mime || 'application/octet-stream' }))
       return
     }
@@ -973,31 +973,31 @@ export class PeerLink {
     const blob = new Blob(entry.buffers, { type: entry.mime || 'application/octet-stream' })
     const got = await blobHash(blob)
     // Insecure origin on our side (can't hash): degrade to size-only acceptance
-    // rather than rejecting forever — matches headHash's null-degrade contract.
+    // rather than rejecting forever, matches headHash's null-degrade contract.
     if (got == null) {
-      rlog.debug('no crypto.subtle — accepting received file on size (no whole-file verify)', id)
+      rlog.debug('no crypto.subtle, accepting received file on size (no whole-file verify)', id)
       finalize(blob)
       return
     }
     if (got === entry.full) {
-      // INTACT — finalize, then tell the sender it landed whole (delivery-ack).
+      // INTACT: finalize, then tell the sender it landed whole (delivery-ack).
       entry.verifyFails = 0
       finalize(blob)
-      rlog.info('whole-file sha256 matched — finalizing + acking', id)
+      rlog.info('whole-file sha256 matched, finalizing + acking', id)
       this._control({ type: CTRL.DELIVERY_ACK, id, sid, v: 1 })
       return
     }
-    // MISMATCH — do NOT finalize. Keep the partial, bound the re-request.
+    // MISMATCH: do NOT finalize. Keep the partial, bound the re-request.
     entry.verifyFails = (entry.verifyFails || 0) + 1
     const truncated = entry.received < (entry.size || 0)
     rlog.debug(
-      `whole-file checksum FAILED (${truncated ? 'truncated ' + entry.received + '/' + entry.size : 'corrupt'}) — attempt ${entry.verifyFails}`,
+      `whole-file checksum FAILED (${truncated ? 'truncated ' + entry.received + '/' + entry.size : 'corrupt'}), attempt ${entry.verifyFails}`,
       id,
     )
     if (entry.verifyFails > MAX_VERIFY_FAILS) {
       // Give up CLEANLY: keep the partial on the store (resumable), mark paused,
       // do not finalize, do not ack. No silent bad file, no hang.
-      rlog.warn(`whole-file checksum still wrong after ${MAX_VERIFY_FAILS} re-fetches — refusing corrupt file (partial kept)`, id)
+      rlog.warn(`whole-file checksum still wrong after ${MAX_VERIFY_FAILS} re-fetches, refusing corrupt file (partial kept)`, id)
       this._incomingBySid.delete(sid)
       this._update(t, { status: 'paused' })
       return
@@ -1038,7 +1038,7 @@ export class PeerLink {
       this.onTransfer(t)
       // The offer ships once the hashes resolve: head (C7 resume) AND the
       // whole-file digest (P4 integrity). Order across concurrent offers
-      // doesn't matter — ids are independent.
+      // doesn't matter, ids are independent.
       Promise.all([headHash(file), fullHash(file)]).then(([head, full]) =>
         this._control({ type: CTRL.OFFER, id, sid, name: file.name, size: file.size, mime: file.type, ...(head ? { head } : {}), ...(full ? { full } : {}) })
       )
@@ -1104,32 +1104,32 @@ export class PeerLink {
       framed.set(new Uint8Array(buf), 4)
       // P0 test shim (?test=freeze): after FREEZE_AFTER_BYTES on THIS transfer,
       // make the data-path send a no-op ONCE (one-shot per transfer) while the
-      // channel stays open — a faithful NAT-rebind black-hole. The control path
+      // channel stays open, a faithful NAT-rebind black-hole. The control path
       // keeps flowing, the channel stays 'open', the pc stays 'connected'; only
       // the bytes-moved watchdog can catch this. Inert in production.
       if (TEST.freeze && !this._frozenIds?.has(id) && sentThisRun + buf.byteLength > FREEZE_AFTER_BYTES) {
         ;(this._frozenIds ||= new Set()).add(id) // one-shot: rung (a)/(b)'s re-stream sends normally
-        rlog.debug('[test] data-path FREEZE engaged — dropping chunks (channel stays open)', id, 'after', sentThisRun)
+        rlog.debug('[test] data-path FREEZE engaged, dropping chunks (channel stays open)', id, 'after', sentThisRun)
         return // park the sender loop without advancing offset; the partial is preserved
       }
-      // P5 test shim (?test=freezepersist): a PERSISTENT freeze — EVERY run of
+      // P5 test shim (?test=freezepersist): a PERSISTENT freeze, EVERY run of
       // this loop black-holes after FREEZE_AFTER_BYTES (not just the first), so a
       // direct path can never carry the transfer and the link stays trapped on the
       // relay P1 rebuilds it onto. It LIFTS once HEAL_AFTER_MS has elapsed since
       // boot ("the network heals"), letting the P5 upgrade prober's re-probe
       // re-detect a usable direct route. relayOnly links are exempt (the relay
-      // path must keep carrying bytes — only DIRECT is frozen). Inert in prod.
+      // path must keep carrying bytes, only DIRECT is frozen). Inert in prod.
       if (TEST.freezePersist && !this.relayOnly && sentThisRun + buf.byteLength > FREEZE_AFTER_BYTES) {
         const now = (() => { try { return performance.now() } catch { return Date.now() } })()
         if (now - _bootAt < HEAL_AFTER_MS) {
           rlog.debug('[test] PERSISTENT data-path FREEZE engaged (direct dark, not yet healed)', id, 'after', sentThisRun)
-          // Re-arm the sender shortly so it resumes (and re-freezes) — this keeps
+          // Re-arm the sender shortly so it resumes (and re-freezes), this keeps
           // the transferring transfer "in flight" so the stall watchdog + the P5
           // verify both have live signal once the heal lifts.
           setTimeout(() => { if (!this._closed && this.channel?.readyState === 'open') this._streamFile(id, offset) }, 500)
           return
         }
-        // Healed — fall through and send normally.
+        // Healed. Fall through and send normally.
       }
       this.channel.send(framed)
       offset += buf.byteLength
@@ -1140,7 +1140,7 @@ export class PeerLink {
     this._control({ type: CTRL.END, id, sid })
     // Don't declare 'complete' while bytes still sit in the SCTP buffer: the
     // user reads 'complete' as permission to close the tab, and closing then
-    // truncates the receiver's tail (caught by CLI gate 6 — ledger F5).
+    // truncates the receiver's tail (caught by CLI gate 6, ledger F5).
     while (!this._closed && this.channel?.readyState === 'open' && this.channel.bufferedAmount > 0) {
       await new Promise((res) => setTimeout(res, 50))
     }
@@ -1149,14 +1149,14 @@ export class PeerLink {
     // receiver delivery-acks the whole-file sha256 (see CTRL.DELIVERY_ACK).
     // Bounded fallback for interop with a peer too old to ack (or one that
     // offered no digest): after the buffer drains, accept on size+drain in
-    // ACK_FALLBACK_MS if no ack arrives — preserves the never-hangs property.
+    // ACK_FALLBACK_MS if no ack arrives, preserves the never-hangs property.
     this._ackTimers ||= new Map()
     if (this._ackTimers.has(id)) clearTimeout(this._ackTimers.get(id))
     this._ackTimers.set(id, setTimeout(() => {
       this._ackTimers.delete(id)
       const cur = this.transfers.get(id)
       if (!cur || cur.status === 'complete') return
-      rlog.debug('no delivery-ack — accepting on drain', id)
+      rlog.debug('no delivery-ack, accepting on drain', id)
       this._outgoingFiles.delete(id)
       this.stores.outgoing.delete(id)
       this._update(cur, { status: 'complete', progress: 1 })
@@ -1180,11 +1180,11 @@ export class PeerLink {
   }
 
   // When the link drops, in-flight transfers become 'paused' if they can resume
-  // (we still hold the File / the partial bytes — kept in the hook-owned stores,
+  // (we still hold the File / the partial bytes, kept in the hook-owned stores,
   // which deliberately survive this link), else 'failed' (#5 + resume).
   _failActive() {
     // P0: the in-flight watchdog is meaningless once we've torn the link's
-    // transfers down — disarm it and clear the episode so a fresh link starts
+    // transfers down, disarm it and clear the episode so a fresh link starts
     // clean (close() also clears it; this covers a mid-life link drop).
     clearInterval(this._stallTimer)
     this._stallTimer = null
@@ -1200,7 +1200,7 @@ export class PeerLink {
     }
     this._incomingBySid.clear() // sid routing dies with the link; partials survive
     this._outgoingFiles.clear() // per-link send state; the Files survive in stores
-    // P4: drop pending ack-fallback timers — the send is no longer 'complete' on
+    // P4: drop pending ack-fallback timers, the send is no longer 'complete' on
     // this link (it becomes 'paused' above and re-offers on the next link).
     if (this._ackTimers) {
       for (const tm of this._ackTimers.values()) clearTimeout(tm)
@@ -1237,12 +1237,12 @@ export class PeerLink {
   //     stays 'connected', so only this runs; rung (a)'s connectionState guard
   //     prevents colliding restartIce calls if a real 'disconnected' happens.
   _checkStall() {
-    // A genuine drop is C4's job — this detector is for an OPEN-but-dark channel.
+    // A genuine drop is C4's job, this detector is for an OPEN-but-dark channel.
     if (this._closed || this.channel?.readyState !== 'open') return
     // An idle link must never trip: nothing with bytes STILL TO MOVE -> reset the
     // baseline. A transfer at progress 1 has handed every byte off and is in its
     // legitimate no-wire-bytes tail (SCTP drain + whole-file verify + delivery-ack,
-    // P4) — counting it would false-trip on a clean transfer, so we require
+    // P4), counting it would false-trip on a clean transfer, so we require
     // progress < 1 (an outstanding byte) to treat the link as stall-eligible.
     const transferring = [...this.transfers.values()].some(
       (t) => t.status === 'transferring' && (t.progress ?? 0) < 1,
@@ -1255,7 +1255,7 @@ export class PeerLink {
       return
     }
     // C21 announced-absence grace: a peer that said `brb` (or whose tab is hidden)
-    // gets its window — don't trip while they're legitimately away.
+    // gets its window, don't trip while they're legitimately away.
     if ((this._awayUntil || 0) > Date.now()) {
       this._lastMovedSnapshot = this._bytesMoved
       this._lastBuffered = this.channel.bufferedAmount
@@ -1263,22 +1263,22 @@ export class PeerLink {
       return
     }
     // PROGRESS check. Either application-level bytes advanced, OR the SCTP send
-    // buffer drained (bytes left for the wire) — the latter prevents a false
+    // buffer drained (bytes left for the wire), the latter prevents a false
     // positive on a slow-but-moving link whose chunks sit briefly buffered.
     const buffered = this.channel.bufferedAmount
     if (this._bytesMoved !== this._lastMovedSnapshot || buffered < this._lastBuffered) {
       this._lastMovedSnapshot = this._bytesMoved
       this._lastBuffered = buffered
       this._stallIdleMs = 0
-      // A moved byte clears any open episode (the link recovered) — mirrors the
+      // A moved byte clears any open episode (the link recovered), mirrors the
       // Rust note_progress(): a future stall may climb the ladder fresh.
       if (this._stallEpisode) {
-        rlog.info('stall corrected — bytes moving again', this.id.slice(-6), 'rung', this._stallEpisode.rung)
+        rlog.info('stall corrected, bytes moving again', this.id.slice(-6), 'rung', this._stallEpisode.rung)
         this._stallEpisode = null
       }
       return
     }
-    // No progress this tick — accumulate idle time.
+    // No progress this tick, accumulate idle time.
     this._lastBuffered = buffered
     this._stallIdleMs += STALL_TICK_MS
     if (this._stallIdleMs < STALL_MS) return
@@ -1291,13 +1291,13 @@ export class PeerLink {
   }
 
   // Least-disruptive-first correction ladder (mirrors Rust correct_stall):
-  //   (a) liveness ping + (impolite, connected) restartIce — cheapest in-place;
+  //   (a) liveness ping + (impolite, connected) restartIce, cheapest in-place;
   //   (b) re-offer/resume unfinished transfers (receiver auto-resumes; the
   //       receiver instead re-acks at its current offset to nudge the sender);
-  //   (c) escalate to onStall (P1: relay-preferred rebuild) — callback may be a
+  //   (c) escalate to onStall (P1: relay-preferred rebuild), callback may be a
   //       no-op for now.
   // Bounded at MAX_STALL_ATTEMPTS; on exhaustion -> onStatus('failed') +
-  // _failActive (transfers become paused/resumable — NEVER silently dead).
+  // _failActive (transfers become paused/resumable, NEVER silently dead).
   _correctStall() {
     const now = Date.now()
     const rung = this._stallEpisode?.rung
@@ -1305,11 +1305,11 @@ export class PeerLink {
     if (!rung) {
       try {
         // A control send over the reliable channel: success ⇒ the transport
-        // itself is up (data path dark, link alive). A throw ⇒ truly dead — let
+        // itself is up (data path dark, link alive). A throw ⇒ truly dead. Let
         // C4 / _failActive own it.
         this.channel.send(JSON.stringify({ type: 'ping', v: 1, reason: 'stall-probe' }))
       } catch {
-        rlog.debug('stall: control send threw — link is dead, deferring to C4', this.id.slice(-6))
+        rlog.debug('stall: control send threw: link is dead, deferring to C4', this.id.slice(-6))
         return
       }
       // Only nudge ICE while CONNECTED and from the IMPOLITE side: C4 owns the
@@ -1319,15 +1319,15 @@ export class PeerLink {
       if (this.pc.connectionState === 'connected' && !this.polite) {
         try {
           this.pc.restartIce()
-          rlog.info('stall corrected attempt (rung a) — liveness ping + restartIce', this.id.slice(-6))
+          rlog.info('stall corrected attempt (rung a), liveness ping + restartIce', this.id.slice(-6))
         } catch {}
       } else {
-        rlog.info('stall corrected attempt (rung a) — liveness ping (no ICE restart: polite/not-connected)', this.id.slice(-6))
+        rlog.info('stall corrected attempt (rung a), liveness ping (no ICE restart: polite/not-connected)', this.id.slice(-6))
       }
       this._stallEpisode = { rung: 'a', at: now }
       return
     }
-    // RUNG (b): still stalled after rung (a)'s grace — re-issue every unfinished
+    // RUNG (b): still stalled after rung (a)'s grace, re-issue every unfinished
     // transfer so the data path re-flows from the partial.
     if (rung === 'a') {
       let nudged = 0
@@ -1341,20 +1341,20 @@ export class PeerLink {
           nudged++
         } else if (t.direction === 'receive') {
           // Receiver side: re-send a resume accept at the current offset to nudge
-          // the sender to (re)stream from where we are — never restart from 0.
+          // the sender to (re)stream from where we are, never restart from 0.
           const partial = this.stores.partials.get(t.id)
           this._control({ type: CTRL.ACCEPT, id: t.id, offset: partial ? partial.received : 0 })
           nudged++
         }
       }
-      rlog.info('stall correction (rung b) — re-offered/resumed unfinished transfers', this.id.slice(-6), 'count', nudged)
+      rlog.info('stall correction (rung b), re-offered/resumed unfinished transfers', this.id.slice(-6), 'count', nudged)
       this._stallEpisode = { rung: 'b', at: now }
       return
     }
-    // RUNG (c): still stalled — escalate to the hook (P1 implements the
+    // RUNG (c): still stalled, escalate to the hook (P1 implements the
     // relay-preferred rebuild). The callback may be a no-op for now.
     if (rung === 'b') {
-      rlog.info('stall correction (rung c) — escalating to onStall', this.id.slice(-6))
+      rlog.info('stall correction (rung c), escalating to onStall', this.id.slice(-6))
       try {
         this.onStall?.({ reason: 'persistent', route: this.route })
       } catch (err) {
@@ -1364,9 +1364,9 @@ export class PeerLink {
       return
     }
     // EXHAUSTED (rungs a→c spent, MAX_STALL_ATTEMPTS): no rung recovered. Fail
-    // CLEAN — transfers become paused/resumable via _failActive, never silently
+    // CLEAN, transfers become paused/resumable via _failActive, never silently
     // dead; the partials are preserved for the next link.
-    rlog.warn('stall correction exhausted — failing clean (partials preserved)', this.id.slice(-6))
+    rlog.warn('stall correction exhausted, failing clean (partials preserved)', this.id.slice(-6))
     this.onStatus('failed')
     this._failActive()
   }

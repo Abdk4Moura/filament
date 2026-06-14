@@ -1,4 +1,4 @@
-// Speakable pairing wordlists — CLIENT-SIDE minting (spec §2.0). The browser
+// Speakable pairing wordlists: CLIENT-SIDE minting (spec §2.0). The browser
 // mints the words locally; the server NEVER sees or generates them. Mirrors
 // pake/src/words.rs. 2^12: 64 adj × 64 animal = 4,096. Minted codes are
 // 3-segment `adj-animal-NNNN` (the same shape as a transfer code).

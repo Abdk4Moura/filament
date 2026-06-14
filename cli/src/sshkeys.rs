@@ -1,4 +1,4 @@
-// sshkeys — filament-managed ssh auth material for the seamless `filament ssh`
+// sshkeys, filament-managed ssh auth material for the seamless `filament ssh`
 // path (docs/design-seamless-ssh.md). NEVER touches the user's ~/.ssh.
 //
 // Two roles:
@@ -8,7 +8,7 @@
 //     with ZERO ssh setup connects with no prompts and no key copying.
 //   * ACCEPTOR installs an initiator's managed pubkey into its OWN
 //     $HOME/.ssh/authorized_keys inside a CLEARLY-MARKED, removable
-//     `# BEGIN/END filament-managed <device>` block — ONLY over the authenticated
+//     `# BEGIN/END filament-managed <device>` block, ONLY over the authenticated
 //     channel AND ONLY when the `shell` cap is granted (enforced by the caller).
 //     It also reports its real host public keys so the initiator can pin them.
 
@@ -35,7 +35,7 @@ pub fn managed_key_path() -> PathBuf {
     ssh_dir().join("id_ed25519")
 }
 
-/// Filament-private known_hosts (pin store) — never the user's.
+/// Filament-private known_hosts (pin store), never the user's.
 pub fn known_hosts_path() -> PathBuf {
     ssh_dir().join("known_hosts")
 }
@@ -82,7 +82,7 @@ const BEGIN: &str = "# BEGIN filament-managed";
 const END: &str = "# END filament-managed";
 
 /// Path to the ACCEPTOR daemon user's authorized_keys ($HOME/.ssh/authorized_keys).
-/// Deliberately rooted at $HOME (NOT the config dir) — that is where sshd reads
+/// Deliberately rooted at $HOME (NOT the config dir), that is where sshd reads
 /// it. Tests sandbox the write by running the acceptor with HOME set to a temp.
 pub fn authorized_keys_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -92,7 +92,7 @@ pub fn authorized_keys_path() -> PathBuf {
 /// M-3 (authorized_keys injection): validate that `pubkey` is a SINGLE, well-
 /// formed ssh public-key line before it is ever written. A trusted+shell peer
 /// could otherwise send a pubkey containing an interior `\n` (which `.trim()`
-/// does NOT strip) to inject EXTRA authorized_keys lines — extra keys, a
+/// does NOT strip) to inject EXTRA authorized_keys lines, extra keys, a
 /// `command=`/`from=` forced-command, etc. We reject anything with a control
 /// character (newline, CR, tab, …) or more than one whitespace-separated key
 /// line, and require the shape `<key-type> <base64-blob> [single-line comment]`.
@@ -105,7 +105,7 @@ pub fn validate_pubkey(pubkey: &str) -> Result<String> {
     }
     // Reject ANY control character (covers \n, \r, \t, NUL, vertical tab, …).
     // After trimming surrounding whitespace, a control char anywhere means the
-    // value is not a single clean line — refuse outright.
+    // value is not a single clean line, refuse outright.
     if key.chars().any(|c| c.is_control()) {
         return Err(anyhow!("pubkey contains a control character (multi-line injection?)"));
     }
@@ -133,8 +133,8 @@ pub fn validate_pubkey(pubkey: &str) -> Result<String> {
 /// authorized_keys. Idempotent: a re-grant replaces that device's block rather
 /// than appending a duplicate. Creates ~/.ssh (0700) and the file (0600) if
 /// absent. SECURITY: the caller MUST have verified the trusted channel + `shell`
-/// cap before calling this. The pubkey is re-validated here (M-3) — defense in
-/// depth — so a bad key is NEVER written even if a caller forgot to check.
+/// cap before calling this. The pubkey is re-validated here (M-3), defense in
+/// depth, so a bad key is NEVER written even if a caller forgot to check.
 pub fn install_authorized_key(device: &str, pubkey: &str) -> Result<()> {
     let pubkey = validate_pubkey(pubkey)?;
     let pubkey = pubkey.as_str();
@@ -167,7 +167,7 @@ pub fn remove_authorized_key(device: &str) -> Result<()> {
 
 /// Return `content` with the `# BEGIN/END filament-managed <device>` block (and
 /// the lines between) removed. Lines outside any such block are preserved
-/// verbatim. Path-pure (testable) — the file I/O wrappers call this.
+/// verbatim. Path-pure (testable), the file I/O wrappers call this.
 pub fn strip_block(content: &str, device: &str) -> String {
     let begin = format!("{BEGIN} {device}");
     let end = format!("{END} {device}");

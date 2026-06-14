@@ -1,4 +1,4 @@
-// TerminalPreview — a pure-visual, no-backend comparison of three "web-ssh"
+// TerminalPreview: a pure-visual, no-backend comparison of three "web-ssh"
 // terminal looks (Step 0 of the web-shell feature). Gated behind ?preview=terminal
 // in main.jsx; it never touches the real app. Reuses the Filament design tokens so
 // what you see here is what the shipped terminal will feel like.
@@ -62,7 +62,7 @@ function xtermTheme(T, accent) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
-// The scripted "alive" session — types commands, prints output, loops gently.
+// The scripted "alive" session: types commands, prints output, loops gently.
 async function runSession(term, T, accent, alive, host = 'do-vm') {
   const prompt = `${BOLD}${fg(accent)}root@${host}${RST}${fg(T.dim)}:${RST}${fg(T.recv)}~${RST}${fg(T.sub)}$ ${RST}`
   const type = async (s, base = 42) => {
@@ -133,7 +133,7 @@ function XTermView({ T, accent, font, fontSize = 13.5, host = 'do-vm' }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // live theme update (accent / light-dark) — no replay
+  // live theme update (accent / light-dark), no replay
   useEffect(() => {
     if (termRef.current) termRef.current.options.theme = xtermTheme(T, accent)
   }, [T, accent])
@@ -257,7 +257,7 @@ function NativePane({ T, accent, font }) {
                 <div>
                   <div style={{ fontSize: 22, color: T.faint, marginBottom: 10 }}>↓</div>
                   drop a file on a device to send it<br />
-                  <span style={{ color: T.faint }}>no terminal here unless you open one — the 90% never see it</span>
+                  <span style={{ color: T.faint }}>no terminal here unless you open one, the 90% never see it</span>
                 </div>
               </div>
             ) : (

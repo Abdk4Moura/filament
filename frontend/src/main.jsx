@@ -20,13 +20,13 @@ ReactDOM.createRoot(document.getElementById('root')).render(
   </React.StrictMode>,
 )
 
-// PWA: register the service worker only in production builds — in dev it would
+// PWA: register the service worker only in production builds; in dev it would
 // cache Vite's module graph and fight HMR.
 //
 // Deploy-freshness: a new deploy ships a new /sw.js (versioned cache name). We
 // (1) register, (2) poll registration.update() on load + when the tab regains
 // focus so a waiting SW is discovered promptly, (3) show a small on-theme
-// "update ready — reload" nudge when a new SW is installed and waiting, and
+// "update ready, reload" nudge when a new SW is installed and waiting, and
 // (4) auto-reload ONCE on controllerchange (the new SW taking control), guarded
 // against the classic reload loop.
 if (import.meta.env.PROD && 'serviceWorker' in navigator) {
@@ -80,7 +80,7 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
         // If a new SW is already waiting at register time, nudge immediately.
         if (reg.waiting && navigator.serviceWorker.controller) showUpdateNudge(reg.waiting)
 
-        // A new SW found on this load — watch it install, then nudge.
+        // A new SW found on this load, watch it install, then nudge.
         reg.addEventListener('updatefound', () => {
           const sw = reg.installing
           if (!sw) return

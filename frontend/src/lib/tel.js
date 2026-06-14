@@ -1,4 +1,4 @@
-// Debugger-grade client telemetry (C24). Connection lifecycle ONLY — never
+// Debugger-grade client telemetry (C24). Connection lifecycle ONLY, never
 // file names, never contents. Events queue locally and flush via
 // navigator.sendBeacon (survives page-hide/unload, exactly the moments we
 // most need to observe) with a fetch-keepalive fallback.
@@ -38,7 +38,7 @@ export function installTel(uid) {
   installed = true
   tel('session-open', { uid, ua: navigator.userAgent.slice(0, 80), vis: document.visibilityState })
 
-  // freeze detector: a 1s heartbeat; a gap means the tab was suspended —
+  // freeze detector: a 1s heartbeat; a gap means the tab was suspended,
   // the prime suspect for stale create-code and dead emits.
   let last = Date.now()
   setInterval(() => {
