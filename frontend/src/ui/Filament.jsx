@@ -516,7 +516,7 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
 function DiscoveryBar({ state, onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, openEntryNonce, T, D, accent }) {
   const scope = state.roomScope || 'link'
   const [copied, fireCopy] = useCopied()
-  // L1-a: the code input serves two verbs now — `null` (closed), `'pair'`
+  // L1-a: the code input serves two verbs now, `null` (closed), `'pair'`
   // (remember the device), or `'receive'` (claim + ephemeral-PAKE + download a
   // file, secret discarded). `entering` stays a derived boolean for the existing
   // layout branches; the verb decides which hook action the submit calls.

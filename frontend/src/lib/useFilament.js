@@ -234,7 +234,7 @@ export function useFilament() {
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
   // L1-a: peers authenticated by an EPHEMERAL transfer-auth ceremony
-  // (receiveWithCode) — secret discarded, link trusted only for this session's
+  // (receiveWithCode), secret discarded, link trusted only for this session's
   // incoming transfer. Distinct from a remembered (stored) device.
   const ephemeralAuthRef = useRef(new Set())
   const [pairStatus, setPairStatus] = useState(null) // 'pairing' | 'paired' | 'refused' | error string
@@ -810,7 +810,7 @@ export function useFilament() {
       const peerId = pakePeerRef.current
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
       // L1-a EPHEMERAL transfer-auth (receiveWithCode): the SAME ceremony runs,
-      // but the agreed secret is DISCARDED — it only authenticated the link
+      // but the agreed secret is DISCARDED, it only authenticated the link
       // (mutual auth, MITM-detectable). NO device is remembered. The peer is now
       // trusted for THIS session's incoming transfer; mark the link verified so
       // the existing transfer UI treats it as an authenticated sender.
@@ -827,7 +827,7 @@ export function useFilament() {
         pendingPakeRef.current = null
         return
       }
-      // K is agreed — pairing crypto succeeded. But remembering is a separate
+      // K is agreed, pairing crypto succeeded. But remembering is a separate
       // trust grant (C27): queue a consent prompt instead of storing silently.
       // Capture secret/caps/name NOW, before we null pakeRef below. Dedup by
       // peerId so the per-tick drivePake doesn't enqueue twice.
@@ -911,7 +911,7 @@ export function useFilament() {
     sigRef.current?.pairClaimV2(nameplate)
   }, [])
 
-  // L1-a: RECEIVE WITH CODE — claim a transfer code, run the SAME ephemeral
+  // L1-a: RECEIVE WITH CODE, claim a transfer code, run the SAME ephemeral
   // SPAKE2 ceremony as pairWithCode, but DISCARD the agreed secret (it only
   // authenticates the link; no device is remembered). After the ceremony
   // confirms, the existing transfer machinery (PeerLink file-offer → onTransfer
@@ -925,15 +925,15 @@ export function useFilament() {
     await pakeReady()
     pakeReadyRef.current = true
     // Parse with the SHARED WASM normCode/splitCode so {nameplate, password} is
-    // byte-identical to the CLI sender — SPAKE2 hashes exactly this password.
+    // byte-identical to the CLI sender, SPAKE2 hashes exactly this password.
     const { nameplate, password } = parseSpokenCode(clean)
     const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
     if (!numericNameplate) {
-      setPairStatus('that code is missing its number — a full code ends in a 3-5 digit number, e.g. brave-otter-3141')
+      setPairStatus('that code is missing its number, a full code ends in a 3-5 digit number, e.g. brave-otter-3141')
       return
     }
     if (!password) {
-      setPairStatus('that does not look like a full code — type the whole thing, e.g. brave-otter-3141')
+      setPairStatus('that does not look like a full code, type the whole thing, e.g. brave-otter-3141')
       return
     }
     // `ephemeral:true` is the only difference from pairWithCode: the agreed

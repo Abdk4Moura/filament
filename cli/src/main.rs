@@ -3830,7 +3830,7 @@ async fn main() -> Result<()> {
                 // L1-a unification: a `word-word-NNNN` (4-digit) code now drives
                 // the SAME ephemeral SPAKE2 ceremony whether the verb is `pair`
                 // or `recv`; a bare code is ambiguous. We keep routing it to
-                // `pair` (the long-standing bare-code behavior — 4-digit codes
+                // `pair` (the long-standing bare-code behavior, 4-digit codes
                 // were always pairing codes), so existing muscle memory is
                 // preserved. To RECEIVE a transfer code, run `filament recv
                 // <code>` explicitly (the `send --code` output prints exactly
@@ -3838,7 +3838,7 @@ async fn main() -> Result<()> {
                 argv.insert(1, "pair".into());
             } else if regex_lite_code(first) {
                 // A legacy `word-word-NNN` (2-3 digit) transfer code from an old
-                // sender — receive it (no v2 ceremony; the recv path fails loudly
+                // sender, receive it (no v2 ceremony; the recv path fails loudly
                 // if the peer can't run the handshake).
                 argv.insert(1, "recv".into());
             }
@@ -4255,7 +4255,7 @@ async fn send_cmd(
         to.as_ref().and_then(|t| devices_load().into_iter().find(|(n, _)| n.eq_ignore_ascii_case(t)));
     // L1-a: `send --code` now mints a v2 nameplate (client-minted words, the
     // server allocates ONLY the numeric nameplate) and runs the SAME ephemeral
-    // SPAKE2 ceremony as `pair` before any byte flows — then DISCARDS the secret
+    // SPAKE2 ceremony as `pair` before any byte flows, then DISCARDS the secret
     // (transfer = "link with mutual auth, then forget"). The words NEVER cross
     // the server; only the nameplate does. The full `words-nameplate` code is
     // displayed from our own local mint when pair-ok arrives.
@@ -4339,7 +4339,7 @@ async fn send_cmd(
         std::env::var("FILAMENT_PAIR_GRACE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60),
     );
     let mut pake_deadline: Option<Instant> = None;
-    // C30 phase 3: link mini-sync — pings out, divergence corrections in.
+    // C30 phase 3: link mini-sync, pings out, divergence corrections in.
     let mut last_state_ping = Instant::now();
     let mut reproved: std::collections::HashSet<String> = Default::default();
     {
@@ -4423,7 +4423,7 @@ async fn send_cmd(
         // L1-a ephemeral PAKE progression (code path only). Once the link to our
         // PAKE counterpart is up: send our SPAKE2 element, then (once K + both
         // DTLS fingerprints exist) the key-confirmation MAC. The secret is
-        // DISCARDED after auth (`pake_done`) — never stored.
+        // DISCARDED after auth (`pake_done`), never stored.
         if let (Some(cer), Some(pid)) = (send_cer.as_mut(), pake_peer.clone()) {
             if let Some(data) = cer.take_msg_payload() {
                 sio.emit("signal", json!({ "to": pid, "data": data })).await.ok();
@@ -4439,7 +4439,7 @@ async fn send_cmd(
             }
         }
         // Interop / downgrade: the ephemeral ceremony must confirm within budget
-        // once the channel is up — a peer that never runs it is an older build.
+        // once the channel is up, a peer that never runs it is an older build.
         if !pake_done {
             if let Some(dl) = pake_deadline {
                 if Instant::now() > dl {
@@ -4546,7 +4546,7 @@ async fn send_cmd(
             }
             Ev::PairError(v) => {
                 // Nameplate collision on create: re-mint a FRESH nameplate (and
-                // fresh words when we minted them) and retry — never reuse a
+                // fresh words when we minted them) and retry, never reuse a
                 // burned code. The ephemeral ceremony restarts with the new pair.
                 if use_code && v["error"].as_str() == Some("taken") {
                     if word.is_none() {
@@ -4631,7 +4631,7 @@ async fn send_cmd(
                                 if cer.secret().is_some() && !pake_done {
                                     // Authenticated. DISCARD the secret (auth only).
                                     pake_done = true;
-                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated — sending"));
+                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, sending"));
                                     // --remember on the code path: hand over a FRESH
                                     // long-lived pair secret only NOW, after the link
                                     // is mutually authenticated (not the pre-PAKE
@@ -4645,7 +4645,7 @@ async fn send_cmd(
                                     }
                                     // Re-drive the canonical offer path for this peer by
                                     // re-emitting ChannelReady (now that pake_done gates
-                                    // it open) — reuses the proven offer/resume logic.
+                                    // it open), reuses the proven offer/resume logic.
                                     if let Some(t) = conn.transport_of(&from) {
                                         let _ = tx.send(Ev::ChannelReady(from.clone(), t));
                                     }
@@ -5236,7 +5236,7 @@ async fn recv_cmd(
         }
     }
     // L1-a unification: a transfer code and a pairing code now have the SAME
-    // shape (`words-NNNN`) and run the SAME ephemeral SPAKE2 ceremony — the verb
+    // shape (`words-NNNN`) and run the SAME ephemeral SPAKE2 ceremony, the verb
     // (`recv` vs `pair`) decides whether the agreed secret is discarded or kept.
     // So `recv` no longer redirects a 4-digit code away (the old width-based
     // hint is obsolete); any well-formed code is a valid claim here.
@@ -5288,7 +5288,7 @@ async fn recv_cmd(
             let normalized = filament_pake::norm_code(c);
             let (np, pw) = filament_pake::split_code(&normalized);
             if pw.is_empty() || np.is_empty() {
-                bail!("that code doesn't look right — expected something like brave-otter-371");
+                bail!("that code doesn't look right, expected something like brave-otter-371");
             }
             recv_cer = Some(Ceremony::new(&pw, &np, pair_v2_caps()));
             sio.emit("pair-claim", json!({ "nameplate": np, "v": 2 })).await.ok();
@@ -5521,7 +5521,7 @@ async fn recv_cmd(
         // L1-a ephemeral PAKE progression (recv code path). Once the link to our
         // PAKE counterpart is up: send our SPAKE2 element, then (once K + both
         // DTLS fingerprints exist) the key-confirmation MAC. The secret is
-        // DISCARDED after auth (`recv_pake_done`) — never stored.
+        // DISCARDED after auth (`recv_pake_done`), never stored.
         if let (Some(cer), Some(pid)) = (recv_cer.as_mut(), recv_pake_peer.clone()) {
             if let Some(data) = cer.take_msg_payload() {
                 sio.emit("signal", json!({ "to": pid, "data": data })).await.ok();
@@ -5537,7 +5537,7 @@ async fn recv_cmd(
             }
         }
         // Interop / downgrade: the ephemeral ceremony must confirm within budget
-        // once the channel is up — a sender that never runs it is an older build.
+        // once the channel is up, a sender that never runs it is an older build.
         if !recv_pake_done {
             if let Some(dl) = recv_pake_deadline {
                 if Instant::now() > dl {
@@ -6045,7 +6045,7 @@ async fn recv_cmd(
                                 if cer.secret().is_some() {
                                     // Authenticated. DISCARD the secret (auth only).
                                     recv_pake_done = true;
-                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated — receiving"));
+                                    ui::say(&ui::paint(ui::Tone::Dim, "  authenticated, receiving"));
                                 }
                             }
                             PakeInbound::Abort(why) => {
@@ -6126,7 +6126,7 @@ async fn recv_cmd(
                         ui::say(&ui::paint(ui::Tone::Dim, "  authenticating…"));
                     }
                 }
-                // C29: an in-session pairing — exactly one side hands over a
+                // C29: an in-session pairing, exactly one side hands over a
                 // secret; consent (pair-keep-ack / our store) completes it.
                 // Only links that aren't ALREADY known are candidates.
                 let fresh_link = conn.link(&pid).map(|l| l.expected_secret.is_none()).unwrap_or(false);
@@ -6482,7 +6482,7 @@ async fn recv_cmd(
                     // L1-a: on the code path, NEVER accept bytes from a peer that
                     // hasn't completed the ephemeral SPAKE2 ceremony with us. A
                     // pre-PAKE file-offer means an unauthenticated (or older) sender
-                    // is trying to push before auth — ignore it; the budget watchdog
+                    // is trying to push before auth, ignore it; the budget watchdog
                     // fails loudly if the ceremony never completes.
                     if recv_cer.is_some() && !recv_pake_done && recv_pake_peer.as_deref() == Some(pid.as_str()) {
                         ui::debug("ignoring file-offer before ephemeral PAKE confirmed");
