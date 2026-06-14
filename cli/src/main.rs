@@ -1416,11 +1416,12 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, word
     // exactly what SPAKE2 will hash, then require >= 2 word tokens.
     let custom_words: Option<String> = match &word {
         Some(w) => {
-            let normalized = filament_pake::norm_code(w);
-            // Strip any trailing number the user typed into --word (the nameplate
-            // is ALWAYS machine-minted); keep only the words half.
-            let (_np, pw) = filament_pake::split_code(&normalized);
-            let words = if pw.is_empty() { normalized.clone() } else { pw };
+            // The nameplate is ALWAYS machine-minted, so discard any number the
+            // user typed; keep only the words half. `split_chosen_code` (unlike
+            // `split_code`) only strips a trailing 3-5 digit nameplate, so a
+            // two-word phrase like "gigantic element" keeps BOTH words.
+            let (words, _np) =
+                filament_pake::split_chosen_code(&filament_pake::norm_code(w));
             if password_word_tokens(&words) < 2 {
                 bail!(
                     "'{w}' is too weak — use at least two words, e.g. gigantic-element \

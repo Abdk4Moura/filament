@@ -52,6 +52,12 @@ export function ctEq(a: Uint8Array, b: Uint8Array): boolean;
 export function normCode(raw: string): string;
 
 /**
+ * Split a user-CHOSEN code into [password, nameplate_or_empty_string]. The
+ * trailing group is the nameplate ONLY if it is 3-5 ASCII digits.
+ */
+export function splitChosenCode(normalized: string): any[];
+
+/**
  * Split a normalized code into [nameplate, password].
  */
 export function splitCode(normalized: string): any[];
@@ -70,6 +76,7 @@ export interface InitOutput {
     readonly pakesession_ourConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly pakesession_secret: (a: number) => [number, number];
     readonly pakesession_verifyPeerConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+    readonly splitChosenCode: (a: number, b: number) => [number, number];
     readonly splitCode: (a: number, b: number) => [number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

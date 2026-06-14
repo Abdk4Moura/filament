@@ -11,6 +11,7 @@ export const pakesession_new: (a: number, b: number, c: number, d: number) => nu
 export const pakesession_ourConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
 export const pakesession_secret: (a: number) => [number, number];
 export const pakesession_verifyPeerConfirm: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number) => number;
+export const splitChosenCode: (a: number, b: number) => [number, number];
 export const splitCode: (a: number, b: number) => [number, number];
 export const __wbindgen_malloc: (a: number, b: number) => number;
 export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

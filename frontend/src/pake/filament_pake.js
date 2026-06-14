@@ -167,6 +167,21 @@ export function normCode(raw) {
 }
 
 /**
+ * Split a user-CHOSEN code into [password, nameplate_or_empty_string]. The
+ * trailing group is the nameplate ONLY if it is 3-5 ASCII digits.
+ * @param {string} normalized
+ * @returns {any[]}
+ */
+export function splitChosenCode(normalized) {
+    const ptr0 = passStringToWasm0(normalized, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.splitChosenCode(ptr0, len0);
+    var v2 = getArrayJsValueFromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+    return v2;
+}
+
+/**
  * Split a normalized code into [nameplate, password].
  * @param {string} normalized
  * @returns {any[]}

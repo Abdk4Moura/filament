@@ -217,6 +217,30 @@ pub fn split_code(normalized: &str) -> (String, String) {
     }
 }
 
+/// Split a user-CHOSEN code (creation side) into (password, optional nameplate).
+/// Trims surrounding dashes. The trailing dash-group is the nameplate ONLY if it
+/// matches the server nameplate shape (3-5 ASCII digits); otherwise the whole
+/// trimmed string is the password and the nameplate is machine-assigned.
+///
+/// Unlike `split_code` (which strips the trailing group UNCONDITIONALLY as the
+/// nameplate — correct for CLAIMING a minted code), this is the CREATION side
+/// where a two-word phrase like `gigantic-element` must keep BOTH words as the
+/// password. Mirrors the JS `splitChosenCode`.
+pub fn split_chosen_code(normalized: &str) -> (String, Option<String>) {
+    let trimmed = normalized.trim_matches('-');
+    if let Some(i) = trimmed.rfind('-') {
+        let after = &trimmed[i + 1..];
+        let before = &trimmed[..i];
+        if !before.is_empty()
+            && (3..=5).contains(&after.len())
+            && after.bytes().all(|b| b.is_ascii_digit())
+        {
+            return (before.to_string(), Some(after.to_string()));
+        }
+    }
+    (trimmed.to_string(), None)
+}
+
 /// Canonicalize a capability set so BOTH sides MAC the identical string:
 /// trimmed, lowercased, de-duplicated, sorted, comma-joined. Empty set -> "".
 pub fn canonical_caps(caps: &[String]) -> String {
@@ -351,6 +375,17 @@ mod wasm {
     pub fn split_code_js(normalized: &str) -> Vec<JsValue> {
         let (np, pw) = super::split_code(normalized);
         vec![JsValue::from_str(&np), JsValue::from_str(&pw)]
+    }
+
+    /// Split a user-CHOSEN code into [password, nameplate_or_empty_string]. The
+    /// trailing group is the nameplate ONLY if it is 3-5 ASCII digits.
+    #[wasm_bindgen(js_name = splitChosenCode)]
+    pub fn split_chosen_code_js(normalized: &str) -> Vec<JsValue> {
+        let (pw, np) = super::split_chosen_code(normalized);
+        vec![
+            JsValue::from_str(&pw),
+            JsValue::from_str(np.as_deref().unwrap_or("")),
+        ]
     }
 }
 
@@ -495,6 +530,37 @@ mod tests {
         // The two halves recombine to the original normalized code.
         let (np2, pw2) = split_code(&norm_code("brave otter 314"));
         assert_eq!((np2.as_str(), pw2.as_str()), ("314", "brave-otter"));
+    }
+
+    #[test]
+    fn split_chosen_code_keeps_words_unless_numeric_nameplate() {
+        // No numeric trailing group: BOTH words stay in the password.
+        assert_eq!(
+            split_chosen_code("gigantic-element"),
+            ("gigantic-element".to_string(), None)
+        );
+        // Trailing dash is trimmed, not treated as an empty nameplate.
+        assert_eq!(
+            split_chosen_code("gigantic-element-"),
+            ("gigantic-element".to_string(), None)
+        );
+        // Leading + trailing dashes both trimmed.
+        assert_eq!(
+            split_chosen_code("-gigantic-element-"),
+            ("gigantic-element".to_string(), None)
+        );
+        // A real 3-5 digit nameplate IS split off.
+        assert_eq!(
+            split_chosen_code("gigantic-element-9641"),
+            ("gigantic-element".to_string(), Some("9641".to_string()))
+        );
+        // 1 digit is NOT a nameplate (below the 3-5 digit shape) — stays a word.
+        assert_eq!(
+            split_chosen_code("gigantic-element-7"),
+            ("gigantic-element-7".to_string(), None)
+        );
+        // Single word, no dash.
+        assert_eq!(split_chosen_code("cat"), ("cat".to_string(), None));
     }
 
     #[test]

@@ -12,7 +12,7 @@
 // secret over the DataChannel; a received pair-keep means the peer is v1 → the
 // caller refuses with "update to pair securely".
 
-import initPake, { PakeSession, canonicalCaps, normCode, splitCode } from '../pake/filament_pake.js'
+import initPake, { PakeSession, canonicalCaps, normCode, splitCode, splitChosenCode as wasmSplitChosenCode } from '../pake/filament_pake.js'
 import pakeWasmUrl from '../pake/filament_pake_bg.wasm?url'
 
 let _ready = null
@@ -177,11 +177,11 @@ export function previewCustomCode(typed, autoNameplate) {
 /// is the nameplate ONLY if it is numeric (3-5 digits, the server's
 /// _NAMEPLATE_RE) — otherwise it is part of the words. So `gigantic-element`
 /// keeps BOTH words as the password (nameplate machine-assigned), while
-/// `gigantic-element-7` honors the typed number. Uses the shared normCode so the
-/// password is byte-identical to what SPAKE2 hashes.
+/// `gigantic-element-9641` honors the typed number. Delegates to the SHARED
+/// Rust→WASM `splitChosenCode` so the browser is byte-identical to the CLI by
+/// construction (`pakeReady()` MUST have resolved first — uses WASM).
 export function splitChosenCode(typed) {
   const normalized = normCode(typed)
-  const [np, pw] = splitCode(normalized)
-  if (/^[0-9]{3,5}$/.test(np)) return { password: pw, nameplate: np, normalized }
-  return { password: normalized, nameplate: '', normalized }
+  const [password, nameplate] = wasmSplitChosenCode(normalized)
+  return { password, nameplate, normalized }
 }
