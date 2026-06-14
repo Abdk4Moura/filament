@@ -57,6 +57,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const [altOn, setAltOn] = useState(false)
   const [status, setStatus] = useState('connecting')
   const [kbInset, setKbInset] = useState(0) // visualViewport keyboard height
+  const [atBottom, setAtBottom] = useState(true) // false => show scroll-to-bottom
   const sessionIdRef = useRef(makeSessionId(instanceId))
 
   const write = useCallback((s) => link && link.sendPtyInput(enc.encode(s)), [link])
@@ -73,6 +74,37 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     }
     if (alt.current) { out = '\x1b' + out; alt.current = false; setAltOn(false) }
     return out
+  }, [])
+
+  // --- scrollback helpers (mobile scroll, issue #5) -----------------------
+  // "At the bottom" means the viewport top equals the buffer base (the live
+  // prompt is visible). We track this to (a) show/hide the scroll-to-bottom
+  // affordance and (b) decide whether a resize should auto-stick to bottom or
+  // preserve the reader's position. In the alternate screen (a full-screen TUI)
+  // there is no scrollback, so we always treat it as "at bottom" and hide the
+  // button: the TUI owns the viewport (issue #1, correct xterm behavior).
+  const computeAtBottom = useCallback(() => {
+    const term = termRef.current
+    if (!term || !term.buffer || !term.buffer.active) return true
+    if (term.buffer.active.type === 'alternate') return true
+    return term.buffer.active.viewportY >= term.buffer.active.baseY
+  }, [])
+  const scrollToBottom = useCallback(() => {
+    const term = termRef.current
+    if (!term) return
+    term.scrollToBottom()
+    setAtBottom(true)
+    haptic()
+    try { term.focus() } catch (e) {}
+  }, [])
+  // Page up/down for the accessory bar (a touch-friendly chunk scroll). A near-
+  // full-page step (rows - 1) keeps a line of context, like a pager.
+  const scrollPage = useCallback((dir) => {
+    const term = termRef.current
+    if (!term) return
+    if (term.buffer && term.buffer.active && term.buffer.active.type === 'alternate') return
+    term.scrollLines(dir * Math.max(1, (term.rows || 24) - 1))
+    haptic()
   }, [])
 
   // --- resize hardening (issue #2) ----------------------------------------
@@ -99,9 +131,25 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       try { dims = fit.proposeDimensions() } catch (e) { return }
       if (!dims || !dims.cols || !dims.rows || !isFinite(dims.cols) || !isFinite(dims.rows)) return
       if (dims.cols === term.cols && dims.rows === term.rows) return // no-op, skip churn
+      // Soft-keyboard open/close must NOT yank the reader away from scrollback.
+      // Remember where we were (and how far from the live tail) BEFORE the fit,
+      // then: if we were at the bottom, stick to the bottom (the common case, so
+      // the prompt stays visible); otherwise restore the same distance-from-tail
+      // so the lines being read stay put (issue #4 / #5).
+      const wasBottom = computeAtBottom()
+      const b = term.buffer && term.buffer.active
+      const fromTail = b ? (b.baseY - b.viewportY) : 0
       try { fit.fit() } catch (e) {}
+      try {
+        if (wasBottom) term.scrollToBottom()
+        else if (fromTail > 0) {
+          const nb = term.buffer && term.buffer.active
+          if (nb) term.scrollToLine(Math.max(0, nb.baseY - fromTail))
+        }
+      } catch (e) {}
+      setAtBottom(computeAtBottom())
     })
-  }, [])
+  }, [computeAtBottom])
 
   // mount xterm + open the pty. Re-runs when `link` changes (a reconnect hands
   // us a fresh PeerLink); the SAME session id makes that a reattach, not a new
@@ -154,6 +202,66 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     // bridge: xterm -> PTY (with sticky modifiers)
     const dataSub = term.onData((d) => write(applyMods(d)))
     const sizeSub = term.onResize(({ cols, rows }) => link.resizePty(cols, rows))
+    // Track scroll position so the scroll-to-bottom affordance shows only when
+    // the reader has scrolled up off the live tail. Fires on wheel, touch swipe,
+    // and programmatic scrolls alike.
+    const scrollSub = term.onScroll(() => setAtBottom(computeAtBottom()))
+
+    // --- touch scrolling (issue #5) -----------------------------------------
+    // On mobile a one-finger swipe over the terminal must scroll the SCROLLBACK,
+    // not type into the PTY and not start a text selection. xterm's own viewport
+    // is touch-finicky, so we translate vertical swipe delta into scrollLines on
+    // the host element directly. We never preventDefault on a clear horizontal
+    // move (let the accessory bar / page scroll), and we skip the alternate
+    // screen (a TUI owns touch there, e.g. scrolling a list). A swipe under a
+    // small threshold is treated as a tap so the keyboard/selection still work.
+    const host = hostRef.current
+    let tY = 0, tX = 0, tAccum = 0, tMoved = false, tActive = false
+    const cellH = () => {
+      const t = termRef.current
+      // approximate row height in px from the viewport; fall back to font-based.
+      const vp = host && host.querySelector('.xterm-viewport')
+      if (vp && t && t.rows) return Math.max(8, vp.clientHeight / t.rows)
+      return 18
+    }
+    const onTouchStart = (e) => {
+      if (e.touches.length !== 1) { tActive = false; return }
+      const t = termRef.current
+      if (t && t.buffer && t.buffer.active && t.buffer.active.type === 'alternate') { tActive = false; return }
+      tActive = true; tMoved = false; tAccum = 0
+      tY = e.touches[0].clientY; tX = e.touches[0].clientX
+    }
+    const onTouchMove = (e) => {
+      if (!tActive || e.touches.length !== 1) return
+      const y = e.touches[0].clientY, x = e.touches[0].clientX
+      const dy = y - tY, dx = x - tX
+      // Ignore a mostly-horizontal drag (let it be / allow text selection drag).
+      if (!tMoved && Math.abs(dx) > Math.abs(dy)) { tActive = false; return }
+      if (!tMoved && Math.abs(dy) < 6) return // below the tap threshold, keep watching
+      tMoved = true
+      // Swiping the content DOWN (finger moves down, dy>0) reveals older lines:
+      // scroll up. Accumulate sub-cell motion so slow drags still move.
+      tAccum += dy
+      const h = cellH()
+      const lines = Math.trunc(tAccum / h)
+      if (lines !== 0) {
+        tAccum -= lines * h
+        const t = termRef.current
+        if (t) t.scrollLines(-lines)
+      }
+      tY = y; tX = x
+      if (e.cancelable) e.preventDefault() // stop selection + PTY input on a scroll
+    }
+    const onTouchEnd = () => {
+      // A genuine tap (no scroll) falls through so xterm focuses + the soft
+      // keyboard opens; a scroll swallowed its motion above. Nothing to do here
+      // beyond resetting; focus on tap is xterm's own job.
+      tActive = false
+    }
+    host.addEventListener('touchstart', onTouchStart, { passive: true })
+    host.addEventListener('touchmove', onTouchMove, { passive: false })
+    host.addEventListener('touchend', onTouchEnd, { passive: true })
+    host.addEventListener('touchcancel', onTouchEnd, { passive: true })
 
     // open (or reattach to) the shell once the channel is up, carrying our
     // stable session id so the CLI can rebind a surviving PTY (issue #4).
@@ -177,7 +285,11 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     return () => {
       if (poll) clearInterval(poll)
       if (fitRaf.current) { cancelAnimationFrame(fitRaf.current); fitRaf.current = 0 }
-      dataSub.dispose(); sizeSub.dispose(); ro.disconnect()
+      dataSub.dispose(); sizeSub.dispose(); scrollSub.dispose(); ro.disconnect()
+      host.removeEventListener('touchstart', onTouchStart)
+      host.removeEventListener('touchmove', onTouchMove)
+      host.removeEventListener('touchend', onTouchEnd)
+      host.removeEventListener('touchcancel', onTouchEnd)
       // Detach our handlers from THIS link but do NOT closePty here on a link
       // swap: the unmount-vs-reconnect distinction is that a true unmount runs
       // the close button (closeSession), which detaches the session. A bare
@@ -292,6 +404,9 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     { l: 'Esc' }, { l: 'Tab' }, { l: 'ctrl', on: ctrlOn, fn: toggleCtrl }, { l: 'alt', on: altOn, fn: toggleAlt },
     { l: 'Up', g: '↑' }, { l: 'Down', g: '↓' }, { l: 'Left', g: '←' }, { l: 'Right', g: '→' },
     { l: '|' }, { l: '/' }, { l: '~' }, { l: '-' }, { l: 'Home', g: '⤒' }, { l: 'End', g: '⤓' }, { l: 'Del' },
+    // Scrollback page controls (scroll the xterm buffer, NOT PgUp/PgDn to the
+    // PTY): a touch-friendly way to move through history a page at a time.
+    { l: 'ScrollUp', g: '⇞', fn: () => scrollPage(-1) }, { l: 'ScrollDn', g: '⇟', fn: () => scrollPage(1) },
     { l: 'Copy', g: 'copy', fn: copySelection }, { l: 'Paste', g: 'paste', fn: pasteClipboard },
   ]
 
@@ -314,8 +429,27 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
           <span title="close (end session)" onClick={endSession} style={{ cursor: 'pointer', fontSize: 15 }}>✕</span>
         </span>
       </div>
-      {/* terminal */}
-      <div ref={hostRef} data-testid="term-host" style={{ flex: 1, minHeight: 0, padding: '8px 10px' }} />
+      {/* terminal (position:relative anchors the scroll-to-bottom affordance) */}
+      <div style={{ flex: 1, minHeight: 0, position: 'relative' }}>
+        {/* Let the xterm viewport own vertical panning; our touch handler does the
+            actual scroll, this just stops the browser from rubber-banding the page
+            or zooming on a swipe over the terminal. */}
+        <style>{`[data-testid="term-host"] .xterm-viewport{touch-action:pan-y}`}</style>
+        <div ref={hostRef} data-testid="term-host" style={{ position: 'absolute', inset: 0, padding: '8px 10px', touchAction: 'none' }} />
+        {/* scroll-to-bottom: appears only when scrolled up off the live tail.
+            Touch-sized (44px), unobtrusive, jumps back to the prompt. */}
+        {!atBottom && (
+          <button data-testid="scroll-to-bottom" aria-label="scroll to bottom"
+            onClick={scrollToBottom}
+            style={{
+              position: 'absolute', right: 14, bottom: 14, width: 44, height: 44,
+              borderRadius: 22, cursor: 'pointer', zIndex: 5,
+              display: 'grid', placeItems: 'center', fontSize: 18, lineHeight: 1,
+              border: `1px solid ${accent}66`, color: T.onAccent, background: accent,
+              boxShadow: '0 2px 10px rgba(0,0,0,.45)', opacity: 0.92,
+            }}>↓</button>
+        )}
+      </div>
       {/* accessory key bar (always on touch; handy on desktop too) */}
       <div style={{
         flex: '0 0 auto', display: 'flex', gap: 6, padding: '7px 10px', borderTop: `1px solid ${T.line}`,
