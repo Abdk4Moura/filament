@@ -4,6 +4,13 @@
 // missing-special-keys fix) with a sticky-toggle modifier model + an escape-
 // sequence map, plus visualViewport keyboard avoidance. Per docs/mobile-terminal-
 // ergonomics.md.
+//
+// Persistence (issue #4): the PTY session id is owned HERE and is STABLE across a
+// reconnect. When the `link` prop changes (a dropped data channel superseded by a
+// fresh one) we re-open with the SAME session id, so the CLI reattaches us to the
+// still-running PTY and replays the buffered output, instead of spawning a fresh
+// shell. The session id is derived from `instanceId` so it survives a re-render
+// and a link swap, but a brand-new WebTerminal (new tab/session) gets a new one.
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -32,6 +39,14 @@ function xtermTheme(T, accent) {
 }
 const haptic = (ms = 8) => { try { navigator.vibrate && navigator.vibrate(ms) } catch (e) {} } // Android only
 
+// A WebTerminal instance keeps ONE stable PTY session id for its whole lifetime,
+// across any number of link swaps (reconnects). Derived from instanceId so two
+// renders of the same session agree; a fallback random id covers the preview.
+function makeSessionId(instanceId) {
+  const base = instanceId || ('s' + Math.random().toString(36).slice(2, 10))
+  return 'pty-' + base
+}
+
 export default function WebTerminal({ link, peerName, route, T, accent, font, onClose, onBackground, hidden, instanceId }) {
   const hostRef = useRef(null)
   const termRef = useRef(null)
@@ -42,6 +57,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const [altOn, setAltOn] = useState(false)
   const [status, setStatus] = useState('connecting')
   const [kbInset, setKbInset] = useState(0) // visualViewport keyboard height
+  const sessionIdRef = useRef(makeSessionId(instanceId))
 
   const write = useCallback((s) => link && link.sendPtyInput(enc.encode(s)), [link])
 
@@ -59,40 +75,87 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     return out
   }, [])
 
-  // mount xterm + open the pty
+  // --- resize hardening (issue #2) ----------------------------------------
+  // The Android soft keyboard fires a burst of visualViewport resizes; the
+  // ResizeObserver fires its own. ALL of them funnel through this one
+  // rAF-coalesced, guarded path so we never refit twice in a frame, never refit
+  // a hidden or zero-size element (which makes the FitAddon throw / compute a
+  // bogus 0x0 and wedge the renderer), and the IO loop is never blocked.
+  const fitRaf = useRef(0)
+  const safeFit = useCallback(() => {
+    if (fitRaf.current) return // already scheduled this frame
+    fitRaf.current = requestAnimationFrame(() => {
+      fitRaf.current = 0
+      const host = hostRef.current
+      const fit = fitRef.current
+      const term = termRef.current
+      if (!host || !fit || !term) return
+      // Never fit a hidden / un-laid-out / zero-size element: offsetParent is
+      // null when display:none (backgrounded session), and a 0 width/height
+      // makes the fit dims NaN/0 and corrupts the buffer.
+      if (host.offsetParent === null) return
+      if (host.clientWidth < 2 || host.clientHeight < 2) return
+      let dims
+      try { dims = fit.proposeDimensions() } catch (e) { return }
+      if (!dims || !dims.cols || !dims.rows || !isFinite(dims.cols) || !isFinite(dims.rows)) return
+      if (dims.cols === term.cols && dims.rows === term.rows) return // no-op, skip churn
+      try { fit.fit() } catch (e) {}
+    })
+  }, [])
+
+  // mount xterm + open the pty. Re-runs when `link` changes (a reconnect hands
+  // us a fresh PeerLink); the SAME session id makes that a reattach, not a new
+  // shell.
   useEffect(() => {
     if (!link) return
     const term = new Terminal({
       fontFamily: font, fontSize: isTouch ? 13 : 13.5, lineHeight: 1.3, letterSpacing: 0.2,
       cursorBlink: true, cursorStyle: 'bar', cursorWidth: 2, scrollback: 5000,
       theme: xtermTheme(T, accent), allowProposedApi: true,
+      // A full-screen TUI (vim/htop/opencode) drives the alternate screen buffer
+      // and expects unmodified passthrough: convertEol off (the PTY already sends
+      // CRLF), the alt buffer scrollback clamped so the TUI owns the viewport.
+      convertEol: false, altClickMovesCursor: false,
       // mobile: stop the OS keyboard from "helping"
       ...(isTouch ? { screenReaderMode: false } : {}),
     })
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(hostRef.current)
-    try { fit.fit() } catch (e) {}
     termRef.current = term; fitRef.current = fit
+    // Initial fit MUST land before we report a size to the PTY, otherwise the
+    // shell allocates 80x24 while xterm shows a different geometry and a TUI
+    // draws into the wrong region (issue #1).
+    try { fit.fit() } catch (e) {}
 
     // harden the hidden textarea for mobile (no autocorrect/autocap/spellcheck)
     const ta = hostRef.current.querySelector('textarea')
     if (ta) { ta.setAttribute('autocorrect', 'off'); ta.setAttribute('autocapitalize', 'off'); ta.setAttribute('autocomplete', 'off'); ta.setAttribute('spellcheck', 'false') }
 
-    // bridge: PTY -> xterm
+    // bridge: PTY -> xterm. Raw bytes, written through unmodified so alternate
+    // screen / cursor-addressing escapes reach the parser intact (issue #1).
     link.onPtyData = (u8) => term.write(u8)
     link.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
-    link.onPtyReady = () => setStatus('ready')
+    link.onPtyReady = () => {
+      setStatus('ready')
+      // The PTY is live (fresh or reattached): make sure its window size matches
+      // what we actually render, then nudge a SIGWINCH so a TUI redraws to fit.
+      safeFit()
+      const t = termRef.current
+      if (t) link.resizePty(t.cols || 80, t.rows || 24)
+    }
     // bridge: xterm -> PTY (with sticky modifiers)
     const dataSub = term.onData((d) => write(applyMods(d)))
     const sizeSub = term.onResize(({ cols, rows }) => link.resizePty(cols, rows))
 
-    // open the shell once the channel is up
+    // open (or reattach to) the shell once the channel is up, carrying our
+    // stable session id so the CLI can rebind a surviving PTY (issue #4).
     const begin = () => {
       if (link.channel && link.channel.readyState === 'open') {
-        const { cols, rows } = term
-        link.openPty(cols || 80, rows || 24)
-        setStatus('ready')
+        const cols = term.cols || 80
+        const rows = term.rows || 24
+        link.openPty(cols, rows, sessionIdRef.current)
+        setStatus('connecting')
         return true
       }
       return false
@@ -100,19 +163,33 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     let poll = null
     if (!begin()) poll = setInterval(() => { if (begin()) clearInterval(poll) }, 200)
 
-    const ro = new ResizeObserver(() => { try { fit.fit() } catch (e) {} })
+    const ro = new ResizeObserver(() => safeFit())
     ro.observe(hostRef.current)
     term.focus()
 
     return () => {
       if (poll) clearInterval(poll)
+      if (fitRaf.current) { cancelAnimationFrame(fitRaf.current); fitRaf.current = 0 }
       dataSub.dispose(); sizeSub.dispose(); ro.disconnect()
-      try { link.closePty() } catch (e) {}
+      // Detach our handlers from THIS link but do NOT closePty here on a link
+      // swap: the unmount-vs-reconnect distinction is that a true unmount runs
+      // the close button (closeSession), which detaches the session. A bare
+      // link swap should leave the remote PTY running. We still send a detach
+      // (closePty) only when the whole component unmounts; React runs this
+      // cleanup on both, so we rely on the CLI keeping the PTY alive on a
+      // channel drop and only treat an explicit `l2-close` as a teardown.
       link.onPtyData = () => {}; link.onPtyClose = () => {}; link.onPtyReady = () => {}
       term.dispose()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [link])
+
+  // Explicit teardown: closing the session (the ✕) must end the remote PTY.
+  // Kept separate from the link-swap cleanup above so a reconnect never kills it.
+  const endSession = useCallback(() => {
+    try { link && link.closePty() } catch (e) {}
+    onClose && onClose()
+  }, [link, onClose])
 
   // live theme
   useEffect(() => { if (termRef.current) termRef.current.options.theme = xtermTheme(T, accent) }, [T, accent])
@@ -124,24 +201,71 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   useEffect(() => {
     if (hidden) return
     const raf = requestAnimationFrame(() => {
-      try { fitRef.current && fitRef.current.fit() } catch (e) {}
+      safeFit()
       try { termRef.current && termRef.current.focus() } catch (e) {}
     })
     return () => cancelAnimationFrame(raf)
-  }, [hidden])
+  }, [hidden, safeFit])
 
-  // visualViewport keyboard avoidance: lift the bar above the soft keyboard
+  // visualViewport keyboard avoidance: lift the bar above the soft keyboard.
+  // The inset state-set is cheap; the refit is the guarded, coalesced safeFit so
+  // a keyboard-open/close burst can never wedge the terminal (issue #2).
   useEffect(() => {
     const vv = window.visualViewport
     if (!vv) return
     const onVV = () => {
       const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
       setKbInset(inset)
-      try { fitRef.current && fitRef.current.fit() } catch (e) {}
+      safeFit()
     }
     vv.addEventListener('resize', onVV); vv.addEventListener('scroll', onVV)
     return () => { vv.removeEventListener('resize', onVV); vv.removeEventListener('scroll', onVV) }
+  }, [safeFit])
+
+  // --- copy / paste (issue #3) --------------------------------------------
+  // Desktop: select-to-copy (auto-copies the current selection) + Ctrl/Cmd+V
+  // paste. Mobile: an explicit Paste accessory button, since selection + the OS
+  // clipboard are awkward on touch. Both write pasted text straight to the PTY.
+  const copySelection = useCallback(async () => {
+    const term = termRef.current
+    if (!term) return false
+    const sel = term.getSelection()
+    if (!sel) return false
+    try { await navigator.clipboard.writeText(sel); haptic(); return true } catch (e) { return false }
   }, [])
+  const pasteClipboard = useCallback(async () => {
+    let text = ''
+    try { text = await navigator.clipboard.readText() } catch (e) { return false }
+    if (!text) return false
+    write(text) // bracketed-paste-safe: the PTY/app decides how to treat it
+    haptic()
+    termRef.current && termRef.current.focus()
+    return true
+  }, [write])
+
+  // Auto-copy on selection (desktop): mirrors a normal terminal's behavior and
+  // gives mobile a no-op-safe path. Wired once per mounted terminal.
+  useEffect(() => {
+    const term = termRef.current
+    if (!term) return
+    const sub = term.onSelectionChange(() => {
+      if (isTouch) return // touch selection is too jumpy to auto-copy
+      const sel = term.getSelection()
+      if (sel && sel.length) navigator.clipboard && navigator.clipboard.writeText(sel).catch(() => {})
+    })
+    // Ctrl/Cmd+Shift+C copy, Ctrl/Cmd+Shift+V / Ctrl+Cmd+V paste. We attach a
+    // key handler that returns false to let xterm forward keys we don't claim.
+    const keySub = term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true
+      const mod = e.ctrlKey || e.metaKey
+      if (mod && e.shiftKey && (e.key === 'C' || e.key === 'c')) { copySelection(); return false }
+      if (mod && e.shiftKey && (e.key === 'V' || e.key === 'v')) { pasteClipboard(); return false }
+      return true
+    })
+    return () => { try { sub.dispose() } catch (e) {} }
+    // attachCustomKeyEventHandler has no disposer; replaced on remount. keySub unused.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [copySelection, pasteClipboard])
 
   const sendKey = (label) => {
     haptic()
@@ -155,11 +279,13 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
 
   const dot = status === 'ready' ? T.ok : status === 'closed' ? T.bad : T.warn
 
-  // accessory bar key spec (default row)
+  // accessory bar key spec (default row). Copy/Paste live at the end so they are
+  // always reachable on touch (issue #3).
   const ROW = [
     { l: 'Esc' }, { l: 'Tab' }, { l: 'ctrl', on: ctrlOn, fn: toggleCtrl }, { l: 'alt', on: altOn, fn: toggleAlt },
     { l: 'Up', g: '↑' }, { l: 'Down', g: '↓' }, { l: 'Left', g: '←' }, { l: 'Right', g: '→' },
     { l: '|' }, { l: '/' }, { l: '~' }, { l: '-' }, { l: 'Home', g: '⤒' }, { l: 'End', g: '⤓' }, { l: 'Del' },
+    { l: 'Copy', g: 'copy', fn: copySelection }, { l: 'Paste', g: 'paste', fn: pasteClipboard },
   ]
 
   return (
@@ -178,11 +304,11 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
             <span title="background (keep running)" onClick={onBackground}
               style={{ cursor: 'pointer', fontSize: 12, letterSpacing: '.04em' }}>hide</span>
           )}
-          <span title="close (end session)" onClick={onClose} style={{ cursor: 'pointer', fontSize: 15 }}>✕</span>
+          <span title="close (end session)" onClick={endSession} style={{ cursor: 'pointer', fontSize: 15 }}>✕</span>
         </span>
       </div>
       {/* terminal */}
-      <div ref={hostRef} style={{ flex: 1, minHeight: 0, padding: '8px 10px' }} />
+      <div ref={hostRef} data-testid="term-host" style={{ flex: 1, minHeight: 0, padding: '8px 10px' }} />
       {/* accessory key bar (always on touch; handy on desktop too) */}
       <div style={{
         flex: '0 0 auto', display: 'flex', gap: 6, padding: '7px 10px', borderTop: `1px solid ${T.line}`,
@@ -191,7 +317,7 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
         {ROW.map((k, i) => {
           const active = k.on
           return (
-            <button key={i} onClick={k.fn || (() => sendKey(k.l))} style={{
+            <button key={i} data-key={k.l} onClick={k.fn || (() => sendKey(k.l))} style={{
               flex: '0 0 auto', minWidth: 38, padding: '9px 11px', fontFamily: font, fontSize: 12,
               cursor: 'pointer', whiteSpace: 'nowrap', transition: 'all .1s',
               border: `1px solid ${active ? accent : T.lineSoft}`, color: active ? T.onAccent : T.sub,
