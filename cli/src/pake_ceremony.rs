@@ -106,11 +106,10 @@ pub enum Inbound {
 /// previously inlined (the live session, our element, derived K, the sent-flags)
 /// so both `pair` and the transfer path drive it identically.
 pub struct Ceremony {
-    /// The SPAKE2 password (the spoken words). NEVER leaves the process; only
-    /// fed to SPAKE2 here. The nameplate (sent to the server) lives in the
-    /// caller, but we keep a copy for `start`/re-`start` on a `taken` re-mint.
-    password: String,
-    nameplate: String,
+    /// The agreed capability set (relayed in the confirm payload) and its
+    /// canonical form (fed to the MAC). The password (spoken words) and nameplate
+    /// are consumed by the SPAKE2 `state` at construction and never re-read here,
+    /// so they are not retained: the words NEVER leave the process by design.
     caps: Vec<String>,
     caps_canon: String,
     /// Live SPAKE2 session (consumed by `finish`). `None` after K is derived.
@@ -136,8 +135,6 @@ impl Ceremony {
         let caps_canon = filament_pake::canonical_caps(&caps);
         let (state, msg) = filament_pake::start(password.as_bytes(), nameplate.as_bytes());
         Ceremony {
-            password: password.to_string(),
-            nameplate: nameplate.to_string(),
             caps,
             caps_canon,
             state: Some(state),
@@ -154,8 +151,6 @@ impl Ceremony {
     /// server `taken` collision. Resets the session and the sent-flag so the new
     /// element goes out. The caller re-emits `pair-create {nameplate}`.
     pub fn restart(&mut self, password: &str, nameplate: &str) {
-        self.password = password.to_string();
-        self.nameplate = nameplate.to_string();
         let (state, msg) = filament_pake::start(password.as_bytes(), nameplate.as_bytes());
         self.state = Some(state);
         self.msg = msg;
@@ -166,15 +161,13 @@ impl Ceremony {
         self.sent_confirm = false;
     }
 
-    pub fn nameplate(&self) -> &str {
-        &self.nameplate
-    }
-    pub fn caps(&self) -> &[String] {
-        &self.caps
-    }
     pub fn secret(&self) -> Option<&String> {
         self.secret.as_ref()
     }
+    /// The abort reason, if the ceremony was refused. Callers normally act on the
+    /// `Inbound::Abort` returned by `on_signal`; this accessor is used by the
+    /// module's own tests to assert the terminal state.
+    #[cfg(test)]
     pub fn aborted(&self) -> Option<&String> {
         self.aborted.as_ref()
     }

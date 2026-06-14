@@ -1391,7 +1391,7 @@ async fn introduce_cmd(server: &str, a: &str, b: &str, relay: bool) -> Result<()
 // the 32-byte confirmation MAC) are encoded/decoded by the shared
 // `pake_ceremony` module, which also owns the ceremony state machine that BOTH
 // `pair` and the transfer path (`send --code` / `recv`) now run.
-use pake_ceremony::{b64_decode, b64_encode, pair_v2_caps, Ceremony, Inbound as PakeInbound};
+use pake_ceremony::{pair_v2_caps, Ceremony, Inbound as PakeInbound};
 
 /// The one-line dim banner shown right before we open the guided entry on a
 /// MALFORMED arg, so the user knows WHY the prompt appeared and how to make it
