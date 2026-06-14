@@ -1451,7 +1451,7 @@ fn malformed_entry_banner(arg: &str) {
     ui::say(&ui::paint(
         ui::Tone::Dim,
         &format!(
-            "couldn't parse '{arg}' — opening guided entry · set FILAMENT_NONINTERACTIVE=1 to fail fast in scripts"
+            "couldn't parse '{arg}', opening guided entry · set FILAMENT_NONINTERACTIVE=1 to fail fast in scripts"
         ),
     ));
 }
@@ -1520,7 +1520,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 filament_pake::split_chosen_code(&filament_pake::norm_code(w));
             if password_word_tokens(&words) < 2 {
                 bail!(
-                    "'{w}' is too weak — use at least two words, e.g. gigantic-element \
+                    "'{w}' is too weak. Use at least two words, e.g. gigantic-element \
                      (easier to say, harder to guess). A single word falls below the \
                      strength floor the rate-limit relies on."
                 );
@@ -1750,7 +1750,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 // legacy server-minted code means the peer can't PAKE-pair.
                 let c = v["code"].as_str().unwrap_or("?");
                 let _ = c;
-                bail!("this server returned a legacy code — update the server (or the peer) to pair securely");
+                bail!("this server returned a legacy code. Update the server (or the peer) to pair securely.");
             }
             Ev::PairUsed(_) => {
                 ui::say(&ui::paint(ui::Tone::Dim, "  code claimed — connecting…"));
@@ -1900,7 +1900,7 @@ async fn pair_cmd(server: &str, mut code: Option<String>, name: Option<String>, 
                 // cannot exploit this: there is no path here that stores a
                 // server-readable secret.
                 Some("pair-keep") => {
-                    bail!("the other device uses an older version and can't pair securely — update it (or this CLI) so first-pairing runs the encrypted handshake. Nothing was stored.");
+                    bail!("the other device uses an older version and can't pair securely. Update it (or this CLI) so first-pairing runs the encrypted handshake. Nothing was stored.");
                 }
                 _ => {}
             },

@@ -97,7 +97,7 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
     if trimmed.is_empty() {
         let steer = match mode {
             Mode::Claim => "type the code they read you, e.g. brave-otter-3141".to_string(),
-            Mode::Create => "type two words — easier to say, harder to guess".to_string(),
+            Mode::Create => "type two words, easier to say and harder to guess".to_string(),
         };
         return Judgment { level: Level::Empty, steer, preview: None };
     }
@@ -112,7 +112,7 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
             if np_ok && has_words {
                 return Judgment {
                     level: Level::Ready,
-                    steer: "✓ ready — press enter".to_string(),
+                    steer: "✓ ready, press enter".to_string(),
                     preview: Some(format!("{pw} · {np}")),
                 };
             }
@@ -128,7 +128,7 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
             // Words present but the trailing group isn't a 3-5 digit nameplate.
             Judgment {
                 level: Level::Incomplete,
-                steer: "keep going — a full code ends in a 3-5 digit number".to_string(),
+                steer: "keep going, a full code ends in a 3-5 digit number".to_string(),
                 preview: None,
             }
         }
@@ -140,13 +140,13 @@ pub fn judge(buf: &str, mode: Mode, auto_nameplate: &str) -> Judgment {
             if crate::password_word_tokens(&words) < 2 {
                 return Judgment {
                     level: Level::Incomplete,
-                    steer: "add another word — easier to say, harder to guess".to_string(),
+                    steer: "add another word, easier to say and harder to guess".to_string(),
                     preview: None,
                 };
             }
             Judgment {
                 level: Level::Ready,
-                steer: format!("✓ {words} — press enter to create"),
+                steer: format!("✓ {words}, press enter to create"),
                 // the auto-nameplate rides along dimmed in the preview
                 preview: Some(format!("{words}-{auto_nameplate}")),
             }
@@ -213,30 +213,31 @@ fn level_color(level: Level) -> Option<&'static str> {
     })
 }
 
-/// Render the two lines (prompt+buffer, then the colored steer line) in place.
-/// Uses CR + clear-to-end-of-line so each keystroke redraws cleanly in raw mode.
+/// Render the entry on a SINGLE line, redrawn in place. We deliberately avoid
+/// save/restore-cursor (`\x1b[s`/`\x1b[u`) and newlines: some shells ignore SCO
+/// save/restore, which made the entry walk down a line per keystroke on those
+/// terminals. A single line cleared with CR + erase-line (`\r\x1b[2K`) redraws
+/// consistently on every terminal.
 fn render(prompt: &str, buf: &str, j: &Judgment) {
     let mut err = std::io::stderr();
-    // Line 1: prompt + the live formatted buffer. Leave the cursor right after
-    // the buffer (browser-like caret at the end).
-    let _ = write!(err, "\r\x1b[2K{prompt}{buf}");
-    // Line 2 (below): the colored steer line + optional dim preview.
     let reset = if ui::caps().color { "\x1b[0m" } else { "" };
     let color = level_color(j.level).unwrap_or("");
     let preview = match &j.preview {
-        Some(p) if j.level != Level::Ready => {
-            if ui::caps().color { format!("   \x1b[2m{p}\x1b[0m") } else { format!("   {p}") }
-        }
-        // For Ready/Create the preview is already woven into steer; for Ready/Claim
-        // the steer + a dim preview reads well.
         Some(p) => {
-            if ui::caps().color { format!("   \x1b[2m{p}\x1b[0m") } else { format!("   {p}") }
+            if ui::caps().color { format!("  \x1b[2m{p}{reset}") } else { format!("  {p}") }
         }
         None => String::new(),
     };
-    // Down one line, clear it, paint, then come back UP and restore the cursor to
-    // just after the buffer on line 1.
-    let _ = write!(err, "\x1b[s\r\n\x1b[2K{color}{}{reset}{preview}\x1b[u", j.steer);
+    // Clear the whole line, then draw: prompt+buffer, a gap, the colored steer
+    // plus optional dim preview.
+    let _ = write!(err, "\r\x1b[2K{prompt}{buf}   {color}{}{reset}{preview}", j.steer);
+    // Put the caret back right after the typed buffer (browser-like), so typing
+    // continues at the end of the code rather than after the steer text.
+    let col = prompt.chars().count() + buf.chars().count();
+    let _ = write!(err, "\r");
+    if col > 0 {
+        let _ = write!(err, "\x1b[{col}C");
+    }
     let _ = err.flush();
 }
 
