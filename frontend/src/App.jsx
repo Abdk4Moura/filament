@@ -47,6 +47,7 @@ export default function App() {
       onClear={qs.clearTransfer}
       onCopyRoomLink={onCopyRoomLink}
       onPairWithCode={qs.pairWithCode}
+      onReceiveWithCode={qs.receiveWithCode}
       onGenerateCode={qs.generateCode}
       onUseAutoRoom={qs.useAutoRoom}
       onAcceptKeep={qs.acceptKeep}

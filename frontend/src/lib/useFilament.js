@@ -233,6 +233,10 @@ export function useFilament() {
   const pendingPakeRef = useRef(null) // { nameplate, password } awaiting a peer
   const pakeRef = useRef(null) // active PakePairing for the current peer
   const pakePeerRef = useRef(null) // peer sid we run the PAKE with
+  // L1-a: peers authenticated by an EPHEMERAL transfer-auth ceremony
+  // (receiveWithCode) — secret discarded, link trusted only for this session's
+  // incoming transfer. Distinct from a remembered (stored) device.
+  const ephemeralAuthRef = useRef(new Set())
   const [pairStatus, setPairStatus] = useState(null) // 'pairing' | 'paired' | 'refused' | error string
   // L1-a consent (mirrors C27 pendingKeeps for v2): when a PAKE completes, K is
   // agreed but remembering is a separate TRUST GRANT the human decides. Queue
@@ -805,7 +809,25 @@ export function useFilament() {
     if (p.secret) {
       const peerId = pakePeerRef.current
       const name = (peerId && linksRef.current.get(peerId)?.name) || 'device'
-      // K is agreed, pairing crypto succeeded. But remembering is a separate
+      // L1-a EPHEMERAL transfer-auth (receiveWithCode): the SAME ceremony runs,
+      // but the agreed secret is DISCARDED — it only authenticated the link
+      // (mutual auth, MITM-detectable). NO device is remembered. The peer is now
+      // trusted for THIS session's incoming transfer; mark the link verified so
+      // the existing transfer UI treats it as an authenticated sender.
+      if (pendingPakeRef.current?.ephemeral) {
+        if (peerId) {
+          const link = linksRef.current.get(peerId)
+          if (link) link._verified = true
+          updatePeer(peerId, { verified: name })
+          ephemeralAuthRef.current.add(peerId)
+        }
+        tel('pake-transfer-authed', { peer: String(peerId).slice(-6) })
+        setPairStatus('connected') // authenticated; ready to receive (secret discarded)
+        pakeRef.current = null
+        pendingPakeRef.current = null
+        return
+      }
+      // K is agreed — pairing crypto succeeded. But remembering is a separate
       // trust grant (C27): queue a consent prompt instead of storing silently.
       // Capture secret/caps/name NOW, before we null pakeRef below. Dedup by
       // peerId so the per-tick drivePake doesn't enqueue twice.
@@ -885,6 +907,38 @@ export function useFilament() {
       return
     }
     pendingPakeRef.current = { nameplate, password }
+    setPairStatus('pairing')
+    sigRef.current?.pairClaimV2(nameplate)
+  }, [])
+
+  // L1-a: RECEIVE WITH CODE — claim a transfer code, run the SAME ephemeral
+  // SPAKE2 ceremony as pairWithCode, but DISCARD the agreed secret (it only
+  // authenticates the link; no device is remembered). After the ceremony
+  // confirms, the existing transfer machinery (PeerLink file-offer → onTransfer
+  // → acceptTransfer → file-data → file-end → delivery-ack) delivers the file.
+  // Sibling to pairWithCode: the ONLY difference is `ephemeral:true`, which
+  // makes finalizePake discard rather than queue a remember-consent.
+  const receiveWithCode = useCallback(async (code) => {
+    const clean = String(code).trim()
+    if (!clean) return
+    setPairStatus(null)
+    await pakeReady()
+    pakeReadyRef.current = true
+    // Parse with the SHARED WASM normCode/splitCode so {nameplate, password} is
+    // byte-identical to the CLI sender — SPAKE2 hashes exactly this password.
+    const { nameplate, password } = parseSpokenCode(clean)
+    const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
+    if (!numericNameplate) {
+      setPairStatus('that code is missing its number — a full code ends in a 3-5 digit number, e.g. brave-otter-3141')
+      return
+    }
+    if (!password) {
+      setPairStatus('that does not look like a full code — type the whole thing, e.g. brave-otter-3141')
+      return
+    }
+    // `ephemeral:true` is the only difference from pairWithCode: the agreed
+    // secret authenticates this transfer and is then discarded (never stored).
+    pendingPakeRef.current = { nameplate, password, ephemeral: true }
     setPairStatus('pairing')
     sigRef.current?.pairClaimV2(nameplate)
   }, [])
@@ -1170,6 +1224,7 @@ export function useFilament() {
     clearTransfer,
     pairStatus, // null | 'pairing' | 'paired' | a user-facing error/refusal string
     pairWithCode, // join a code room to pair across networks
+    receiveWithCode, // L1-a: claim a code, ephemeral-PAKE auth, then RECEIVE a file (secret discarded)
     generateCode, // mint a fresh code and switch to it; returns the code
     useAutoRoom, // go back to the 'people near you' auto room
     knownDevices, // C12: [{name, secret, addedAt}], remembered devices

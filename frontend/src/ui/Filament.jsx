@@ -513,10 +513,16 @@ function CustomCodeEntry({ onCreate, onCancel, accent, T }) {
   )
 }
 
-function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, openEntryNonce, T, D, accent }) {
+function DiscoveryBar({ state, onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onCopyRoomLink, openEntryNonce, T, D, accent }) {
   const scope = state.roomScope || 'link'
   const [copied, fireCopy] = useCopied()
-  const [entering, setEntering] = useState(false)
+  // L1-a: the code input serves two verbs now — `null` (closed), `'pair'`
+  // (remember the device), or `'receive'` (claim + ephemeral-PAKE + download a
+  // file, secret discarded). `entering` stays a derived boolean for the existing
+  // layout branches; the verb decides which hook action the submit calls.
+  const [entryMode, setEntryMode] = useState(null)
+  const entering = entryMode !== null
+  const setEntering = (on) => setEntryMode(on ? 'pair' : null)
   const [customizing, setCustomizing] = useState(false) // "choose your own code"
   const [code, setCode] = useState('')
 
@@ -545,7 +551,12 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
   // Keep the input open after submitting a code so the user sees the result
   // (success/failure) and can correct a mistyped code in place; closing the
   // box on submit is why pairing failures used to vanish silently.
-  const submitCode = () => { const c = code.trim(); if (c) onPairWithCode(c) }
+  const submitCode = () => {
+    const c = code.trim()
+    if (!c) return
+    if (entryMode === 'receive') onReceiveWithCode(c)
+    else onPairWithCode(c)
+  }
 
   // Surface pairing feedback (set by the hook). 'pairing'/'paired' are neutral;
   // anything else is a user-facing error/refusal shown in the accent-warning hue.
@@ -606,19 +617,20 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
         {customizing ? (
           <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
         ) : entering ? (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }} data-testid={`code-entry-${entryMode}`}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
-                onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
+                onSubmit={submitCode} onCancel={() => { setEntryMode(null); setCode('') }}
                 placeholder="ENTER CODE" accent={accent} T={T} />
-              {ghostBtn('pair', submitCode, true)}
-              {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+              {ghostBtn(entryMode === 'receive' ? 'receive' : 'pair', submitCode, true)}
+              {ghostBtn('cancel', () => { setEntryMode(null); setCode('') })}
             </div>
             {pairMsg}
           </div>
         ) : (
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            {ghostBtn('pair with code', () => setEntering(true))}
+            {ghostBtn('receive with code', () => setEntryMode('receive'))}
+            {ghostBtn('pair with code', () => setEntryMode('pair'))}
             {ghostBtn('create code', onGenerateCode, true)}
             {ghostBtn('choose your own', () => setCustomizing(true))}
           </div>
@@ -638,19 +650,20 @@ function DiscoveryBar({ state, onPairWithCode, onGenerateCode, onUseAutoRoom, on
       {customizing ? (
         <CustomCodeEntry onCreate={createCustom} onCancel={() => setCustomizing(false)} accent={accent} T={T} />
       ) : entering ? (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }} data-testid={`code-entry-${entryMode}`}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <CodeInput autoFocus value={code} onChange={setCode} format={formatCode}
-              onSubmit={submitCode} onCancel={() => { setEntering(false); setCode('') }}
+              onSubmit={submitCode} onCancel={() => { setEntryMode(null); setCode('') }}
               placeholder="ENTER CODE" accent={accent} T={T} />
-            {ghostBtn('pair', submitCode, true)}
-            {ghostBtn('cancel', () => { setEntering(false); setCode('') })}
+            {ghostBtn(entryMode === 'receive' ? 'receive' : 'pair', submitCode, true)}
+            {ghostBtn('cancel', () => { setEntryMode(null); setCode('') })}
           </div>
           {pairMsg}
         </div>
       ) : (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          {ghostBtn('pair with code', () => setEntering(true))}
+          {ghostBtn('receive with code', () => setEntryMode('receive'))}
+          {ghostBtn('pair with code', () => setEntryMode('pair'))}
           {ghostBtn('create code', onGenerateCode, true)}
           {ghostBtn('choose your own', () => setCustomizing(true))}
         </div>
@@ -750,7 +763,7 @@ function SessionsStrip({ sessions, activeId, onSwitch, onClose, narrow, T, accen
 
 export default function Filament(props) {
   const { state, onSendFiles, onAccept, onDecline, onSave, onClear, onCopyRoomLink,
-    onPairWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
+    onPairWithCode, onReceiveWithCode, onGenerateCode, onUseAutoRoom, onAcceptKeep, onDeclineKeep,
     onAcceptPakeKeep, onDeclinePakeKeep, onForgetDevice, onRenameDevice, ui = {} } = props
   const mode = ui.theme === 'light' ? 'light' : 'dark'
   const accentSet = ACCENTS[ui.accent] || ACCENTS.green
@@ -925,7 +938,7 @@ export default function Filament(props) {
     <>
       {keepBanners}
       {pakeKeepBanners}
-      <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
+      <DiscoveryBar state={state} onPairWithCode={onPairWithCode || (() => {})} onReceiveWithCode={onReceiveWithCode || (() => {})} onGenerateCode={onGenerateCode || (() => {})}
         onUseAutoRoom={onUseAutoRoom || (() => {})} onCopyRoomLink={onCopyRoomLink} openEntryNonce={pairEntryNonce} T={T} D={D} accent={accent} />
     </>
   )
