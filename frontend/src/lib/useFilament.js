@@ -862,23 +862,26 @@ export function useFilament() {
     setPairStatus(null) // clear any stale failure from a previous attempt
     await pakeReady()
     pakeReadyRef.current = true
-    const { nameplate, password, normalized } = parseSpokenCode(clean)
-    // A valid PAKE code is `words…-NNNN`: a numeric trailing nameplate (3-5
-    // digits, matching the server's _NAMEPLATE_RE) AND at least one word of
-    // password before it. Catch the common mistakes CLIENT-SIDE with a clear,
-    // case-specific message instead of bouncing off the server as a bare
-    // "invalid" — distinguishing "no nameplate at all" from "looks like an old
-    // legacy code" from "missing the words half".
+    // Parse with the SHARED WASM normCode/splitCode (via parseSpokenCode) so the
+    // browser's view of {nameplate, password} is byte-identical to the CLI's —
+    // SPAKE2 hashes exactly this `password`, so any drift between an inline
+    // validator and the real split would silently break key agreement. A valid
+    // PAKE code is `words…-NNNN`: a numeric trailing nameplate (3-5 digits,
+    // matching the server's _NAMEPLATE_RE) AND at least one word of password
+    // before it. The error cases below are derived from the shared split, not a
+    // separate regex, keeping a clear case-specific message.
+    const { nameplate, password } = parseSpokenCode(clean)
     const numericNameplate = /^[0-9]{3,5}$/.test(nameplate)
-    if (!password || !normalized.includes('-')) {
-      // No dash / nothing before the number — not a full spoken code.
-      setPairStatus('that does not look like a full code — type the whole thing, e.g. brave-otter-ruby-3141')
+    if (!numericNameplate) {
+      // The shared split's trailing group isn't a numeric nameplate (no number
+      // at all, or a partial/typo'd code) — there is nothing for the server to
+      // route on.
+      setPairStatus('that code is missing its number — a full code ends in a 3-5 digit number, e.g. brave-otter-3141')
       return
     }
-    if (!numericNameplate) {
-      // Trailing group is not the numeric nameplate (e.g. a 3-word legacy code
-      // with no number, or a partial/typo'd code).
-      setPairStatus('that code is missing its number — a full code ends in a 4-digit number, e.g. brave-otter-ruby-3141')
+    if (!password) {
+      // A bare number with no words before it — nothing for SPAKE2 to hash.
+      setPairStatus('that does not look like a full code — type the whole thing, e.g. brave-otter-3141')
       return
     }
     pendingPakeRef.current = { nameplate, password }
