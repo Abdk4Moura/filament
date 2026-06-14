@@ -1418,35 +1418,15 @@ async fn pair_cmd(server: &str, code: Option<String>, name: Option<String>, rela
         }
     }
 
-    let mut conn = Conn {
-        server: server.to_string(),
-        sio: sio.clone(),
-        tx: tx.clone(),
-        my_uid: my_uid.clone(),
-        my_id: String::new(),
-        relay_only: relay,
-        to_filter: None,
-        links: HashMap::new(),
-        roster: HashMap::new(),
-        active: None,
-        next_gen: 0,
-        waiting_rejoin: None,
-        rejoin_window: REJOIN_WINDOW,
-        away: None,
-        chunk_size: net::MAX_DC_PAYLOAD,
-        deferred_left: HashMap::new(),
-        recv_done: false,
-    direct_pending: HashMap::new(),
-    stall_repairs: HashMap::new(),
-    relay_committed: std::collections::HashSet::new(),
-    // P3 (GAP-3): warm redundancy is selective — OFF for one-shot / non-session
-    // flows; the long-lived `up` acceptor turns it ON below. The override knob
-    // (`FILAMENT_WARM_STANDBY`) can force it either way.
-    warm_standby: net::warm_standby_override().unwrap_or(false),
-    warm_cutover: std::collections::HashSet::new(),
-    upgrade_probe: HashMap::new(),
-    iface_snapshot: Vec::new(),
-    };
+    let mut conn = Conn::for_command(
+        server,
+        sio.clone(),
+        tx.clone(),
+        my_uid.clone(),
+        relay,        // relay_only
+        None,         // to_filter
+        false,        // warm_standby default (pair is one-shot)
+    );
     {
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -2043,6 +2023,53 @@ struct DirectPending {
 }
 
 impl Conn {
+    /// Single constructor for the `pair`/`send`/`recv` command event loops, which
+    /// built the identical ~17-field `Conn` literal three times (the only
+    /// per-command differences are `relay_only`, `to_filter`, and the
+    /// warm-standby default). Everything else is the fixed fresh-session state.
+    /// `warm_standby_default` is the per-session-kind default that the
+    /// `FILAMENT_WARM_STANDBY` override (via `net::warm_standby_override`) can
+    /// still force either way. NOTE: the long-lived `up` daemon loop keeps its
+    /// own literal on purpose — it is a different (non-command) session.
+    fn for_command(
+        server: &str,
+        sio: rust_socketio::asynchronous::Client,
+        tx: mpsc::UnboundedSender<Ev>,
+        my_uid: String,
+        relay_only: bool,
+        to_filter: Option<String>,
+        warm_standby_default: bool,
+    ) -> Self {
+        Conn {
+            server: server.to_string(),
+            sio,
+            tx,
+            my_uid,
+            my_id: String::new(),
+            relay_only,
+            to_filter,
+            links: HashMap::new(),
+            roster: HashMap::new(),
+            active: None,
+            next_gen: 0,
+            waiting_rejoin: None,
+            rejoin_window: REJOIN_WINDOW,
+            away: None,
+            chunk_size: net::MAX_DC_PAYLOAD,
+            deferred_left: HashMap::new(),
+            recv_done: false,
+            direct_pending: HashMap::new(),
+            stall_repairs: HashMap::new(),
+            relay_committed: std::collections::HashSet::new(),
+            // P3 (GAP-3): warm redundancy is selective; the caller passes the
+            // per-session default and the override knob can still force either way.
+            warm_standby: net::warm_standby_override().unwrap_or(warm_standby_default),
+            warm_cutover: std::collections::HashSet::new(),
+            upgrade_probe: HashMap::new(),
+            iface_snapshot: Vec::new(),
+        }
+    }
+
     fn link(&self, pid: &str) -> Option<&Link> {
         self.links.get(pid)
     }
@@ -4117,35 +4144,15 @@ async fn send_cmd(
         });
     }
 
-    let mut conn = Conn {
-        server: server.to_string(),
-        sio: sio.clone(),
-        tx: tx.clone(),
+    let mut conn = Conn::for_command(
+        server,
+        sio.clone(),
+        tx.clone(),
         my_uid,
-        my_id: String::new(),
-        relay_only: relay,
-        to_filter: to,
-        links: HashMap::new(),
-        roster: HashMap::new(),
-        active: None,
-        next_gen: 0,
-        waiting_rejoin: None,
-        rejoin_window: REJOIN_WINDOW,
-        away: None,
-        chunk_size: net::MAX_DC_PAYLOAD,
-        deferred_left: HashMap::new(),
-        recv_done: false,
-    direct_pending: HashMap::new(),
-    stall_repairs: HashMap::new(),
-    relay_committed: std::collections::HashSet::new(),
-    // P3 (GAP-3): warm redundancy is selective — OFF for one-shot / non-session
-    // flows; the long-lived `up` acceptor turns it ON below. The override knob
-    // (`FILAMENT_WARM_STANDBY`) can force it either way.
-    warm_standby: net::warm_standby_override().unwrap_or(false),
-    warm_cutover: std::collections::HashSet::new(),
-    upgrade_probe: HashMap::new(),
-    iface_snapshot: Vec::new(),
-    };
+        relay,        // relay_only
+        to,           // to_filter
+        false,        // warm_standby default (one-shot send)
+    );
     if known_target.is_some() {
         conn.to_filter = None; // identity supersedes name matching
     }
@@ -5031,35 +5038,18 @@ async fn recv_cmd(
         }
     }
 
-    let mut conn = Conn {
-        server: server.to_string(),
-        sio: sio.clone(),
-        tx: tx.clone(),
-        my_uid: my_uid.clone(),
-        my_id: String::new(),
-        relay_only: relay,
-        to_filter: to,
-        links: HashMap::new(),
-        roster: HashMap::new(),
-        active: None,
-        next_gen: 0,
-        waiting_rejoin: None,
-        rejoin_window: REJOIN_WINDOW,
-        away: None,
-        chunk_size: net::MAX_DC_PAYLOAD,
-        deferred_left: HashMap::new(),
-        recv_done: false,
-    direct_pending: HashMap::new(),
-    stall_repairs: HashMap::new(),
-    relay_committed: std::collections::HashSet::new(),
-    // P3 (GAP-3): the `up`/`up --shell` daemon acceptor is the canonical
-    // long-lived / interactive session, so warm redundancy defaults ON for it
-    // (a one-shot `recv` keeps daemon=false -> OFF). Override knob can force either.
-    warm_standby: net::warm_standby_override().unwrap_or(daemon),
-    warm_cutover: std::collections::HashSet::new(),
-    upgrade_probe: HashMap::new(),
-    iface_snapshot: Vec::new(),
-    };
+    let mut conn = Conn::for_command(
+        server,
+        sio.clone(),
+        tx.clone(),
+        my_uid.clone(),
+        relay,        // relay_only
+        to,           // to_filter
+        // P3 (GAP-3): the `up`/`up --shell` daemon acceptor is the canonical
+        // long-lived / interactive session, so warm redundancy defaults ON for it
+        // (a one-shot `recv` keeps daemon=false -> OFF).
+        daemon,       // warm_standby default
+    );
     {
         let tx = tx.clone();
         tokio::spawn(async move {
