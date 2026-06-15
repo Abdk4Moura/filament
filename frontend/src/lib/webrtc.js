@@ -11,6 +11,7 @@
 //   declined     -> receiver said no
 //   failed       -> connection/transfer error
 import { log } from './log.js'
+import * as linkdiag from './linkdiag.js'
 
 const rlog = log.scope('rtc')
 
@@ -389,6 +390,22 @@ export class PeerLink {
       iceServers,
       ...(this.relayOnly ? { iceTransportPolicy: 'relay' } : {}),
     })
+    // Link-diagnostics (telemetry capture): a per-link getStats sampler that
+    // records the selected candidate pair (route + candidate types), periodic
+    // compact deltas (RTT, bytes/packets advancing, ICE consent advancing), and
+    // a 'pair' event whenever the selected pair id changes (the NAT-rebind
+    // smoking gun). It reads the live pc + identity each tick. start()/stop()
+    // ride the channel-open / fail / close lifecycle below. Tagged with the peer
+    // uid and whether this is the shell (PTY) link.
+    this._diagMeta = () => ({ uid: this.peerUid || this.id, shell: this._ptySid != null })
+    this._diag = linkdiag.attach({ getPc: () => this.pc, getMeta: this._diagMeta })
+    // Capture every ICE-level transition with the new state (the brief's #1).
+    this.pc.oniceconnectionstatechange = () =>
+      linkdiag.record('ice', { state: this.pc.iceConnectionState }, this._diagMeta())
+    this.pc.onicegatheringstatechange = () =>
+      linkdiag.record('gather', { state: this.pc.iceGatheringState }, this._diagMeta())
+    this.pc.onsignalingstatechange = () =>
+      linkdiag.record('signaling', { state: this.pc.signalingState }, this._diagMeta())
     this.pc.onicecandidate = (e) => {
       if (e.candidate) {
         rlog.trace('ice candidate', this.id.slice(-6), e.candidate.candidate)
@@ -414,10 +431,12 @@ export class PeerLink {
     this.pc.onconnectionstatechange = () => {
       const s = this.pc.connectionState
       rlog.trace('connectionState', this.id.slice(-6), s)
+      linkdiag.record('conn-state', { state: s }, this._diagMeta())
       if (s === 'connected') {
         clearTimeout(this._dcTimer)
         clearTimeout(this._watchdog) // established, watchdog stands down (#8)
         this.onStatus('ready')
+        this._diag?.start() // begin the getStats poll now that we're connected
         this._detectRoute() // which physical path did ICE actually pick?
       } else if (s === 'disconnected') {
         rlog.debug('peer disconnected, attempting recovery', this.id.slice(-6))
@@ -428,6 +447,7 @@ export class PeerLink {
         if (!this.polite) {
           try {
             rlog.debug('restarting ICE (repair)', this.id.slice(-6))
+            linkdiag.record('action', { what: 'restartIce', reason: 'disconnected' }, this._diagMeta())
             this.pc.restartIce()
           } catch {}
         }
@@ -570,6 +590,7 @@ export class PeerLink {
       return null
     }
     if (route !== this.route) {
+      linkdiag.record('route', { route, from: this.route || null }, this._diagMeta())
       this.route = route
       this.onRoute(route)
     }
@@ -648,6 +669,7 @@ export class PeerLink {
     if (!this.polite) {
       try {
         rlog.debug('upgrade probe: restartIce to find a direct path', this.id.slice(-6))
+        linkdiag.record('action', { what: 'restartIce', reason: 'p5-upgrade-probe' }, this._diagMeta())
         this.pc.restartIce()
       } catch {}
     } else {
@@ -725,6 +747,7 @@ export class PeerLink {
   // line, and disarm the prober (we're a destination now, not a way-station).
   _commitUpgrade(route) {
     if (this._closed) return
+    linkdiag.record('action', { what: 'upgrade-commit', route, from: this.route || null }, this._diagMeta())
     this.route = route
     this.onRoute(route)
     rlog.info('upgraded to direct, relay released', this.id.slice(-6), route)
@@ -791,7 +814,7 @@ export class PeerLink {
     // web-shell: PTY bytes for the open terminal stream (empty frame = closed).
     if (sid === this._ptySid) {
       const payload = data.slice(4)
-      if (payload.byteLength === 0) { this.onPtyClose(); this._ptySid = null }
+      if (payload.byteLength === 0) { linkdiag.record('pty', { what: 'remote-close', session: this._ptySession }, this._diagMeta()); this.onPtyClose(); this._ptySid = null }
       else this.onPtyData(new Uint8Array(payload))
       return
     }
@@ -855,6 +878,10 @@ export class PeerLink {
   openPty(cols, rows, session) {
     this._ptySid = (0x80000000 | (this._nextSid++)) >>> 0
     this._ptySession = session || null
+    // PTY session event: an open is a fresh-or-reattach request carrying the
+    // stable session id (the persistence path); the ack ('pty-attach') tells us
+    // which it was. Tagged shell:true since a PTY now exists on this link.
+    linkdiag.record('pty', { what: 'open', session: this._ptySession }, this._diagMeta())
     this._control({ type: 'pty-open', sid: this._ptySid, cols, rows, session: this._ptySession })
     return this._ptySid
   }
@@ -885,6 +912,7 @@ export class PeerLink {
   // covers a CLI that has the session AND frees the per-link stream bookkeeping.
   closePty() {
     if (this._ptySid == null && this._ptySession == null) return
+    linkdiag.record('pty', { what: 'close', session: this._ptySession }, this._diagMeta())
     if (this._ptySession) this._control({ type: 'pty-close', session: this._ptySession })
     if (this._ptySid != null) this._control({ type: 'l2-close', sid: this._ptySid })
     this._ptySid = null
@@ -898,6 +926,10 @@ export class PeerLink {
         this.onCaps({ shell: this.peerShell })
         return
       case 'pty-open-ack':
+        // The CLI confirmed the PTY is live. msg.reattached (when the CLI
+        // reports it) distinguishes a reattach to a surviving shell from a fresh
+        // spawn, the persistence path the brief asks us to capture.
+        linkdiag.record('pty', { what: msg.reattached ? 'reattach' : 'attach', session: this._ptySession }, this._diagMeta())
         this.onPtyReady()
         return
       case 'l2-close':
@@ -1263,6 +1295,8 @@ export class PeerLink {
   // (we still hold the File / the partial bytes, kept in the hook-owned stores,
   // which deliberately survive this link), else 'failed' (#5 + resume).
   _failActive() {
+    linkdiag.record('action', { what: 'failActive', route: this.route || null }, this._diagMeta())
+    this._diag?.stop() // the getStats poll is meaningless once the link is torn down
     // P0: the in-flight watchdog is meaningless once we've torn the link's
     // transfers down, disarm it and clear the episode so a fresh link starts
     // clean (close() also clears it; this covers a mid-life link drop).
@@ -1403,6 +1437,7 @@ export class PeerLink {
       // mid-stall (C4 then takes over).
       if (this.pc.connectionState === 'connected' && !this.polite) {
         try {
+          linkdiag.record('action', { what: 'restartIce', reason: 'stall-rung-a' }, this._diagMeta())
           this.pc.restartIce()
           rlog.info('stall corrected attempt (rung a), liveness ping + restartIce', this.id.slice(-6))
         } catch {}
@@ -1440,6 +1475,7 @@ export class PeerLink {
     // relay-preferred rebuild). The callback may be a no-op for now.
     if (rung === 'b') {
       rlog.info('stall correction (rung c), escalating to onStall', this.id.slice(-6))
+      linkdiag.record('action', { what: 'onStall', reason: 'stall-rung-c', route: this.route || null }, this._diagMeta())
       try {
         this.onStall?.({ reason: 'persistent', route: this.route })
       } catch (err) {
@@ -1542,6 +1578,7 @@ export class PeerLink {
     const now = Date.now()
     if (this._ptyEpisode && now - this._ptyEpisode.at < PTY_LIVENESS_WINDOW_MS) return
     rlog.debug('idle shell link appears dead (consent not advancing)', this.id.slice(-6), 'deadMs', this._ptyDeadMs)
+    linkdiag.record('m1-dead', { deadMs: this._ptyDeadMs, route: this.route || null }, this._diagMeta())
     this._correctPtyDead()
   }
 
@@ -1560,6 +1597,7 @@ export class PeerLink {
       // Rung 1: in-place ICE repair (impolite + connected only, mirrors rung a).
       if (this.pc.connectionState === 'connected' && !this.polite) {
         try {
+          linkdiag.record('action', { what: 'restartIce', reason: 'm1-shell-rung-1' }, this._diagMeta())
           this.pc.restartIce()
           rlog.info('idle shell dead (rung 1): restartIce', this.id.slice(-6))
         } catch {}
@@ -1575,6 +1613,7 @@ export class PeerLink {
     // new link via the stable sessionId, so the terminal recovers on the relay.
     if (stage === 'ice') {
       rlog.info('idle shell still dead (rung 2): escalating to relay rebuild (onStall)', this.id.slice(-6))
+      linkdiag.record('action', { what: 'onStall', reason: 'm1-shell-rung-2', route: this.route || null }, this._diagMeta())
       try {
         this.onStall?.({ reason: 'persistent', route: this.route })
       } catch (err) {
@@ -1591,6 +1630,8 @@ export class PeerLink {
   }
 
   close() {
+    linkdiag.record('action', { what: 'close', route: this.route || null }, this._diagMeta())
+    this._diag?.stop() // P5/diag: stop the getStats poll
     clearInterval(this._stateTimer)
     clearInterval(this._stallTimer) // P0: disarm the in-flight stall watchdog
     this._disarmUpgradeProber() // P5: disarm the relay→direct upgrade prober

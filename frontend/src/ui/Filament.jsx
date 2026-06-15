@@ -9,6 +9,7 @@ import { createPortal } from 'react-dom'
 import WebTerminal from './WebTerminal.jsx'
 import DeviceSheet from './DeviceSheet.jsx'
 import CommandPalette from './CommandPalette.jsx'
+import DiagPanel from './DiagPanel.jsx'
 import { pakeReady, previewCustomCode } from '../lib/pairing.js'
 import { mintNameplate } from '../lib/words.js'
 
@@ -1073,6 +1074,11 @@ export default function Filament(props) {
     />
   )
 
+  // Link-diagnostics export affordance (telemetry capture). Portals to body, so
+  // it floats over either layout. Default-on / ?diag=1; renders nothing when
+  // capture is disabled. Lets a mobile user export the timeline after a blip.
+  const diagPanel = <DiagPanel T={T} accent={accent} font={font} />
+
   // ── Mobile layout ──────────────────────────────────────────────
   if (narrow) {
     const tabBtn = (k, n) => (
@@ -1088,6 +1094,7 @@ export default function Filament(props) {
         {terminalOverlay}
         {deviceSheet}
         {commandPalette}
+        {diagPanel}
         {/* stacked top bar */}
         <div style={{ flexShrink: 0, borderBottom: '1px solid ' + T.line, background: T.bg, padding: '11px 16px', display: 'flex', flexDirection: 'column', gap: 9 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -1143,6 +1150,7 @@ export default function Filament(props) {
       {terminalOverlay}
       {deviceSheet}
       {commandPalette}
+        {diagPanel}
       {/* top bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '0 ' + D.pad + 'px', height: 58, flexShrink: 0,
         borderBottom: '1px solid ' + T.line, background: T.bg }}>

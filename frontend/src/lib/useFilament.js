@@ -12,6 +12,7 @@ import { createSession } from './session.js'
 import { PeerLink, politeRole } from './webrtc.js'
 import { api } from './api.js'
 import { tel, telPeer, installTel, flush as telFlush } from './tel.js'
+import * as linkdiag from './linkdiag.js'
 import { log } from './log.js'
 import { devicesLoad, devicesStore, devicesStoreV2, devicesForget, devicesRename, channelOf, proofFor } from './devices.js'
 import { mintWords, mintNameplate, ADJ, ANIMAL as ANIMALS } from './words.js'
@@ -502,6 +503,10 @@ export function useFilament() {
         },
       })
       linksRef.current.set(id, link)
+      // Link-diagnostics: a makeLink is a (re)build; relayOnly marks the P1
+      // relay-preferred rebuild. Tagged with the peer uid so the timeline shows
+      // exactly when a fresh link replaced a dead one.
+      linkdiag.record('makeLink', { relayOnly: !!relayOnly, polite }, { uid: uid || id })
       return link
     },
     [addPeer, updatePeer, upsertTransfer, removePeer, subscribeKnown],
@@ -538,6 +543,7 @@ export function useFilament() {
       const sig = await createSignaling(cfg)
       sigRef.current = sig
       installTel(tabUid())
+      linkdiag.installEnv() // link-diagnostics: env/network taps (vis, online, conn, pagehide)
       const myName = randomName()
       myNameRef.current = myName
 
@@ -700,6 +706,8 @@ export function useFilament() {
       // and refresh ICE config on reconnect (TURN creds are time-limited, #9).
       sig.on('status', ({ connected: up }) => {
         tel(up ? 'socket-up' : 'socket-down', {})
+        linkdiag.record('signal', { state: up ? 'connect' : 'disconnect' }) // signaling status change
+
         // info = socket connected (a lifecycle landmark); a drop is debug,
         // the rejoin is automatic, so it's not a user-actionable warning.
         if (up) log.info('socket connected')
