@@ -14,6 +14,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { PredictiveEcho } from '../lib/predict.js'
 import '@xterm/xterm/css/xterm.css'
 
 const enc = new TextEncoder()
@@ -67,6 +68,12 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
   const [toast, setToast] = useState('') // brief copy/paste feedback
   const toastTimer = useRef(0)
   const sessionIdRef = useRef(makeSessionId(instanceId))
+  // Predictive / local echo (mosh-style): paints keystrokes instantly, styled,
+  // then reconciles to the server's authoritative bytes. Created per-terminal in
+  // the mount effect. composingRef is shared with the IME path so we never both
+  // predict a char AND let the composition commit insert it (double insert).
+  const predictRef = useRef(null)
+  const composingRef = useRef(false)
   // --- custom scrollbar (the reliable mobile scroll, issue #5) -------------
   // A plain DOM track+thumb pinned to the right edge. Unlike the swipe handler
   // (which never fired reliably on real iPad/Android), a dragged DOM element
@@ -281,6 +288,16 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
     term.loadAddon(fit)
     term.open(hostRef.current)
     termRef.current = term; fitRef.current = fit
+    // Predictive local echo. A pure overlay: the real key is still sent to the
+    // PTY below; this only paints it a few ms sooner and self-corrects. Starts
+    // OFF and turns on only after it observes the server echoing our input.
+    const predict = new PredictiveEcho(term)
+    predictRef.current = predict
+    try {
+      if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('preview')) {
+        window.__webtermPredict = predict // dev harness assertion hook
+      }
+    } catch (e) {}
     // Dev-only: expose the live Terminal for the ?preview= harness so Playwright
     // can assert alt-screen state / dimensions. Inert in the real app (no query).
     try {
@@ -325,13 +342,20 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       // the resolved word ourselves, exactly once, on compositionend.
       if (isTouch) {
         let composing = false
-        const onCompStart = () => { composing = true; ta.value = '' }
+        const onCompStart = () => { composing = true; composingRef.current = true; ta.value = '' }
         const onCompUpdate = () => { ta.value = '' } // never let it accumulate
         const onCompEnd = (e) => {
-          composing = false
+          composing = false; composingRef.current = false
           // Commit the resolved/autocompleted word ONCE.
           const data = e && e.data ? e.data : ''
-          if (data) write(applyMods(data))
+          if (data) {
+            write(applyMods(data))
+            // Predict the committed text now (NOT during composition, so we never
+            // double-insert): mirrors typing the resolved chars.
+            if (!ctrl.current && !alt.current) {
+              try { predictRef.current && predictRef.current.onUserText(data) } catch (err) {}
+            }
+          }
           // Blank on the next tick too: xterm's _finalizeComposition reads the
           // value from a setTimeout, so clearing now AND async keeps it empty.
           ta.value = ''
@@ -352,12 +376,27 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
         ta.addEventListener('compositionupdate', onCompUpdate, true)
         ta.addEventListener('compositionend', onCompEnd, true)
         ta.addEventListener('beforeinput', onBeforeInput, true)
+      } else {
+        // Desktop IME (no Gboard interception): xterm finalizes the composition
+        // itself and emits the resolved text through term.onData. We only need to
+        // suppress prediction WHILE composing so a half-formed candidate is not
+        // painted; the committed text is predicted via onData like normal typing.
+        ta.addEventListener('compositionstart', () => { composingRef.current = true }, true)
+        ta.addEventListener('compositionend', () => { composingRef.current = false }, true)
       }
     }
 
     // bridge: PTY -> xterm. Raw bytes, written through unmodified so alternate
     // screen / cursor-addressing escapes reach the parser intact (issue #1).
-    link.onPtyData = (u8) => term.write(u8, () => syncBar())
+    // Server bytes are authoritative. Let the predictor reconcile its pending
+    // predictions against them FIRST (confirm matches / erase divergences), then
+    // write the real bytes (which overwrite any confirmed styled cells with the
+    // truth), then resync the predictor's view of the buffer (e.g. a flip into a
+    // TUI's alternate screen drops prediction).
+    link.onPtyData = (u8) => {
+      try { predict.onServerData(u8) } catch (e) {}
+      term.write(u8, () => { try { predict.syncBuffer() } catch (e) {}; syncBar() })
+    }
     link.onPtyClose = () => { setStatus('closed'); term.write('\r\n\x1b[90m( session ended )\x1b[0m\r\n') }
     link.onPtyReady = () => {
       setStatus('ready')
@@ -367,8 +406,18 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       const t = termRef.current
       if (t) link.resizePty(t.cols || 80, t.rows || 24)
     }
-    // bridge: xterm -> PTY (with sticky modifiers)
-    const dataSub = term.onData((d) => write(applyMods(d)))
+    // bridge: xterm -> PTY (with sticky modifiers). Prediction is attempted on
+    // the RAW key first (cosmetic only; the real key is always sent), but only
+    // when no sticky modifier is armed: Ctrl/Alt turn a printable into a control
+    // sequence (applyMods), which the server will not echo as that char, so
+    // predicting it would be wrong. We also never predict mid-IME-composition;
+    // the resolved text is predicted on compositionend instead.
+    const dataSub = term.onData((d) => {
+      if (!ctrl.current && !alt.current) {
+        try { predict.onUserKey(d, composingRef.current) } catch (e) {}
+      }
+      write(applyMods(d))
+    })
     const sizeSub = term.onResize(({ cols, rows }) => link.resizePty(cols, rows))
     // Track scroll position so the scroll-to-bottom affordance shows only when
     // the reader has scrolled up off the live tail. Fires on wheel, touch swipe,
@@ -473,6 +522,8 @@ export default function WebTerminal({ link, peerName, route, T, accent, font, on
       // cleanup on both, so we rely on the CLI keeping the PTY alive on a
       // channel drop and only treat an explicit `l2-close` as a teardown.
       link.onPtyData = () => {}; link.onPtyClose = () => {}; link.onPtyReady = () => {}
+      try { predict.dispose() } catch (e) {}
+      predictRef.current = null
       term.dispose()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
