@@ -779,6 +779,161 @@ fn revoked_device_first_transfer_is_denied() {
     );
 }
 
+/// #172, the 1.0.0 gate: a REVOKED device, with the direct path forced ON and
+/// BLOCKED (so the blocked route is the one being denied), must not reach
+/// anything on the fallback. It must not fall back into access.
+///
+/// The negative case, per the user-flow rule: the neighbouring states must not
+/// satisfy the same assertion.
+///
+///   - a device that is merely OFFLINE never reaches the offer stage, so it
+///     cannot produce a revocation-named denial with the ceremony complete;
+///   - a device whose grant was never made (but is not revoked) is denied with
+///     a different reason at the gate, never "device revoked".
+///
+/// So the assertion is not "no file lands" (every neighbour satisfies that) but
+/// "the transfer is declined, after the ceremony, with the revocation reason,
+/// while the direct path was the blocked one". The control that makes the
+/// denial attributable to revocation rather than to the blocked transport is
+/// `direct_blocked_falls_back_to_webrtc_promptly`: a legitimate device under
+/// IDENTICAL transport conditions completes via the fallback. Same conditions,
+/// opposite outcome, so the denial is revocation.
+#[test]
+fn revoked_device_direct_blocked_gets_no_fallback_access() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    let base_env = [
+        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
+        ("FILAMENT_DIRECT", "1"),
+        ("FILAMENT_DIRECT_TEST_BLOCK", "1"),
+        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
+        ("FILAMENT_L3_USERSPACE", "1"),
+    ];
+
+    // 1. B holds A's device record (cert + secret); A is then revoked on B.
+    // Same construction as `revoked_device_first_transfer_is_denied`.
+    let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
+    let a_cert_raw = std::fs::read_to_string(&a_cert_path).expect("a device cert");
+    let a_cert_val: Value = serde_json::from_str(&a_cert_raw).expect("parse a device cert");
+    let a_cert = &a_cert_val["cert"];
+    assert!(
+        a_cert["devicePub"].as_str().is_some(),
+        "A's device cert has a devicePub"
+    );
+    let a_record = serde_json::json!([{
+        "name": "test-a",
+        "secret": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "deviceCert": a_cert,
+        "caps": ["transfer"],
+    }]);
+    std::fs::write(
+        h.b_dir.join("devices.json"),
+        serde_json::to_string_pretty(&a_record).unwrap(),
+    )
+    .expect("write b devices.json");
+
+    let revoke = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["devices", "revoke", "test-a", "--yes"])
+        .output()
+        .expect("revoke");
+    assert!(
+        revoke.status.success(),
+        "devices revoke failed: {}",
+        String::from_utf8_lossy(&revoke.stderr)
+    );
+
+    // 2. A sends a one-shot code transfer. Direct is forced ON and BLOCKED, so
+    // the only route to B is the WebRTC fallback: this is the transport whose
+    // revoked-device case the gate exists for.
+    let test_file = h.work_dir.join("revoked-blocked-payload.bin");
+    std::fs::write(&test_file, b"secret bytes that must never land").unwrap();
+    let mut send_proc = Command::new(&bin)
+        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .arg("send")
+        .arg(&test_file)
+        .arg("--word")
+        .arg("revoked-blocked-code")
+        .arg("--server")
+        .arg(&server)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("send");
+
+    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
+    let stderr = send_proc.stderr.take().unwrap();
+    let code_word = "revoked-blocked-code".to_string();
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = line.unwrap_or_default();
+            let lower = line.to_lowercase();
+            if let Some(start) = lower.find(&code_word.to_lowercase()) {
+                let rest = &line[start..];
+                let end = rest
+                    .find(|c: char| c.is_whitespace())
+                    .unwrap_or(rest.len());
+                let _ = code_tx.send(line[start..start + end].to_lowercase().to_string());
+            }
+        }
+    });
+    let full_code = code_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("send did not mint a code within 30s");
+
+    let recv_dir = h.b_dir.join("received_blocked");
+    std::fs::create_dir_all(&recv_dir).unwrap();
+    let mut recv_proc = Command::new(&bin)
+        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .arg("receive")
+        .arg(&full_code)
+        .arg("--yes")
+        .arg("--dir")
+        .arg(&recv_dir)
+        .arg("--server")
+        .arg(&server)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("receive");
+    let recv_out = recv_proc.wait_with_output().expect("recv result");
+    let recv_stdout = String::from_utf8_lossy(&recv_out.stdout);
+    let recv_stderr = String::from_utf8_lossy(&recv_out.stderr);
+    let send_out = send_proc.wait_with_output().expect("send result");
+    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
+    let send_stderr = String::from_utf8_lossy(&send_out.stderr);
+
+    // 3. The instrument engaged: the block fired on the direct path. Without
+    // this, the run is UNCLASSIFIED (on a platform where direct never starts,
+    // nothing is blocked, nothing falls back, and the revocation question was
+    // not exercised).
+    let both = format!("{send_stdout}\n{send_stderr}\n{recv_stdout}\n{recv_stderr}");
+    assert!(
+        both.contains("DIRECT-BLOCKED"),
+        "DIRECT-BLOCKED marker absent: the block never engaged, so this run is \
+         UNCLASSIFIED rather than a fallback-finding"
+    );
+
+    // 4. The revoked device did NOT reach anything: no file lands, and the
+    // denial names revocation. An offline device never reaches the offer
+    // stage, and a merely-un-granted device is denied for a different reason,
+    // so neither neighbour can satisfy this assertion.
+    assert!(
+        !recv_dir.join("revoked-blocked-payload.bin").exists(),
+        "a revoked device must not reach the fallback; file landed"
+    );
+    assert!(
+        recv_stderr.contains("revoked"),
+        "expected a REVOCATION-named decline (not a generic transport failure \
+         or a no-grant denial), got: {recv_stderr}"
+    );
+}
+
 /// The case the WebRTC fallback EXISTS for: direct-QUIC enabled, direct-QUIC
 /// FAILS, and the transfer must still complete over WebRTC, promptly.
 ///
@@ -2126,5 +2281,177 @@ fn warm_one_shot_pty_instant_eof() {
     assert!(
         out_stdout.contains(&nonce),
         "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+}
+
+// ------------------------------------------------------------- invitations ---
+
+/// Write a file that `read_owner_only_file` will accept (owner-only mode on
+/// unix; the join path refuses anything with group/other bits). The minted
+/// invitations and the test v1 token all travel this way, same as a real
+/// `add --out`.
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// A fresh, clean joiner config dir: no identity, no certificate. `join` only
+/// proceeds from this state (main.rs join_cmd refuses if a UserKey or cert
+/// exists), so every invitation-lifecycle test claims from here.
+fn clean_joiner_dir(h: &Harness, name: &str) -> PathBuf {
+    let dir = h.work_dir.join(name);
+    std::fs::create_dir_all(&dir).expect("create clean joiner dir");
+    dir
+}
+
+/// `add --for device` and `add --for person` mint different SIGNED ceilings:
+/// device carries transfer+mount, person carries transfer only. The difference
+/// lives in the signed auth-key caps, which is exactly what the delegated-
+/// ceiling gate (`cap_gate_effective`'s `action in auth_key_caps` check) enforces
+/// at serve time. So the difference is enforced, not just displayed: a
+/// person-joined device is denied `mount` because `mount` is not in its signed
+/// caps.
+#[test]
+fn add_for_device_and_person_carry_different_caps() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use filament_cap::ephemeral::InvitationV2;
+
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let device_file = h.work_dir.join("inv-device.txt");
+    let person_file = h.work_dir.join("inv-person.txt");
+
+    for (for_, file) in [("device", &device_file), ("person", &person_file)] {
+        let out = Command::new(&bin)
+            .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+            .args(["--server", &server, "add", "--for", for_, "--out"])
+            .arg(file)
+            .arg("--yes")
+            .output()
+            .expect("add --for mint");
+        assert!(
+            out.status.success(),
+            "add --for {for_} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let parse = |file: &Path| -> InvitationV2 {
+        let raw = std::fs::read_to_string(file).expect("read invitation file");
+        let token = raw.trim();
+        let encoded = token
+            .strip_prefix("filament-invite:v2:")
+            .unwrap_or_else(|| panic!("token has the v2 prefix: {token}"));
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("token is valid base64url");
+        // InvitationV2 is not Debug; go through a Result whose error is a &str.
+        InvitationV2::from_token(&bytes)
+            .ok_or("token parses as a v2 invitation")
+            .expect("from_token")
+    };
+
+    let mut device_caps = parse(&device_file).caps;
+    device_caps.sort();
+    assert_eq!(
+        device_caps,
+        vec!["mount".to_string(), "transfer".to_string()],
+        "device invitation must carry transfer+mount in the SIGNED ceiling"
+    );
+    let person_caps = parse(&person_file).caps;
+    assert_eq!(
+        person_caps,
+        vec!["transfer".to_string()],
+        "person invitation must carry transfer only: the mount difference is \
+         what the gate enforces for a person-joined device"
+    );
+}
+
+/// An expired bounded invitation is refused AS expired. The joiner names the
+/// expiry; it does not fail to parse and it does not time out.
+#[test]
+fn expired_invitation_refused_as_expired() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let invite_file = h.work_dir.join("inv-expired.txt");
+    let mint = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "add", "--for", "device", "--expires", "2s", "--out"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("mint short-lived invitation");
+    assert!(
+        mint.status.success(),
+        "mint failed: {}",
+        String::from_utf8_lossy(&mint.stderr)
+    );
+
+    // Let the 2s TTL lapse, then claim from a clean joiner.
+    std::thread::sleep(Duration::from_secs(4));
+    let clean = clean_joiner_dir(&h, "c");
+    let join = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &clean)
+        .args(["--server", &server, "join", "--invite-file"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("join expired invitation");
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        !join.status.success(),
+        "an expired invitation must be refused; join unexpectedly succeeded"
+    );
+    assert!(
+        stderr.contains("expired"),
+        "expired invitation must be refused AS expired, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown format") && !stderr.contains("not valid"),
+        "an expired invitation is not a parse error, got: {stderr}"
+    );
+}
+
+/// An invitation minted before 0.8.4 is refused with a message SAYING SO, not
+/// with a parse error: the v1 token is recognized and named stale.
+#[test]
+fn pre_084_invitation_refused_with_message_not_parse_error() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let invite_file = h.work_dir.join("inv-v1.txt");
+    write_owner_only(&invite_file, "filament-invite:v1:AAAA\n").expect("write v1 invitation");
+
+    let clean = clean_joiner_dir(&h, "c");
+    let join = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &clean)
+        .args(["--server", &server, "join", "--invite-file"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("join v1 invitation");
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        !join.status.success(),
+        "a pre-0.8.4 invitation must be refused"
+    );
+    assert!(
+        stderr.contains("pre-0.8.4"),
+        "the refusal must name the pre-0.8.4 format, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown format") && !stderr.contains("not valid"),
+        "the refusal must not be a parse error, got: {stderr}"
     );
 }
