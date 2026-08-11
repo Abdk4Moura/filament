@@ -141,9 +141,53 @@ cleanup_all() {
 # A throwaway config dir with a name pre-seeded (helper for direct-store rigs).
 fresh_cfg() { local name="$1"; local d="$UX_TMP/$name"; rm -rf "$d"; mkdir -p "$d"; echo "$d"; }
 
-# Seed a devices.json store directly (the gates' shortcut for known-device flows).
+# Seed a devices.json store directly.
+#
+# DEPRECATED for anything that claims to test a user-facing flow. Writing the
+# record ourselves asserts that we know the on-disk shape `add` produces, which
+# is the assumption most likely to rot: the store gained an issuer fingerprint,
+# packed capability fields and an expiry between 0.8.2 and 0.8.4, and a seeded
+# scenario keeps passing across every one of those changes without ever
+# exercising the code that writes them. Use pair_two below. seed_store stays only
+# for negative cases that need a store no ceremony can legitimately produce
+# (revoked, expired, corrupt).
 # usage: seed_store <cfgdir> <json-array-string>
 seed_store() { printf '%s\n' "$2" > "$1/devices.json"; chmod 600 "$1/devices.json"; }
+
+# Poll a logfile for a minted 4-segment code. Defined here as well as in
+# scenarios.sh so pair_two does not depend on its caller having defined it.
+wait_code() { local f="$1" n=0 c=""; while [ $n -lt 80 ]; do
+  c=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$f" 2>/dev/null | head -1 | tr 'A-Z' 'a-z')
+  [ -n "$c" ] && { echo "$c"; return 0; }; n=$((n+1)); sleep 0.2; done; return 1; }
+
+# Pair two config dirs the way a person does: one side mints a code, the other
+# claims it. No secrets are invented here and nothing is written by hand; both
+# stores end up holding whatever the shipping ceremony actually writes.
+#
+#   pair_two <cfgA> <A-calls-B> <cfgB> <B-calls-A>   → 0 on success
+#
+# Both sides run to completion before returning, so a caller can immediately
+# use `send --to <name>`.
+pair_two() {
+  local DA="$1" NB="$2" DB="$3" NA="$4"
+  local log="$UX_WORK/pair-$(basename "$DA")-$(basename "$DB")"
+  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 45 "$FILAMENT" add --name "$NB" -y \
+      --server "$UX_SERVER" </dev/null >"$log.a" 2>&1 &
+  local PA=$!; track $PA
+  local C
+  C=$(wait_code "$log.a") || { echo "pair_two: $DA never minted a code" >&2; kill $PA 2>/dev/null; return 1; }
+  FILAMENT_CONFIG_DIR="$DB" timeout -k 5 45 "$FILAMENT" add "$C" --name "$NA" -y \
+      --server "$UX_SERVER" </dev/null >"$log.b" 2>&1
+  local rcB=$?
+  wait $PA 2>/dev/null; local rcA=$?
+  # Assert on the stores, not on exit codes: the pairing is only real if each
+  # side can now name the other.
+  FILAMENT_CONFIG_DIR="$DA" "$FILAMENT" devices 2>/dev/null | grep -q "$NB" || {
+    echo "pair_two: $DA does not list $NB (rcA=$rcA rcB=$rcB)" >&2; return 1; }
+  FILAMENT_CONFIG_DIR="$DB" "$FILAMENT" devices 2>/dev/null | grep -q "$NA" || {
+    echo "pair_two: $DB does not list $NA (rcA=$rcA rcB=$rcB)" >&2; return 1; }
+  return 0
+}
 
 # A 32-byte hex pair secret.
 mk_secret() { head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
