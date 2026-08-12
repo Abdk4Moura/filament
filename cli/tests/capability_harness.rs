@@ -784,6 +784,10 @@ fn revoked_device_first_transfer_is_denied() {
 /// the captured receive and send outcomes and the receive dir. A transfer that
 /// does not converge yields a `TimedOut` outcome instead of hanging the harness
 /// step, so a stalled flow FAILS loudly at a bounded time.
+///
+/// When `remember` is set, the RECEIVER stores the sender under that name
+/// (`receive --remember <name>`): the REAL code-derived secret is recorded, the
+/// pair-for-real ceremony, never a seeded store.
 fn run_code_transfer(
     bin: &Path,
     server: &str,
@@ -792,6 +796,7 @@ fn run_code_transfer(
     receiver_dir: &Path,
     payload: &Path,
     code: &str,
+    remember: Option<&str>,
 ) -> (CapturedChild, CapturedChild, PathBuf) {
     let mut send = Command::new(bin);
     send.envs(envs.iter().map(|(k, v)| (*k, *v)))
@@ -834,6 +839,9 @@ fn run_code_transfer(
         .arg(&recv_dir)
         .arg("--server")
         .arg(server);
+    if let Some(name) = remember {
+        recv.arg("--remember").arg(name);
+    }
     let recv_out = spawn_captured(recv)
         .expect("recv spawn")
         .wait_until(Duration::from_secs(90));
@@ -882,36 +890,24 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         ("FILAMENT_L3_USERSPACE", "1"),
     ];
 
-    // 1. B holds A's device record (cert + secret), NOT yet revoked. Same
-    // construction as `revoked_device_first_transfer_is_denied`.
+    // 1. The CONTROL both exercises the happy path AND records the real pair:
+    // B receives with `--remember test-a`, storing A's record with the REAL
+    // code-derived secret. This is the pair-for-real rule (USER-FLOWS.md):
+    // seed_store is reserved for states no ceremony produces, and a seeded
+    // placeholder secret is precisely what made the first version of this test
+    // stall forever (the pair-proof over the link failed, the link dropped and
+    // re-established, and it stayed invisible until a happy path ran next to
+    // it). Do not reseed a store here for convenience.
     let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
-    let a_cert_raw = std::fs::read_to_string(&a_cert_path).expect("a device cert");
-    let a_cert_val: Value = serde_json::from_str(&a_cert_raw).expect("parse a device cert");
-    let a_cert = &a_cert_val["cert"];
-    assert!(
-        a_cert["devicePub"].as_str().is_some(),
-        "A's device cert has a devicePub"
-    );
-    let a_record = serde_json::json!([{
-        "name": "test-a",
-        "secret": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        "deviceCert": a_cert,
-        "caps": ["transfer"],
-    }]);
-    std::fs::write(
-        h.b_dir.join("devices.json"),
-        serde_json::to_string_pretty(&a_record).unwrap(),
-    )
-    .expect("write b devices.json");
 
     // 2. CONTROL: a legitimate (not yet revoked) A transfers under identical
-    // direct-blocked conditions. It must complete. If it does not, the
-    // transport is wedged under these conditions and the revoked case that
-    // follows cannot be attributed to revocation.
+    // direct-blocked conditions, and B remembers A for real. It must complete.
+    // If it does not, the transport is wedged under these conditions and the
+    // revoked case that follows cannot be attributed to revocation.
     let control_payload = h.work_dir.join("control-payload.bin");
     std::fs::write(&control_payload, b"control bytes that must land").unwrap();
     let (ctrl_recv, ctrl_send, ctrl_dir) = run_code_transfer(
-        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &control_payload, "ctrl-blocked-code",
+        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &control_payload, "ctrl-blocked-code", Some("test-a"),
     );
     let ctrl_both = format!("{}\n{}\n{}\n{}", ctrl_recv.stdout, ctrl_recv.stderr, ctrl_send.stdout, ctrl_send.stderr);
     assert!(
@@ -924,7 +920,49 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         ctrl_both.contains("DIRECT-BLOCKED"),
     );
 
-    // 3. Revoke A on B.
+    // 3. B must hold A's CERT for the revocation gate to bind (cert_revoked_for
+    // keys off deviceCert.devicePub). The code transfer records the secret; the
+    // cert may or may not have been learned via identity resolution. If it was
+    // not, record A's REAL cert now: this is the state B reaches after
+    // resolving A's identity during real contact, not a seed. The secret in the
+    // record came from the real ceremony, so the happy path already proved it
+    // authenticates.
+    let b_records: Value = serde_json::from_str(
+        &std::fs::read_to_string(h.b_dir.join("devices.json")).expect("b devices.json"),
+    )
+    .expect("parse b devices.json");
+    let b_has_a_cert = b_records.as_array().unwrap().iter().any(|d| {
+        d["name"].as_str() == Some("test-a")
+            && d["deviceCert"]["devicePub"].as_str().is_some()
+    });
+    if !b_has_a_cert {
+        let a_cert_val: Value = serde_json::from_str(
+            &std::fs::read_to_string(&a_cert_path).expect("a device cert"),
+        )
+        .expect("parse a device cert");
+        let a_cert = a_cert_val["cert"].clone();
+        assert!(
+            a_cert["devicePub"].as_str().is_some(),
+            "A's device cert has a devicePub"
+        );
+        let mut arr: Vec<Value> = serde_json::from_str(
+            &std::fs::read_to_string(h.b_dir.join("devices.json")).expect("b devices.json"),
+        )
+        .expect("parse b devices.json");
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some("test-a") {
+                d["userKey"] = serde_json::json!(a_cert["userPub"].as_str().unwrap_or_default());
+                d["deviceCert"] = a_cert.clone();
+            }
+        }
+        std::fs::write(
+            h.b_dir.join("devices.json"),
+            serde_json::to_string_pretty(&arr).unwrap(),
+        )
+        .expect("write b devices.json with A's cert");
+    }
+
+    // 4. Revoke A on B.
     let revoke = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
         .args(["devices", "revoke", "test-a", "--yes"])
@@ -936,12 +974,12 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         String::from_utf8_lossy(&revoke.stderr)
     );
 
-    // 4. REVOKED CASE: A transfers again under the same conditions. Three
+    // 5. REVOKED CASE: A transfers again under the same conditions. Three
     // possible verdicts, named explicitly.
     let revoked_payload = h.work_dir.join("revoked-blocked-payload.bin");
     std::fs::write(&revoked_payload, b"secret bytes that must never land").unwrap();
     let (recv_out, send_out, recv_dir) = run_code_transfer(
-        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &revoked_payload, "revoked-blocked-code",
+        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &revoked_payload, "revoked-blocked-code", None,
     );
 
     let rev_both = format!("{}\n{}\n{}\n{}", recv_out.stdout, recv_out.stderr, send_out.stdout, send_out.stderr);
@@ -2502,6 +2540,18 @@ fn sha256_file(path: &Path) -> Option<String> {
     )
 }
 
+/// Wait for a file to exist, up to `timeout`. Returns true if it appeared.
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    path.exists()
+}
+
 /// Count capability GRANTS in a cap store. A store that exists but contains no
 /// grants (genesis header + ratchet only) is the allowed delta after a join.
 fn cap_store_grant_count(config_dir: &Path) -> usize {
@@ -2565,10 +2615,26 @@ fn join_does_not_change_the_capability_store() {
     let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
     h.daemon_a = Some(child_a);
     h.daemon_a_log = log_a;
-    std::thread::sleep(Duration::from_secs(8));
+
+    // #211: `up` prints its ready banner BEFORE its control socket accepts, and
+    // the mint's try_arm swallows a connect failure as None. A mint that races
+    // the socket produces an invitation nobody can ever claim. The PRODUCT bug
+    // is #211 (filed); this wait only keeps the test from tripping over it. The
+    // arm-success assertion below still fails loudly if the socket never came
+    // up, so the test cannot silently pass while the product cannot arm.
+    let ctl_sock = h.a_dir.join("control.sock");
+    assert!(
+        wait_for_file(&ctl_sock, Duration::from_secs(30)),
+        "issuer daemon control socket never appeared: {}. The enrollment room \
+         could not be armed, so the join cannot run (see #211).",
+        ctl_sock.display()
+    );
+    std::thread::sleep(Duration::from_millis(500));
 
     // Mint an invitation. Minting is a local act (signing + printing) and must
-    // not touch the issuer's cap store either.
+    // not touch the issuer's cap store either. If the arm failed (the daemon
+    // was not ready, or #205's Windows stub), the mint says so and this test
+    // stops HERE with a clear message instead of failing 60s later at the join.
     let invite_file = h.work_dir.join("inv-cap-store.txt");
     let mint = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &h.a_dir)
@@ -2577,10 +2643,16 @@ fn join_does_not_change_the_capability_store() {
         .arg("--yes")
         .output()
         .expect("mint invitation");
+    let mint_stderr = String::from_utf8_lossy(&mint.stderr);
     assert!(
         mint.status.success(),
-        "mint failed: {}",
-        String::from_utf8_lossy(&mint.stderr)
+        "mint failed: {mint_stderr}"
+    );
+    assert!(
+        !mint_stderr.contains("cannot be claimed"),
+        "UNCLASSIFIED: the mint did not arm the enrollment room (stderr says \
+         the invitation 'cannot be claimed yet'). This run cannot exercise the \
+         join. stderr: {mint_stderr}"
     );
     let issuer_after_mint = sha256_file(&issuer_caps).unwrap();
     assert_eq!(
