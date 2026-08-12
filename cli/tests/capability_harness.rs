@@ -846,8 +846,11 @@ fn live_pair(
         );
         std::thread::sleep(Duration::from_millis(20));
     };
-    let create_out = create_proc.wait_until(Duration::from_secs(60));
 
+    // The create process BLOCKS until the other side claims the code, so the
+    // claim MUST be spawned before we wait for the create to exit: waiting on
+    // the create first is a deadlock (the claim never arrives, the create
+    // times out, and the pairing reports a spurious failure).
     let mut claim = Command::new(bin);
     claim.envs(envs.iter().map(|(k, v)| (*k, *v)))
         .env("FILAMENT_CONFIG_DIR", b_dir)
@@ -859,6 +862,7 @@ fn live_pair(
     let claim_out = spawn_captured(claim)
         .expect("pair claim spawn")
         .wait_until(Duration::from_secs(60));
+    let create_out = create_proc.wait_until(Duration::from_secs(60));
 
     assert!(
         matches!(create_out.outcome, ChildOutcome::ExitedSuccess(_)),
