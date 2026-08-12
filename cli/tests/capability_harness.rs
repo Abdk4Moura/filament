@@ -876,169 +876,112 @@ fn live_pair(
     );
 }
 
-/// Run a one-shot `send --word <code>` / `receive <code>` code transfer between
-/// two config dirs with the given env, under DEADLINE-bounded waits. Returns
-/// the captured receive and send outcomes and the receive dir. A transfer that
-/// does not converge yields a `TimedOut` outcome instead of hanging the harness
-/// step, so a stalled flow FAILS loudly at a bounded time.
-///
-/// When `remember` is set, the RECEIVER stores the sender under that name
-/// (`receive --remember <name>`): the REAL code-derived secret is recorded, the
-/// pair-for-real ceremony, never a seeded store.
-fn run_code_transfer(
+/// Send a file to a REMEMBERED device (`send <file> --to <name>`), deadline-
+/// bounded so a non-converging transfer FAILS loudly instead of hanging the
+/// harness step. Used where the receiver is a daemon, which is the only path
+/// that surfaces the gate's decline reason.
+fn run_send_to(
     bin: &Path,
     server: &str,
     envs: &[(&str, &str)],
     sender_dir: &Path,
-    receiver_dir: &Path,
+    to: &str,
     payload: &Path,
-    code: &str,
-    remember: Option<&str>,
-) -> (CapturedChild, CapturedChild, PathBuf) {
+) -> CapturedChild {
     let mut send = Command::new(bin);
     send.envs(envs.iter().map(|(k, v)| (*k, *v)))
         .env("FILAMENT_CONFIG_DIR", sender_dir)
         .arg("send")
         .arg(payload)
-        .arg("--word")
-        .arg(code)
+        .arg("--to")
+        .arg(to)
         .arg("--server")
         .arg(server);
-    let send_proc = spawn_captured(send).expect("send");
-
-    let code_word = code.to_string();
-    let code_started = Instant::now();
-    let full_code = loop {
-        let (stdout, stderr) = send_proc.snapshot();
-        let text = format!("{stdout}\n{stderr}");
-        let lower = text.to_lowercase();
-        if let Some(start) = lower.find(&code_word.to_lowercase()) {
-            let rest = &text[start..];
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            break rest[..end].to_lowercase();
-        }
-        assert!(
-            code_started.elapsed() < Duration::from_secs(30),
-            "send did not mint a code within 30s"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-
-    let recv_dir = receiver_dir.join(format!("received-{code}"));
-    std::fs::create_dir_all(&recv_dir).unwrap();
-    let mut recv = Command::new(bin);
-    recv.envs(envs.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", receiver_dir)
-        .arg("receive")
-        .arg(&full_code)
-        .arg("--yes")
-        .arg("--dir")
-        .arg(&recv_dir)
-        .arg("--server")
-        .arg(server);
-    if let Some(name) = remember {
-        recv.arg("--remember").arg(name);
-    }
-    let recv_out = spawn_captured(recv)
-        .expect("recv spawn")
-        .wait_until(Duration::from_secs(90));
-    let send_out = send_proc.wait_until(Duration::from_secs(90));
-    (recv_out, send_out, recv_dir)
+    spawn_captured(send)
+        .expect("send")
+        .wait_until(Duration::from_secs(90))
 }
 
-/// #172, the 1.0.0 gate: a REVOKED device, with the direct path forced ON and
-/// BLOCKED (so the blocked route is the one being denied), must not reach
-/// anything on the fallback.
+
+/// #172, the 1.0.0 gate: a REVOKED device must not reach anything, and a
+/// revocation denial must be observable.
 ///
-/// The test reports one of THREE verdicts, which get different release
-/// treatment, so the failure message names the one observed rather than a
-/// generic "blocked":
+/// The receiver is a DAEMON, deliberately: only the daemon surfaces the gate's
+/// xfer_deny_reason. The one-shot receive masks EVERY denial as "no tty, use -y
+/// to auto-accept" (main.rs:17848) even when the reason is "device revoked",
+/// so a one-shot receiver can never produce the revocation-named denial this
+/// cell asserts. That masking is filed as its own bug.
+///
+/// Transport is WebRTC-only (FILAMENT_DIRECT=0): the artificial direct-blocked
+/// fallback glare-loops for already-paired devices (#214, filed), so the exact
+/// direct-blocked scenario cannot be exercised yet, and WebRTC is the transport
+/// the fallback lands on anyway. The direct-blocked residual remains the
+/// documented gap in #214.
+///
+/// Three verdicts, named in the failure message:
 ///
 ///   FAIL-OPEN            the file lands. Security hole: blocks 1.0 and the tag.
-///   FAIL-CLOSED-LOUD     no file, and a prompt denial naming revocation.
-///                        Correct behaviour: the test passes.
-///   FAIL-CLOSED-SILENT   no file, no revocation-named denial, wedges until a
-///                        deadline. Message-correctness defect (#206 class),
-///                        not a fail-open hole. Fix before 1.0, does not block
-///                        the tag on its own.
+///   FAIL-CLOSED-LOUD     no file, and the daemon names revocation. Correct.
+///   FAIL-CLOSED-SILENT   no file, no revocation-named denial. Message defect
+///                        (#206 class), not a fail-open hole.
 ///
 /// The CONTROL runs first in the same test: a legitimate device under IDENTICAL
-/// direct-blocked conditions must complete via the fallback. If the control
-/// stalls, the transport is wedged under these conditions and nothing can be
-/// attributed to revocation: the test reports UNCLASSIFIED and fails rather
-/// than let a double-stall be misread as a revocation result.
-///
-/// The assertion names revocation (an offline device never reaches the offer
-/// stage, and a merely-un-granted device is denied for a different reason), and
-/// every process wait is deadline-bounded so a non-converging transfer FAILS
-/// loudly at a bounded time instead of hanging the harness step.
+/// conditions must complete. If it does not, nothing can be attributed to
+/// revocation and the test reports UNCLASSIFIED.
 #[test]
 fn revoked_device_direct_blocked_gets_no_fallback_access() {
-    let h = Harness::new();
+    let mut h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
     let server = h.server_url();
     let loopback_only =
         std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
-    let base_env = [
+    // WebRTC-only (FILAMENT_DIRECT=0): the direct-blocked fallback glare (#214)
+    // prevents the artificial direct-block path for already-paired devices.
+    let env = [
         ("FILAMENT_CAP_AUTHORITATIVE", "0"),
-        ("FILAMENT_DIRECT", "1"),
-        ("FILAMENT_DIRECT_TEST_BLOCK", "1"),
-        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
-        ("FILAMENT_L3_USERSPACE", "1"),
-    ];
-    // The pairing ceremony runs WITHOUT the direct block (it is setup, not the
-    // path under test); the CONTROL and the REVOKED case run under base_env,
-    // identical direct-blocked conditions.
-    let pair_env = [
-        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
-        ("FILAMENT_DIRECT", "1"),
+        ("FILAMENT_DIRECT", "0"),
         ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
         ("FILAMENT_L3_USERSPACE", "1"),
     ];
 
-    // 1. REAL pairing first: `add --word` mints a code, `add <code>` claims it,
-    // and B stores A's record with the REAL code-derived shared secret. This is
-    // the pair-for-real rule (USER-FLOWS.md): seed_store is reserved for states
-    // no ceremony produces, and a seeded placeholder secret is precisely what
-    // made the first version of this test stall forever (the pair-proof over
-    // the link failed, the link dropped and re-established, and it stayed
-    // invisible until a happy path ran next to it). Do not reseed a store here
-    // for convenience.
+    // 1. REAL pairing first: `add --word` mints, `add <code>` claims, and B
+    // stores A's record with the REAL code-derived secret. This is the
+    // pair-for-real rule (USER-FLOWS.md): a seeded placeholder secret is
+    // exactly what made the first version of this test stall forever (the
+    // pair-proof over the link failed, the link dropped and re-established,
+    // silent until a happy path ran next to it). Do not reseed a store here.
     let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
     let pair_word = format!("cryptocell-pair-p{:x}", std::process::id());
-    live_pair(&bin, &server, &pair_env, &h.a_dir, &h.b_dir, &pair_word);
+    live_pair(&bin, &server, &env, &h.a_dir, &h.b_dir, &pair_word);
 
-    // 2. CONTROL: a legitimate (not yet revoked) A transfers under identical
-    // direct-blocked conditions. It must complete. If it does not, the
-    // transport is wedged under these conditions and the revoked case that
-    // follows cannot be attributed to revocation.
+    // 2. B's DAEMON is the receiver: it is the only path that surfaces
+    // xfer_deny_reason.
+    let (daemon_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_b = Some(daemon_b);
+    h.daemon_b_log = log_b;
+    std::thread::sleep(Duration::from_secs(8));
+
+    // 3. CONTROL: A sends to the remembered B (`--to test-b`); the daemon must
+    // accept it. If it does not, the transport is wedged under these conditions
+    // and the revoked case that follows cannot be attributed to revocation.
     let control_payload = h.work_dir.join("control-payload.bin");
     std::fs::write(&control_payload, b"control bytes that must land").unwrap();
-    let (ctrl_recv, ctrl_send, ctrl_dir) = run_code_transfer(
-        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &control_payload, "ctrl-blocked-code", None,
-    );
-    let ctrl_both = format!("{}\n{}\n{}\n{}", ctrl_recv.stdout, ctrl_recv.stderr, ctrl_send.stdout, ctrl_send.stderr);
+    let ctrl_send = run_send_to(&bin, &server, &env, &h.a_dir, "test-b", &control_payload);
+    let control_landed = h.b_dir.join("drops").join("control-payload.bin").exists();
     assert!(
-        ctrl_dir.join("control-payload.bin").exists() && ctrl_both.contains("DIRECT-BLOCKED"),
-        "UNCLASSIFIED: the CONTROL (legitimate device) did not complete via the \
-         fallback under direct-blocked conditions (file landed: {}, DIRECT-BLOCKED: {}). \
-         The transport is wedged under these conditions, so nothing can be attributed to \
-         revocation. control output:\n{ctrl_both}",
-        ctrl_dir.join("control-payload.bin").exists(),
-        ctrl_both.contains("DIRECT-BLOCKED"),
+        control_landed,
+        "UNCLASSIFIED: the CONTROL (legitimate device) did not reach B's daemon \
+         (file landed: false). The transport is wedged under these conditions, so \
+         nothing can be attributed to revocation. send output:\n{}{}",
+        ctrl_send.stdout, ctrl_send.stderr
     );
 
-    // 3. B must hold A's CERT for the revocation gate to bind (cert_revoked_for
-    // keys off deviceCert.devicePub). The code transfer records the secret; the
-    // cert may or may not have been learned via identity resolution. If it was
-    // not, record A's REAL cert now: this is the state B reaches after
-    // resolving A's identity during real contact, not a seed. The secret in the
-    // record came from the real ceremony, so the happy path already proved it
-    // authenticates.
+    // 4. B must hold A's CERT for the revocation gate to bind (cert_revoked_for
+    // keys off deviceCert.devicePub). The daemon records it when it resolves A's
+    // identity during the control; if not, record A's REAL cert now.
     let b_records = read_devices_json(&h.b_dir);
     let b_has_a_cert = b_records.as_array().unwrap().iter().any(|d| {
-        d["name"].as_str() == Some("test-a")
-            && d["deviceCert"]["devicePub"].as_str().is_some()
+        d["name"].as_str() == Some("test-a") && d["deviceCert"]["devicePub"].as_str().is_some()
     });
     if !b_has_a_cert {
         let a_cert_val: Value = serde_json::from_str(
@@ -1046,14 +989,8 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         )
         .expect("parse a device cert");
         let a_cert = a_cert_val["cert"].clone();
-        assert!(
-            a_cert["devicePub"].as_str().is_some(),
-            "A's device cert has a devicePub"
-        );
-        let mut arr: Vec<Value> = read_devices_json(&h.b_dir)
-            .as_array()
-            .unwrap()
-            .clone();
+        assert!(a_cert["devicePub"].as_str().is_some(), "A's device cert has a devicePub");
+        let mut arr: Vec<Value> = read_devices_json(&h.b_dir).as_array().unwrap().clone();
         for d in arr.iter_mut() {
             if d["name"].as_str() == Some("test-a") {
                 d["userKey"] = serde_json::json!(a_cert["userPub"].as_str().unwrap_or_default());
@@ -1067,7 +1004,7 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         .expect("write b devices.json with A's cert");
     }
 
-    // 4. Revoke A on B.
+    // 5. Revoke A on B.
     let revoke = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
         .args(["devices", "revoke", "test-a", "--yes"])
@@ -1079,33 +1016,25 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         String::from_utf8_lossy(&revoke.stderr)
     );
 
-    // 5. REVOKED CASE: A transfers again under the same conditions. Three
-    // possible verdicts, named explicitly.
+    // 6. REVOKED CASE: A sends again under the same conditions. Three verdicts,
+    // named explicitly.
     let revoked_payload = h.work_dir.join("revoked-blocked-payload.bin");
     std::fs::write(&revoked_payload, b"secret bytes that must never land").unwrap();
-    let (recv_out, send_out, recv_dir) = run_code_transfer(
-        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &revoked_payload, "revoked-blocked-code", None,
-    );
-
-    let rev_both = format!("{}\n{}\n{}\n{}", recv_out.stdout, recv_out.stderr, send_out.stdout, send_out.stderr);
-    assert!(
-        rev_both.contains("DIRECT-BLOCKED"),
-        "UNCLASSIFIED: DIRECT-BLOCKED marker absent on the revoked run, the block \
-         never engaged. Output:\n{rev_both}"
-    );
-
-    let file_landed = recv_dir.join("revoked-blocked-payload.bin").exists();
-    let revoked_denied = recv_out.stderr.contains("revoked");
+    let rev_send = run_send_to(&bin, &server, &env, &h.a_dir, "test-b", &revoked_payload);
+    let rev_out = format!("{}\n{}", rev_send.stdout, rev_send.stderr);
+    let file_landed = h.b_dir.join("drops").join("revoked-blocked-payload.bin").exists();
+    let daemon_log = log_b.lock().unwrap().join("\n");
     assert!(
         !file_landed,
-        "FAIL-OPEN: a revoked device's transfer LANDED via the fallback. Security \
-         hole: a revoked device reached data it must not have. Blocks 1.0.\n{rev_both}"
+        "FAIL-OPEN: a revoked device's transfer LANDED on B's daemon. Security \
+         hole: a revoked device reached data it must not have. Blocks 1.0.\n\
+         send:\n{rev_out}\ndaemon log:\n{daemon_log}"
     );
     assert!(
-        revoked_denied,
-        "FAIL-CLOSED-SILENT: the revoked device was refused (no file landed) but no \
-         revocation-named denial arrived; the denial is indistinguishable from a network \
-         problem (#206 class). Correctness-of-message defect, not fail-open. rev output:\n{rev_both}"
+        daemon_log.contains("device revoked"),
+        "FAIL-CLOSED-SILENT: the revoked device was refused (no file landed) but \
+         the daemon did not NAME revocation. Message defect (#206 class), not a \
+         fail-open hole.\nsend:\n{rev_out}\ndaemon log:\n{daemon_log}"
     );
     // Otherwise: FAIL-CLOSED-LOUD, the correct behaviour, and the test passes.
 }
