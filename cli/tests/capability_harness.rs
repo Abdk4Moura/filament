@@ -1023,7 +1023,7 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
     let rev_send = run_send_to(&bin, &server, &env, &h.a_dir, "test-b", &revoked_payload);
     let rev_out = format!("{}\n{}", rev_send.stdout, rev_send.stderr);
     let file_landed = h.b_dir.join("drops").join("revoked-blocked-payload.bin").exists();
-    let daemon_log = log_b.lock().unwrap().join("\n");
+    let daemon_log = h.daemon_b_log.lock().unwrap().join("\n");
     assert!(
         !file_landed,
         "FAIL-OPEN: a revoked device's transfer LANDED on B's daemon. Security \
