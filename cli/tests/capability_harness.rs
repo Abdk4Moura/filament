@@ -779,25 +779,94 @@ fn revoked_device_first_transfer_is_denied() {
     );
 }
 
+/// Run a one-shot `send --word <code>` / `receive <code>` code transfer between
+/// two config dirs with the given env, under DEADLINE-bounded waits. Returns
+/// the captured receive and send outcomes and the receive dir. A transfer that
+/// does not converge yields a `TimedOut` outcome instead of hanging the harness
+/// step, so a stalled flow FAILS loudly at a bounded time.
+fn run_code_transfer(
+    bin: &Path,
+    server: &str,
+    envs: &[(&str, &str)],
+    sender_dir: &Path,
+    receiver_dir: &Path,
+    payload: &Path,
+    code: &str,
+) -> (CapturedChild, CapturedChild, PathBuf) {
+    let mut send = Command::new(bin);
+    send.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", sender_dir)
+        .arg("send")
+        .arg(payload)
+        .arg("--word")
+        .arg(code)
+        .arg("--server")
+        .arg(server);
+    let send_proc = spawn_captured(send).expect("send");
+
+    let code_word = code.to_string();
+    let code_started = Instant::now();
+    let full_code = loop {
+        let (stdout, stderr) = send_proc.snapshot();
+        let text = format!("{stdout}\n{stderr}");
+        let lower = text.to_lowercase();
+        if let Some(start) = lower.find(&code_word.to_lowercase()) {
+            let rest = &text[start..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            break rest[..end].to_lowercase();
+        }
+        assert!(
+            code_started.elapsed() < Duration::from_secs(30),
+            "send did not mint a code within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let recv_dir = receiver_dir.join(format!("received-{code}"));
+    std::fs::create_dir_all(&recv_dir).unwrap();
+    let mut recv = Command::new(bin);
+    recv.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", receiver_dir)
+        .arg("receive")
+        .arg(&full_code)
+        .arg("--yes")
+        .arg("--dir")
+        .arg(&recv_dir)
+        .arg("--server")
+        .arg(server);
+    let recv_out = spawn_captured(recv)
+        .expect("recv spawn")
+        .wait_until(Duration::from_secs(90));
+    let send_out = send_proc.wait_until(Duration::from_secs(90));
+    (recv_out, send_out, recv_dir)
+}
+
 /// #172, the 1.0.0 gate: a REVOKED device, with the direct path forced ON and
 /// BLOCKED (so the blocked route is the one being denied), must not reach
-/// anything on the fallback. It must not fall back into access.
+/// anything on the fallback.
 ///
-/// The negative case, per the user-flow rule: the neighbouring states must not
-/// satisfy the same assertion.
+/// The test reports one of THREE verdicts, which get different release
+/// treatment, so the failure message names the one observed rather than a
+/// generic "blocked":
 ///
-///   - a device that is merely OFFLINE never reaches the offer stage, so it
-///     cannot produce a revocation-named denial with the ceremony complete;
-///   - a device whose grant was never made (but is not revoked) is denied with
-///     a different reason at the gate, never "device revoked".
+///   FAIL-OPEN            the file lands. Security hole: blocks 1.0 and the tag.
+///   FAIL-CLOSED-LOUD     no file, and a prompt denial naming revocation.
+///                        Correct behaviour: the test passes.
+///   FAIL-CLOSED-SILENT   no file, no revocation-named denial, wedges until a
+///                        deadline. Message-correctness defect (#206 class),
+///                        not a fail-open hole. Fix before 1.0, does not block
+///                        the tag on its own.
 ///
-/// So the assertion is not "no file lands" (every neighbour satisfies that) but
-/// "the transfer is declined, after the ceremony, with the revocation reason,
-/// while the direct path was the blocked one". The control that makes the
-/// denial attributable to revocation rather than to the blocked transport is
-/// `direct_blocked_falls_back_to_webrtc_promptly`: a legitimate device under
-/// IDENTICAL transport conditions completes via the fallback. Same conditions,
-/// opposite outcome, so the denial is revocation.
+/// The CONTROL runs first in the same test: a legitimate device under IDENTICAL
+/// direct-blocked conditions must complete via the fallback. If the control
+/// stalls, the transport is wedged under these conditions and nothing can be
+/// attributed to revocation: the test reports UNCLASSIFIED and fails rather
+/// than let a double-stall be misread as a revocation result.
+///
+/// The assertion names revocation (an offline device never reaches the offer
+/// stage, and a merely-un-granted device is denied for a different reason), and
+/// every process wait is deadline-bounded so a non-converging transfer FAILS
+/// loudly at a bounded time instead of hanging the harness step.
 #[test]
 fn revoked_device_direct_blocked_gets_no_fallback_access() {
     let h = Harness::new();
@@ -813,8 +882,8 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         ("FILAMENT_L3_USERSPACE", "1"),
     ];
 
-    // 1. B holds A's device record (cert + secret); A is then revoked on B.
-    // Same construction as `revoked_device_first_transfer_is_denied`.
+    // 1. B holds A's device record (cert + secret), NOT yet revoked. Same
+    // construction as `revoked_device_first_transfer_is_denied`.
     let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
     let a_cert_raw = std::fs::read_to_string(&a_cert_path).expect("a device cert");
     let a_cert_val: Value = serde_json::from_str(&a_cert_raw).expect("parse a device cert");
@@ -835,6 +904,27 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
     )
     .expect("write b devices.json");
 
+    // 2. CONTROL: a legitimate (not yet revoked) A transfers under identical
+    // direct-blocked conditions. It must complete. If it does not, the
+    // transport is wedged under these conditions and the revoked case that
+    // follows cannot be attributed to revocation.
+    let control_payload = h.work_dir.join("control-payload.bin");
+    std::fs::write(&control_payload, b"control bytes that must land").unwrap();
+    let (ctrl_recv, ctrl_send, ctrl_dir) = run_code_transfer(
+        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &control_payload, "ctrl-blocked-code",
+    );
+    let ctrl_both = format!("{}\n{}\n{}\n{}", ctrl_recv.stdout, ctrl_recv.stderr, ctrl_send.stdout, ctrl_send.stderr);
+    assert!(
+        ctrl_dir.join("control-payload.bin").exists() && ctrl_both.contains("DIRECT-BLOCKED"),
+        "UNCLASSIFIED: the CONTROL (legitimate device) did not complete via the \
+         fallback under direct-blocked conditions (file landed: {}, DIRECT-BLOCKED: {}). \
+         The transport is wedged under these conditions, so nothing can be attributed to \
+         revocation. control output:\n{ctrl_both}",
+        ctrl_dir.join("control-payload.bin").exists(),
+        ctrl_both.contains("DIRECT-BLOCKED"),
+    );
+
+    // 3. Revoke A on B.
     let revoke = Command::new(&bin)
         .env("FILAMENT_CONFIG_DIR", &h.b_dir)
         .args(["devices", "revoke", "test-a", "--yes"])
@@ -846,92 +936,35 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         String::from_utf8_lossy(&revoke.stderr)
     );
 
-    // 2. A sends a one-shot code transfer. Direct is forced ON and BLOCKED, so
-    // the only route to B is the WebRTC fallback: this is the transport whose
-    // revoked-device case the gate exists for.
-    let test_file = h.work_dir.join("revoked-blocked-payload.bin");
-    std::fs::write(&test_file, b"secret bytes that must never land").unwrap();
-    let mut send_proc = Command::new(&bin)
-        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
-        .arg("send")
-        .arg(&test_file)
-        .arg("--word")
-        .arg("revoked-blocked-code")
-        .arg("--server")
-        .arg(&server)
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("send");
-
-    let (code_tx, code_rx) = std::sync::mpsc::channel::<String>();
-    let stderr = send_proc.stderr.take().unwrap();
-    let code_word = "revoked-blocked-code".to_string();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            let line = line.unwrap_or_default();
-            let lower = line.to_lowercase();
-            if let Some(start) = lower.find(&code_word.to_lowercase()) {
-                let rest = &line[start..];
-                let end = rest
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(rest.len());
-                let _ = code_tx.send(line[start..start + end].to_lowercase().to_string());
-            }
-        }
-    });
-    let full_code = code_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("send did not mint a code within 30s");
-
-    let recv_dir = h.b_dir.join("received_blocked");
-    std::fs::create_dir_all(&recv_dir).unwrap();
-    let mut recv_proc = Command::new(&bin)
-        .envs(base_env.iter().map(|(k, v)| (*k, *v)))
-        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
-        .arg("receive")
-        .arg(&full_code)
-        .arg("--yes")
-        .arg("--dir")
-        .arg(&recv_dir)
-        .arg("--server")
-        .arg(&server)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("receive");
-    let recv_out = recv_proc.wait_with_output().expect("recv result");
-    let recv_stdout = String::from_utf8_lossy(&recv_out.stdout);
-    let recv_stderr = String::from_utf8_lossy(&recv_out.stderr);
-    let send_out = send_proc.wait_with_output().expect("send result");
-    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
-    let send_stderr = String::from_utf8_lossy(&send_out.stderr);
-
-    // 3. The instrument engaged: the block fired on the direct path. Without
-    // this, the run is UNCLASSIFIED (on a platform where direct never starts,
-    // nothing is blocked, nothing falls back, and the revocation question was
-    // not exercised).
-    let both = format!("{send_stdout}\n{send_stderr}\n{recv_stdout}\n{recv_stderr}");
-    assert!(
-        both.contains("DIRECT-BLOCKED"),
-        "DIRECT-BLOCKED marker absent: the block never engaged, so this run is \
-         UNCLASSIFIED rather than a fallback-finding"
+    // 4. REVOKED CASE: A transfers again under the same conditions. Three
+    // possible verdicts, named explicitly.
+    let revoked_payload = h.work_dir.join("revoked-blocked-payload.bin");
+    std::fs::write(&revoked_payload, b"secret bytes that must never land").unwrap();
+    let (recv_out, send_out, recv_dir) = run_code_transfer(
+        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &revoked_payload, "revoked-blocked-code",
     );
 
-    // 4. The revoked device did NOT reach anything: no file lands, and the
-    // denial names revocation. An offline device never reaches the offer
-    // stage, and a merely-un-granted device is denied for a different reason,
-    // so neither neighbour can satisfy this assertion.
+    let rev_both = format!("{}\n{}\n{}\n{}", recv_out.stdout, recv_out.stderr, send_out.stdout, send_out.stderr);
     assert!(
-        !recv_dir.join("revoked-blocked-payload.bin").exists(),
-        "a revoked device must not reach the fallback; file landed"
+        rev_both.contains("DIRECT-BLOCKED"),
+        "UNCLASSIFIED: DIRECT-BLOCKED marker absent on the revoked run, the block \
+         never engaged. Output:\n{rev_both}"
+    );
+
+    let file_landed = recv_dir.join("revoked-blocked-payload.bin").exists();
+    let revoked_denied = recv_out.stderr.contains("revoked");
+    assert!(
+        !file_landed,
+        "FAIL-OPEN: a revoked device's transfer LANDED via the fallback. Security \
+         hole: a revoked device reached data it must not have. Blocks 1.0.\n{rev_both}"
     );
     assert!(
-        recv_stderr.contains("revoked"),
-        "expected a REVOCATION-named decline (not a generic transport failure \
-         or a no-grant denial), got: {recv_stderr}"
+        revoked_denied,
+        "FAIL-CLOSED-SILENT: the revoked device was refused (no file landed) but no \
+         revocation-named denial arrived; the denial is indistinguishable from a network \
+         problem (#206 class). Correctness-of-message defect, not fail-open. rev output:\n{rev_both}"
     );
+    // Otherwise: FAIL-CLOSED-LOUD, the correct behaviour, and the test passes.
 }
 
 /// The case the WebRTC fallback EXISTS for: direct-QUIC enabled, direct-QUIC
@@ -2453,5 +2486,154 @@ fn pre_084_invitation_refused_with_message_not_parse_error() {
     assert!(
         !stderr.contains("unknown format") && !stderr.contains("not valid"),
         "the refusal must not be a parse error, got: {stderr}"
+    );
+}
+
+// ----------------------------------------------------------- cap-store cell ---
+
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+}
+
+/// Count capability GRANTS in a cap store. A store that exists but contains no
+/// grants (genesis header + ratchet only) is the allowed delta after a join.
+fn cap_store_grant_count(config_dir: &Path) -> usize {
+    let p = config_dir.join("caps.json");
+    let Ok(raw) = std::fs::read_to_string(&p) else {
+        return 0; // absent store: no grants by construction
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        panic!("caps.json at {} is not a valid store: {raw}", p.display());
+    };
+    arr.iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("cap_grant"))
+        .count()
+}
+
+/// #210/advisor invariant: a full join must not change the capability store.
+///
+/// No CapOp is ever parsed from the wire. `apply_cap_op` (capability.rs:1360)
+/// is the only owner-signature-verifying store writer and has exactly one
+/// production call site, the local `revoke`. This property contains owner-key
+/// compromise: fleet_auto_trust already grants transfer+mount fleet-wide with
+/// no local grant, so the local grant is the last boundary for the deliberate
+/// tier. The owner is considering putting permissions inside the invitation
+/// and applying them at join, which would be the first network-origin write.
+///
+/// This test turns "there is no network path into the cap store" from a grep
+/// someone ran once into an invariant that stays true. It performs a REAL join
+/// (not a seeded store) and asserts:
+///
+///   - the JOINER's cap store is unchanged across the ceremony (a clean joiner
+///     has no store before or after; if a genesis header appears, no grant may),
+///   - the ISSUER's cap store is byte-identical across mint + claim,
+///   - the join actually RAN (the joiner ends up with a device cert), so a
+///     no-op join cannot read as a pass.
+///
+/// Hash, not eyeball: the issuer side asserts byte equality of the whole file.
+/// The joiner side asserts the grant set specifically, because a genesis header
+/// written during the ceremony is legitimate and would break a byte comparison;
+/// the grant count is the strongest assertion available there.
+#[test]
+fn join_does_not_change_the_capability_store() {
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let joiner = clean_joiner_dir(&h, "joiner");
+    let issuer_caps = h.a_dir.join("caps.json");
+    let joiner_caps = joiner.join("caps.json");
+
+    // The issuer (a_dir) was init'd, so its genesis header already exists; the
+    // daemon-start heal is a no-op and the store must stay byte-stable.
+    let issuer_before = sha256_file(&issuer_caps)
+        .unwrap_or_else(|| panic!("issuer caps.json absent after init: {}", issuer_caps.display()));
+    assert_eq!(
+        cap_store_grant_count(&h.a_dir),
+        0,
+        "issuer must start with zero grants"
+    );
+
+    // Start the issuer daemon: the join claim needs the armed enrollment room.
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_a_log = log_a;
+    std::thread::sleep(Duration::from_secs(8));
+
+    // Mint an invitation. Minting is a local act (signing + printing) and must
+    // not touch the issuer's cap store either.
+    let invite_file = h.work_dir.join("inv-cap-store.txt");
+    let mint = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "add", "--for", "device", "--out"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("mint invitation");
+    assert!(
+        mint.status.success(),
+        "mint failed: {}",
+        String::from_utf8_lossy(&mint.stderr)
+    );
+    let issuer_after_mint = sha256_file(&issuer_caps).unwrap();
+    assert_eq!(
+        issuer_after_mint, issuer_before,
+        "minting an invitation must not change the issuer's cap store"
+    );
+
+    // The joiner starts clean: no cap store, no identity.
+    assert!(!joiner_caps.exists(), "clean joiner must have no cap store");
+
+    // Full join ceremony. The joiner must actually complete it (device cert
+    // written), or the invariant below is vacuous.
+    let join = spawn_captured({
+        let mut c = Command::new(&bin);
+        c.env("FILAMENT_CONFIG_DIR", &joiner)
+            .args(["--server", &server, "join", "--invite-file"])
+            .arg(&invite_file)
+            .arg("--name")
+            .arg("joiner")
+            .arg("--yes");
+        c
+    })
+    .expect("join spawn")
+    .wait_until(Duration::from_secs(120));
+    let joined_cert = joiner.join("identity").join("device-cert.json");
+    assert!(
+        joined_cert.exists(),
+        "the join did not run: no device cert written for the joiner.\n\
+         join stdout: {}\njoin stderr: {}",
+        join.stdout, join.stderr
+    );
+
+    // ISSUER: byte-identical across the whole ceremony (mint + claim). This is
+    // the strong form: no writer touched the store at any step.
+    let issuer_after_claim = sha256_file(&issuer_caps).unwrap();
+    assert_eq!(
+        issuer_after_claim, issuer_before,
+        "a full join changed the issuer's cap store: byte-level invariant broken.\n\
+         This is the network-origin write the advisor's grep said does not exist."
+    );
+
+    // JOINER: the store must contain no grants. The joiner started with NO
+    // store, so the byte-level invariant is "still absent". If a genesis
+    // header was legitimately written during the ceremony, a byte comparison
+    // becomes impossible, and the grant set is the strongest assertion
+    // available there: no cap_grant may appear, either way. Both cases are
+    // covered by the single grant count below.
+    assert_eq!(
+        cap_store_grant_count(&joiner),
+        0,
+        "a full join wrote a capability GRANT into the joiner's cap store.\n\
+         This is the network-origin write the advisor's grep said does not exist.\n\
+         joiner store: {}",
+        std::fs::read_to_string(&joiner_caps).unwrap_or_default()
     );
 }
