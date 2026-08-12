@@ -779,6 +779,99 @@ fn revoked_device_first_transfer_is_denied() {
     );
 }
 
+/// Read a config dir's devices.json, dumping the dir listing on failure so a
+/// missing store (a real setup finding) names what actually exists.
+fn read_devices_json(config_dir: &Path) -> Value {
+    let p = config_dir.join("devices.json");
+    let raw = match std::fs::read_to_string(&p) {
+        Ok(raw) => raw,
+        Err(e) => {
+            let listing: Vec<String> = std::fs::read_dir(config_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "cannot read {}: {e}; config dir contents: {listing:?}",
+                p.display()
+            );
+        }
+    };
+    serde_json::from_str(&raw).expect("parse devices.json")
+}
+
+/// Run a real pairing ceremony between two config dirs: A mints a code with
+/// `add --word <word>` and B claims it with `add <code>`. Both sides store the
+/// REAL code-derived shared secret. This is the pair-for-real rule; a seeded
+/// store (placeholder secret) is exactly what made the first #172 control
+/// stall forever. Deadline-bounded; a ceremony that does not converge fails
+/// loudly.
+fn live_pair(
+    bin: &Path,
+    server: &str,
+    envs: &[(&str, &str)],
+    a_dir: &Path,
+    b_dir: &Path,
+    word: &str,
+) {
+    let mut create = Command::new(bin);
+    create.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", a_dir)
+        .env("FILAMENT_NAME", "test-a")
+        .arg("add")
+        .arg("--word")
+        .arg(word)
+        .arg("--server")
+        .arg(server);
+    let create_proc = spawn_captured(create).expect("pair create spawn");
+
+    let word_lower = word.to_lowercase();
+    let started = Instant::now();
+    let code = loop {
+        let (stdout, stderr) = create_proc.snapshot();
+        let text = format!("{stdout}\n{stderr}");
+        let lower = text.to_lowercase();
+        if let Some(start) = lower.find(&word_lower) {
+            if let Some(tok) = text[start..].split_whitespace().find(|w| {
+                w.to_lowercase().contains(&word_lower) && w.split('-').count() >= 4
+            }) {
+                break tok.to_string();
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "pair create did not mint a code within 60s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let create_out = create_proc.wait_until(Duration::from_secs(60));
+
+    let mut claim = Command::new(bin);
+    claim.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", b_dir)
+        .env("FILAMENT_NAME", "test-b")
+        .arg("add")
+        .arg(&code)
+        .arg("--server")
+        .arg(server);
+    let claim_out = spawn_captured(claim)
+        .expect("pair claim spawn")
+        .wait_until(Duration::from_secs(60));
+
+    assert!(
+        matches!(create_out.outcome, ChildOutcome::ExitedSuccess(_)),
+        "pair create failed: {}",
+        create_out.stderr
+    );
+    assert!(
+        matches!(claim_out.outcome, ChildOutcome::ExitedSuccess(_)),
+        "pair claim failed: {}",
+        claim_out.stderr
+    );
+}
+
 /// Run a one-shot `send --word <code>` / `receive <code>` code transfer between
 /// two config dirs with the given env, under DEADLINE-bounded waits. Returns
 /// the captured receive and send outcomes and the receive dir. A transfer that
@@ -889,25 +982,36 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
         ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
         ("FILAMENT_L3_USERSPACE", "1"),
     ];
+    // The pairing ceremony runs WITHOUT the direct block (it is setup, not the
+    // path under test); the CONTROL and the REVOKED case run under base_env,
+    // identical direct-blocked conditions.
+    let pair_env = [
+        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
+        ("FILAMENT_DIRECT", "1"),
+        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
+        ("FILAMENT_L3_USERSPACE", "1"),
+    ];
 
-    // 1. The CONTROL both exercises the happy path AND records the real pair:
-    // B receives with `--remember test-a`, storing A's record with the REAL
-    // code-derived secret. This is the pair-for-real rule (USER-FLOWS.md):
-    // seed_store is reserved for states no ceremony produces, and a seeded
-    // placeholder secret is precisely what made the first version of this test
-    // stall forever (the pair-proof over the link failed, the link dropped and
-    // re-established, and it stayed invisible until a happy path ran next to
-    // it). Do not reseed a store here for convenience.
+    // 1. REAL pairing first: `add --word` mints a code, `add <code>` claims it,
+    // and B stores A's record with the REAL code-derived shared secret. This is
+    // the pair-for-real rule (USER-FLOWS.md): seed_store is reserved for states
+    // no ceremony produces, and a seeded placeholder secret is precisely what
+    // made the first version of this test stall forever (the pair-proof over
+    // the link failed, the link dropped and re-established, and it stayed
+    // invisible until a happy path ran next to it). Do not reseed a store here
+    // for convenience.
     let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
+    let pair_word = format!("cryptocell-pair-p{:x}", std::process::id());
+    live_pair(&bin, &server, &pair_env, &h.a_dir, &h.b_dir, &pair_word);
 
     // 2. CONTROL: a legitimate (not yet revoked) A transfers under identical
-    // direct-blocked conditions, and B remembers A for real. It must complete.
-    // If it does not, the transport is wedged under these conditions and the
-    // revoked case that follows cannot be attributed to revocation.
+    // direct-blocked conditions. It must complete. If it does not, the
+    // transport is wedged under these conditions and the revoked case that
+    // follows cannot be attributed to revocation.
     let control_payload = h.work_dir.join("control-payload.bin");
     std::fs::write(&control_payload, b"control bytes that must land").unwrap();
     let (ctrl_recv, ctrl_send, ctrl_dir) = run_code_transfer(
-        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &control_payload, "ctrl-blocked-code", Some("test-a"),
+        &bin, &server, &base_env, &h.a_dir, &h.b_dir, &control_payload, "ctrl-blocked-code", None,
     );
     let ctrl_both = format!("{}\n{}\n{}\n{}", ctrl_recv.stdout, ctrl_recv.stderr, ctrl_send.stdout, ctrl_send.stderr);
     assert!(
@@ -927,10 +1031,7 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
     // resolving A's identity during real contact, not a seed. The secret in the
     // record came from the real ceremony, so the happy path already proved it
     // authenticates.
-    let b_records: Value = serde_json::from_str(
-        &std::fs::read_to_string(h.b_dir.join("devices.json")).expect("b devices.json"),
-    )
-    .expect("parse b devices.json");
+    let b_records = read_devices_json(&h.b_dir);
     let b_has_a_cert = b_records.as_array().unwrap().iter().any(|d| {
         d["name"].as_str() == Some("test-a")
             && d["deviceCert"]["devicePub"].as_str().is_some()
@@ -945,10 +1046,10 @@ fn revoked_device_direct_blocked_gets_no_fallback_access() {
             a_cert["devicePub"].as_str().is_some(),
             "A's device cert has a devicePub"
         );
-        let mut arr: Vec<Value> = serde_json::from_str(
-            &std::fs::read_to_string(h.b_dir.join("devices.json")).expect("b devices.json"),
-        )
-        .expect("parse b devices.json");
+        let mut arr: Vec<Value> = read_devices_json(&h.b_dir)
+            .as_array()
+            .unwrap()
+            .clone();
         for d in arr.iter_mut() {
             if d["name"].as_str() == Some("test-a") {
                 d["userKey"] = serde_json::json!(a_cert["userPub"].as_str().unwrap_or_default());
@@ -2664,10 +2765,17 @@ fn join_does_not_change_the_capability_store() {
     assert!(!joiner_caps.exists(), "clean joiner must have no cap store");
 
     // Full join ceremony. The joiner must actually complete it (device cert
-    // written), or the invariant below is vacuous.
+    // written), or the invariant below is vacuous. The joiner's transport env
+    // matches the issuer daemon's (direct enabled, same candidate policy) so
+    // the enrollment link has the same chances the transfer path does; without
+    // it the joiner can end up with only a STUN srflx candidate and ICE fails.
+    let loopback_only = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
     let join = spawn_captured({
         let mut c = Command::new(&bin);
         c.env("FILAMENT_CONFIG_DIR", &joiner)
+            .env("FILAMENT_DIRECT", "1")
+            .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+            .env("FILAMENT_L3_USERSPACE", "1")
             .args(["--server", &server, "join", "--invite-file"])
             .arg(&invite_file)
             .arg("--name")
