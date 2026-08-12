@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# One command to run the whole UX suite: record every scenario (cli↔cli 01–07 as
-# casts→GIFs, cli↔web 08–10 as side-by-side CLI+browser GIFs), build the gallery,
-# and tear everything down.
+# One command to run the whole UX suite. Default is VERIFY-ONLY: every scenario
+# runs bare (no asciinema recorder), so the verdict can never be contaminated by
+# presentation. Set UX_RECORD=1 to ALSO record casts and build the gallery.
 #
-#   ./run.sh                 run all 10 scenarios
+#   ./run.sh                 verify all scenarios (no recorder, default)
 #   ./run.sh 01 03 06        run a subset
+#   UX_RECORD=1 ./run.sh     verify AND record casts→GIFs, build the gallery
 #   SEQUENTIAL=1 ./run.sh    run one-at-a-time (debugging; old behaviour)
 #   JOBS=3 ./run.sh          cap batch concurrency (default = nproc/2, clamped 2..4)
 #   SPEED=fast ./run.sh      render faster (see README → SPEED knob)
@@ -30,9 +31,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # top-level rig (for shared work dir + the suite-wide cleanup of marked backends)
 source "$HERE/rig/lib.sh"
 
-ALL_CLI="01 02 03 04 05 06 07 11"
+ALL_CLI="01 02 03 04 05 06 11 12"
 ALL_WEB="08 09 10"
 SEL="${*:-$ALL_CLI $ALL_WEB}"
+# Recording is opt-in; without UX_RECORD every scenario runs verify-only.
+UX_RECORD="${UX_RECORD:-}"
+export UX_RECORD
 # Default concurrency scales to the box: single-host WebRTC/ssh ICE timing (03,
 # 06, 08, 09) and eventlet backend boots get starved if we oversubscribe cores.
 # Each scenario already uses ~2 cores (backend + two peers + a recorder), so cap
@@ -54,6 +58,7 @@ echo "================ Filament UX harness ================"
 echo "binary  : $FILAMENT"
 echo "speed   : SPEED=$SPEED (agg --speed $UX_AGG_SPEED, idle $UX_IDLE_LIMIT)"
 echo "mode    : ${SEQUENTIAL:+sequential}${SEQUENTIAL:-parallel (JOBS=$JOBS)}"
+echo "recording: ${UX_RECORD:+ON (casts + gallery)}${UX_RECORD:-OFF (verify-only)}"
 echo "tmp root: $UX_TMP   work root: $UX_WORK"
 echo "scenarios: $SEL"
 echo "====================================================="
@@ -130,8 +135,9 @@ fi
 
 SUITE_T=$((SECONDS-SUITE_T0))
 
-# build gallery from the lifted results-*.txt
-python3 "$HERE/gallery.py"
+# build gallery from the lifted results-*.txt — only when recording (a
+# verify-only run has no casts/GIFs to assemble)
+if [ -n "$UX_RECORD" ]; then python3 "$HERE/gallery.py"; fi
 
 # write timing summary (collected from each scenario's time-<id>.txt)
 declare -A TIMES
@@ -144,7 +150,7 @@ for id in $SEL; do TIMES[$id]=$(cut -d' ' -f2 "$UX_WORK/time-$id.txt" 2>/dev/nul
 } | tee "$UX_WORK/timings.txt"
 
 echo "===================================================="
-echo "gallery: $HERE/gallery/index.html"
+[ -n "$UX_RECORD" ] && echo "gallery: $HERE/gallery/index.html"
 echo "total wall-clock: ${SUITE_T}s"
 # suite-wide safety net: now that ALL scenarios have finished, reap any of OUR
 # marked backends that outlived their worker (matches FIL_UX_RIG=1 only). Safe to

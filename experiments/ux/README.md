@@ -11,9 +11,11 @@
 
 A self-contained, human-watchable test harness for the Filament CLI's user-facing
 flows. Each scenario drives the **real** `/root/.local/bin/filament` against a
-**local** signaling backend, asserts the outcome (sha256 of transferred bytes,
-derived channel ids, stored devices, remote command output), and records a GIF a
-person can watch. Ten scenarios cover both `cli↔cli` and `cli↔web` directions.
+**local** signaling backend and asserts an invariant (sha256 of transferred
+bytes, mutual device recognition, stored caps, remote command output), never a
+bare exit code. Recording is strictly optional: the default `./run.sh` is
+**verify-only** (no asciinema recorder, so presentation can never change a
+verdict); `UX_RECORD=1 ./run.sh` also records casts and builds the gallery.
 
 The harness is **self-safe**: every `filament` call points at a throwaway
 `FILAMENT_CONFIG_DIR` under `/tmp/ux`, each backend runs on a free loopback port
@@ -26,8 +28,9 @@ The harness is **self-safe**: every `filament` call points at a throwaway
 ## Run it
 
 ```bash
-./run.sh                 # all 10 scenarios (parallel), build gallery, tear down
+./run.sh                 # verify all scenarios (no recorder; default)
 ./run.sh 01 03 06        # a subset
+UX_RECORD=1 ./run.sh     # verify AND record casts → GIFs, build the gallery
 SEQUENTIAL=1 ./run.sh    # one-at-a-time (debugging / the old behaviour)
 JOBS=3 ./run.sh          # cap concurrency (default 4)
 SPEED=fast ./run.sh      # render faster (SPEED knob — see below)
@@ -52,7 +55,7 @@ The five **live cross-peer handshakes** — `03` (word-code CLI↔CLI), `06`
 drains, each on a quiet host: on a small box their ICE/data-channel/PAKE timing
 wedges if other heavy scenarios share the cores (documented contention below).
 `SOLO_IDS="03 06 08 09 10"` controls this set (shrink it on a bigger box). The
-remaining six (`01 02 04 05 07`) parallelize in the batch.
+remaining (`01 02 04 05 11 12`) parallelize in the batch.
 
 ### SPEED knob
 
@@ -74,9 +77,9 @@ cast→GIF) and `web-scenarios.sh` (the cli cast + webm→GIF steps).
 Single scenario, manually:
 
 ```bash
-bash record.sh 05 100 28          # cli↔cli: cast → GIF + RESULT
-bash web-scenarios.sh 08          # cli↔web: CLI cast + browser webm → side-by-side GIF
-bash scenarios.sh 07              # run a cli↔cli scenario WITHOUT recording (just assert)
+bash scenarios.sh 12              # run a cli↔cli scenario WITHOUT recording (just assert)
+UX_RECORD=1 bash record.sh 05 100 28   # cli↔cli: cast → GIF + RESULT
+bash web-scenarios.sh 08          # cli↔web: CLI cast + browser webm → side-by-side GIF (new-renewer's)
 python3 gallery.py                # rebuild gallery/index.html + results.json from results-*.txt
 ```
 
@@ -97,16 +100,17 @@ Open `gallery/index.html` to see every flow with its caption and PASS/FAIL badge
 
 | # | Flow | What it proves |
 |---|---|---|
-| 01 | cli↔cli | `pair`: A mints a PAKE code, B claims it; both derive the same channel id (no key crosses the server) |
-| 02 | cli↔cli | `devices` list / rename / forget — **and** the regression guard: forgetting one device must not wipe another's granted `shell` cap |
-| 03 | cli↔cli | `send --word` one-time code → `recv`; bytes sha256-verified end-to-end |
-| 04 | cli↔cli | `send --to` a known device: no code, identity proof-verified, auto-accepted; bytes verified |
+| 01 | cli↔cli | `add`: A mints a PAKE code (via `--word`), B claims it; each store lists the other, so the ceremony ran end-to-end (no key crosses the server) |
+| 02 | cli↔cli | real-paired `devices` list / rename / forget — **and** the regression guard: forgetting one device must not wipe another's granted `shell` cap |
+| 03 | cli↔cli | `send --word` one-time code → `receive <full code>`; bytes sha256-verified end-to-end |
+| 04 | cli↔cli | `send --to` a known device: no code, auto-accepted, whole-file sha256 verified |
 | 05 | cli↔cli | always-on receiver `up` / `status` / `down`, with a paired send into it; bytes verified |
-| 06 | cli↔cli | `grant shell` (deny-by-default consent) then `ssh peer -- echo OK` over the data-channel tunnel |
-| 07 | cli↔cli | `introduce`: a hub that knows two devices vouches them to each other with a fresh mutual secret |
-| 08 | cli↔web | CLI sends → the web app accepts the offer and reaches the download (save) affordance |
-| 09 | cli↔web | the web app sends → CLI `recv` writes it, sha256-verified (see decoupling note below) |
-| 10 | cli↔web | `pair` the web app with the CLI: CLI mints a PAKE code, the browser claims + stores the device |
+| 06 | cli↔cli | `grant shell` (deny-by-default consent) then `shell --ssh` over the data-channel tunnel. **Currently FAILS on the shipping 0.8.5 binary**: `shell --ssh`'s ProxyCommand calls `filament netcat`, which is not a verb in 0.8.5 (product bug; the grant half works). |
+| 11 | cli↔cli | live pairing: a device `add`ed MID-SESSION while the always-on `up` daemon runs is picked up live, no restart; real ceremony writes the store |
+| 12 | cli↔cli | `down` targets ONE daemon: a system-managed and a user-managed daemon coexist (own units, distinct config dirs); `down -y` for one config dir stops only that daemon, the other survives untouched. Requires root; verification-only, not a gallery cast. |
+| 08 | cli↔web | CLI sends → the web app accepts the offer and reaches the download (save) affordance (moving to Playwright, new-renewer) |
+| 09 | cli↔web | the web app sends → CLI `receive` writes it, sha256-verified (moving to Playwright, new-renewer) |
+| 10 | cli↔web | `add` the web app with the CLI: CLI mints a PAKE code, the browser claims + stores the device (moving to Playwright, new-renewer) |
 
 ## Measured runtimes
 
@@ -118,21 +122,22 @@ sequential **solo tail** on a quiet host so their contention-sensitive timing
 doesn't wedge. Old fully-sequential best case was **~167 s** but flaky.
 
 <!-- TIMINGS:BEGIN -->
-Parallel run (`JOBS=2` batch + sequential solo tail), **all 10 PASS**, 4-core VM:
+Parallel run (`JOBS=2` batch + sequential solo tail), 4-core VM (06 FAILS on the 0.8.5 `shell --ssh` netcat bug; 08–10 are cli↔web, moving to Playwright):
 
 | # | flow | phase | wall-clock | notes |
 |---|---|---|---|---|
-| 01 | cli↔cli | batch | 5 s | pair |
-| 02 | cli↔cli | batch | 5 s | devices list/rename/forget + regression |
-| 04 | cli↔cli | batch | 5 s | send --to known device |
-| 05 | cli↔cli | batch | 7 s | up / status / down |
-| 07 | cli↔cli | batch | 6 s | introduce |
-| 03 | cli↔cli | **solo** | 27 s | **decoupled**: verify + 22 s best-effort cast box |
-| 06 | cli↔cli | **solo** | 9 s | **decoupled** ssh tunnel: verify + best-effort cast |
-| 08 | cli↔web | **solo** | 76 s | CLI → web (timeout-boxed cast + ≤2 attempts; a 1st-attempt ICE wedge adds a retry) |
-| 09 | cli↔web | **solo** | 80 s | **decoupled**: no-recorder verify pass + best-effort visual + webm→GIF |
-| 10 | cli↔web | **solo** | 18 s | pair web ↔ CLI (PAKE) |
-| | | | **~180–230 s** | parallel batch (~25 s) + sequential solo tail; varies with per-scenario retries |
+| 01 | cli↔cli | batch | ~5 s | add mint/claim, mutual stores |
+| 02 | cli↔cli | batch | ~15 s | 3 real pairings + devices list/rename/forget + shell-cap regression |
+| 04 | cli↔cli | batch | ~7 s | send --to known device |
+| 05 | cli↔cli | batch | ~7 s | up / status / down |
+| 11 | cli↔cli | batch | ~15 s | live mid-session add |
+| 12 | cli↔cli | batch | ~10 s | down targets one of two managed daemons (root; verification-only) |
+| 03 | cli↔cli | **solo** | ~27 s | **decoupled**: verify + 22 s best-effort cast box |
+| 06 | cli↔cli | **solo** | ~9 s | **decoupled** shell --ssh: verify + best-effort cast; FAILS on 0.8.5 (netcat ProxyCommand bug) |
+| 08 | cli↔web | **solo** | ~76 s | CLI → web (moving to Playwright) |
+| 09 | cli↔web | **solo** | ~80 s | web → CLI, sha256-verified (moving to Playwright) |
+| 10 | cli↔web | **solo** | ~18 s | web ↔ CLI PAKE (moving to Playwright) |
+| | | | varies | parallel batch + sequential solo tail |
 
 The batch overlaps and finishes in ~25 s; the five live-handshake flows then run
 **one at a time** on a quiet host — that solo tail is the long pole and its total
@@ -152,7 +157,7 @@ failures, no leftover-process starvation between runs. Raise `JOBS` / shrink
 >   `backend_start` retries on a fresh port if a boot is starved; and a
 >   per-scenario `cleanup_all` only kills its **own** backend (a suite-wide marker
 >   sweep runs once, at the very end — never while siblings are live).
-> - All `filament` invocations are `timeout -k 5`-boxed so a `recv`/`send` that
+> - All `filament` invocations are `timeout -k 5`-boxed so a `receive`/`send` that
 >   ignores SIGTERM (rejoin-window linger) gets SIGKILLed and can't hang the suite.
 > - The decoupled scenarios' verdicts always come from their no-recorder verify
 >   passes, so a wedged cast never produces a wrong PASS/FAIL.
@@ -172,11 +177,11 @@ twice over (a no-recorder verify pass **and** a best-effort visual pass).
   backend + config root + room, so the suite finishes near the slowest scenario
   (09's solo tail) rather than the sum. `SEQUENTIAL=1` falls back to one-at-a-time.
 - **Event waits, not blind sleeps** — scenarios now wait on deterministic signals
-  (the `filament up —` ready banner, `recv`'s `● listening` line, the sender's
+  (the `filament up —` ready banner, `receive`'s `● listening` line, the sender's
   `code <word>` line, the sshd port opening) via the `wait_for` / `wait_log`
   helpers in `rig/lib.sh`, instead of fixed `sleep 3/4`. Faster and less flaky.
 - **`FILAMENT_REJOIN_SECS` low** (set to 2–3 in the scenarios) — a completed
-  `recv -y` otherwise lingers the full rejoin window after the sender drops.
+  `receive -y` otherwise lingers the full rejoin window after the sender drops.
 - **agg `--speed` / `--idle-time-limit`** and **ffmpeg `fps` + `scale` + palette**
   + **gifsicle `--lossy`** — trim idle time and quantize so GIFs are a few MB,
   not tens of MB (08 went from ~13 MB, 09 from ~29 MB down to single-digit MB).
@@ -191,7 +196,7 @@ twice over (a no-recorder verify pass **and** a best-effort visual pass).
 Single-host **browser → CLI** WebRTC is the most contention-sensitive flow in the
 suite. The transfer is GREEN standalone (sha256 matches, ~11 MB/s), but when a
 Playwright **webm recorder** runs concurrently on the same host, the browser→CLI
-ICE / data-channel timing reliably wedges (`recv` interrupts, no bytes land).
+ICE / data-channel timing reliably wedges (`receive` interrupts, no bytes land).
 This is a **recording-contention** artifact, not a product break.
 
 So scenario 09 is split:
@@ -215,7 +220,7 @@ single-host test accommodation.)
 
 Two single-host CLI↔CLI flows wedge under asciinema recorder load even though
 both are GREEN standalone:
-- **03** — the anonymous `send --word` ↔ `recv` path opens ICE between two fresh
+- **03** — the anonymous `send --word` ↔ `receive` path opens ICE between two fresh
   ephemeral peers; the first `connecting…` attempt can wedge.
 - **06** — the `ssh`-over-tunnel handshake can wedge after the data channel is up.
 
@@ -230,21 +235,19 @@ behind a 549 s outlier (see timings).
 
 These are real product behaviors the harness surfaced (not harness bugs):
 
-1. **`send --name X` does not rename the received file.** The receiver (`recv`,
-   `up`, and `--to`) always saves under the **sender's source basename**,
-   silently ignoring `--name`. Confusing: the flag looks like it sets the saved
-   name. (Worked around in the harness by hash-verifying bytes regardless of
-   filename.)
-2. **`recv -y` lingers** the full rejoin window after a completed transfer when
+1. **`send --name X` is honored by the receiver in 0.8.5** (sc_04/sc_05 land the
+   file under the sender's `--name`). The harness still hash-verifies bytes
+   regardless of filename so a future rename regression can't fake a pass.
+2. **`receive -y` lingers** the full rejoin window after a completed transfer when
    the sender disconnects first — no prompt-exit on success. Slows demos; needs a
    low `FILAMENT_REJOIN_SECS` or an outer `timeout`.
 3. **`filament devices` does not surface granted capabilities.** You can't see
    which devices hold `shell` without reading `devices.json` by hand.
-4. **Two non-interchangeable "code" systems.** `filament pair` mints a 4-segment
-   PAKE code; `filament send --word/--code` mints a 3-segment legacy
-   file-transfer code. The browser's "pair with code" only consumes the PAKE
-   code; it cannot claim a `send` code — confusing given both are called "codes."
-   (So cli↔web file transfer uses the shared auto-room, not a code.)
+4. **`shell --ssh` is broken in the shipping 0.8.5 binary.** Its ProxyCommand
+   invokes `filament netcat <peer> <port>`, and `netcat` is not a verb in the
+   0.8.5 surface (`filament netcat` → "unknown command or device"). sc_06's
+   grant half works; the ssh half cannot pass until the product fixes the
+   ProxyCommand to a current raw-stream verb.
 5. **Single-host CLI↔browser WebRTC is unusable without disabling chromium mDNS,**
    and the failure mode (`connection stuck while connecting — retrying`) gives no
    hint that it's an ICE/mDNS issue.
@@ -257,9 +260,9 @@ These are real product behaviors the harness surfaced (not harness bugs):
 ```
 run.sh             one-command suite (rig up → record all → gallery → teardown)
 record.sh          record ONE cli↔cli scenario: cast → GIF + RESULT line
-scenarios.sh       cli↔cli scenario bodies (01–07)
-web-scenarios.sh   cli↔web scenario bodies (08–10): CLI cast + browser webm → GIF
-web/*.js           Playwright browser halves (recv/send/pair, ±video)
+scenarios.sh       cli↔cli scenario bodies (01–06, 11, 12)
+web-scenarios.sh   cli↔web scenario bodies (08–10): CLI cast + browser webm → GIF (new-renewer's)
+web/*.js           Playwright browser halves (receive/send/add, ±video) (new-renewer's)
 rig/lib.sh         self-safe primitives: backend up/down, throwaway config dirs,
                    kill-only-ours
 gallery.py         build gallery/index.html + results.json from .work/results-*.txt

@@ -16,7 +16,7 @@ UX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UX_BIN="$UX_DIR/bin"
 REPO="$(cd "$UX_DIR/../.." && pwd)"
 FILAMENT="${FILAMENT_BIN:-/root/.local/bin/filament}"
-PYV="${UX_PYV:-/root/.claude/jobs/330c2366/tmp/venv/bin/python}"
+PYV="${UX_PYV:-/root/filament-bench/venv/bin/python}"
 
 # Unique env marker stamped on EVERY backend this harness starts. Cleanup matches
 # ONLY procs carrying it, so we never touch the user's daemon, the gallery server
@@ -157,8 +157,13 @@ seed_store() { printf '%s\n' "$2" > "$1/devices.json"; chmod 600 "$1/devices.jso
 # Poll a logfile for a minted 4-segment code. Defined here as well as in
 # scenarios.sh so pair_two does not depend on its caller having defined it.
 wait_code() { local f="$1" n=0 c=""; while [ $n -lt 80 ]; do
-  c=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[A-Za-z]+-[0-9]+' "$f" 2>/dev/null | head -1 | tr 'A-Z' 'a-z')
+  c=$(grep -oE '[A-Za-z]+-[A-Za-z]+-[0-9]+' "$f" 2>/dev/null | head -1 | tr 'A-Z' 'a-z')
   [ -n "$c" ] && { echo "$c"; return 0; }; n=$((n+1)); sleep 0.2; done; return 1; }
+
+# Two random words for --word (the SPAKE2 password). Any two words work; a
+# fresh phrase per ceremony avoids reusing a burned code across pair_two calls.
+_UX_WORDS=(amber birch cedar dune elm fir gale hazel iris juniper kestrel larch moss nimbus oak pine quartz ridge spruce thistle)
+ux_words() { local a=$((RANDOM % ${#_UX_WORDS[@]})) b=$((RANDOM % ${#_UX_WORDS[@]})); while [ "$b" = "$a" ]; do b=$((RANDOM % ${#_UX_WORDS[@]})); done; echo "${_UX_WORDS[$a]} ${_UX_WORDS[$b]}"; }
 
 # Pair two config dirs the way a person does: one side mints a code, the other
 # claims it. No secrets are invented here and nothing is written by hand; both
@@ -171,7 +176,11 @@ wait_code() { local f="$1" n=0 c=""; while [ $n -lt 80 ]; do
 pair_two() {
   local DA="$1" NB="$2" DB="$3" NA="$4"
   local log="$UX_WORK/pair-$(basename "$DA")-$(basename "$DB")"
-  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 45 "$FILAMENT" add --name "$NB" -y \
+  # --word supplies the SPAKE2 password so the mint runs non-interactively: a
+  # bare `add --name` drops into the guided "type two words" prompt, which
+  # refuses from a non-TTY (found 2026-08-12 while converting the rig).
+  local W; W=$(ux_words)
+  FILAMENT_CONFIG_DIR="$DA" timeout -k 5 45 "$FILAMENT" add --word "$W" --name "$NB" -y \
       --server "$UX_SERVER" </dev/null >"$log.a" 2>&1 &
   local PA=$!; track $PA
   local C
@@ -181,12 +190,16 @@ pair_two() {
   local rcB=$?
   wait $PA 2>/dev/null; local rcA=$?
   # Assert on the stores, not on exit codes: the pairing is only real if each
-  # side can now name the other.
-  FILAMENT_CONFIG_DIR="$DA" "$FILAMENT" devices 2>/dev/null | grep -q "$NB" || {
-    echo "pair_two: $DA does not list $NB (rcA=$rcA rcB=$rcB)" >&2; return 1; }
-  FILAMENT_CONFIG_DIR="$DB" "$FILAMENT" devices 2>/dev/null | grep -q "$NA" || {
-    echo "pair_two: $DB does not list $NA (rcA=$rcA rcB=$rcB)" >&2; return 1; }
-  return 0
+  # side can now name the other. Poll, because under parallel load the store
+  # write or the `devices` read can lag a moment; a single shot is flaky.
+  local okA okB
+  okA=$(wait_for 15 0.3 bash -c "FILAMENT_CONFIG_DIR='$DA' '$FILAMENT' devices 2>/dev/null | grep -q '$NB'" && echo 1 || echo 0)
+  okB=$(wait_for 15 0.3 bash -c "FILAMENT_CONFIG_DIR='$DB' '$FILAMENT' devices 2>/dev/null | grep -q '$NA'" && echo 1 || echo 0)
+  if [ "$okA" = 1 ] && [ "$okB" = 1 ]; then
+    return 0
+  fi
+  echo "pair_two: mutual listing incomplete (A lists $NB=$okA, B lists $NA=$okB; rcA=$rcA rcB=$rcB)" >&2
+  return 1
 }
 
 # A 32-byte hex pair secret.
