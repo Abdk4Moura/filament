@@ -193,3 +193,14 @@ WireGuard is still the admin-mode default for non-browser users.
    the portfolio's path selection.
 4. Make WireGuard the default; demote the QUIC-datagram plane to the
    browser/no-WG/migration bridge.
+
+## Status 2026-09-06: wired and reconciling; the key exchange does not yet complete
+
+See the commit history for detail. The module is wired (warnings 115 -> 95),
+reconciles on a 10s tick, and creates `filament-wg` on both machines. The peer is
+not configured yet: `wg show` reports zero peers, so no tunnel has carried a
+packet. Three real bugs were found and fixed on the way (a probe interface name
+one character over the Linux 15-char limit, which made the capability check
+always answer no; both ends able to pick the same exchange role; and no timeout
+on the exchange, which made that deadlock silent). Reproduce with
+`experiments/wireguard-2machine.sh`.

@@ -5482,6 +5482,9 @@ async fn add_for_cmd(
     // because owner-equivalent access to a stranger should stay a deliberate
     // flag rather than a menu item one keypress away.
     let mut interactive_shell = false;
+    // Prefixes pulled out of `--allow route:<cidr>`; empty for every other kind
+    // of invitation, which keeps those tokens byte-identical v2.
+    let mut route_prefixes: Vec<String> = Vec::new();
     if allow.is_empty() && kind == "device" && caps.interactive {
         let choices = vec![
             "Send files, and mount my folders".to_string(),
@@ -5508,7 +5511,24 @@ async fn add_for_cmd(
             vec!["transfer".to_string()]
         }
     } else {
-        allow.into_iter().map(|capability| mint_capability(&capability)).collect::<Result<Vec<_>>>()?
+        // `route:10.0.0.0/24` carries its scope in the flag. Split the prefixes
+        // out here so they can travel in the SIGNED ceiling: a bare `route` is
+        // refused at mint, because a ceiling that cannot say which prefix is not
+        // a scope at all, and it previously authorised every prefix a member
+        // chose to advertise, 0.0.0.0/0 included.
+        let mut caps = Vec::new();
+        for entry in allow {
+            match entry.split_once(':') {
+                Some((name, cidr)) if mint_capability(name).ok().as_deref() == Some(crate::capability::CAP_ROUTE) => {
+                    caps.push(crate::capability::CAP_ROUTE.to_string());
+                    for one in cidr.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+                        route_prefixes.push(one.to_string());
+                    }
+                }
+                _ => caps.push(mint_capability(&entry)?),
+            }
+        }
+        caps
     };
     ceiling.sort();
     ceiling.dedup();
@@ -5573,6 +5593,7 @@ async fn add_for_cmd(
         crate::ephemeral::Reuse::Once,
         ephemeral,
         display_name(),
+        route_prefixes.clone(),
     )?;
     enroll_seed.fill(0);
     let token = Zeroizing::new(format!(
@@ -6660,6 +6681,9 @@ async fn handle_auth_key_enroll_response(
                         return;
                     }
                 };
+            // `ak.caps` already carries the route scope as `route:<cidr>`:
+            // Invitation::to_auth_key does that conversion once, so nothing here
+            // has to reassemble it.
             let stored_name = if persistent {
                 match devices_upsert_atomic(
                     &requested_name,
@@ -6929,6 +6953,12 @@ async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
             // forwarding for an overlay that is gone, and nothing would report
             // it.
             subnet_forward::cleanup();
+            // A WireGuard interface must not outlive the daemon that made it:
+            // left behind, it keeps routing a peer's overlay address into a
+            // tunnel with nobody on the other end, which looks exactly like the
+            // network breaking. Best-effort and idempotent, like the rest of
+            // teardown.
+            crate::wg::teardown(crate::wg::WG_DEV);
             n.notify_one();
         });
     }
@@ -17980,6 +18010,7 @@ async fn recv_cmd(
     let mut last_sweep = Instant::now();
     let mut last_renewal_check = Instant::now();
     let mut last_route_reconcile = Instant::now();
+    let mut last_wg_check = Instant::now();
     // Owner-only roster push: mint + push the mesh roster on membership change,
     // validity refresh, or a newly-established link.
     let mut last_roster_push = Instant::now();
@@ -18493,6 +18524,70 @@ async fn recv_cmd(
             let lapsed = devices_sweep_lapsed(crate::identity::now_secs());
             if lapsed > 0 {
                 ui::say(&format!("{} {lapsed} device(s) lapsed (offline past their budget)", ui::paint(ui::Tone::Warn, ui::glyph_warn())));
+            }
+        }
+
+        // WIREGUARD RECONCILE. On a timer, and deliberately NOT on an event.
+        //
+        // The first version hooked the moment a peer joined the L3 plane, which
+        // is when its ANNOUNCE arrives. A link that starts relayed and upgrades
+        // to direct upgrades AFTER that, so the hook saw the relay transport and
+        // declined forever: the rig showed "DIRECT-CONNECT ok (route:
+        // direct-quic)" in the same log as "WireGuard skipped". Reconciling on a
+        // tick is order-independent, picks up a link that goes direct later, and
+        // is idempotent, which an event hook can only approximate.
+        //
+        // Each attempt is spawned rather than awaited: the two ends rendezvous
+        // on a QUIC bi-stream, so whichever side ticks first waits for the
+        // other, and blocking the daemon loop on that would stall everything.
+        if daemon
+            && last_wg_check.elapsed() >= Duration::from_secs(10)
+            && crate::settings::get_str("wireguard", None)
+                .map(|v| v == "on" || v == "true")
+                .unwrap_or(false)
+        {
+            last_wg_check = Instant::now();
+            if let Some(l3) = l3.as_ref() {
+                if crate::wg::usable() {
+                    let ours = l3.my_addr().map(|a| a.to_string()).unwrap_or_default();
+                    for (who, addr, t) in l3.peers_with_transport().await {
+                        // Direct links only: the key exchange rides the QUIC
+                        // connection filament already authenticated, and a relay
+                        // link has none to ride.
+                        let (Some(qc), Some(sa)) = (t.quic_connection(), t.remote_addr()) else {
+                            continue;
+                        };
+                        if !crate::wg::claim_attempt(&addr.to_string()) {
+                            continue; // already established or in flight
+                        }
+                        // Derived from the two overlay addresses so the two ends
+                        // are guaranteed to disagree; the transport's answerer
+                        // flag is not, and when both chose "accept" the exchange
+                        // hung forever with no log either way.
+                        let initiator = crate::wg::is_initiator(&ours, &addr.to_string());
+                        let (ours, peer_s) = (ours.clone(), addr.to_string());
+                        tokio::spawn(async move {
+                            match crate::wg::establish(
+                                &qc, initiator, &ours, &peer_s, sa.ip(), 1380,
+                            )
+                            .await
+                            {
+                                Ok(()) => ui::say(&format!(
+                                    "  {} WireGuard tunnel to {who}",
+                                    ui::paint(ui::Tone::Ok, ui::glyph_ok())
+                                )),
+                                Err(e) => {
+                                    // Release the claim so the next tick retries:
+                                    // the peer may simply not have ticked yet.
+                                    crate::wg::release_attempt(&peer_s);
+                                    ui::debug(&format!(
+                                        "  WireGuard to {who} not established ({e}); staying on the QUIC plane"
+                                    ));
+                                }
+                            }
+                        });
+                    }
+                }
             }
         }
 
@@ -20177,21 +20272,6 @@ async fn recv_cmd(
                                                 // that is a fleet member could never
                                                 // be authorized by any route at all.
                                                 //
-                                                // KNOWN COARSENESS, deliberately
-                                                // recorded rather than hidden: a
-                                                // ceiling carries an ACTION and no
-                                                // resource, so `route` in a ceiling
-                                                // authorizes ANY prefix that member
-                                                // advertises, including 0.0.0.0/0.
-                                                // It is bounded by accept-routes
-                                                // being off by default and settable
-                                                // per peer, so nothing installs
-                                                // without the receiver opting in.
-                                                // Narrowing it to a per-prefix
-                                                // ceiling needs a v3 invitation
-                                                // token, since v2 encodes caps as an
-                                                // 8-bit mask with nowhere to put a
-                                                // CIDR. See docs/design-subnet-routes.md.
                                                 // Read the ceiling from the PERSISTED
                                                 // record, not from the link's
                                                 // principal. Which admission path ran
@@ -20208,18 +20288,35 @@ async fn recv_cmd(
                                                 // same source `devices` renders and
                                                 // `grant` consults, so all three agree
                                                 // by construction.
-                                                let delegated_route = principal_ceiling_for(&who)
-                                                    .map(|c| {
-                                                        c.iter().any(|x| {
-                                                            x.as_str() == crate::capability::CAP_ROUTE
+                                                //
+                                                // SCOPED, not a bare yes. The ceiling
+                                                // entries are `route:<cidr>`, taken
+                                                // from the signed invitation, so this
+                                                // asks whether the advertised prefix
+                                                // is INSIDE one the owner allowed. A
+                                                // bare `route` used to authorise every
+                                                // prefix a member cared to advertise,
+                                                // 0.0.0.0/0 included, which is an exit
+                                                // node the owner never agreed to.
+                                                let ceiling_routes: Vec<String> =
+                                                    principal_ceiling_for(&who)
+                                                        .unwrap_or_default()
+                                                        .iter()
+                                                        .filter_map(|c| {
+                                                            c.strip_prefix("route:")
+                                                                .map(str::to_string)
                                                         })
-                                                    })
-                                                    .unwrap_or(false);
+                                                        .collect();
                                                 let ok = crate::l3::installable_routes(
                                                     &advertised,
                                                     accept,
                                                     |cidr| {
-                                                        if delegated_route { return true; }
+                                                        if crate::capability::cidr_within_any(
+                                                            cidr,
+                                                            &ceiling_routes,
+                                                        ) {
+                                                            return true;
+                                                        }
                                                         let Some(pk) = owner_pk else { return false };
                                                         let Ok(res) =
                                                             crate::capability::route_resource_id(
@@ -25874,6 +25971,7 @@ mod tests {
             Reuse::Once,
             false,
             "alice".into(),
+            Vec::new(),
         )
         .unwrap();
         let token = format!(

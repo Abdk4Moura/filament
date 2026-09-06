@@ -198,6 +198,22 @@ pub fn registry() -> &'static [Setting] {
             help: "Masquerade forwarded subnet traffic as this machine, so LAN hosts can reply without a route back to the overlay. Turn off only if the LAN already routes to your overlay range.",
         },
         Setting {
+            key: "wireguard",
+            aliases: &["wg"],
+            store: "wireguard",
+            kind: Kind::Bool,
+            // OFF by default because it changes the DATA PLANE. The QUIC
+            // datagram path is what every gate measures and what works without
+            // privilege; WireGuard needs the module, the tools and
+            // CAP_NET_ADMIN, and silently switching the plane a user's traffic
+            // rides on is not something a default should do.
+            default: "off",
+            scope: ScopeKind::GlobalOnly,
+            env: None,
+            daemon: true,
+            help: "Carry overlay traffic to DIRECT peers over kernel WireGuard instead of QUIC datagrams. Linux only, needs wireguard-tools and CAP_NET_ADMIN; falls back to the QUIC path per peer when unavailable.",
+        },
+        Setting {
             key: "accept-routes",
             aliases: &["accept"],
             store: "accept-routes",

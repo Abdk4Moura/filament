@@ -156,14 +156,27 @@ name a single device, and `grant` refuses outright rather than report a success
 enforcement would not honour. Authorization therefore comes from the
 owner-signed invitation, the same place `transfer` and `mount` come from.
 
-**Known coarseness, recorded rather than hidden.** A ceiling carries an ACTION
-and no resource, so `route` in a ceiling authorizes ANY prefix that member
-advertises, including `0.0.0.0/0`. Two things bound it: `accept-routes` is off by
-default and is settable per peer, so nothing installs without the receiver opting
-in. Narrowing it to a per-prefix ceiling needs a v3 invitation token, because v2
-encodes capabilities as an 8-bit mask with nowhere to put a CIDR. Until then the
-prefix-bound `route:<cidr>` resource is the model for owner-to-owner grants,
-and the ceiling is the model for fleet members.
+**The coarseness is closed (2026-09-05).** A ceiling used to carry an ACTION and
+no resource, so `route` in a ceiling authorised ANY prefix that member
+advertised, `0.0.0.0/0` included: an exit node the owner never agreed to.
+
+Ceilings now carry their scope. `--allow route:10.66.0.0/24` puts the prefixes
+inside the invitation, in the SIGNED domain, so a member cannot widen its own
+grant; a test asserts that tampering with the prefixes invalidates the signature.
+Minting `--allow route` with no prefix is refused outright, because a ceiling
+that cannot say which prefix is not a scope. `Invitation::to_auth_key` is the one
+conversion into everything downstream, so it emits `route:<cidr>` rather than a
+bare `route`, and the stored ceiling, the `devices` display and enforcement all
+read the same scoped entry.
+
+Enforcement asks CONTAINMENT, not equality (`cidr_within_any`): a ceiling of
+`10.0.0.0/8` permits advertising `10.66.0.0/24`, and a ceiling of `10.66.0.0/24`
+refuses `10.0.0.0/8` and refuses `0.0.0.0/0`. An exit node is therefore only
+possible when the owner wrote `--allow route:0.0.0.0/0`.
+
+The invitation format was NOT versioned for this. There is one format tag and one
+parser: an invitation is a short-lived credential, so carrying a second encoding
+forever costs more than it buys.
 
 ### The result
 

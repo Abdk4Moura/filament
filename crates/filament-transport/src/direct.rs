@@ -1299,6 +1299,10 @@ impl Transport for DirectTransport {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+    fn quic_connection(&self) -> Option<quinn::Connection> {
+        // Cloning a quinn::Connection is a handle clone, not a new connection.
+        Some(self.conn.clone())
+    }
     fn force_close(&self) {
         self.conn.close(0u32.into(), b"dropped");
     }

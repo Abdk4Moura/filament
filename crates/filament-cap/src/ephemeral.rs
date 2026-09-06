@@ -359,8 +359,27 @@ pub struct Invitation {
     /// so the verifier cannot replay possession. Zeroed on drop.
     pub enroll_private_key: [u8; 32],
     pub owner_name: String,
+    /// Prefixes a `route` ceiling is limited to, as normalised CIDR strings.
+    ///
+    /// EMPTY MEANS NO ROUTING AUTHORITY, never "any prefix". A ceiling records
+    /// an action and, before this, nothing else: `route` in a ceiling therefore
+    /// authorised ANY prefix the member advertised, including 0.0.0.0/0, which
+    /// is an exit node the owner never agreed to. The prefixes travel inside the
+    /// signed domain, so a member cannot widen its own grant.
+    ///
+    /// Always encoded, as a count that is zero when there are none, so the
+    /// format has one shape and one parser.
+    pub routes: Vec<String>,
     pub sig: [u8; 64],
 }
+
+/// The invitation wire format tag.
+///
+/// A TAG, not a version to maintain. There is exactly one format and exactly one
+/// parser: an invitation is a short-lived credential (minutes to days), so the
+/// cost of carrying a second encoding forever is real and the benefit is not.
+/// A byte that does not match is refused rather than guessed at.
+const INV_FORMAT: u8 = 0x03;
 
 const INV_CAP_TRANSFER: u8 = 1 << 0;
 const INV_CAP_MOUNT: u8 = 1 << 1;
@@ -453,6 +472,58 @@ fn pubkey_from_seed(seed: &[u8; 32]) -> [u8; 32] {
 
 /// Fixed field region (everything before the variable owner name): version,
 /// issuer fp, caps, expiry, budget, reuse, ephemeral, name length.
+
+/// Encode the route prefixes of a v3 invitation.
+///
+/// `count | (family, prefix_len, addr)*`, with family as the address byte width
+/// so a reader never has to guess. Fixed-width and self-describing, because this
+/// sits inside the SIGNED domain and a length the reader can disagree about is
+/// a signature-confusion bug waiting to happen.
+fn inv_routes_encode(routes: &[String]) -> Vec<u8> {
+    let mut b = vec![routes.len() as u8];
+    for cidr in routes {
+        let Some((net, len)) = cidr.split_once('/') else { continue };
+        let Ok(len) = len.parse::<u8>() else { continue };
+        match net.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(a)) => {
+                b.push(4);
+                b.push(len);
+                b.extend_from_slice(&a.octets());
+            }
+            Ok(std::net::IpAddr::V6(a)) => {
+                b.push(16);
+                b.push(len);
+                b.extend_from_slice(&a.octets());
+            }
+            Err(_) => continue,
+        }
+    }
+    b
+}
+
+/// Decode route prefixes, returning them and how many bytes were consumed.
+/// `None` on any malformed input: a partially-read route list would change the
+/// offset of the key and signature that follow.
+fn inv_routes_decode(raw: &[u8]) -> Option<(Vec<String>, usize)> {
+    let count = *raw.first()? as usize;
+    let mut off = 1;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let width = *raw.get(off)? as usize;
+        let len = *raw.get(off + 1)?;
+        off += 2;
+        let bytes = raw.get(off..off + width)?;
+        off += width;
+        let ip = match width {
+            4 => std::net::IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?),
+            16 => std::net::IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?),
+            _ => return None,
+        };
+        out.push(format!("{ip}/{len}"));
+    }
+    Some((out, off))
+}
+
 fn inv_field_fixed_len() -> usize {
     1 + 8 + 1 + 4 + 4 + 1 + 1 + 2
 }
@@ -471,8 +542,30 @@ impl Invitation {
         reuse: Reuse,
         ephemeral: bool,
         owner_name: String,
+        routes: Vec<String>,
     ) -> Result<Self> {
         let caps = caps.iter().map(|c| super::capability::canonical_capability(c)).collect::<Result<Vec<_>>>()?;
+        // A route ceiling MUST name its prefixes, and prefixes without the
+        // capability are meaningless. Before this, `route` in a ceiling carried
+        // no scope at all, so it authorised every prefix the member chose to
+        // advertise, up to and including 0.0.0.0/0: an exit node the owner never
+        // agreed to. Refusing both halves here is what makes the scope real,
+        // because a ceiling that can be minted unscoped is not a scope.
+        let wants_route = caps.iter().any(|c| c == super::capability::CAP_ROUTE);
+        if wants_route && routes.is_empty() {
+            bail!(
+                "a 'route' invitation must name the prefixes it allows, e.g. --allow route:10.0.0.0/24"
+            );
+        }
+        if !routes.is_empty() && !wants_route {
+            bail!("route prefixes were given without the 'route' capability");
+        }
+        // Normalised so the signed bytes are canonical: 10.0.0.5/24 and
+        // 10.0.0.0/24 must not be two different signed ceilings.
+        let routes = routes
+            .iter()
+            .map(|r| super::capability::normalize_cidr(r))
+            .collect::<Result<Vec<_>>>()?;
         let owner_pub: [u8; 32] = owner_uk.public_key().as_ref().try_into().map_err(|_| anyhow!("bad owner pub"))?;
         let enroll_pub = pubkey_from_seed(&enroll_private_key);
         let mut t = Invitation {
@@ -485,6 +578,7 @@ impl Invitation {
             enroll_pub,
             enroll_private_key,
             owner_name,
+            routes,
             sig: [0u8; 64],
         };
         let prefix = t.signed_prefix();
@@ -498,7 +592,7 @@ impl Invitation {
     /// be verified without ever seeing the seed.
     fn signed_prefix(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.push(0x02);
+        b.push(INV_FORMAT);
         b.extend_from_slice(&self.issuer_fp);
         // `.unwrap_or(0)` here silently turned an unencodable capability into an
         // EMPTY ceiling: the invitation still minted, still signed, still
@@ -516,6 +610,7 @@ impl Invitation {
         b.push(if self.ephemeral { 1 } else { 0 });
         b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
         b.extend_from_slice(self.owner_name.as_bytes());
+        b.extend_from_slice(&inv_routes_encode(&self.routes));
         b.extend_from_slice(&self.enroll_pub);
         b
     }
@@ -524,7 +619,7 @@ impl Invitation {
     /// The joiner derives the public key from the seed and verifies the sig.
     pub fn to_token(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.push(0x02);
+        b.push(INV_FORMAT);
         b.extend_from_slice(&self.issuer_fp);
         // `.unwrap_or(0)` here silently turned an unencodable capability into an
         // EMPTY ceiling: the invitation still minted, still signed, still
@@ -542,6 +637,7 @@ impl Invitation {
         b.push(if self.ephemeral { 1 } else { 0 });
         b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
         b.extend_from_slice(self.owner_name.as_bytes());
+        b.extend_from_slice(&inv_routes_encode(&self.routes));
         b.extend_from_slice(&self.enroll_private_key);
         b.extend_from_slice(&self.sig);
         b
@@ -551,7 +647,7 @@ impl Invitation {
     /// No seed crosses the wire; the verifier learns only the public key.
     pub fn to_payload(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.push(0x02);
+        b.push(INV_FORMAT);
         b.extend_from_slice(&self.issuer_fp);
         // `.unwrap_or(0)` here silently turned an unencodable capability into an
         // EMPTY ceiling: the invitation still minted, still signed, still
@@ -569,6 +665,7 @@ impl Invitation {
         b.push(if self.ephemeral { 1 } else { 0 });
         b.extend_from_slice(&(self.owner_name.len() as u16).to_le_bytes());
         b.extend_from_slice(self.owner_name.as_bytes());
+        b.extend_from_slice(&inv_routes_encode(&self.routes));
         b.extend_from_slice(&self.enroll_pub);
         b.extend_from_slice(&self.sig);
         b
@@ -581,11 +678,17 @@ impl Invitation {
         if raw.len() < fixed + 32 + 64 {
             return None;
         }
-        if raw[0] != 0x02 {
+        if raw[0] != INV_FORMAT {
             return None;
         }
         let name_len = u16::from_le_bytes(raw[fixed - 2..fixed].try_into().ok()?) as usize;
-        let key_off = fixed + name_len;
+        let after_name = fixed + name_len;
+        // Always present, zero-length when there are no routes. ONE shape, so
+        // there is no second parse path to keep in step with the first.
+        let (routes, routes_len) = inv_routes_decode(raw.get(after_name..)?)?;
+        let key_off = after_name + routes_len;
+        // Exact, not "at least": a trailing byte would mean the reader and the
+        // signer disagree about where the signed region ends.
         if key_off + 32 + 64 != raw.len() {
             return None;
         }
@@ -602,7 +705,8 @@ impl Invitation {
             ephemeral: raw[19] == 1,
             enroll_pub: pubkey_from_seed(&enroll_private_key),
             enroll_private_key,
-            owner_name: String::from_utf8(raw[fixed..key_off].to_vec()).ok()?,
+            owner_name: String::from_utf8(raw[fixed..after_name].to_vec()).ok()?,
+            routes,
             sig,
         };
         Some(t)
@@ -615,11 +719,17 @@ impl Invitation {
         if raw.len() < fixed + 32 + 64 {
             return None;
         }
-        if raw[0] != 0x02 {
+        if raw[0] != INV_FORMAT {
             return None;
         }
         let name_len = u16::from_le_bytes(raw[fixed - 2..fixed].try_into().ok()?) as usize;
-        let key_off = fixed + name_len;
+        let after_name = fixed + name_len;
+        // Always present, zero-length when there are no routes. ONE shape, so
+        // there is no second parse path to keep in step with the first.
+        let (routes, routes_len) = inv_routes_decode(raw.get(after_name..)?)?;
+        let key_off = after_name + routes_len;
+        // Exact, not "at least": a trailing byte would mean the reader and the
+        // signer disagree about where the signed region ends.
         if key_off + 32 + 64 != raw.len() {
             return None;
         }
@@ -632,7 +742,8 @@ impl Invitation {
             ephemeral: raw[19] == 1,
             enroll_pub: raw[key_off..key_off + 32].try_into().ok()?,
             enroll_private_key: [0u8; 32],
-            owner_name: String::from_utf8(raw[fixed..key_off].to_vec()).ok()?,
+            owner_name: String::from_utf8(raw[fixed..after_name].to_vec()).ok()?,
+            routes,
             sig: raw[key_off + 32..].try_into().ok()?,
         };
         Some(t)
@@ -655,10 +766,27 @@ impl Invitation {
     /// it after enrollment, so this is for carrying the ceiling forward.
     pub fn to_auth_key(&self, owner_pub: &[u8; 32]) -> AuthKey {
         let kind_tag = if self.caps.iter().any(|c| c == "mount") { "join-device" } else { "join-person" };
+        // Carry the route SCOPE into the caps themselves: `route:10.0.0.0/24`
+        // rather than a bare `route`. The prefixes arrived inside the signed
+        // invitation, and this is the one conversion between the invitation and
+        // everything downstream, so scoping here means the ceiling that gets
+        // stored, displayed and enforced all say which prefix without any of
+        // them needing a second field to look up.
+        let caps = self
+            .caps
+            .iter()
+            .flat_map(|c| {
+                if c == super::capability::CAP_ROUTE {
+                    self.routes.iter().map(|r| format!("route:{r}")).collect::<Vec<_>>()
+                } else {
+                    vec![c.clone()]
+                }
+            })
+            .collect();
         AuthKey {
             issuer: *owner_pub,
             enroll_pub: self.enroll_pub,
-            caps: self.caps.clone(),
+            caps,
             audience: Vec::new(),
             expires: self.expires,
             reuse: self.reuse.clone(),
@@ -1155,6 +1283,7 @@ mod tests {
             Reuse::Once,
             false,
             "alice".into(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -1939,5 +2068,100 @@ mod invitation_ceiling_codec_tests {
     fn an_unencodable_capability_is_refused_not_silently_dropped() {
         let err = inv_caps_to_bitmask(&["not-a-real-capability".to_string()]);
         assert!(err.is_err(), "an unknown capability must not encode to a mask");
+    }
+}
+
+#[cfg(test)]
+mod route_ceiling_tests {
+    use super::*;
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    fn owner() -> Ed25519KeyPair {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap()
+    }
+    fn seed() -> [u8; 32] {
+        let rng = SystemRandom::new();
+        let mut s = [0u8; 32];
+        rng.fill(&mut s).unwrap();
+        s
+    }
+    fn mint(caps: Vec<String>, routes: Vec<String>) -> Result<Invitation> {
+        Invitation::mint(
+            &owner(), seed(), caps, 1_800_000_000, 86400,
+            Reuse::Once, false, "alice".into(), routes,
+        )
+    }
+
+    /// The whole point: a ceiling that cannot say WHICH prefix is not a scope,
+    /// and previously authorised every prefix a member chose, 0.0.0.0/0 included.
+    #[test]
+    fn a_route_ceiling_without_prefixes_is_refused_at_mint() {
+        let err = match mint(vec!["route".into()], vec![]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an unscoped route ceiling must not mint"),
+        };
+        assert!(err.contains("must name the prefixes"), "got: {err}");
+    }
+
+    #[test]
+    fn prefixes_without_the_capability_are_refused() {
+        assert!(matches!(mint(vec!["transfer".into()], vec!["10.0.0.0/8".into()]), Err(_)));
+    }
+
+    /// The prefixes must survive the round trip, or the scope is decorative.
+    #[test]
+    fn prefixes_survive_the_token_and_payload_round_trip() {
+        let inv = mint(vec!["route".into()], vec!["10.66.0.0/24".into(), "192.168.0.0/16".into()])
+            .unwrap();
+        let back = Invitation::from_token(&inv.to_token()).expect("token parses");
+        assert_eq!(back.routes, inv.routes);
+        let payload = Invitation::from_payload(&inv.to_payload()).expect("payload parses");
+        assert_eq!(payload.routes, inv.routes);
+    }
+
+    /// Host bits must not create two different signed ceilings for one network.
+    #[test]
+    fn prefixes_are_normalised_before_signing() {
+        let inv = mint(vec!["route".into()], vec!["10.66.0.5/24".into()]).unwrap();
+        assert_eq!(inv.routes, vec!["10.66.0.0/24".to_string()]);
+    }
+
+    /// The prefixes are inside the SIGNED domain: widening them must invalidate
+    /// the signature, or a member could grant itself an exit node.
+    #[test]
+    fn widening_the_prefixes_breaks_the_signature() {
+        let o = owner();
+        let owner_pub: [u8; 32] = o.public_key().as_ref().try_into().unwrap();
+        let inv = Invitation::mint(
+            &o, seed(), vec!["route".into()], 1_800_000_000, 86400,
+            Reuse::Once, false, "alice".into(), vec!["10.66.0.0/24".into()],
+        )
+        .unwrap();
+        assert!(inv.verify_against_owner(&owner_pub), "honest invitation verifies");
+
+        let mut tampered = inv.clone();
+        tampered.routes = vec!["0.0.0.0/0".to_string()];
+        assert!(
+            !tampered.verify_against_owner(&owner_pub),
+            "a member must not be able to widen its own ceiling to a default route"
+        );
+    }
+
+    /// to_auth_key is the one conversion into everything downstream, so the
+    /// scope has to survive it or enforcement sees a bare `route` again.
+    #[test]
+    fn the_auth_key_carries_the_scope_not_a_bare_route() {
+        let o = owner();
+        let owner_pub: [u8; 32] = o.public_key().as_ref().try_into().unwrap();
+        let inv = Invitation::mint(
+            &o, seed(), vec!["route".into()], 1_800_000_000, 86400,
+            Reuse::Once, false, "alice".into(), vec!["10.66.0.0/24".into()],
+        )
+        .unwrap();
+        let ak = inv.to_auth_key(&owner_pub);
+        assert!(ak.caps.contains(&"route:10.66.0.0/24".to_string()), "caps: {:?}", ak.caps);
+        assert!(!ak.caps.contains(&"route".to_string()), "a bare route would be unscoped");
     }
 }

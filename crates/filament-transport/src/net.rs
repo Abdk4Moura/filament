@@ -473,6 +473,16 @@ pub trait Transport: Send + Sync {
     fn remote_addr(&self) -> Option<std::net::SocketAddr> {
         None
     }
+    /// The underlying QUIC connection, when this transport has one.
+    ///
+    /// Exists so a caller can run its own authenticated exchange over the SAME
+    /// connection filament already established, rather than opening a second
+    /// path with its own trust story. `None` for a relay/DataChannel transport,
+    /// which has no QUIC connection: callers must treat that as "not available
+    /// here" and fall back, never as a reason to build an unauthenticated one.
+    fn quic_connection(&self) -> Option<quinn::Connection> {
+        None
+    }
     /// Smoothed round-trip time of the underlying connection in ms, when the
     /// transport measures one. Direct-QUIC reports quinn's estimate (free, no peer
     /// cooperation); `None` for transports that don't measure RTT themselves.

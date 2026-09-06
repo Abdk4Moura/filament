@@ -195,6 +195,61 @@ fn route_resource_nonce(normalized_cidr: &str) -> [u8; 32] {
 /// resource than the one the owner granted, and the grant would silently not
 /// apply. Host bits are masked off, text is trimmed, v6 is lowercased by
 /// `Ipv6Addr`'s own Display.
+
+/// Is `candidate` contained within any of `allowed`?
+///
+/// CONTAINMENT, not equality, and the direction matters more than anything else
+/// in this file. A ceiling of `10.0.0.0/8` permits advertising `10.66.0.0/24`,
+/// because the narrower prefix carries strictly less traffic. The reverse must
+/// be refused: a ceiling of `10.66.0.0/24` must NOT permit `10.0.0.0/8`, and a
+/// ceiling of anything must not permit `0.0.0.0/0`. Getting that backwards would
+/// let a member widen its own grant into an exit node, which is the exact hole
+/// this scoping exists to close.
+///
+/// Family-crossing never matches: a v4 ceiling cannot authorise a v6 prefix.
+pub fn cidr_within_any(candidate: &str, allowed: &[String]) -> bool {
+    let Some((c_net, c_len)) = parse_cidr(candidate) else { return false };
+    allowed.iter().any(|a| {
+        let Some((a_net, a_len)) = parse_cidr(a) else { return false };
+        // The candidate must be at least as SPECIFIC as the allowance, and sit
+        // inside it. `c_len >= a_len` is what refuses widening.
+        c_len >= a_len && same_family(&c_net, &a_net) && masked_eq(&c_net, &a_net, a_len)
+    })
+}
+
+fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (net, len) = s.trim().split_once('/')?;
+    let net: std::net::IpAddr = net.trim().parse().ok()?;
+    let len: u8 = len.trim().parse().ok()?;
+    let max = if net.is_ipv4() { 32 } else { 128 };
+    if len > max { return None; }
+    Some((net, len))
+}
+
+fn same_family(a: &std::net::IpAddr, b: &std::net::IpAddr) -> bool {
+    a.is_ipv4() == b.is_ipv4()
+}
+
+/// Compare the first `len` bits of two addresses of the same family.
+fn masked_eq(a: &std::net::IpAddr, b: &std::net::IpAddr, len: u8) -> bool {
+    // A zero-length prefix matches everything in its family, and shifting by the
+    // full width is undefined, so it is handled before any shift happens.
+    if len == 0 {
+        return true;
+    }
+    match (a, b) {
+        (std::net::IpAddr::V4(x), std::net::IpAddr::V4(y)) => {
+            let mask = u32::MAX << (32 - len);
+            (u32::from(*x) & mask) == (u32::from(*y) & mask)
+        }
+        (std::net::IpAddr::V6(x), std::net::IpAddr::V6(y)) => {
+            let mask = u128::MAX << (128 - len);
+            (u128::from(*x) & mask) == (u128::from(*y) & mask)
+        }
+        _ => false,
+    }
+}
+
 pub fn normalize_cidr(cidr: &str) -> Result<String> {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     let t = cidr.trim();
@@ -3206,5 +3261,58 @@ mod tests {
             evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
             Decision::Denied(_)
         ), "no shell grant → grants-only denies shell for same-owner device");
+    }
+}
+
+#[cfg(test)]
+mod route_scope_tests {
+    use super::cidr_within_any;
+
+    fn allow(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn a_narrower_prefix_is_inside_a_wider_allowance() {
+        assert!(cidr_within_any("10.66.0.0/24", &allow(&["10.0.0.0/8"])));
+        assert!(cidr_within_any("10.0.0.0/8", &allow(&["10.0.0.0/8"])), "exact match");
+    }
+
+    /// The hole this scoping exists to close: a member must not be able to widen
+    /// its own grant, and least of all into a default route.
+    #[test]
+    fn a_wider_prefix_is_refused() {
+        assert!(!cidr_within_any("10.0.0.0/8", &allow(&["10.66.0.0/24"])));
+        assert!(!cidr_within_any("0.0.0.0/0", &allow(&["10.66.0.0/24"])));
+        assert!(!cidr_within_any("0.0.0.0/0", &allow(&["10.0.0.0/8"])));
+    }
+
+    /// An exit node is legitimate only when the owner said 0.0.0.0/0.
+    #[test]
+    fn a_default_route_needs_a_default_route_allowance() {
+        assert!(cidr_within_any("0.0.0.0/0", &allow(&["0.0.0.0/0"])));
+        assert!(cidr_within_any("10.66.0.0/24", &allow(&["0.0.0.0/0"])), "0/0 allows anything v4");
+    }
+
+    #[test]
+    fn a_different_network_is_refused() {
+        assert!(!cidr_within_any("192.168.1.0/24", &allow(&["10.0.0.0/8"])));
+    }
+
+    #[test]
+    fn families_do_not_cross() {
+        assert!(!cidr_within_any("fd00::/8", &allow(&["0.0.0.0/0"])));
+        assert!(!cidr_within_any("10.0.0.0/8", &allow(&["::/0"])));
+        assert!(cidr_within_any("fd00:1::/32", &allow(&["fd00::/8"])));
+    }
+
+    #[test]
+    fn an_empty_allowance_permits_nothing() {
+        assert!(!cidr_within_any("10.0.0.0/24", &[]));
+    }
+
+    #[test]
+    fn malformed_input_is_refused_not_guessed_at() {
+        assert!(!cidr_within_any("not-a-cidr", &allow(&["10.0.0.0/8"])));
+        assert!(!cidr_within_any("10.0.0.0/33", &allow(&["10.0.0.0/8"])));
+        assert!(!cidr_within_any("10.0.0.0/24", &allow(&["garbage"])));
     }
 }
