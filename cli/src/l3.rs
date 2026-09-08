@@ -129,6 +129,59 @@ const IFNAME: &str = "filament0";
 /// One reader for every announce path, so a route cannot be forwarded by the
 /// kernel but omitted from the wire (or the reverse) because two call sites
 /// parsed the same setting differently.
+/// Is IPv6 switched off for new interfaces on this host?
+///
+/// Read from the two knobs that actually govern a freshly created device. A TUN
+/// filament just made inherits `default`, and `all` overrides everything, so
+/// either being set is enough to make the overlay address unassignable.
+pub fn ipv6_disabled() -> bool {
+    let read = |p: &str| std::fs::read_to_string(p).ok().map(|v| v.trim() == "1").unwrap_or(false);
+    read("/proc/sys/net/ipv6/conf/all/disable_ipv6")
+        || read("/proc/sys/net/ipv6/conf/default/disable_ipv6")
+}
+
+/// Turn a kernel-TUN failure into the thing the operator has to change.
+///
+/// WHY THIS EXISTS. The fallback message used to quote the failed command and
+/// stop: "no kernel TUN (ip addr add fdf1:.../128 dev filament0)". That names
+/// the symptom and hides every cause behind it, and one of those causes is
+/// silent and consequential: a host with IPv6 disabled cannot hold the overlay
+/// address at all, so it runs on the userspace plane forever while looking
+/// merely unlucky. It cost a full debugging session to notice, on a machine
+/// where the setting was a hardening default nobody had thought about since.
+///
+/// Pure so every branch is testable without breaking the host's networking.
+pub fn diagnose_tun_failure(err: &str, ipv6_off: bool) -> String {
+    let e = err.to_ascii_lowercase();
+    if ipv6_off || e.contains("ipv6 is disabled") {
+        return format!(
+            "IPv6 is disabled on this host (net.ipv6.conf.all.disable_ipv6=1), and filament's \
+             overlay address is an IPv6 ULA, so the kernel plane cannot hold it. Re-enable it \
+             with `sysctl -w net.ipv6.conf.all.disable_ipv6=0 \
+             net.ipv6.conf.default.disable_ipv6=0` (persist it in /etc/sysctl.d). Original error: {err}"
+        );
+    }
+    if e.contains("operation not permitted") || e.contains("permission denied") {
+        return format!(
+            "no permission to create a network device: filament needs CAP_NET_ADMIN (run as root, \
+             or grant the capability on the binary). Original error: {err}"
+        );
+    }
+    if e.contains("no such file or directory") && e.contains("tun") {
+        return format!(
+            "/dev/net/tun is missing: load the tun module (`modprobe tun`) or run somewhere it is \
+             available. Original error: {err}"
+        );
+    }
+    if e.contains("busy") {
+        return format!(
+            "another process already holds {IFNAME}: only one filament per host can own the kernel \
+             device. Original error: {err}"
+        );
+    }
+    err.to_string()
+}
+
 pub fn advertised_prefixes() -> Vec<String> {
     crate::settings::get_str("advertise-routes", None)
         .unwrap_or_default()
@@ -226,8 +279,14 @@ impl L3 {
                 Ok(t) => (t, None),
                 Err(e) => {
                     crate::ui::say(&format!(
-                        "  {} no kernel TUN ({e}); using the userspace overlay (zero privilege)",
-                        crate::ui::paint(crate::ui::Tone::Brand, "●")
+                        "  {} no kernel TUN: {}",
+                        crate::ui::paint(crate::ui::Tone::Brand, "●"),
+                        diagnose_tun_failure(&e.to_string(), ipv6_disabled())
+                    ));
+                    crate::ui::say(&format!(
+                        "    {} using the userspace overlay (zero privilege): no kernel routes, \
+                         no host firewall, and WireGuard cannot be used",
+                        crate::ui::paint(crate::ui::Tone::Dim, "·")
                     ));
                     open_netstack()?
                 }
@@ -1205,7 +1264,50 @@ fn dest_ip(pkt: &[u8]) -> Option<IpAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dest_ip, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
+
+    /// The failure that cost a whole session: a hardening default nobody had
+    /// looked at since, surfaced only as a quoted `ip addr add`.
+    #[test]
+    fn a_disabled_ipv6_stack_is_named_and_not_just_quoted() {
+        let raw = "ip addr add fdf1::1/128 dev filament0: Error: ipv6: address disabled.";
+        let d = diagnose_tun_failure(raw, true);
+        assert!(d.contains("IPv6 is disabled"), "must name the cause: {d}");
+        assert!(d.contains("disable_ipv6=0"), "must say how to fix it: {d}");
+        assert!(d.contains(raw), "must keep the original error: {d}");
+    }
+
+    /// Detected from the error text even when the sysctls read false, because
+    /// a per-device setting can disable it without the global ones saying so.
+    #[test]
+    fn the_error_text_alone_is_enough_to_name_ipv6() {
+        let d = diagnose_tun_failure("Error: ipv6: IPv6 is disabled on this device.", false);
+        assert!(d.contains("IPv6 is disabled"));
+    }
+
+    #[test]
+    fn privilege_and_module_and_busy_each_name_their_own_fix() {
+        assert!(
+            diagnose_tun_failure("TUNSETIFF: Operation not permitted", false)
+                .contains("CAP_NET_ADMIN")
+        );
+        assert!(
+            diagnose_tun_failure("open /dev/net/tun: No such file or directory", false)
+                .contains("modprobe tun")
+        );
+        assert!(
+            diagnose_tun_failure("TUNSETIFF filament0: Device or resource busy", false)
+                .contains("already holds")
+        );
+    }
+
+    /// An unrecognised failure must pass through unchanged rather than be
+    /// dressed up as a cause we did not identify.
+    #[test]
+    fn an_unknown_failure_is_passed_through_verbatim() {
+        let raw = "something nobody has seen before";
+        assert_eq!(diagnose_tun_failure(raw, false), raw);
+    }
+    use super::{diagnose_tun_failure, dest_ip, prefix_contains, render_hosts, sanitize_host, RouteTable, Transport};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::Arc;
 
