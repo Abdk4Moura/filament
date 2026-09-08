@@ -35,6 +35,15 @@ pub const WG_DEV: &str = "filament-wg";
 const MAX_IFNAME: usize = 15;
 
 pub fn usable() -> bool {
+    // A KERNEL TUN IS A PRECONDITION. A node that fell back to the userspace
+    // overlay has no kernel device for the overlay address, so configuring a
+    // WireGuard peer against it produces a half-built interface: observed as
+    // "ip addr add ... /128" with no address in front of the prefix, because the
+    // address it would have used does not exist. wg tools and the module being
+    // present says nothing about that.
+    if !std::path::Path::new("/sys/class/net/filament0").exists() {
+        return false;
+    }
     debug_assert!(WG_DEV.len() <= MAX_IFNAME, "wg device name too long for Linux");
     if Command::new("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
         return false;

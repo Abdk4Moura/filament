@@ -625,10 +625,14 @@ impl L3 {
     }
 
     /// The overlay address a given link's peer holds, if it is on the plane.
-    pub fn peer_overlay_of(&self, pid: &str) -> Option<IpAddr> {
-        // Blocking lock: called from the control-message path, which is already
-        // inside the daemon's single event loop.
-        let by_pid = self.by_pid.try_lock().ok()?;
+    ///
+    /// AWAITS the lock. This used `try_lock`, which turns ordinary contention
+    /// into `None`, and `None` here is indistinguishable from "that peer is not
+    /// on the overlay". The observable result was a WireGuard key announcement
+    /// rejected with "no direct endpoint or overlay address yet" for a peer that
+    /// was plainly on the mesh, intermittently, depending on who held the lock.
+    pub async fn peer_overlay_of(&self, pid: &str) -> Option<IpAddr> {
+        let by_pid = self.by_pid.lock().await;
         by_pid.get(pid)?.iter().find(|i| i.is_ipv6()).copied()
     }
 
