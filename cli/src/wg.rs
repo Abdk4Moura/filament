@@ -176,7 +176,12 @@ pub fn configure_peer(
     // second peer would otherwise fail here with "File exists" and take the
     // whole establish down with it.
     if let Err(e) = ip(&["addr", "add", addr_cidr, "dev", dev]) {
-        if !e.to_string().contains("File exists") {
+        // BOTH wordings. iproute2 says "File exists" for IPv4 and "address
+        // already assigned" for IPv6, and filament's overlay is an IPv6 ULA, so
+        // matching only the IPv4 phrasing meant every retry and every second
+        // peer failed here and took the whole adopt down with it.
+        let msg = e.to_string();
+        if !msg.contains("File exists") && !msg.contains("already assigned") {
             return Err(e).context("ip addr add on wg dev");
         }
     }
@@ -370,6 +375,20 @@ pub fn release_attempt(peer: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// iproute2 reports an existing address differently per family, and the
+    /// overlay is IPv6, so matching only the IPv4 wording broke every retry.
+    #[test]
+    fn both_families_report_an_existing_address_as_benign() {
+        let v4 = "ip addr add 10.0.0.1/32 dev x: RTNETLINK answers: File exists";
+        let v6 = "ip addr add fdf1::1/128 dev x: Error: ipv6: address already assigned.";
+        for m in [v4, v6] {
+            assert!(
+                m.contains("File exists") || m.contains("already assigned"),
+                "not treated as benign: {m}"
+            );
+        }
+    }
 
     /// The probe name being one character over the Linux limit made usable()
     /// return false on every machine, which disabled WireGuard silently: no
