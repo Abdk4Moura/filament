@@ -11,6 +11,14 @@
 #
 # Each daemon runs in a network namespace because l3::ifname() is a const, so a
 # second daemon on a host that already runs one cannot get its own kernel TUN.
+#
+# AND THE NAMESPACE'S WIREGUARD PORT IS FORWARDED IN. An earlier version of this
+# rig gave the namespaces outbound NAT and nothing else, so WireGuard's port had
+# no inbound mapping and kernel-to-kernel could never handshake. I read that as a
+# property of the system and reported it as one; it was a property of this file.
+# Both machines have PUBLIC IPs, and plain kernel WireGuard between them
+# handshakes in seconds. The DNAT below restores that, so the namespace behaves
+# like the host it stands in for instead of like a machine behind CGNAT.
 set -uo pipefail
 # PINNED OUT OF THE SHARED CARGO_TARGET_DIR: a concurrent build in another
 # checkout has silently replaced a rig binary mid-run before, which makes every
@@ -61,6 +69,7 @@ cleanup() {
   iptables -t nat -D POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE 2>/dev/null
   iptables -D FORWARD -i srr-h -j ACCEPT 2>/dev/null
   iptables -D FORWARD -o srr-h -j ACCEPT 2>/dev/null
+  iptables -t nat -D PREROUTING -p udp --dport 51820 -j DNAT --to-destination 10.77.0.2:51820 2>/dev/null
   rm -rf /etc/netns/srr
   rsh "$KILL_REMOTE
        ip netns del srp 2>/dev/null; ip netns del srlan 2>/dev/null
@@ -68,6 +77,7 @@ cleanup() {
        iptables -t nat -D POSTROUTING -s 10.88.0.0/24 ! -o srp-h -j MASQUERADE 2>/dev/null
        iptables -D FORWARD -i srp-h -j ACCEPT 2>/dev/null
        iptables -D FORWARD -o srp-h -j ACCEPT 2>/dev/null
+       iptables -t nat -D PREROUTING -p udp --dport 51820 -j DNAT --to-destination 10.88.0.2:51820 2>/dev/null
        rm -rf $RDIR /etc/netns/srp; echo remote-clean" 120 >/dev/null 2>&1
   echo "  local and remote state removed"
 }
@@ -95,6 +105,9 @@ mkdir -p /etc/netns/srr && echo "nameserver 1.1.1.1" > /etc/netns/srr/resolv.con
 iptables -t nat -A POSTROUTING -s 10.77.0.0/24 ! -o srr-h -j MASQUERADE
 iptables -I FORWARD 1 -i srr-h -j ACCEPT
 iptables -I FORWARD 1 -o srr-h -j ACCEPT
+# WireGuard's registered port, forwarded into the namespace: this is what makes
+# the endpoint reachable, as it would be on a host with a public IP.
+iptables -t nat -A PREROUTING -p udp --dport 51820 -j DNAT --to-destination 10.77.0.2:51820
 ip netns exec srr getent hosts api.filament.autumated.com >/dev/null 2>&1 \
   && ok "receiver namespace has internet" || { echo "SETUP: no internet in receiver ns"; exit 2; }
 
@@ -110,6 +123,7 @@ rsh "sysctl -qw net.ipv4.ip_forward=1
      iptables -t nat -A POSTROUTING -s 10.88.0.0/24 ! -o srp-h -j MASQUERADE
      iptables -I FORWARD 1 -i srp-h -j ACCEPT
      iptables -I FORWARD 1 -o srp-h -j ACCEPT
+     iptables -t nat -A PREROUTING -p udp --dport 51820 -j DNAT --to-destination 10.88.0.2:51820
      mkdir -p $RDIR" 180 >/dev/null
 RNET=$(rsh "ip netns exec srp getent hosts api.filament.autumated.com >/dev/null 2>&1 && echo OK || echo FAIL" 90 | tail -1)
 [ "$RNET" = "OK" ] && ok "router namespace has internet" || { echo "SETUP: no internet in router ns"; exit 2; }
@@ -170,8 +184,8 @@ done
 say "4. wait for the link to go direct and the reconcile to fire"
 # The reconcile ticks every 10s and only acts on a DIRECT link, so allow several
 # ticks plus the relay-to-direct upgrade.
-for i in $(seq 1 20); do
-  ip netns exec srr wg show filament-wg >/dev/null 2>&1 && break
+for i in $(seq 1 30); do
+  ip netns exec srr wg show filament-wg latest-handshakes 2>/dev/null | awk '$2>0' | grep -q . && break
   sleep 8
 done
 grep -E "WireGuard|DIRECT-CONNECT" "$W/rtr.log" | tail -3 | sed 's/^/    /'

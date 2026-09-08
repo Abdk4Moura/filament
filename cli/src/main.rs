@@ -20430,10 +20430,10 @@ async fn recv_cmd(
                         let peer_pub = v["pubkey"].as_str().unwrap_or_default().to_string();
                         let peer_port = v["port"].as_u64().unwrap_or(0) as u16;
                         let underlay = conn.transport_of(&pid).and_then(|t| t.remote_addr());
-                        let peer_overlay = l3
-                            .as_ref()
-                            .map(|l| l.peer_overlay_of(&pid))
-                            .unwrap_or(None);
+                        let peer_overlay = match l3.as_ref() {
+                            Some(l) => l.peer_overlay_of(&pid).await,
+                            None => None,
+                        };
                         let ours = l3
                             .as_ref()
                             .and_then(|l| l.my_addr())

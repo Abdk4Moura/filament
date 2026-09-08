@@ -35,6 +35,15 @@ pub const WG_DEV: &str = "filament-wg";
 const MAX_IFNAME: usize = 15;
 
 pub fn usable() -> bool {
+    // A KERNEL TUN IS A PRECONDITION. A node that fell back to the userspace
+    // overlay has no kernel device for the overlay address, so configuring a
+    // WireGuard peer against it produces a half-built interface: observed as
+    // "ip addr add ... /128" with no address in front of the prefix, because the
+    // address it would have used does not exist. wg tools and the module being
+    // present says nothing about that.
+    if !std::path::Path::new("/sys/class/net/filament0").exists() {
+        return false;
+    }
     debug_assert!(WG_DEV.len() <= MAX_IFNAME, "wg device name too long for Linux");
     if Command::new("wg").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
         return false;
@@ -101,7 +110,11 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
     // `wg set <dev> private-key <path>`: feed the key on stdin via /dev/stdin so it
     // never lands on disk.
     let mut child = Command::new("wg")
-        .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "0"])
+        // WireGuard's registered port, not an ephemeral one. A port that
+        // changes every start cannot be port-forwarded, and a forwardable port
+        // is the difference between a peer being directly reachable and having
+        // to fall back. Falls back to ephemeral if it is already taken.
+        .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "51820"])
         .stdin(Stdio::piped())
         .spawn()
         .context("spawn `wg set private-key`")?;
@@ -119,6 +132,20 @@ pub fn create_iface(dev: &str, privkey: &str) -> Result<u16> {
     // port the kernel actually assigned (down interfaces always report 0).
     ip(&["link", "set", "dev", dev, "up"]).with_context(|| format!("bring {dev} up"))?;
 
+    // If 51820 was taken the set above failed; retry on an ephemeral port so a
+    // second filament on the same host still works, just unforwardably.
+    if Command::new("wg").args(["show", dev, "listen-port"]).output().map(|o| !o.status.success()).unwrap_or(true) {
+        let mut child = Command::new("wg")
+            .args(["set", dev, "private-key", "/dev/stdin", "listen-port", "0"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("spawn wg set (ephemeral port)")?;
+        if let Some(mut si) = child.stdin.take() {
+            use std::io::Write as _;
+            let _ = si.write_all(privkey.as_bytes());
+        }
+        let _ = child.wait();
+    }
     let out = Command::new("wg").args(["show", dev, "listen-port"]).output().context("wg show listen-port")?;
     if !out.status.success() {
         bail!("wg show listen-port failed: {}", String::from_utf8_lossy(&out.stderr).trim());
@@ -149,7 +176,12 @@ pub fn configure_peer(
     // second peer would otherwise fail here with "File exists" and take the
     // whole establish down with it.
     if let Err(e) = ip(&["addr", "add", addr_cidr, "dev", dev]) {
-        if !e.to_string().contains("File exists") {
+        // BOTH wordings. iproute2 says "File exists" for IPv4 and "address
+        // already assigned" for IPv6, and filament's overlay is an IPv6 ULA, so
+        // matching only the IPv4 phrasing meant every retry and every second
+        // peer failed here and took the whole adopt down with it.
+        let msg = e.to_string();
+        if !msg.contains("File exists") && !msg.contains("already assigned") {
             return Err(e).context("ip addr add on wg dev");
         }
     }
@@ -238,8 +270,13 @@ pub async fn adopt_peer(
             // So an unreachable WireGuard endpoint simply means this peer stays
             // on the plane it was already on.
             let _ = remove_peer(&peer_pub_owned);
+            // Release the claim so a later tick RETRIES. A peer can become
+            // reachable after the fact (a port-forward appears, a NAT mapping
+            // opens), and without this the first failure was permanent for the
+            // life of the process.
+            release_attempt(&peer_overlay_owned);
             crate::ui::debug(&format!(
-                "  wg: {peer_overlay_owned} is not reachable for a direct tunnel; staying on the QUIC plane"
+                "  wg: {peer_overlay_owned} is not reachable for a direct tunnel; staying on the QUIC plane, will retry"
             ));
         }
     });
@@ -338,6 +375,20 @@ pub fn release_attempt(peer: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// iproute2 reports an existing address differently per family, and the
+    /// overlay is IPv6, so matching only the IPv4 wording broke every retry.
+    #[test]
+    fn both_families_report_an_existing_address_as_benign() {
+        let v4 = "ip addr add 10.0.0.1/32 dev x: RTNETLINK answers: File exists";
+        let v6 = "ip addr add fdf1::1/128 dev x: Error: ipv6: address already assigned.";
+        for m in [v4, v6] {
+            assert!(
+                m.contains("File exists") || m.contains("already assigned"),
+                "not treated as benign: {m}"
+            );
+        }
+    }
 
     /// The probe name being one character over the Linux limit made usable()
     /// return false on every machine, which disabled WireGuard silently: no
