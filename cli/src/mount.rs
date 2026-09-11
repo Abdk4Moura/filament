@@ -64,7 +64,7 @@ fn delete_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn generate_mount_id() -> String {
+fn generate_mount_id() -> String {
     use std::io::Read;
     let mut buf = [0u8; 4];
     // Use /dev/urandom for true randomness.
@@ -102,7 +102,7 @@ pub(crate) struct MountEntry {
     pub(crate) created: String,
 }
 
-pub(crate) fn load_mounts() -> Vec<MountEntry> {
+fn load_mounts() -> Vec<MountEntry> {
     let path = mounts_path();
     let Ok(data) = std::fs::read_to_string(&path) else {
         return Vec::new();

@@ -2054,7 +2054,7 @@ async fn pump_initiator(mut rx: mpsc::UnboundedReceiver<Ev>, mux: Arc<Mux>) {
 /// the inbound pipe is wired. Returns the registered receiver. The initiator
 /// registers its OWN pipe up front so a server-speaks-first protocol (ssh
 /// banner) can't lose bytes.
-pub(crate) async fn open_stream(
+async fn open_stream(
     mux: &Arc<Mux>,
     rport: u16,
 ) -> Result<(u32, mpsc::Receiver<PipeItem>)> {
@@ -2159,7 +2159,7 @@ pub(crate) async fn serve_verified_stream<S: AsyncRead + AsyncWrite + Unpin + Se
 /// server capabilities, then sends `mount-cap-ack` to confirm the negotiated
 /// protocol. Returns sid + inbound pipe + the server's MountCaps.
 /// No sshd, no sshfs.
-pub(crate) async fn open_mount_stream(
+async fn open_mount_stream(
     mux: &Arc<Mux>,
     root: &str,
 ) -> Result<(u32, mpsc::Receiver<PipeItem>, crate::mount_proto::MountCaps)> {
@@ -2206,7 +2206,7 @@ pub(crate) async fn open_mount_stream(
 /// pipe; the caller bridges with `serve_opened_stream` and relays `pty-resize` by
 /// the sid. `session` keys the peer's persistent PTY so a reconnect reattaches.
 /// The remote acceptor serves this exactly as a cold `pty-open`.
-pub(crate) async fn open_pty_stream(
+async fn open_pty_stream(
     mux: &Arc<Mux>,
     session: &str,
     cols: u16,

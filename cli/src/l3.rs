@@ -1129,7 +1129,7 @@ fn prefix_contains(net: IpAddr, len: u8, addr: IpAddr) -> bool {
 /// /32 or /128, so "most specific wins" is the single rule; keeping hosts separate
 /// is a performance and blast-radius choice, not a semantic one.
 #[derive(Default)]
-pub(crate) struct RouteTable {
+struct RouteTable {
     hosts: HashMap<IpAddr, Arc<dyn Transport>>,
     /// (network, prefix_len, via). Small and read on every packet that misses the
     /// host map, so a linear longest-match scan is the right shape until a node
