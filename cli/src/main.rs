@@ -136,6 +136,26 @@ mod runtime_support;
 pub(crate) use runtime_support::{add_pending_request, is_light_command, next_ev, read_owner_only_file, recover_identity, resolve_for_kind, spawn_session_pumps, stop_managed_service};
 #[cfg(any(target_os = "linux", all(target_os = "macos", feature = "mount-macos"), all(target_os = "windows", feature = "mount-windows")))]
 pub(crate) use runtime_support::unmount_fuse;
+/// L2 allow/open policy.
+mod l2_policy;
+pub(crate) use l2_policy::{l2_open_allowed, l2_target_allowed};
+#[cfg(test)]
+pub(crate) use l2_policy::l2_target_allowed_in;
+/// Owner-only files, pidfile and small parsers.
+mod file_io;
+pub(crate) use file_io::{parse_duration_secs, parse_invitation, parse_mint_ttl, pidfile, read_owner_only_fd, write_owner_only_fd, write_owner_only_file, write_pidfile};
+/// Shared limits, wire constants and small types.
+mod shared_defs;
+pub(crate) use shared_defs::{DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, HEAD_BYTES, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, RevokeRecheck, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
+/// Shell authority helpers and daemon/service probes.
+mod shell_support;
+pub(crate) use shell_support::{any_shell_grant, daemon_alive, daemon_running, require_shell_owner_ack, service_manager_for_pid, shell_argv, shell_grant_names, shell_root_note};
+#[cfg(test)]
+pub(crate) use shell_support::service_manager_for_cgroup;
+#[cfg(test)]
+pub(crate) use shell_support::shell_grant_names_at;
+#[cfg(test)]
+pub(crate) use shell_support::any_shell_grant_at;
 use enrollment::{enroll_cmd};
 /// `filament up --install`: the managed-service unit, per platform.
 mod install_service;
@@ -208,7 +228,7 @@ mod local;
 mod ui;
 mod fleet_ui;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use net::{Ev, Transport};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -216,8 +236,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
@@ -233,14 +253,6 @@ use zeroize::Zeroizing;
 // files). Loop until the whole buffer lands; return Err on a real failure so the caller
 // can react instead of silently dropping bytes.
 
-const DEFAULT_SERVER: &str = "https://api.filament.autumated.com";
-/// C7: content identity for resume, sha256 over the first 256 KiB.
-const HEAD_BYTES: u64 = 256 * 1024;
-/// C4/C6/C21: how long we wait for a vanished peer to rejoin. UNWARNED is the
-/// blind default; a peer that announced `brb` (e.g. the browser opening a
-/// mobile file picker suspends the whole tab) gets its declared ttl instead,
-/// informed waits are both longer when promised and shorter when not.
-const REJOIN_WINDOW: Duration = Duration::from_secs(120);
 fn rejoin_unwarned() -> Duration {
     std::env::var("FILAMENT_REJOIN_SECS") // test knob (gate 15)
         .ok()
@@ -258,8 +270,6 @@ fn quiet_exit_window() -> Duration {
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(10))
 }
-/// C3/C4: connection (re)establishment attempts before failing honestly.
-const MAX_ATTEMPTS: u32 = 5;
 
 /// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
 /// gates (runner/sim/*) to drive deterministic failure modes. They are compiled
@@ -423,25 +433,12 @@ mod test_hooks {
     #[inline] pub fn corrupt_recv_target() -> Option<String> { None }
 }
 
-/// P1 (GAP-4): process-global "the user forbade relay" flag, set once from the
-/// `--no-relay` CLI flag at startup. Read by `Conn::relay_forbidden` so the
-/// stall ladder knows, at `Rung::Exhausted`, whether it MAY auto-escalate to a
-/// TURN relay (the never-flaky promise) or must FAIL CLEANLY (the hard
-/// direct-only promise the user asked for). A global rather than a threaded
-/// param so the many `Conn` construction sites stay untouched; written exactly
-/// once, before the runtime spawns any worker (mirrors the `FILAMENT_NAME`
-/// single-threaded-set pattern in `run`).
-static NO_RELAY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// True when the user passed `--no-relay`: relay fallback is forbidden.
 fn relay_forbidden() -> bool {
     NO_RELAY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Set once in `run`, before any worker spawns, from the global `--no-interactive`
-/// flag (mirrors NO_RELAY). The guided code entry NEVER opens when this is set.
-static NO_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static FORCE_INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// App-wide UI capability resolved once from flags + env. Controls how every
 /// command renders: interactive vs steer, human vs JSON, color vs plain.
@@ -545,30 +542,8 @@ fn relay_banner() -> String {
     )
 }
 
-/// P0 (GAP-1): stall-correction ladder bound. Attempt 0 is rung (a) (resume on
-/// the same transport); attempts 1..STALL_MAX_REPAIRS are rung (c) (repair the
-/// transport in place, a fresh direct dial / ICE-restart). At the ceiling the
-/// ladder is exhausted (P1's relay fallback is the next rung, a clean hook).
-/// Slightly above MAX_ATTEMPTS because a fresh direct dial needs BOTH ends to
-/// re-offer within one race budget, which can take a couple of aligned ticks;
-/// a re-dial is cheap, so a few extra are worth a deterministic recovery.
-const STALL_MAX_REPAIRS: u32 = 5;
 
-/// P5 (GAP-6): reserved sid for the relay->direct upgrade VERIFY heartbeat. A
-/// real DATA frame on this sid lets the prober confirm the new direct path is
-/// actually MOVING data (not just connected) before cutting over. It lives in the
-/// non-L2 sid space and far above any file-transfer counter, so it never collides;
-/// the receiver has no `by_sid` entry for it, so the inbound chunk is dropped
-/// harmlessly (after stamping inbound activity, which is the point: symmetric
-/// verify). See `Conn::judge_upgrade_standby`.
-const VERIFY_PROBE_SID: u32 = 0x7FFF_FFFF;
 
-/// P4 (GAP-5): how many times the receiver re-requests a transfer whose
-/// whole-file sha256 didn't match on completion (truncated/corrupt) before it
-/// gives up and fails CLEARLY (kept partial, no silent bad file). A transient
-/// truncation recovers on the first resume; this bound only catches a payload
-/// that is genuinely, repeatedly corrupt, never a hang, never a silent accept.
-const MAX_VERIFY_FAILS: u32 = 3;
 
 /// Gate-18 Mode B: the single predicate that decides whether a stuck/lost link
 /// should be DROPPED (transfer is complete; nothing left to fetch) rather than
@@ -804,15 +779,6 @@ fn head_hash(path: &Path) -> Option<String> {
 }
 
 
-/// Sidecar metadata for a partial receive (`<name>.part.meta`).
-/// JSON {"size":N,"head":"hex","full":"hex"}; legacy files hold a bare size string.
-/// `full` is the whole-file sha256 the sender offered (P4), persisted so a
-/// resume after a process restart can still verify-on-completion.
-struct PartMeta {
-    size: u64,
-    head: Option<String>,
-    full: Option<String>,
-}
 
 impl PartMeta {
     fn load(path: &Path) -> Option<PartMeta> {
@@ -881,18 +847,6 @@ fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
 
 
 
-/// The three clocks that can end a delegated device's recognition. The binding
-/// one is whichever expires first; the state display names it so "X time left"
-/// never lies about which bound is actually in charge.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DeadlineClock {
-    /// The device certificate's own expiry (`verify` fails past it).
-    CertExpiry,
-    /// The signed absolute stop (`not_after` from the auth key).
-    AbsoluteStop,
-    /// The liveness budget (`last_seen + effective_max_offline`).
-    LivenessBudget,
-}
 
 
 
@@ -942,19 +896,6 @@ fn in_binding(
 
 
 
-/// Re-checks a live session's authorization on a bounded interval, so a revoked
-/// peer loses a long-lived stream (mount, pty, l2) without re-reading the device
-/// store per operation. The interval-and-verdict decision lives here, once,
-/// instead of being re-derived in each serve loop where it can drift (the shape
-/// of #226 and #228).
-///
-/// The caller MUST deliver the denial in a form its client can act on, then
-/// close. Returning silently is not enough: a client that just stops receiving
-/// parks where no signal lands (see #235's FUSE D-state).
-pub(crate) struct RevokeRecheck {
-    last: std::time::Instant,
-    interval: std::time::Duration,
-}
 
 impl RevokeRecheck {
     pub(crate) fn new() -> Self {
@@ -984,14 +925,7 @@ impl RevokeRecheck {
 }
 
 
-/// Terminal principal states written to `principalState` on a device record.
-const PRINCIPAL_STATE_LAPSED: &str = "lapsed";
-const PRINCIPAL_STATE_REVOKED: &str = "revoked";
 
-/// Display name for a fleet link before its certificate names it. Contains a
-/// space and a colon so it cannot collide with a device petname, and it is never
-/// used as a capability key regardless.
-const FLEET_LINK_NAME: &str = "fleet: unverified";
 
 
 /// The enrollment refusal for a prior record of the same device_pub, if any.
@@ -1054,93 +988,14 @@ fn apply_peer_identity(arr: &mut Vec<Value>, name: &str, peer_cert: &identity::D
 
 
 
-/// True if ANY known device has been granted the `shell` capability. The daemon
-/// uses this to switch L2/shell ON even for a plain `filament up`: otherwise
-/// `filament grant <dev> shell` writes a grant the running daemon never consults
-/// (l2_enabled was set only by --shell/--shell-only at startup), so the grant
-/// silently did nothing and `filament shell --ssh` timed out. With this, a grant alone is
-/// enough; the per-device cap gate (auto_allows || device_allows) still denies
-/// every non-granted device, so this does NOT broaden access, it only honors the
-/// grants that already exist.
-fn any_shell_grant() -> bool {
-    !shell_grant_names_at(&devices_path()).is_empty()
-}
 
-fn any_shell_grant_at(path: &Path) -> bool {
-    !shell_grant_names_at(path).is_empty()
-}
 
-fn shell_grant_names() -> Vec<String> {
-    shell_grant_names_at(&devices_path())
-}
 
-fn shell_grant_names_at(path: &Path) -> Vec<String> {
-    let Ok(raw) = std::fs::read_to_string(path) else { return Vec::new() };
-    let Ok(arr) = serde_json::from_str::<Value>(&raw) else { return Vec::new() };
-    let mut names: Vec<String> = arr.as_array().into_iter().flatten()
-        .filter(|d| d.get("caps").and_then(|c| c.as_array())
-            .map(|list| list.iter().any(|c| c.as_str() == Some("shell")))
-            .unwrap_or(false))
-        .filter_map(|d| d.get("name").and_then(|n| n.as_str()).map(String::from))
-        .collect();
-    names.sort();
-    names
-}
 
-/// Whether to serve an `l2-open` (TCP tunnel / ssh data link) from a peer.
-/// Blanket modes (`--shell` / `--shell-only` / `FILAMENT_L2`) keep their existing
-/// trusted-gated behavior. But when L2 is on ONLY because some device was
-/// `grant`ed shell, the OPENING peer must itself hold that grant: otherwise a
-/// grant for ONE device would let EVERY trusted device open loopback tunnels.
-/// `trusted` is still required upstream; this is the additional per-device gate.
-fn l2_open_allowed(blanket: bool, peer_has_shell: bool) -> bool {
-    blanket || peer_has_shell
-}
 
-/// Opt-in non-loopback forward allowlist: `{config_dir}/l2-allow.json`. Absent or
-/// malformed file => no entries => loopback-only (the default SSRF posture). Lets
-/// an operator deliberately turn the daemon into a gateway to SPECIFIC hosts for
-/// SPECIFIC devices, without opening blanket SSRF. Shape:
-///   { "laptop": ["10.0.0.5:5432", "192.168.1.10:*"], "*": ["db.internal:5432"] }
-/// A "*" device key applies to any authorized device; "host:*" allows any port.
-fn l2_allow_path() -> PathBuf {
-    devices_path().with_file_name("l2-allow.json")
-}
 
-fn l2_allow_load() -> Value {
-    std::fs::read_to_string(l2_allow_path())
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or(Value::Null)
-}
 
-/// True if `allow` lists `host:port` (or `host:*`) for `device` or for "*". Pure,
-/// so the matching logic is unit-testable without the filesystem. Host match is
-/// case-insensitive; the device key must match the proven `verified_name` exactly
-/// (or be "*").
-fn l2_target_allowed_in(allow: &Value, device: &str, host: &str, port: u16) -> bool {
-    let matches = |list: &Value| -> bool {
-        list.as_array()
-            .map(|a| {
-                a.iter().any(|e| {
-                    let s = e.as_str().unwrap_or("");
-                    match s.rsplit_once(':') {
-                        Some((h, "*")) => h.eq_ignore_ascii_case(host),
-                        Some((h, p)) => {
-                            h.eq_ignore_ascii_case(host) && p.parse::<u16>().ok() == Some(port)
-                        }
-                        None => false,
-                    }
-                })
-            })
-            .unwrap_or(false)
-    };
-    allow.get(device).map(&matches).unwrap_or(false) || allow.get("*").map(&matches).unwrap_or(false)
-}
 
-fn l2_target_allowed(device: &str, host: &str, port: u16) -> bool {
-    l2_target_allowed_in(&l2_allow_load(), device, host, port)
-}
 
 
 
@@ -1259,11 +1114,6 @@ fn path_within_canonical(root: &Path, path: &Path) -> bool {
     !root_c.as_os_str().is_empty() && path_c.starts_with(&root_c)
 }
 
-/// True when an `up` daemon is currently running (drives the "takes effect on
-/// next up" hint after a settings change).
-pub(crate) fn daemon_running() -> bool {
-    daemon_alive().is_some()
-}
 
 /// Minimal `YYYY-MM-DD HH:MM` UTC stamp (civil-from-days; avoids chrono).
 fn chrono_now() -> String {
@@ -1284,38 +1134,11 @@ fn chrono_now() -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
-fn pidfile() -> PathBuf {
-    devices_path().with_file_name("up.pid")
-}
 fn up_log() -> PathBuf {
     devices_path().with_file_name("up.log")
 }
 
-/// Record the daemon's identity beside its pid. A pid alone can be recycled and
-/// a name substring can lie, so the pidfile carries the executable path the
-/// daemon started from; `daemon_alive` confirms it against the live process.
-fn write_pidfile() -> Result<()> {
-    let pid = std::process::id();
-    let exe = std::env::current_exe()?;
-    std::fs::write(pidfile(), format!("{pid}\n{}\n", exe.display()))?;
-    Ok(())
-}
 
-fn daemon_alive() -> Option<u32> {
-    let raw = std::fs::read_to_string(pidfile()).ok()?;
-    let mut lines = raw.lines();
-    let pid: u32 = lines.next()?.trim().parse().ok()?;
-    // The executable the daemon recorded when it wrote the pidfile. A pidfile
-    // from before this fix records only the pid; the daemon and this CLI are
-    // the same installed binary, so fall back to our own executable.
-    let recorded = lines.next().map(str::trim).filter(|s| !s.is_empty()).map(PathBuf::from);
-    let expected = recorded.or_else(|| std::env::current_exe().ok())?;
-    // Identify the process by its executable path, never by matching a name.
-    // process_exe_path returns None for a dead or recycled pid, which is
-    // exactly the case the pidfile alone cannot detect.
-    let live = platform::process_exe_path(pid)?;
-    same_executable(&live, &expected).then_some(pid)
-}
 
 /// Compare two executable paths the way daemon identity needs: symlinks
 /// resolved, and the " (deleted)" suffix Linux appends to `/proc/<pid>/exe`
@@ -1334,17 +1157,6 @@ fn same_executable(a: &Path, b: &Path) -> bool {
     a.canonicalize().unwrap_or(a) == b.canonicalize().unwrap_or(b)
 }
 
-/// The argv for a web-shell PTY.
-///
-/// M-1 (owner-equivalence gate): when `--shell-user <name>` is set, drop the PTY
-/// to that account via `runuser -l <user>`. Without it, the PTY runs as the
-/// up-process user and is owner-equivalent at any uid. Startup requires the
-/// explicit `--i-know` acknowledgement in `require_shell_owner_ack`; root also
-/// makes the shell machine-wide. See docs/security/web-shell-review.md.
-fn shell_argv(shell_program: Option<&str>, shell_user: Option<&str>) -> (Vec<String>, bool) {
-    let shell_config = settings::get_str("shell-program", None);
-    platform::Paths::shell_argv(shell_program, shell_config.as_deref(), shell_user)
-}
 
 /// Dev-debug logging: dlog! expands to eprintln! only under debug-logs feature.
 macro_rules! dlog {
@@ -1357,20 +1169,6 @@ macro_rules! dlog {
 pub(crate) use dlog;
 
 
-/// Auto-shell policy for the `up`/`recv` acceptor: which proof-verified devices
-/// may `filament shell --ssh` in WITHOUT a per-device `grant`. Trust (pair-proof) is
-/// always enforced separately, this is purely the capability side.
-#[derive(Clone, Debug)]
-enum ShellPolicy {
-    /// Default: only devices explicitly `grant`ed the `shell` cap.
-    Granted,
-    /// `up --shell`: any paired device. M-2: this INTENTIONALLY grants every
-    /// proof-verified paired device, including ones introduced later via
-    /// pair-intro. Use `Only`/`--shell-only` to scope it.
-    All,
-    /// `up --shell-only a,b`: only these petnames auto-shell; others need a grant.
-    Only(std::collections::HashSet<String>),
-}
 
 impl ShellPolicy {
     fn auto_allows(&self, name: &str) -> bool {
@@ -1414,82 +1212,16 @@ impl ShellPolicy {
     }
 }
 
-fn shell_root_note() -> &'static str {
-    #[cfg(unix)]
-    {
-        if unsafe { libc::geteuid() } == 0 {
-            return " This process is root, so the shell can control the whole machine.";
-        }
-    }
-    ""
-}
-
-fn require_shell_owner_ack(shell_enabled: bool, shell_user: Option<&str>, can_use_user: bool, i_know: bool) -> Result<()> {
-    if shell_enabled && shell_user.is_some() && !can_use_user && !i_know {
-        bail!("--shell-user is unsupported on this platform; the PTY would run as this process's user and retain the owner's authority. Pass --i-know to deliberately serve an owner-equivalent shell.");
-    }
-    if shell_enabled && shell_user.is_none() && !i_know {
-        bail!("serving a shell without --shell-user grants the peer the owner's authority, because the PTY runs as this process's user and can read the config directory.{} Pass --shell-user or --i-know to continue.", shell_root_note());
-    }
-    Ok(())
-}
 
 
 
 
-fn write_owner_only_file(path: &Path, contents: &str) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("create owner-only file {}", path.display()))?;
-    writeln!(file, "{contents}")?;
-    file.sync_all()?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_owner_only_fd(fd: i32, contents: &str) -> Result<()> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-    if fd < 0 {
-        bail!("secret file descriptor must be non-negative");
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    writeln!(file, "{contents}")?;
-    file.flush()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_owner_only_fd(_fd: i32, _contents: &str) -> Result<()> {
-    bail!("file-descriptor secret output is not yet implemented on this platform; use a new owner-only file")
-}
 
 
-#[cfg(unix)]
-fn read_owner_only_fd(fd: i32) -> Result<String> {
-    use std::io::Read;
-    use std::os::fd::FromRawFd;
-    if fd < 0 {
-        bail!("secret file descriptor must be non-negative");
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    Ok(contents)
-}
 
-#[cfg(not(unix))]
-fn read_owner_only_fd(_fd: i32) -> Result<String> {
-    bail!("file-descriptor secret input is not yet implemented on this platform; use an owner-only file")
-}
+
+
+
 
 fn prompt_line(prompt: &str) -> Result<String> {
     use std::io::Write;
@@ -1531,20 +1263,8 @@ fn command_arg(value: &str) -> String {
 // The daemon holds them until the owner explicitly approves or denies via CLI.
 // Deny-by-default: a pending request carries NO access.
 
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingRequest {
-    id: u64,
-    peer: String,
-    capability: String,
-    timestamp: u64,
-    status: String, // "pending", "approved", "denied", "expired"
-    granted_at: Option<u64>,
-}
 
-const MAX_PENDING: usize = 100;
-const REQUEST_TTL_SECS: u64 = 3600;
 
 fn requests_path() -> PathBuf {
     crate::settings::config_dir().join("requests.json")
@@ -1578,20 +1298,6 @@ fn expire_requests(requests: &mut Vec<PendingRequest>) {
     }
 }
 
-fn parse_duration_secs(input: &str) -> Result<u64> {
-    let (number, unit) = input.trim().split_at(input.trim().len().saturating_sub(1));
-    let value: u64 = number.parse().map_err(|_| anyhow::anyhow!("invalid duration '{input}'"))?;
-    let multiplier = match unit {
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => bail!("invalid duration '{input}', use e.g. 30m, 1h, or 1d"),
-    };
-    let seconds = value.checked_mul(multiplier).ok_or_else(|| anyhow::anyhow!("duration too large"))?;
-    if seconds == 0 { bail!("duration must be greater than zero"); }
-    Ok(seconds)
-}
 
 /// Enqueue a consent request for a denied action from an identified peer.
 /// No-op if the peer is unidentified, the cap is not requestable, or a
@@ -1704,24 +1410,6 @@ fn fmt_short_duration(secs: u64) -> String {
 
 
 
-/// CLI handler for `filament ephemeral`
-fn parse_mint_ttl(raw: &str) -> Result<u64> {
-    let raw = raw.trim().to_ascii_lowercase();
-    let (number, unit) = raw.split_at(raw.trim_end_matches(|c: char| c.is_ascii_alphabetic()).len());
-    let value: u64 = number.parse().map_err(|_| anyhow!("invalid --ttl '{raw}'"))?;
-    let multiplier = match unit {
-        // A bare number is seconds. `ephemeral mint --ttl` was a raw u64 before
-        // the mint verbs were collapsed, and its default is still "86400", so
-        // dropping this arm would break every script that passes a number.
-        "" => 1,
-        "s" => 1,
-        "m" => 60,
-        "h" => 3600,
-        "d" => 86400,
-        _ => bail!("invalid --ttl '{raw}', use a duration such as 15m or 1h (or plain seconds)"),
-    };
-    Ok(value.saturating_mul(multiplier))
-}
 
 
 #[test]
@@ -1788,18 +1476,6 @@ fn joined_owner_record() -> Option<(String, String)> {
 
 
 
-fn parse_invitation(raw: &str) -> Result<crate::ephemeral::Invitation> {
-    use base64::Engine;
-    let token = raw.trim();
-    let encoded = token
-        .strip_prefix("filament-invite:")
-        .ok_or_else(|| anyhow!("invitation has an unknown format"))?;
-    let bytes = Zeroizing::new(base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| anyhow!("invitation is not valid base64url"))?);
-    crate::ephemeral::Invitation::from_token(bytes.as_slice())
-        .ok_or_else(|| anyhow!("invitation payload is not a valid v2 invitation"))
-}
 
 
 
@@ -1875,49 +1551,8 @@ fn down_cmd() -> Result<()> {
 
 
 
-/// Stop the daemon through its service manager, if one owns it. Returns true
-/// only when a manager stop actually succeeded. The system and per-user
-/// systemd units are tried first, then launchd on macOS; a box where the
-/// daemon is not a managed service (a foreground `up`, no systemd) falls back
-/// to a plain kill.
-/// Which systemd manager owns a daemon pid, if any. Two units can share the
-/// name `filament.service` (a system unit and a per-user unit under Linger),
-/// so the cgroup's SCOPE, not the unit name, decides which manager to ask:
-///   system unit:  /system.slice/filament.service
-///   user unit:    /user.slice/user-0.slice/user@0.service/app.slice/filament.service
-/// The unit name is matched as a cgroup segment (`/filament.service`), never as
-/// a substring, so a neighbouring unit (`my-filament.service`) cannot collide.
-#[derive(Debug, PartialEq, Eq)]
-enum ServiceManager {
-    SystemdSystem,
-    SystemdUser,
-}
 
-fn service_manager_for_cgroup(cg: &str) -> Option<ServiceManager> {
-    // The unit name is matched as a cgroup segment (`/filament.service`), never
-    // as a substring, so a neighbouring unit (`my-filament.service`) cannot
-    // collide. The scope decides which manager.
-    if cg.contains("/system.slice/filament.service") {
-        return Some(ServiceManager::SystemdSystem);
-    }
-    if cg.contains("/app.slice/filament.service") && cg.contains("/user.slice/") {
-        return Some(ServiceManager::SystemdUser);
-    }
-    None
-}
 
-fn service_manager_for_pid(pid: u32) -> Option<ServiceManager> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
-            .ok()
-            .and_then(|cg| service_manager_for_cgroup(&cg))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
-}
 
 
 // ---------------------------------------------------------------- reset -----
@@ -1993,33 +1628,6 @@ fn invite_path_for(named: Option<&str>, kind: &str) -> std::path::PathBuf {
 }
 
 
-/// Everything the capability gate needs to know about a peer, resolved once.
-///
-/// This preamble was written FIVE times in the daemon, identically: lazy-resolve
-/// the peer's identity from its stored certificate, then read binding, expiry,
-/// revocation and the auth-key ceiling off the link. Five copies of the inputs
-/// to an authorization decision.
-///
-/// This file already records what that shape costs. The four role-election bugs
-/// were ONE bug: an input trusted to be computed the same way in several places,
-/// with nothing enforcing it. Aimed at the gate that decides who may open a
-/// shell, mount a folder or receive a file, it is the same wager.
-///
-/// Checked before extracting, because a divergence would be a live bug rather
-/// than untidiness: all five DO reach cap_gate_effective with cert_revoked. Four
-/// compute it here and the transfer arm computed it a few lines later, after its
-/// trust floor. Ordering differed; the input did not. Two copies had also
-/// drifted in whitespace, which is the usual sign of paste.
-///
-/// Owned, not borrowed, so a caller can hold it while still using `conn`.
-struct PeerAuthz {
-    idev: Option<[u8; 32]>,
-    iusr: Option<[u8; 32]>,
-    binding: crate::capability::BindingStrength,
-    expires: Option<u64>,
-    cert_revoked: bool,
-    ak_caps: Option<Vec<String>>,
-}
 
 impl PeerAuthz {
     /// The gate's arguments in the order every call site uses them.
@@ -2176,13 +1784,6 @@ fn main() -> Result<()> {
 }
 
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct MountPlan {
-    peer: String,
-    remote: String,
-    local: String,
-    read_only: bool,
-}
 
 fn default_mount_point(peer: &str, remote: &str) -> String {
     let leaf = Path::new(remote)
@@ -2207,7 +1808,6 @@ fn default_mount_point(peer: &str, remote: &str) -> String {
 // archive for this platform, verifies it against SHA256SUMS, and atomically
 // replaces the current executable.
 
-const REPO: &str = "Abdk4Moura/filament";
 
 fn release_target() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
@@ -2224,11 +1824,6 @@ fn release_target() -> Option<&'static str> {
 
 
 
-#[derive(Debug, PartialEq, Eq)]
-enum SendOutcome {
-    Complete { completed: usize },
-    Declined { completed: usize, declined: usize },
-}
 
 fn send_outcome(completed: usize, declined: usize) -> SendOutcome {
     if declined == 0 {
@@ -2274,53 +1869,6 @@ fn shell_policy_from_settings() -> ShellPolicy {
 
 
 
-#[allow(clippy::too_many_arguments)]
-/// Receive-transfer and consent state for one `recv_cmd` session.
-///
-/// Grouped out of the function's locals so the transfer arms can be lifted
-/// next. Field types, initial values and comments are exactly what the locals
-/// had; nothing else moved.
-struct RecvState {
-    by_sid: HashMap<(String, u32), IncomingFile>,
-    // P4 (GAP-5): per-transfer count of whole-file-verify FAILURES (the digest
-    // didn't match on completion). Each failure re-requests a resume (truncated)
-    // or a from-zero re-fetch (corrupt body); bounded so a genuinely
-    // unrecoverable corruption fails CLEARLY after a few rounds rather than
-    // looping forever. Keyed by transfer id.
-    verify_fails: HashMap<String, u32>,
-    completed: usize,
-    ever_received: bool,
-    // C22: offers awaiting consent, exactly ONE stdin owner (the reader
-    // task); answers arrive as StdinLine events, never via a competing
-    // blocking read racing for the user's "y".
-    pending: std::collections::VecDeque<(String, Value)>,
-    // #30: hold ChannelReady until Proven settles or 3s timeout, so short-session
-    // gates never decide on Inferred while the possession-sig challenge is in flight.
-    pending_proven: Arc<Mutex<HashMap<String, (Arc<dyn Transport>, Instant)>>>,
-    // A listening recv accepts a code typed straight into it, the first
-    // thing real users try (observed live). C22: stdin runs RAW (cbreak) on a
-    // tty so an open y/N question resolves on a single keypress, no Enter;
-    // outside a question, bytes accumulate into lines (echoed manually since
-    // raw mode disables terminal echo).
-    question_open: Arc<std::sync::atomic::AtomicBool>,
-    // C25: when the current question appeared (answers sooner than 300ms are
-    // buffered keystrokes, not decisions)
-    question_shown: Instant,
-    // Once a peer wins authentication, Conn binds the receive to its sid/install
-    // uid. Only that peer (or its same-uid signaling rejoin) may become active or
-    // offer files.
-    // A file-offer can race ahead of auth: the sender offers as soon as IT has our
-    // confirm, which can land a tick BEFORE we finish verifying ITS confirm (the
-    // two confirms cross on the wire, and the shared-room mesh widens that gap). We
-    // must not silently drop that offer, the sender offers it only once. So we
-    // BUFFER the most recent pre-auth offer per candidate peer and REPLAY it the
-    // instant that peer authenticates. Bounded by RECV_MAX_CANDIDATES (same keys).
-    recv_pending_offers: HashMap<String, Value>,
-    // Each candidate peer's own ephemeral ceremony, keyed by peer id.
-    recv_cers: HashMap<String, Ceremony>,
-    // Each candidate peer's own bounded budget (armed when its channel comes up).
-    recv_deadlines: HashMap<String, Instant>,
-}
 
 
 
@@ -2337,13 +1885,6 @@ async fn flush_inflight(by_sid: &mut HashMap<(String, u32), IncomingFile>) {
     }
 }
 
-/// C22: cbreak-mode guard, single-keypress answers without losing line
-/// input. `stty` keeps us dependency-free; Drop restores the terminal (and
-/// the Interrupted path calls restore() explicitly since process::exit skips
-/// Drop).
-struct TtyGuard {
-    saved: Option<String>,
-}
 
 impl TtyGuard {
     fn raw() -> TtyGuard {
