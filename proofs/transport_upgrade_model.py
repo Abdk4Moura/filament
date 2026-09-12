@@ -106,6 +106,7 @@ Faithfulness -- state <-> code:
 """
 from collections import deque, namedtuple
 from itertools import product
+import glob
 import os
 import re
 import sys
@@ -515,14 +516,20 @@ if __name__ == '__main__':
     # green while describing something that stopped being true, which is the
     # defect class this whole file exists to catch.
     here = os.path.dirname(os.path.abspath(__file__))
-    main_rs = os.path.join(here, os.pardir, "cli", "src", "main.rs")
+    src_dir = os.path.join(here, os.pardir, "cli", "src")
+    # Anchor is anywhere in cli/src since the 2026-09-12 main.rs
+    # decomposition (fn rearm_channel_ready now lives in conn.rs).
+    files = sorted(glob.glob(os.path.join(src_dir, "**", "*.rs"), recursive=True))
     try:
-        with open(main_rs, encoding="utf-8", errors="replace") as fh:
-            tree = fh.read()
+        if not files:
+            raise OSError(f"no .rs files under {src_dir}")
+        tree = "".join(
+            open(p, encoding="utf-8", errors="replace").read() for p in files
+        )
     except OSError as e:
         # An expiry check that cannot read the tree has not passed, it has
         # failed to run. Never let that read as a pass.
-        print(f"\n  GATE 0 EXPIRY UNVERIFIABLE: cannot read {main_rs} ({e}).")
+        print(f"\n  GATE 0 EXPIRY UNVERIFIABLE: cannot read {src_dir} ({e}).")
         print("  The calibration cannot be confirmed current. Refusing to report.")
         sys.exit(1)
 

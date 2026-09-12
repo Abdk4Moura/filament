@@ -32,7 +32,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def source_ladder_constants():
     """Read the ladder bounds from the Rust tree this model claims to describe."""
-    main = open(os.path.join(ROOT, "cli", "src", "main.rs")).read()
+    # Anchor is anywhere in cli/src since the 2026-09-12 main.rs
+    # decomposition (const MAX_ATTEMPTS now lives in shared_defs.rs).
+    import glob
+    src_dir = os.path.join(ROOT, "cli", "src")
+    files = sorted(glob.glob(os.path.join(src_dir, "**", "*.rs"), recursive=True))
+    if not files:
+        raise SystemExit(
+            "stall-ladder guard: no .rs files under cli/src; "
+            "the calibration cannot be confirmed current. Refusing to report."
+        )
+    main = "".join(open(p, encoding="utf-8", errors="replace").read() for p in files)
     # net.rs moved to crates/filament-transport on 2026-08-27. This guard READS
     # the source to keep the model calibrated against it, so a file move breaks
     # it loudly, which is how the move was caught. Try the current home, fall
