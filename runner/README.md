@@ -169,7 +169,7 @@ The T4 is glibc 2.35 and you must not install `sshd`. Build the **static musl**
 binary on the host:
 
 ```bash
-cargo build --release --features static --target x86_64-unknown-linux-musl
+cargo build --release --target x86_64-unknown-linux-musl
 # -> cli/target/x86_64-unknown-linux-musl/release/filament   (static-pie; runs on the T4)
 ```
 

@@ -48,10 +48,11 @@ debug-logs = []
 #
 # Found by asking whether these crates are usable in other things and measuring
 # it, rather than by anything failing.
-static = ["dep:openssl-sys"]
+# (The mirrored `static` feature that vendored OpenSSL was removed 2026-09-12
+# together with the CLI's: the tree is rustls-only, so the musl target is
+# static on its own.)
 
 [dependencies]
-openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 # Versions copied verbatim from cli/Cargo.toml, so behaviour is byte-identical.
 anyhow = "1.0.102"
 async-trait = "0.1.89"
