@@ -1,5 +1,7 @@
 # Startup cost and footprint
 
+> Status: implemented (2026-09-05). Measurement record and rationale for the shipped startup/footprint work; re-measure before making new performance claims.
+
 ## Why this document exists
 
 "It takes a while to start" was reported and could NOT be reproduced on the

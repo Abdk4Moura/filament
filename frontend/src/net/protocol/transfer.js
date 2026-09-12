@@ -5,7 +5,7 @@
 // (`_streamFile` / `_finishReceive` / `_onControl`). It mirrors the CLI's
 // send_cmd/recv_cmd protocol and the wire shapes are FROZEN (CONTRACT.md).
 //
-// Discipline (consolidation-GOAL.md §3 "un-mangling rule"): PROTOCOL is pure —
+// Discipline (docs/archive/plans/consolidation-GOAL-2026-06-16.md §3 "un-mangling rule"): PROTOCOL is pure —
 // it builds control-message shapes and decides "what should happen next" from
 // plain inputs. It owns NO timer, NO retry, NO transport, NO instance state and
 // NO browser API. The mutable transfer bookkeeping (this.transfers / partials /

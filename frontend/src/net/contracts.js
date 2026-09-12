@@ -3,7 +3,7 @@
 // This file defines (as JSDoc interfaces — no runtime code) the three seams the
 // consolidation is built on. The whole point: each layer depends only on the
 // INTERFACE of the layer below, never its implementation. See
-// consolidation-plan-2026-06-15.md for the why; CONTRACT.md for the wire bytes.
+// docs/archive/plans/consolidation-plan-2026-06-15.md for the why; CONTRACT.md for the wire bytes.
 //
 //   ┌─ APPLICATION (useFilament, web-shell) ─────────────────────────┐
 //   ├─ ORCHESTRATION (PeerLink: wires the three below per peer) ──────┤

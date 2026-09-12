@@ -3,7 +3,7 @@
 //! correction ladder; `Conn::correct_stall` in `main.rs` owns the state + I/O
 //! (the repair/escalate side effects) and calls in here to classify each tick.
 //!
-//! Discipline (consolidation-GOAL.md §3): if it has a timer/retry/reconnect it is
+//! Discipline (docs/archive/plans/consolidation-GOAL-2026-06-16.md §3): if it has a timer/retry/reconnect it is
 //! RESILIENCE, but the *decision* of which rung to take is pure, so it lives here
 //! and is unit-tested directly. Mirrors `frontend/src/net/resilience/stall.js`
 //! (`nextStallRung`) + `net/app/recovery.js` (`decideStallEscalation`).

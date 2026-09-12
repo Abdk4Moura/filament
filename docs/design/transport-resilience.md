@@ -1,5 +1,7 @@
 # Transport resilience: the never-flaky model + relay honesty
 
+> Status: proposed design. Use the resilience ledgers and standing gates for shipped behavior.
+
 *Design doc. Decision-grade, no code in this change. Targets the Rust CLI in
 `cli/src/` and the browser client in `frontend/src/`. Companion to the failure
 ledgers [`../cli-resilience.md`](../cli-resilience.md) (C-series) and

@@ -1,5 +1,7 @@
 # Item 3 — L2/ssh rides the direct-QUIC ladder
 
+> Status: historical implementation record. Verify the current L2 transport path and gates before extending it.
+
 ## Problem (diagnosed live, do not re-derive)
 Seamless `filament ssh` is unreliable cross-machine because the L2 link rides WebRTC,
 which gets `connection stuck while connecting → dropping peer` cross-machine **even over

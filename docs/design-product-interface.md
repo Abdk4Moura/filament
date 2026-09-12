@@ -2,8 +2,8 @@
 
 > Status: design (2026-07-26). Formalizes the existing control socket (`ctl.rs`)
 > into the stable interface that PRODUCTS build on. Stress-tested adversarially.
-> Not yet built. See `docs/WORK-STATE.md` for the core/product boundary this
-> serves.
+> Not yet built. See [`docs/status/CURRENT.md`](status/CURRENT.md) for the current
+> core/product boundary this serves.
 
 ## Why
 

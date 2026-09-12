@@ -1,5 +1,7 @@
 # Rung-2: UDP hole-punching (FILAMENT_HOLEPUNCH=1)
 
+> Status: proposed. Design only; no implementation claim is implied.
+
 Additive transport rung that sits BETWEEN rung-1 (direct-dial QUIC) and rung-3
 (relay / the shipped WebRTC fallback) on the ladder. The ladder's rule is "max
 out each rung before stepping down": rung-1 already wins whenever a host or

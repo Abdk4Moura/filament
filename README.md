@@ -79,7 +79,7 @@ No inbound ports, no VPN config, no accounts — reachability rides the same aut
               └ crypto-addressed L3 overlay for reach (shell / expose / mount)
 ```
 
-The signaling relay only introduces peers; all data is peer-to-peer and end-to-end encrypted. Reliability is documented failure-by-failure: [docs/resilience.md](docs/resilience.md) (the browser's fixes) and [docs/cli-resilience.md](docs/cli-resilience.md) (the CLI's ledger, every entry gated by a test in `cli/tests/gates.sh`). Routing is explained in [docs/filament-routing.md](docs/filament-routing.md).
+The signaling relay only introduces peers; all data is peer-to-peer and end-to-end encrypted. Reliability is documented failure-by-failure: [docs/resilience.md](docs/resilience.md) (the browser's fixes) and [docs/cli-resilience.md](docs/cli-resilience.md) (the CLI's ledger, every entry gated by a test in `cli/tests/gates.sh`). Routing is explained in [the routing reference](cli/docs/filament-routing.md).
 
 ## Layout
 

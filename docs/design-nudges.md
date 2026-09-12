@@ -1,5 +1,7 @@
 # Nudges: an error should name the next command
 
+> Status: proposed UX guidance. Not a normative CLI reference.
+
 ## The bug that started this
 
 `filament add` in a script said:

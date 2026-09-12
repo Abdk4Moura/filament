@@ -26,8 +26,8 @@ produced bugs in one copy and not the other:
   describing "the peer", stored as a single value, on a channel that carries
   every sibling. The daemon's copy had it right. The sender's did not.
 - The close-reason hole was found and FIXED for `mount`, and survived in `pty`,
-  because nobody walked the other copy. That one is recorded in WORK-STATE.md by
-  the person who hit it the second time.
+  because nobody walked the other copy. The contemporary record is preserved in
+  [`archived work-state record`](archive/handoffs/WORK-STATE-2026-09-03.md).
 - `main.rs` is ~22,400 lines and hand-writes the peer event loop EIGHT times.
 
   CORRECTION (2026-08-27): an earlier version of this line said the eight were

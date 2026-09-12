@@ -1,5 +1,7 @@
 # V4: Userspace-netstack IPv4 Implementation Plan
 
+> Status: historical plan (2026-07-06). Retained as implementation context; verify against the tree before resuming any unchecked work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use compose:subagent (recommended) or compose:execute to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add IPv4 support to the userspace netstack for zero-privilege containers

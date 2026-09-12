@@ -475,7 +475,7 @@ nodes, and it comes with the coordinator / account / admin-controlled-membership
 tradeoff filament exists to avoid. filament does not compose *onto* a mesh to
 gain reach; it declines the use case. (Distinct and legitimate: filament may
 select an existing `tailscale0` interface as one candidate path for its own
-pairwise connection, per `docs/filament-routing.md`. That is transport-interface
+pairwise connection, per `cli/docs/filament-routing.md`. That is transport-interface
 selection, not a mesh-reach strategy, and it is redundant if raw connectivity is
 all you want.)
 
@@ -697,6 +697,6 @@ self-hosted relay, and introducer-TOFU are the shared primitives regardless of
 how far any mesh idea might have gone. This note simply records that the mesh
 destination was explored to its end and the road stops at the pairwise core.
 
-See also: `docs/filament-routing.md` (the pairwise route model), `ROADMAP.md`
+See also: `cli/docs/filament-routing.md` (the pairwise route model), `ROADMAP.md`
 (the Exploration entries this note supersedes), `/root/xats/BRIDGE-M0-SPEC.md`
 (the app-level federation prototype that motivated the question).

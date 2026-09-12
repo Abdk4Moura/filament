@@ -1,9 +1,12 @@
 # Subnet routes: reaching a network, not just a machine
 
-> Status: **partly built (2026-09-01).** The routing table and the policy surface
-> are in (`l3::RouteTable`, `advertise-routes` / `accept-routes`). Wire
-> advertisement and forwarding are not, and the authorization model is an open
-> decision. This records what was built, what was deliberately not, and why.
+> Status: **implemented and verified on Linux (2026-09-07).** The initial
+> 2026-09-01 sections below are preserved as an implementation trail. Subsequent
+> commits added signed wire advertisement, scoped route authorization, Linux kernel
+> forwarding and optional SNAT, withdrawal/dead-link cleanup, and end-to-end
+> evidence on two machines. macOS and Windows router-side forwarding remain
+> explicitly unsupported. Route ceilings became prefix-scoped in `3c6599f`, so a
+> fleet member cannot widen an invitation into an arbitrary subnet or exit route.
 
 ## What the overlay gives you today, and what it does not
 
@@ -52,7 +55,7 @@ decisions made by different people:
 - `accept-routes` (bool, per-peer via `--peer`, **default off**): whether to
   install what a peer offers.
 
-## 3. Forwarding (not built)
+## 3. Forwarding (historical: not built on 2026-09-01)
 
 On the router: enable IP forwarding, and NAT the LAN side, because the LAN host
 replies to an overlay address it has never heard of and needs either a masquerade
@@ -66,7 +69,7 @@ failure mode this tree has been repeatedly bitten by, most recently the
 fault-injection hook that was dead for ~620 commits while its gate reported
 green.
 
-## 4. Authorization (the open decision)
+## 4. Authorization (historical: open decision on 2026-09-01)
 
 The announce already proves a lot: signature, channel binding, possession, and a
 sequence number that stops replay and address rollback. But note the asymmetry it
@@ -96,7 +99,7 @@ Three ways to close it:
 `accept-routes` defaulting to off is correct under ALL THREE, which is why it
 could ship before the decision.
 
-## Wire format, when advertisement is built
+## Wire format (historical pre-implementation design)
 
 Prefixes must live INSIDE the signed announce payload or they are forgeable in
 transit. `Announce` lives in the `filament-overlay` crate, so this is a published

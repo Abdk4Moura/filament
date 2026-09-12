@@ -1,7 +1,7 @@
 # Filament consolidation — GOAL / handoff charter
 
-Self-contained brief for a fresh agent picking this up cold. Read this, then
-`CONTRACT.md` (the wire spec) and `consolidation-plan-2026-06-15.md` (the layer
+Historical consolidation brief. Read this only as an archive record; use the current documentation map for authoritative material. Its referenced wire spec is [`CONTRACT.md`](../../../CONTRACT.md), and its companion [`consolidation plan`](consolidation-plan-2026-06-15.md) is archived beside it.
+
 design + progress log). You have full repo access at `/root/stunning-tribble`.
 
 ---

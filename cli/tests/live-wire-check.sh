@@ -16,7 +16,7 @@
 # The file path and the PTY/shell path share the SAME wire.js functions
 # (frame/parseFrame/encode/decodeControl/highHalfSid), so a green here covers the
 # PTY framing too (the only PTY-unique pieces are MSG.PTY_* constants, pinned by
-# wire.test.mjs). See consolidation-plan-2026-06-15.md.
+# wire.test.mjs). See docs/archive/plans/consolidation-plan-2026-06-15.md.
 #
 # Env (sensible defaults; override as needed):
 #   FILAMENT_TEST_VENV  python with the backend deps (flask/eventlet/socketio)

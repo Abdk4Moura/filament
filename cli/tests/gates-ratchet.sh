@@ -105,7 +105,7 @@ if [ "$missing" -gt 0 ]; then
     echo "      means the suite died before reaching them, which marks every later gate" >&2
     echo "      at once. Check the end of the run before treating them as regressions." >&2
   fi
-  echo "NOTE: this suite is known to flake (see WORK-STATE.md, 1i: 12/13/11 of the" >&2
+  echo "NOTE: this suite is known to flake (the historical `docs/archive/handoffs/WORK-STATE-2026-09-03.md` §1i: 12/13/11 of the" >&2
   echo "      expected-green gates across three runs, one of which differed only in" >&2
   echo "      .gitignore). Confirm against a re-run before concluding the tree broke." >&2
   exit 1

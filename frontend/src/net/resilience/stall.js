@@ -1,6 +1,6 @@
 // RESILIENCE layer — stall handling (keeping an OPEN-but-dark link alive).
 //
-// First seam of the resilience layer (consolidation-GOAL.md §4). Resilience OWNS
+// First seam of the resilience layer (docs/archive/plans/consolidation-GOAL-2026-06-16.md §4). Resilience OWNS
 // the timers and the mutable episode/idle state — unlike PROTOCOL it is NOT pure
 // overall — but the POLICY pieces that don't need a clock are split out here so
 // they are directly node-testable. This module currently holds the ladder SHAPE;

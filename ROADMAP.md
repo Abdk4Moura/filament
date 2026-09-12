@@ -1,50 +1,35 @@
 # Filament roadmap
 
-Single source of truth for what is in flight, next, and parked. Design detail
-lives in `docs/design-*.md`; this file is the backlog and ordering. Keep it short
-and current: move items to Shipped when done, add new ones under Backlog or
-Exploration.
+> **Status:** canonical priority backlog
+> **Last reviewed:** 2026-09-07 against commit `3c6599f`
+> **Rule:** this is the only ordered backlog. A design document is not an in-flight commitment; move work here only after its scope and evidence are verified.
 
-## Now (in flight)
+## Now
 
-- **Windows Service + UAC elevation** (PR #21). ShellExecuteW "runas" with a
-  Scheduled-Task fallback on decline, firewall rule, userspace fallback. Blocked
-  on a real-Windows-runner UAC smoke test (CI cannot drive the elevation prompt).
-- **Per-OS capability CI harness** (opencode, starting). Two local nodes paired
-  without the hosted signaling server, over the userspace netstack. Spec:
-  `docs/design-per-os-ci.md`.
+No implementation item is asserted in flight from repository history alone. Add the next owner-approved, source-audited slice here before starting it.
 
-## Next (sequenced)
+## Next
 
-1. **Per-OS CI, complete.** Capability smoke tests (pair, send/recv, pty
-   interactive+exec, forward, expose/proxy) on ubuntu/macos/windows, gated as
-   required checks, plus `filament doctor` + support matrix. This is the
-   self-policing layer that stops the Windows-regression whack-a-mole.
-2. **Finish mount end to end.** Protocol landed (PR #23). Remaining: wire the FUSE
-   bridge (fuser 0.17 API), then WinFsp/ProjFS client adapters, then the
-   name/metadata model per the spec (raw-byte paths, escaping, capability
-   handshake). Rules: `docs/design-cross-platform-capabilities.md`.
-3. **ControlChannel: named-pipe warm IPC on Windows.** Today Windows
-   forward/ssh/pty/netcat always cold-establish. A named pipe brings warm-path
-   parity. Pure speed win.
-4. **0.5.1 release.** Cut once #21 verifies. Bundles the reconnect fix (#19), the
-   mount stale-dir fix (#22), and Windows elevation (#21).
+1. **Make the local product interface real.** Turn the existing control-socket seam into a versioned, documented local API only after its contract and authorization boundary are approved. Source: [`docs/design-product-interface.md`](docs/design-product-interface.md).
+2. **Choose and scope the next L2 transport slice.** Per-stream QUIC is proposal material, not an active implementation claim. Confirm its benefit and compatibility constraints before work begins. Source: [`docs/design-l2-perstream-quic.md`](docs/design-l2-perstream-quic.md).
+3. **Continue cross-platform capability parity from measured failures.** Keep platform behavior behind portable adapters and extend capability CI with every user-facing capability change. Sources: [`docs/architecture/PLATFORM.md`](docs/architecture/PLATFORM.md) and [`docs/design-per-os-ci.md`](docs/design-per-os-ci.md).
 
-## Backlog (smaller, known)
+## Backlog / exploration
 
-- `--shell-user` real Windows implementation (currently only warns).
-- Run `filament proxy` automatically as part of `filament up` when kernel TUN is
-  unavailable, on a known port.
-- HTTP CONNECT proxy alongside SOCKS5 (Tailscale parity; some tools only speak
-  HTTP proxy).
-- Serve a PAC file so a browser routes only `*.mesh` through the proxy.
-- MagicDNS / hosts-file management polish.
+- Edge signaling architecture
+- Additional transport rungs (hole punching and direct-to-relay recovery)
+- Enterprise asynchronous delivery
+- UX nudges and command-surface simplification
 
-## Shipped recently
+These remain proposals. Their design documents state scope and status; they must not be presented as shipped functionality.
 
-- ShellHost: Windows pty shell fix, customizable shell, one-shot exec (0.5.0).
-- Five-channel distribution via OIDC trusted publishing (crates.io, npm, winget,
-  Homebrew, GitHub), no long-lived tokens.
-- Reconnect/staircase flap fix (#19); mount stale-dir + honest no-sshd message
-  (#22); mesh-native mount protocol foundation (#23).
-- macOS osascript shell-arg escaping; branch protection + auto-merge on `main`.
+## Recently shipped
+
+- WireGuard L3 module wiring and scoped route ceilings (#297, 2026-09-07)
+- Startup and binary-footprint reduction (#296, 2026-09-05)
+- Certificate renewal and unsafe exit-route guard (#295, 2026-09-03)
+- Initial subnet-route support (#293, 2026-09-02)
+- Same-owner fleet auto-mesh and sibling-send reliability (#291, 2026-09-01)
+- Deterministic-core CI ratchet (#288, 2026-08-25)
+
+For present implementation status, use [`docs/status/CURRENT.md`](docs/status/CURRENT.md). For release history, use [`CHANGELOG.md`](CHANGELOG.md).

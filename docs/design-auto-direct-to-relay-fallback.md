@@ -1,5 +1,7 @@
 # Auto direct-to-relay fallback for L2 cold establish
 
+> Status: proposed. Design only; verify current L2 behavior before implementation.
+
 ## Problem
 
 `bring_up_to_known` (l2.rs:983) unconditionally races a direct-QUIC dial against
