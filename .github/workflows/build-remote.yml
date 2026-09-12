@@ -1,0 +1,142 @@
+# On-demand remote build: compile the filament CLI on GitHub's free 4-core
+# public-repo runner and hand the binary back as an artifact.
+#
+# This exists because the dev box is small (2 cores, 5 GB). Drive it with
+# scripts/rbuild.sh, which dispatches, waits, and downloads. The `tag` input
+# is how the wrapper finds its own run: it lands in the run name, and
+# `gh run list` is filtered on it. Cache setup mirrors test.yml on purpose so
+# dispatched builds share sccache warmth with CI instead of competing with it.
+
+name: Build (remote)
+
+run-name: "rbuild ${{ inputs.tag }} ${{ inputs.target }} ${{ inputs.profile }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Opaque id the caller uses to find this run
+        required: true
+        type: string
+      target:
+        description: Rust target triple
+        required: true
+        default: x86_64-unknown-linux-musl
+        type: choice
+        options:
+          - x86_64-unknown-linux-musl
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+      profile:
+        description: Cargo profile
+        required: true
+        default: release
+        type: choice
+        options: [release, dev]
+      features:
+        description: Feature flags, passed verbatim (e.g. "--features static")
+        required: false
+        default: ""
+        type: string
+      cargo_args:
+        description: Extra cargo arguments, passed verbatim
+        required: false
+        default: ""
+        type: string
+      run_tests:
+        description: Also run cargo test for the CLI package
+        required: false
+        default: false
+        type: boolean
+      retention_days:
+        description: Artifact retention in days
+        required: false
+        default: "7"
+        type: string
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+
+jobs:
+  build:
+    name: "${{ inputs.target }} (${{ inputs.profile }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+      - name: musl toolchain
+        if: contains(inputs.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: aarch64 cross linker
+        if: startsWith(inputs.target, 'aarch64')
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> ~/.cargo/config.toml
+      - run: rustup target add ${{ inputs.target }}
+      - name: Build
+        id: build
+        working-directory: cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          export FILAMENT_BUILD_SHA="${GITHUB_SHA::7}"
+          export FILAMENT_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          PROFILE_FLAG=""; OUTDIR="debug"
+          if [ "${{ inputs.profile }}" = "release" ]; then PROFILE_FLAG="--release"; OUTDIR="release"; fi
+          start=$(date +%s)
+          cargo build $PROFILE_FLAG --target "${{ inputs.target }}" ${{ inputs.features }} ${{ inputs.cargo_args }}
+          echo "build_seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
+      - name: Test
+        if: inputs.run_tests
+        working-directory: cli
+        shell: bash
+        run: |
+          PROFILE_FLAG=""
+          if [ "${{ inputs.profile }}" = "release" ]; then PROFILE_FLAG="--release"; fi
+          cargo test $PROFILE_FLAG --target "${{ inputs.target }}" ${{ inputs.features }}
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="cli/target/${{ inputs.target }}/${{ steps.build.outputs.outdir }}/filament"
+          mkdir -p out
+          cp "$BIN" out/filament
+          {
+            echo "sha=${GITHUB_SHA}"
+            echo "ref=${GITHUB_REF_NAME}"
+            echo "target=${{ inputs.target }}"
+            echo "profile=${{ inputs.profile }}"
+            echo "features=${{ inputs.features }}"
+            echo "cargo_args=${{ inputs.cargo_args }}"
+            echo "build_seconds=${{ steps.build.outputs.build_seconds }}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > out/BUILD_INFO
+          ls -la out; cat out/BUILD_INFO
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filament-${{ inputs.target }}-${{ inputs.profile }}
+          path: out/
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+          if-no-files-found: error
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats

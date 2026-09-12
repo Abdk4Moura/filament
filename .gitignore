@@ -53,3 +53,6 @@ target-fleet/
 target-musl/
 target-win/
 target-hooks/
+
+# remote-build outputs (scripts/rbuild.sh, scripts/cs.sh)
+/out/
