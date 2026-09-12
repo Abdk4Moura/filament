@@ -28,42 +28,6 @@ fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
-fn exhausted_giveup_then_digest_does_not_recreate_link() {
-    let mut suppressed = HashSet::new();
-    let mut link_present = true;
-    let mut attempts = MAX_ATTEMPTS;
-
-    // Model the exhausted on_stuck transition: dropping the Link loses the
-    // counter, so only the out-of-Link suppression mark carries the give-up.
-    if attempts >= MAX_ATTEMPTS {
-        link_present = false;
-        attempts = 0;
-        suppressed.insert("peer-sid".to_string());
-    }
-    assert!(!link_present);
-    assert_eq!(attempts, 0);
-    assert!(!match_adoption_source(
-        &mut suppressed,
-        "peer-sid",
-        AdoptSource::Digest
-    ));
-
-    // A real contact is evidence the peer is reachable and clears only the
-    // digest suppression, allowing the next adoption.
-    assert!(match_adoption_source(
-        &mut suppressed,
-        "peer-sid",
-        AdoptSource::Contact
-    ));
-    assert!(!suppressed.contains("peer-sid"));
-    assert!(match_adoption_source(
-        &mut suppressed,
-        "peer-sid",
-        AdoptSource::Digest
-    ));
-}
-
-#[test]
 fn send_outcome_refuses_success_for_any_declined_file() {
     assert_eq!(send_outcome(1, 0), SendOutcome::Complete { completed: 1 });
     assert_eq!(
@@ -80,30 +44,6 @@ fn send_outcome_refuses_success_for_any_declined_file() {
             declined: 1,
         }
     );
-}
-
-#[test]
-fn code_receive_binding_rejects_unrelated_paired_peer_but_allows_rejoin() {
-    let binding = (
-        "sender-old-sid".to_string(),
-        Some("sender-install".to_string()),
-    );
-
-    assert!(active_binding_matches(
-        &binding,
-        "sender-old-sid",
-        Some("sender-install")
-    ));
-    assert!(active_binding_matches(
-        &binding,
-        "sender-new-sid",
-        Some("sender-install")
-    ));
-    assert!(!active_binding_matches(
-        &binding,
-        "unrelated-paired-sid",
-        Some("unrelated-install")
-    ));
 }
 
 #[test]
@@ -258,40 +198,6 @@ async fn transfer_part_refuses_symlink() {
         meta.file_type().is_symlink(),
         "symlink must not have been followed"
     );
-
-    let _ = std::fs::remove_dir_all(&tmp);
-}
-
-/// Transfer resume: safe_resume_part must refuse to open a symlink.
-#[cfg(unix)]
-#[tokio::test]
-async fn transfer_open_part_refuses_symlink() {
-    let uid = format!(
-        "{}-resume-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    // Create a regular .part file first
-    let part_path = tmp.join("data.tar.part");
-    std::fs::write(&part_path, b"partial data").unwrap();
-
-    // Verify it opens normally for resume
-    let result = safe_resume_part(&part_path).await;
-    assert!(result.is_ok(), "regular file must open normally for resume");
-
-    // Now replace with a symlink
-    std::fs::remove_file(&part_path).unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", &part_path).unwrap();
-
-    // Must refuse
-    let result = safe_resume_part(&part_path).await;
-    assert!(result.is_err(), "must refuse to resume through a symlink");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -504,18 +410,6 @@ fn mount_root_symlink_refused() {
 }
 
 #[test]
-fn sanitize_device_name_strips_escape_junk() {
-    // The exact corruption observed on the snapshot: a terminal
-    // device-attributes reply captured ahead of the real name.
-    let dirty = "\u{1b}[?1;2c\u{1b}[?1;2c\u{1b}[>0;276;0cpixel";
-    assert_eq!(sanitize_device_name(dirty), "pixel");
-    // Lone control chars dropped; surrounding whitespace trimmed.
-    assert_eq!(sanitize_device_name("  lap\u{7}top \n"), "laptop");
-    // A clean name is unchanged.
-    assert_eq!(sanitize_device_name("agboola@pop-os"), "agboola@pop-os");
-}
-
-#[test]
 fn capability_deny_by_default() {
     // GATE 5: deny-by-default. A device with empty caps is refused any gated
     // action; "transfer" is the always-allowed L0 baseline; a v1 record
@@ -627,77 +521,6 @@ fn any_shell_grant_detects_a_shell_cap() {
     // A missing/garbage file is false, never a panic.
     assert!(!any_shell_grant_at(&dir.join("nope.json")));
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn l2_open_gate_scopes_grant_mode() {
-    // Blanket mode (--shell / --shell-only / FILAMENT_L2): any trusted peer
-    // may open, regardless of its own per-device grant (unchanged behavior).
-    assert!(l2_open_allowed(true, false));
-    assert!(l2_open_allowed(true, true));
-    // Grant-only mode (L2 on solely because SOME device has a shell grant):
-    // the opening peer must itself hold the grant.
-    assert!(l2_open_allowed(false, true), "granted device may open");
-    assert!(
-        !l2_open_allowed(false, false),
-        "ungranted device denied in grant mode"
-    );
-}
-
-#[test]
-fn l2_target_allowlist_matches() {
-    let allow = json!({
-        "laptop": ["10.0.0.5:5432", "192.168.1.10:*"],
-        "*": ["db.internal:5432"]
-    });
-    // Exact host:port for the named device.
-    assert!(l2_target_allowed_in(&allow, "laptop", "10.0.0.5", 5432));
-    // host:* allows any port for that host.
-    assert!(l2_target_allowed_in(&allow, "laptop", "192.168.1.10", 9999));
-    // "*" device entry applies to any device.
-    assert!(l2_target_allowed_in(&allow, "phone", "db.internal", 5432));
-    // Wrong port (no wildcard) is denied.
-    assert!(!l2_target_allowed_in(&allow, "laptop", "10.0.0.5", 22));
-    // Host not listed is denied.
-    assert!(!l2_target_allowed_in(&allow, "laptop", "10.0.0.9", 5432));
-    // A device with no entry (and not matching "*") is denied.
-    assert!(!l2_target_allowed_in(&allow, "phone", "10.0.0.5", 5432));
-    // No allowlist at all (null) denies everything (loopback-only default).
-    assert!(!l2_target_allowed_in(
-        &Value::Null,
-        "laptop",
-        "10.0.0.5",
-        5432
-    ));
-    // Host match is case-insensitive.
-    assert!(l2_target_allowed_in(&allow, "phone", "DB.INTERNAL", 5432));
-}
-
-#[test]
-fn shell_policy_gates_auto_shell() {
-    // `up` default: NOTHING auto-shells, a device needs an explicit grant.
-    let g = ShellPolicy::Granted;
-    assert!(!g.auto_allows("popos"));
-    assert!(
-        !g.enables_l2(),
-        "default must not silently enable the L2 acceptor"
-    );
-    // `up --shell`: every paired device auto-shells, and L2 is on.
-    let a = ShellPolicy::All;
-    assert!(a.auto_allows("popos") && a.auto_allows("anything"));
-    assert!(a.enables_l2());
-    // `up --shell-only popos,laptop`: only the listed petnames; others don't.
-    let o = ShellPolicy::Only(
-        ["popos".to_string(), "laptop".to_string()]
-            .into_iter()
-            .collect(),
-    );
-    assert!(o.auto_allows("popos") && o.auto_allows("laptop"));
-    assert!(
-        !o.auto_allows("stranger"),
-        "shell-only must not auto-shell unlisted devices"
-    );
-    assert!(o.enables_l2());
 }
 
 #[test]
@@ -1320,28 +1143,6 @@ fn corrupt_store_fails_closed_to_revoked() {
 }
 
 #[test]
-fn unidentified_peer_is_not_revoked_but_unknown_device_is() {
-    // #157 call-site derivation: a peer with NO resolved device identity
-    // (idev=None) must derive cert_revoked=false. The old
-    // `.map(device_cert_revoked).unwrap_or(true)` at the call sites
-    // conflated "we do not know who you are" with "you are revoked", and
-    // the absolute gate Deny turned that into a total transfer outage for
-    // every freshly paired peer before identity resolution settles. An
-    // unknown DEVICE (a device_pub with no record) is likewise not revoked:
-    // revocation is a decision about a known device, and a fresh code peer
-    // legitimately has no record yet (#161 composition).
-    assert!(
-        !cert_revoked_for(None),
-        "no identity must not read as revoked"
-    );
-    let unknown = [0x44u8; 32];
-    assert!(
-        !cert_revoked_for(Some(&unknown)),
-        "an unknown device (no record) is not revoked"
-    );
-}
-
-#[test]
 fn proof_matches_browser() {
     // Pinned to the SAME external vector as frontend devices.js (computed
     // with `printf 'filament-proof2:u1|u1|u2|FPA|FPB' | openssl dgst
@@ -1376,35 +1177,6 @@ fn polite_role_matches_browser() {
 }
 
 #[test]
-fn part_meta_roundtrip_and_legacy() {
-    let dir = std::env::temp_dir().join(format!("filament-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("x.part.meta");
-    PartMeta {
-        size: 42,
-        head: Some("abc".into()),
-        full: Some("deadbeef".into()),
-    }
-    .store(&p)
-    .unwrap();
-    let m = PartMeta::load(&p).unwrap();
-    assert_eq!(m.size, 42);
-    assert_eq!(m.head.as_deref(), Some("abc"));
-    // P4: the whole-file digest survives the round-trip too.
-    assert_eq!(m.full.as_deref(), Some("deadbeef"));
-    // legacy plain-size format still parses
-    std::fs::write(&p, "1234").unwrap();
-    let m = PartMeta::load(&p).unwrap();
-    assert_eq!(m.size, 1234);
-    assert!(m.head.is_none());
-    assert!(m.full.is_none());
-    // garbage does not
-    std::fs::write(&p, "{not json").unwrap();
-    assert!(PartMeta::load(&p).is_none());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn head_hash_is_prefix_stable() {
     let dir = std::env::temp_dir().join(format!("filament-test-h-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1425,58 +1197,6 @@ fn head_hash_is_prefix_stable() {
     std::fs::write(&a, b"tiny").unwrap();
     std::fs::write(&b, b"tinY").unwrap();
     assert_ne!(head_hash(&a), head_hash(&b));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn full_hash_whole_file_integrity() {
-    // P4 (GAP-5): full_hash digests the WHOLE file (not just the 256 KiB
-    // head), so a difference PAST the head, exactly the truncation/corrupt
-    // case the head-hash can't see, produces a different digest.
-    let dir = std::env::temp_dir().join(format!("filament-test-fh-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let a = dir.join("a.bin");
-    let b = dir.join("b.bin");
-    let mut base = vec![3u8; (HEAD_BYTES + 4096) as usize];
-    std::fs::write(&a, &base).unwrap();
-    // identical head, byte flipped well PAST the head: head_hash agrees but
-    // full_hash MUST differ (this is the whole-file guarantee).
-    base[(HEAD_BYTES + 2048) as usize] = 4;
-    std::fs::write(&b, &base).unwrap();
-    assert_eq!(
-        head_hash(&a),
-        head_hash(&b),
-        "tails past the head don't change the head hash"
-    );
-    assert_ne!(
-        full_hash(&a),
-        full_hash(&b),
-        "full_hash sees the whole file"
-    );
-    // a truncated file (same prefix, shorter) also differs.
-    std::fs::write(&b, &base[..base.len() - 100]).unwrap();
-    assert_ne!(
-        full_hash(&a),
-        full_hash(&b),
-        "truncation changes the full hash"
-    );
-    // full_hash matches a one-shot sha256 of the bytes.
-    assert_eq!(
-        full_hash(&a),
-        Some(sha256_hex(&vec![3u8; (HEAD_BYTES + 4096) as usize]))
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn unique_path_suffixes() {
-    let dir = std::env::temp_dir().join(format!("filament-test-u-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt"));
-    std::fs::write(dir.join("f.txt"), b"x").unwrap();
-    assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.1"));
-    std::fs::write(dir.join("f.txt.1"), b"x").unwrap();
-    assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.2"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1507,23 +1227,6 @@ fn route_address_classification() {
     ] {
         assert!(!net::is_private_addr(a), "{a} should be public/invalid");
     }
-}
-
-#[test]
-fn filename_sanitization() {
-    // the recv path strips directories from remote names
-    assert_eq!(safe_incoming_name("../../etc/passwd"), "passwd");
-    assert_eq!(safe_incoming_name("/absolute/path.bin"), "path.bin");
-    assert_eq!(safe_incoming_name("plain.bin"), "plain.bin");
-    // control bytes are stripped; a NUL in particular must NOT survive into a
-    // path (it would fail the CString conversion in safe_open_beneath and
-    // abort the receive loop). A remote peer must not be able to do that.
-    assert_eq!(safe_incoming_name("evil\0.bin"), "evil.bin");
-    assert_eq!(safe_incoming_name("with\ttab\nand\r.bin"), "withtaband.bin");
-    // a name that reduces to nothing (or . / ..) falls back to a fixed name
-    assert_eq!(safe_incoming_name("\0\0\0"), "file.bin");
-    assert_eq!(safe_incoming_name(".."), "file.bin");
-    assert_eq!(safe_incoming_name(""), "file.bin");
 }
 
 // Bug 1: `send --name X` is honored for a SINGLE regular file (offer name =
@@ -1868,79 +1571,6 @@ fn known_peer_liveness_allows_reconnect() {
     // Link dies: clear to allow reconnect
     saw.remove(n);
     assert!(!saw.contains(n), "dead link must be reconnectable");
-}
-
-/// #23: the atomicity-relevant invariant — upsert_peer_record puts secret AND cert
-/// into ONE record, so the single write that persists it can never yield
-/// new-secret + old-cert. Drives the real merge fn across two generations against an
-/// in-memory store (no file, no env — deterministic). A non-atomic write path (the
-/// old pair flow: write secret, then separately write cert) is exactly what this
-/// forbids: it would leave secretB paired with certA (dpub_a), a wrong-userPub state.
-#[test]
-fn upsert_peer_record_writes_secret_and_cert_together() {
-    // Hand-crafted certs (from_json only parses fields — no signature check — so this
-    // structural test needs no UserKey/disk/env and is fully deterministic).
-    let mk_cert = |dpub: u8| -> identity::DeviceCert {
-        identity::DeviceCert::from_json(&serde_json::json!({
-            "devicePub": hex::encode([dpub; 32]),
-            "userPub": hex::encode([0x11u8; 32]),
-            "expires": 9_999_999_999u64,
-            "issued": 1u64,
-            "sig": hex::encode([0u8; 64]),
-        }))
-        .unwrap()
-    };
-    let cert_a = mk_cert(0xa1);
-    let cert_b = mk_cert(0xb2);
-
-    let mut arr: Vec<Value> = vec![];
-
-    // Generation A: secretA + certA land together.
-    upsert_peer_record(
-        &mut arr,
-        "bob",
-        Some("secretA"),
-        Some(&cert_a),
-        None,
-        None,
-        None,
-        None,
-    );
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["secret"].as_str(), Some("secretA"));
-    let stored_a = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
-    assert_eq!(
-        stored_a.device_pub, [0xa1u8; 32],
-        "gen A: cert must be certA"
-    );
-
-    // Generation B: secretB + certB — the update that a non-atomic path could tear.
-    upsert_peer_record(
-        &mut arr,
-        "bob",
-        Some("secretB"),
-        Some(&cert_b),
-        None,
-        None,
-        None,
-        None,
-    );
-    assert_eq!(arr.len(), 1, "same name updates in place, not duplicated");
-    // The invariant: secret and cert are BOTH gen-B in the SAME record.
-    assert_eq!(
-        arr[0]["secret"].as_str(),
-        Some("secretB"),
-        "secret must be gen B"
-    );
-    let stored_b = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
-    assert_eq!(
-        stored_b.device_pub, [0xb2u8; 32],
-        "cert must be gen B — never torn to certA"
-    );
-    assert_ne!(
-        stored_b.device_pub, [0xa1u8; 32],
-        "new secret must not retain the old-gen cert"
-    );
 }
 
 #[test]
@@ -2450,54 +2080,6 @@ fn credential_lifetime_defaults_parse() {
         assert!(
             secs > 0 && secs <= 30 * 24 * 3600,
             "{d} must be inside the bound"
-        );
-    }
-}
-
-#[test]
-fn help_banner_agrees_with_clap_visibility() {
-    // 0.8.5 (rec 5): the help COMMANDS banner is a hand-written list and a
-    // second source of truth. This test is the enforcement: every clap-
-    // visible subcommand appears in the banner, and every leading verb in
-    // the banner's COMMANDS section is a clap-visible subcommand. A command
-    // hidden from clap must not appear as discoverable, and a visible one
-    // must be listed. (Deriving the banner from clap outright is awkward
-    // because it is a grouped static const; the agreement test is the
-    // accepted second best.)
-    use clap::CommandFactory;
-    let cmd = Cli::command();
-    let visible: std::collections::HashSet<String> = cmd
-        .get_subcommands()
-        .filter(|sc| !sc.is_hide_set())
-        .map(|sc| sc.get_name().to_string())
-        .collect();
-    // Every visible subcommand is in the banner.
-    for name in &visible {
-        assert!(
-            EXAMPLES.contains(name.as_str()),
-            "visible command '{name}' must appear in the help banner"
-        );
-    }
-    // Every leading verb in the banner's COMMANDS section is visible.
-    let section = EXAMPLES.split("\nEXAMPLES").next().unwrap_or(EXAMPLES);
-    for line in section.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("COMMANDS") {
-            continue;
-        }
-        let first = trimmed.split_whitespace().next().unwrap_or("");
-        let verb = first.trim_end_matches(':');
-        // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
-        // not commands.
-        if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh") {
-            continue;
-        }
-        if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
-            continue; // `add --for`, `add <code>`, `up --install` all key off add/up
-        }
-        assert!(
-            visible.contains(verb),
-            "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
         );
     }
 }
@@ -3658,30 +3240,6 @@ fn consent_enqueue_dedup_same_peer_cap_pending() {
 }
 
 #[test]
-fn consent_enqueue_max_evicts_oldest() {
-    let mut reqs: Vec<PendingRequest> = (0..(MAX_PENDING + 1))
-        .map(|i| PendingRequest {
-            id: i as u64,
-            peer: format!("peer{i}"),
-            capability: "shell".into(),
-            timestamp: 0,
-            status: "pending".into(),
-            granted_at: None,
-        })
-        .collect();
-    // add_pending_request evicts while pending count >= MAX_PENDING
-    add_pending_request("overflow", "shell", &mut reqs);
-    // The oldest (id=0, peer0) should be gone
-    let has_peer0 = reqs.iter().any(|r| r.peer == "peer0");
-    assert!(!has_peer0, "oldest pending must be evicted when queue full");
-    let count_pending = reqs.iter().filter(|r| r.status == "pending").count();
-    assert!(
-        count_pending <= MAX_PENDING,
-        "queue must not exceed MAX_PENDING"
-    );
-}
-
-#[test]
 fn consent_expiry_is_terminal() {
     let old_ts = crate::capability::now_secs().saturating_sub(REQUEST_TTL_SECS + 1);
     let mut reqs = vec![PendingRequest {
@@ -3774,25 +3332,6 @@ fn delegated_ceiling_survives_record_roundtrip() {
         decision,
         crate::capability::GateDecision::Deny { .. }
     ));
-}
-
-#[test]
-fn missing_same_owner_record_fails_closed() {
-    let cert = identity::DeviceCert::from_json(&json!({
-        "devicePub": hex::encode([0xddu8; 32]),
-        "userPub": hex::encode([0x11u8; 32]),
-        "expires": 9_999_999_999u64,
-        "issued": 1u64,
-        "sig": hex::encode([0u8; 64]),
-    }))
-    .unwrap();
-    let (principal, expires, _max_offline, _last_seen) =
-        principal_from_records(&[], &cert, Some(&cert.user_pub));
-    assert_eq!(
-        principal,
-        crate::capability::PrincipalKind::Delegated { caps: Vec::new() }
-    );
-    assert_eq!(expires, Some(0));
 }
 
 #[test]

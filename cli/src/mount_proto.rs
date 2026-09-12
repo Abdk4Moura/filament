@@ -1554,6 +1554,9 @@ fn cfg_unix_gid() -> u32 {
 mod tests {
     use super::*;
 
+    use crate::recv_files::safe_resume_part;
+    use crate::safe_incoming_name;
+
     #[cfg(unix)]
     #[test]
     fn path_roundtrip_preserves_non_utf8_bytes() {
@@ -1966,5 +1969,56 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"bin\":true"));
+    }
+
+    /// Transfer resume: safe_resume_part must refuse to open a symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn transfer_open_part_refuses_symlink() {
+        let uid = format!(
+            "{}-resume-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let tmp = std::env::temp_dir().join(format!("fil-xfer-{uid}"));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Create a regular .part file first
+        let part_path = tmp.join("data.tar.part");
+        std::fs::write(&part_path, b"partial data").unwrap();
+
+        // Verify it opens normally for resume
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_ok(), "regular file must open normally for resume");
+
+        // Now replace with a symlink
+        std::fs::remove_file(&part_path).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", &part_path).unwrap();
+
+        // Must refuse
+        let result = safe_resume_part(&part_path).await;
+        assert!(result.is_err(), "must refuse to resume through a symlink");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn filename_sanitization() {
+        // the recv path strips directories from remote names
+        assert_eq!(safe_incoming_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_incoming_name("/absolute/path.bin"), "path.bin");
+        assert_eq!(safe_incoming_name("plain.bin"), "plain.bin");
+        // control bytes are stripped; a NUL in particular must NOT survive into a
+        // path (it would fail the CString conversion in safe_open_beneath and
+        // abort the receive loop). A remote peer must not be able to do that.
+        assert_eq!(safe_incoming_name("evil\0.bin"), "evil.bin");
+        assert_eq!(safe_incoming_name("with\ttab\nand\r.bin"), "withtaband.bin");
+        // a name that reduces to nothing (or . / ..) falls back to a fixed name
+        assert_eq!(safe_incoming_name("\0\0\0"), "file.bin");
+        assert_eq!(safe_incoming_name(".."), "file.bin");
+        assert_eq!(safe_incoming_name(""), "file.bin");
     }
 }

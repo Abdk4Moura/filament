@@ -663,8 +663,11 @@ impl Filesystem for FilamentFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::devices_store::upsert_peer_record;
+    use crate::identity;
+    use crate::identity_flow::principal_from_records;
+    use serde_json::json;
     use std::os::unix::ffi::OsStringExt;
-
     #[test]
     fn inodemap_case_sensitive_distinct_keys() {
         let mut map = InodeMap::new(true);
@@ -715,6 +718,98 @@ mod tests {
     fn kind_to_fuse_fifo_mapped_to_regular_when_not_supported() {
         let stat = FileStat { ino: 1, kind: None, mode: 0o010644, size: 0, blocks: 0, mtime: 0, nlink: 1, uid: 0, gid: 0, blksize: 512 };
         assert_eq!(kind_to_fuse(&stat, false), FileType::RegularFile);
+    }
+
+    /// #23: the atomicity-relevant invariant — upsert_peer_record puts secret AND cert
+    /// into ONE record, so the single write that persists it can never yield
+    /// new-secret + old-cert. Drives the real merge fn across two generations against an
+    /// in-memory store (no file, no env — deterministic). A non-atomic write path (the
+    /// old pair flow: write secret, then separately write cert) is exactly what this
+    /// forbids: it would leave secretB paired with certA (dpub_a), a wrong-userPub state.
+    #[test]
+    fn upsert_peer_record_writes_secret_and_cert_together() {
+        // Hand-crafted certs (from_json only parses fields — no signature check — so this
+        // structural test needs no UserKey/disk/env and is fully deterministic).
+        let mk_cert = |dpub: u8| -> identity::DeviceCert {
+            identity::DeviceCert::from_json(&serde_json::json!({
+                "devicePub": hex::encode([dpub; 32]),
+                "userPub": hex::encode([0x11u8; 32]),
+                "expires": 9_999_999_999u64,
+                "issued": 1u64,
+                "sig": hex::encode([0u8; 64]),
+            }))
+            .unwrap()
+        };
+        let cert_a = mk_cert(0xa1);
+        let cert_b = mk_cert(0xb2);
+
+        let mut arr: Vec<Value> = vec![];
+
+        // Generation A: secretA + certA land together.
+        upsert_peer_record(
+            &mut arr,
+            "bob",
+            Some("secretA"),
+            Some(&cert_a),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["secret"].as_str(), Some("secretA"));
+        let stored_a = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
+        assert_eq!(
+            stored_a.device_pub, [0xa1u8; 32],
+            "gen A: cert must be certA"
+        );
+
+        // Generation B: secretB + certB — the update that a non-atomic path could tear.
+        upsert_peer_record(
+            &mut arr,
+            "bob",
+            Some("secretB"),
+            Some(&cert_b),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(arr.len(), 1, "same name updates in place, not duplicated");
+        // The invariant: secret and cert are BOTH gen-B in the SAME record.
+        assert_eq!(
+            arr[0]["secret"].as_str(),
+            Some("secretB"),
+            "secret must be gen B"
+        );
+        let stored_b = identity::DeviceCert::from_json(&arr[0]["deviceCert"]).unwrap();
+        assert_eq!(
+            stored_b.device_pub, [0xb2u8; 32],
+            "cert must be gen B — never torn to certA"
+        );
+        assert_ne!(
+            stored_b.device_pub, [0xa1u8; 32],
+            "new secret must not retain the old-gen cert"
+        );
+    }
+
+    #[test]
+    fn missing_same_owner_record_fails_closed() {
+        let cert = identity::DeviceCert::from_json(&json!({
+            "devicePub": hex::encode([0xddu8; 32]),
+            "userPub": hex::encode([0x11u8; 32]),
+            "expires": 9_999_999_999u64,
+            "issued": 1u64,
+            "sig": hex::encode([0u8; 64]),
+        }))
+        .unwrap();
+        let (principal, expires, _max_offline, _last_seen) =
+            principal_from_records(&[], &cert, Some(&cert.user_pub));
+        assert_eq!(
+            principal,
+            crate::capability::PrincipalKind::Delegated { caps: Vec::new() }
+        );
+        assert_eq!(expires, Some(0));
     }
 }
 

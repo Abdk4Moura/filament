@@ -270,3 +270,88 @@ pub(crate) struct RecvState {
 pub(crate) struct TtyGuard {
     pub(crate) saved: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{MAX_PENDING, PartMeta, PendingRequest, ShellPolicy, add_pending_request};
+
+    #[test]
+    fn shell_policy_gates_auto_shell() {
+        // `up` default: NOTHING auto-shells, a device needs an explicit grant.
+        let g = ShellPolicy::Granted;
+        assert!(!g.auto_allows("popos"));
+        assert!(
+            !g.enables_l2(),
+            "default must not silently enable the L2 acceptor"
+        );
+        // `up --shell`: every paired device auto-shells, and L2 is on.
+        let a = ShellPolicy::All;
+        assert!(a.auto_allows("popos") && a.auto_allows("anything"));
+        assert!(a.enables_l2());
+        // `up --shell-only popos,laptop`: only the listed petnames; others don't.
+        let o = ShellPolicy::Only(
+            ["popos".to_string(), "laptop".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        assert!(o.auto_allows("popos") && o.auto_allows("laptop"));
+        assert!(
+            !o.auto_allows("stranger"),
+            "shell-only must not auto-shell unlisted devices"
+        );
+        assert!(o.enables_l2());
+    }
+
+    #[test]
+    fn consent_enqueue_max_evicts_oldest() {
+        let mut reqs: Vec<PendingRequest> = (0..(MAX_PENDING + 1))
+            .map(|i| PendingRequest {
+                id: i as u64,
+                peer: format!("peer{i}"),
+                capability: "shell".into(),
+                timestamp: 0,
+                status: "pending".into(),
+                granted_at: None,
+            })
+            .collect();
+        // add_pending_request evicts while pending count >= MAX_PENDING
+        add_pending_request("overflow", "shell", &mut reqs);
+        // The oldest (id=0, peer0) should be gone
+        let has_peer0 = reqs.iter().any(|r| r.peer == "peer0");
+        assert!(!has_peer0, "oldest pending must be evicted when queue full");
+        let count_pending = reqs.iter().filter(|r| r.status == "pending").count();
+        assert!(
+            count_pending <= MAX_PENDING,
+            "queue must not exceed MAX_PENDING"
+        );
+    }
+
+    #[test]
+    fn part_meta_roundtrip_and_legacy() {
+        let dir = std::env::temp_dir().join(format!("filament-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.part.meta");
+        PartMeta {
+            size: 42,
+            head: Some("abc".into()),
+            full: Some("deadbeef".into()),
+        }
+        .store(&p)
+        .unwrap();
+        let m = PartMeta::load(&p).unwrap();
+        assert_eq!(m.size, 42);
+        assert_eq!(m.head.as_deref(), Some("abc"));
+        // P4: the whole-file digest survives the round-trip too.
+        assert_eq!(m.full.as_deref(), Some("deadbeef"));
+        // legacy plain-size format still parses
+        std::fs::write(&p, "1234").unwrap();
+        let m = PartMeta::load(&p).unwrap();
+        assert_eq!(m.size, 1234);
+        assert!(m.head.is_none());
+        assert!(m.full.is_none());
+        // garbage does not
+        std::fs::write(&p, "{not json").unwrap();
+        assert!(PartMeta::load(&p).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

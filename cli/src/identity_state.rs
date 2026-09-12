@@ -391,3 +391,41 @@ pub(crate) fn mark_lapsed_now(device_pub: &[u8; 32]) -> Option<String> {
     })
     .ok()
 }
+#[cfg(test)]
+mod tests {
+    use crate::{cert_revoked_for, sanitize_device_name};
+
+    #[test]
+    fn sanitize_device_name_strips_escape_junk() {
+        // The exact corruption observed on the snapshot: a terminal
+        // device-attributes reply captured ahead of the real name.
+        let dirty = "\u{1b}[?1;2c\u{1b}[?1;2c\u{1b}[>0;276;0cpixel";
+        assert_eq!(sanitize_device_name(dirty), "pixel");
+        // Lone control chars dropped; surrounding whitespace trimmed.
+        assert_eq!(sanitize_device_name("  lap\u{7}top \n"), "laptop");
+        // A clean name is unchanged.
+        assert_eq!(sanitize_device_name("agboola@pop-os"), "agboola@pop-os");
+    }
+
+    #[test]
+    fn unidentified_peer_is_not_revoked_but_unknown_device_is() {
+        // #157 call-site derivation: a peer with NO resolved device identity
+        // (idev=None) must derive cert_revoked=false. The old
+        // `.map(device_cert_revoked).unwrap_or(true)` at the call sites
+        // conflated "we do not know who you are" with "you are revoked", and
+        // the absolute gate Deny turned that into a total transfer outage for
+        // every freshly paired peer before identity resolution settles. An
+        // unknown DEVICE (a device_pub with no record) is likewise not revoked:
+        // revocation is a decision about a known device, and a fresh code peer
+        // legitimately has no record yet (#161 composition).
+        assert!(
+            !cert_revoked_for(None),
+            "no identity must not read as revoked"
+        );
+        let unknown = [0x44u8; 32];
+        assert!(
+            !cert_revoked_for(Some(&unknown)),
+            "an unknown device (no record) is not revoked"
+        );
+    }
+}

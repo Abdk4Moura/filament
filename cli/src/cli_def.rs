@@ -794,3 +794,56 @@ pub(crate) enum DevicesAction {
     /// Undo a durable revoke. The device returns to its prior state.
     Restore { name: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{Cli, EXAMPLES};
+
+    #[test]
+    fn help_banner_agrees_with_clap_visibility() {
+        // 0.8.5 (rec 5): the help COMMANDS banner is a hand-written list and a
+        // second source of truth. This test is the enforcement: every clap-
+        // visible subcommand appears in the banner, and every leading verb in
+        // the banner's COMMANDS section is a clap-visible subcommand. A command
+        // hidden from clap must not appear as discoverable, and a visible one
+        // must be listed. (Deriving the banner from clap outright is awkward
+        // because it is a grouped static const; the agreement test is the
+        // accepted second best.)
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let visible: std::collections::HashSet<String> = cmd
+            .get_subcommands()
+            .filter(|sc| !sc.is_hide_set())
+            .map(|sc| sc.get_name().to_string())
+            .collect();
+        // Every visible subcommand is in the banner.
+        for name in &visible {
+            assert!(
+                EXAMPLES.contains(name.as_str()),
+                "visible command '{name}' must appear in the help banner"
+            );
+        }
+        // Every leading verb in the banner's COMMANDS section is visible.
+        let section = EXAMPLES.split("\nEXAMPLES").next().unwrap_or(EXAMPLES);
+        for line in section.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("COMMANDS") {
+                continue;
+            }
+            let first = trimmed.split_whitespace().next().unwrap_or("");
+            let verb = first.trim_end_matches(':');
+            // Group headings in the banner (Start/Share/Serve/Devices/Mesh) are
+            // not commands.
+            if matches!(verb, "Start" | "Share" | "Serve" | "Devices" | "Mesh") {
+                continue;
+            }
+            if verb.is_empty() || verb.starts_with("add") || verb.starts_with("up") {
+                continue; // `add --for`, `add <code>`, `up --install` all key off add/up
+            }
+            assert!(
+                visible.contains(verb),
+                "banner lists '{verb}' but clap hides it; a command that works must be discoverable or deliberately removed"
+            );
+        }
+    }
+}

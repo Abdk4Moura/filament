@@ -69,3 +69,53 @@ pub(crate) fn l2_target_allowed_in(allow: &Value, device: &str, host: &str, port
 pub(crate) fn l2_target_allowed(device: &str, host: &str, port: u16) -> bool {
     l2_target_allowed_in(&l2_allow_load(), device, host, port)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{l2_open_allowed, l2_target_allowed_in};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn l2_open_gate_scopes_grant_mode() {
+        // Blanket mode (--shell / --shell-only / FILAMENT_L2): any trusted peer
+        // may open, regardless of its own per-device grant (unchanged behavior).
+        assert!(l2_open_allowed(true, false));
+        assert!(l2_open_allowed(true, true));
+        // Grant-only mode (L2 on solely because SOME device has a shell grant):
+        // the opening peer must itself hold the grant.
+        assert!(l2_open_allowed(false, true), "granted device may open");
+        assert!(
+            !l2_open_allowed(false, false),
+            "ungranted device denied in grant mode"
+        );
+    }
+
+    #[test]
+    fn l2_target_allowlist_matches() {
+        let allow = json!({
+            "laptop": ["10.0.0.5:5432", "192.168.1.10:*"],
+            "*": ["db.internal:5432"]
+        });
+        // Exact host:port for the named device.
+        assert!(l2_target_allowed_in(&allow, "laptop", "10.0.0.5", 5432));
+        // host:* allows any port for that host.
+        assert!(l2_target_allowed_in(&allow, "laptop", "192.168.1.10", 9999));
+        // "*" device entry applies to any device.
+        assert!(l2_target_allowed_in(&allow, "phone", "db.internal", 5432));
+        // Wrong port (no wildcard) is denied.
+        assert!(!l2_target_allowed_in(&allow, "laptop", "10.0.0.5", 22));
+        // Host not listed is denied.
+        assert!(!l2_target_allowed_in(&allow, "laptop", "10.0.0.9", 5432));
+        // A device with no entry (and not matching "*") is denied.
+        assert!(!l2_target_allowed_in(&allow, "phone", "10.0.0.5", 5432));
+        // No allowlist at all (null) denies everything (loopback-only default).
+        assert!(!l2_target_allowed_in(
+            &Value::Null,
+            "laptop",
+            "10.0.0.5",
+            5432
+        ));
+        // Host match is case-insensitive.
+        assert!(l2_target_allowed_in(&allow, "phone", "DB.INTERNAL", 5432));
+    }
+}

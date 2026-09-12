@@ -470,3 +470,60 @@ pub(crate) async fn finalize_incoming(
     }
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{HEAD_BYTES, full_hash, head_hash, sha256_hex, unique_path};
+
+    #[test]
+    fn full_hash_whole_file_integrity() {
+        // P4 (GAP-5): full_hash digests the WHOLE file (not just the 256 KiB
+        // head), so a difference PAST the head, exactly the truncation/corrupt
+        // case the head-hash can't see, produces a different digest.
+        let dir = std::env::temp_dir().join(format!("filament-test-fh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        let mut base = vec![3u8; (HEAD_BYTES + 4096) as usize];
+        std::fs::write(&a, &base).unwrap();
+        // identical head, byte flipped well PAST the head: head_hash agrees but
+        // full_hash MUST differ (this is the whole-file guarantee).
+        base[(HEAD_BYTES + 2048) as usize] = 4;
+        std::fs::write(&b, &base).unwrap();
+        assert_eq!(
+            head_hash(&a),
+            head_hash(&b),
+            "tails past the head don't change the head hash"
+        );
+        assert_ne!(
+            full_hash(&a),
+            full_hash(&b),
+            "full_hash sees the whole file"
+        );
+        // a truncated file (same prefix, shorter) also differs.
+        std::fs::write(&b, &base[..base.len() - 100]).unwrap();
+        assert_ne!(
+            full_hash(&a),
+            full_hash(&b),
+            "truncation changes the full hash"
+        );
+        // full_hash matches a one-shot sha256 of the bytes.
+        assert_eq!(
+            full_hash(&a),
+            Some(sha256_hex(&vec![3u8; (HEAD_BYTES + 4096) as usize]))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_path_suffixes() {
+        let dir = std::env::temp_dir().join(format!("filament-test-u-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt"));
+        std::fs::write(dir.join("f.txt"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.1"));
+        std::fs::write(dir.join("f.txt.1"), b"x").unwrap();
+        assert_eq!(unique_path(&dir, "f.txt"), dir.join("f.txt.2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
