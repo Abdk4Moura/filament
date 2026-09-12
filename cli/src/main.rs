@@ -146,12 +146,20 @@ mod file_io;
 pub(crate) use file_io::{parse_duration_secs, parse_invitation, parse_mint_ttl, pidfile, read_owner_only_fd, write_owner_only_fd, write_owner_only_file, write_pidfile};
 /// Shared limits, wire constants and small types.
 mod shared_defs;
-pub(crate) use shared_defs::{DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, HEAD_BYTES, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, RevokeRecheck, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
+pub(crate) use shared_defs::{DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, RevokeRecheck, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
+#[cfg(test)]
+pub(crate) use shared_defs::HEAD_BYTES;
 /// Shell authority helpers and daemon/service probes.
 mod shell_support;
 pub(crate) use shell_support::{any_shell_grant, daemon_alive, daemon_running, require_shell_owner_ack, service_manager_for_pid, shell_argv, shell_grant_names, shell_root_note};
 #[cfg(test)]
 pub(crate) use shell_support::service_manager_for_cgroup;
+/// Hashing, time and randomness primitives.
+mod crypto_atoms;
+/// Policy gates.
+mod policy;
+pub(crate) use policy::{cancelled, interactive_allowed, quiet_exit_window, relay_banner, relay_forbidden};
+pub(crate) use crypto_atoms::{chrono_now, fresh_secret, head_hash, hmac_sha256, link_nonce, sha256_hex};
 #[cfg(test)]
 pub(crate) use shell_support::shell_grant_names_at;
 #[cfg(test)]
@@ -228,12 +236,12 @@ mod local;
 mod ui;
 mod fleet_ui;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use net::{Ev, Transport};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc};
@@ -259,16 +267,6 @@ fn rejoin_unwarned() -> Duration {
         .and_then(|v| v.parse().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(45))
-}
-/// G-k: how long the recv quiet-check must hold (everything done, nobody
-/// attached, no questions) before exiting without a `peer-left`. The 10 s
-/// default is overridable for tests (gate 18).
-fn quiet_exit_window() -> Duration {
-    std::env::var("FILAMENT_QUIET_EXIT_SECS") // test knob (gate 18)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(10))
 }
 
 /// Test/injection hooks, env-gated fault injectors used ONLY by the resilience
@@ -434,10 +432,6 @@ mod test_hooks {
 }
 
 
-/// True when the user passed `--no-relay`: relay fallback is forbidden.
-fn relay_forbidden() -> bool {
-    NO_RELAY.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 
 /// App-wide UI capability resolved once from flags + env. Controls how every
@@ -513,34 +507,11 @@ impl UiCapability {
     }
 }
 
-/// THE interactivity GATE, scripts/automation are safe BY DEFAULT. Three layers:
-///   1. stdin is not a TTY  -> never interactive (pipes, CI, `< /dev/null`).
-///   2. TTY but opted out    -> never interactive: `--no-interactive` OR the env
-///                              var `FILAMENT_NONINTERACTIVE` (any value).
-///   3. TTY and not opted out -> interactive (the guided entry may open).
-/// When this returns false, callers MUST keep exactly today's behavior (a clear
-/// parse error + expected format and non-zero exit for a malformed arg, or the
-/// existing non-interactive default for a missing-but-optional code). NEVER block.
-fn interactive_allowed() -> bool {
-    std::io::stdin().is_terminal()
-        && !NO_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
-        && std::env::var_os("FILAMENT_NONINTERACTIVE").is_none()
-}
 
 fn interactive_requested() -> bool {
     FORCE_INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The one honest CLI line shown whenever a transfer/connection is actually on
-/// the TURN relay route (rung d). Relay is still end-to-end encrypted, but it is
-/// NOT a direct link, the "no middleman on the wire" property is gone, so we say
-/// so, loudly (amber ⚠), reusing `ui::Tone::Warn`. §3.3 of the design.
-fn relay_banner() -> String {
-    ui::paint(
-        ui::Tone::Warn,
-        "⚠ on relay, via a TURN server, not a direct link (still end-to-end encrypted)",
-    )
-}
 
 
 
@@ -742,11 +713,6 @@ pub(crate) fn default_display_name() -> String {
     }
 }
 
-fn sha256_hex(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
 
 pub(crate) fn human(bytes: u64) -> String {
     const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -759,24 +725,6 @@ pub(crate) fn human(bytes: u64) -> String {
     if i == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", U[i]) }
 }
 
-/// C7: hash of the first min(256 KiB, len) bytes, cheap content identity
-/// carried in file-offer so resume can detect a different file wearing the
-/// same name + size.
-fn head_hash(path: &Path) -> Option<String> {
-    let mut f = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; HEAD_BYTES as usize];
-    let mut got = 0usize;
-    while got < buf.len() {
-        match f.read(&mut buf[got..]) {
-            Ok(0) => break,
-            Ok(n) => got += n,
-            Err(_) => return None,
-        }
-    }
-    let mut h = Sha256::new();
-    h.update(&buf[..got]);
-    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
-}
 
 
 
@@ -856,11 +804,6 @@ fn direct_ok_for(daemon: bool, l2_enabled: bool) -> bool {
 
 
 
-/// A fresh per-link challenge nonce for transports with no RFC-5705 exporter.
-fn link_nonce() -> Vec<u8> {
-    // fresh_secret() is the same CSPRNG the pair secrets use; 32 bytes of it.
-    hex::decode(fresh_secret()).unwrap_or_else(|_| fresh_secret().into_bytes())
-}
 
 /// The binding to SIGN outgoing `l3-announce` / `fleet-hello` with.
 ///
@@ -1007,26 +950,6 @@ pub(crate) fn channel_of(secret: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// HMAC-SHA256 (manual: avoids a hmac-crate version dance with sha2 0.11).
-fn hmac_sha256(key: &[u8], msg: &[u8]) -> String {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let mut h = Sha256::new();
-        h.update(key);
-        k[..32].copy_from_slice(&h.finalize());
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(msg);
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(inner.finalize());
-    outer.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
 
 /// C20: the proof binds the pair secret to the DTLS session. uids are
 /// order-normalized (direction-tagged by the prover's uid prefix) and BOTH
@@ -1042,20 +965,6 @@ pub(crate) fn proof_for(secret: &str, prover_uid: &str, a_uid: &str, b_uid: &str
     )
 }
 
-pub(crate) fn fresh_secret() -> String {
-    let mut buf = [0u8; 32];
-    // std-only CSPRNG is unavailable; derive from getrandom via std::fs on unix
-    if std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .is_err()
-    {
-        // fallback (non-unix): hash of time+pid noise, still unpredictable enough
-        let mut h = Sha256::new();
-        h.update(format!("{:?}{}", SystemTime::now(), std::process::id()));
-        buf.copy_from_slice(&h.finalize()[..32]);
-    }
-    buf.iter().map(|b| format!("{b:02x}")).collect()
-}
 
 // ------------------------------------------------------------- daemon (C19) --
 
@@ -1115,24 +1024,6 @@ fn path_within_canonical(root: &Path, path: &Path) -> bool {
 }
 
 
-/// Minimal `YYYY-MM-DD HH:MM` UTC stamp (civil-from-days; avoids chrono).
-fn chrono_now() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (days, rem) = (secs / 86400, secs % 86400);
-    let (hh, mm) = (rem / 3600, (rem % 3600) / 60);
-    // Howard Hinnant's civil_from_days
-    let z = days as i64 + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
-}
 
 fn up_log() -> PathBuf {
     devices_path().with_file_name("up.log")
@@ -1699,9 +1590,6 @@ fn token_is_pairing_code(token: &str) -> bool {
         && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-fn cancelled() -> anyhow::Error {
-    anyhow!("cancelled")
-}
 
 
 
