@@ -68,7 +68,7 @@ at and to your peer, nothing else.
 
 ```
 cargo build --release                                          # -> target/release/filament
-cargo build --release --target x86_64-unknown-linux-musl --features static   # fully static
+cargo build --release --target x86_64-unknown-linux-musl   # fully static (rustls-only tree)
 ```
 
 For repeated functional experiments against a real binary, use the measurement

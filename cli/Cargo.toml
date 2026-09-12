@@ -16,12 +16,11 @@ name = "filament"
 path = "src/main.rs"
 
 [features]
-# Fully static builds (musl): historically this compiled OpenSSL from source
-# because rust_socketio hard-depended on native-tls, which made a rustls-only
-# tree impossible without forking it (ledger C16). That dependency is gone,
-# replaced by filament-signal, so the tree no longer needs system TLS at all.
-# The feature is kept for musl builds that still want a vendored OpenSSL.
-static = ["dep:openssl-sys"]
+# Static builds need no feature: the musl target alone produces a static-pie
+# binary because the whole TLS tree is rustls. A `static` feature that vendored
+# OpenSSL (a rust_socketio/native-tls leftover, ledger C16) was removed on
+# 2026-09-12: nothing linked it and it added ~650 C compiles to every cold
+# release build. cli-release.yml still asserts the musl binary is static.
 # Env-gated fault/injection hooks used ONLY by the resilience gates
 # (runner/sim/*). NOT in `default` and NOT pulled by the release profile, so a
 # default `cargo build --release` (what users install) strips every test hook
@@ -50,7 +49,6 @@ mount-macos = ["dep:fuser"]
 
 
 [dependencies]
-openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 base64 = "0.22"

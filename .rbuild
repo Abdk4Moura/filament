@@ -3,6 +3,5 @@
 MANIFEST_DIR=cli
 BIN=filament
 TARGET=x86_64-unknown-linux-musl
-FEATURES=--features static
 CS=effective-spoon-pg59gwpxj6cxv5
 CS_DIR=/workspaces/filament

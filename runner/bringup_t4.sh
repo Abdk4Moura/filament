@@ -102,7 +102,7 @@ if [ ! -x "$BIN" ]; then
     cp "$(dirname "$0")/filament" "$BIN"; chmod +x "$BIN"
   else
     log "ERROR: no filament binary. Build it on the host with:"
-    log "  cargo build --release --features static --target x86_64-unknown-linux-musl"
+    log "  cargo build --release --target x86_64-unknown-linux-musl"
     log "then host it (FILAMENT_URL) or copy it next to this script as ./filament"
     exit 1
   fi

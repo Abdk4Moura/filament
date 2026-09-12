@@ -35,7 +35,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            features: "--features static"
+            features: ""
           - target: aarch64-apple-darwin
             os: macos-latest
             features: ""
