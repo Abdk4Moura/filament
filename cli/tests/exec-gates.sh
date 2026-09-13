@@ -184,8 +184,9 @@ fi
 # must end cleanly (output + rc 0), not hang: a write error to the dead
 # child's stdin is treated as EOF and the loop still waits for its exit.
 say E3
-OUTE3=$(yes | timeout 20 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- head -n 1 2>"$WORK/E3.err")
-rcE3=$?
+yes | timeout 20 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- head -n 1 >"$WORK/E3.out" 2>"$WORK/E3.err"
+rcE3=${PIPESTATUS[1]}
+OUTE3=$(cat "$WORK/E3.out")
 echo "## (epipe) rc=$rcE3 out='$OUTE3'"
 if [ "$rcE3" = "0" ] && [ "$OUTE3" = "y" ]; then
   ok "gateE3: flooded stdin vs early exit ended cleanly (output + rc 0)"
