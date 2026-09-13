@@ -1235,6 +1235,70 @@ pub(crate) async fn async_main() -> Result<()> {
                 l2::pty_cmd(&server, &peer, relay, args).await
             }
         }
+        Cmd::Exec {
+            peer,
+            shell,
+            tty,
+            cwd,
+            env,
+            argv,
+        } => {
+            let peer = match peer {
+                Some(peer) => peer,
+                None if ui_caps.interactive => {
+                    let devices = devices_load();
+                    if devices.is_empty() {
+                        bail!("no devices are connected; start with `filament add`");
+                    }
+                    let labels = devices
+                        .iter()
+                        .map(|(name, _)| name.clone())
+                        .collect::<Vec<_>>();
+                    let selected = codeentry::pick("RUN COMMAND ON", &labels)?
+                        .ok_or_else(|| anyhow!("cancelled"))?;
+                    devices[selected].0.clone()
+                }
+                None => {
+                    bail!(
+                        "exec needs a device in non-interactive mode: filament exec <device> -- <cmd>"
+                    )
+                }
+            };
+            require_known_device(&peer)?;
+            // Same ceiling pre-check as a shell: exec rides the shell grant,
+            // so a device whose invitation ceiling excludes shell can never
+            // serve one. Say so before opening anything, like #219 did.
+            if let Some(caps) = principal_ceiling_for(&peer) {
+                if !caps.iter().any(|c| c == "shell") {
+                    bail!(
+                        "exec denied by {peer}: this device's invitation ceiling ({}) does not include shell",
+                        caps.join(", ")
+                    );
+                }
+            }
+            if argv.is_empty() {
+                bail!("exec needs a command: filament exec <device> -- <cmd>");
+            }
+            // --shell wraps here, visibly, on the initiator side: the receiver
+            // never invokes a shell on its own.
+            let final_argv = crate::exec_send::build_argv(&argv, shell);
+            let mut pairs = Vec::new();
+            for e in &env {
+                pairs.push(crate::exec_send::parse_env_pair(e)?);
+            }
+            let opts = crate::exec_send::ExecOpts {
+                argv: final_argv,
+                tty,
+                cwd,
+                env: pairs,
+            };
+            // The remote status becomes our own exit code (backup.rs precedent).
+            // Refusals and link failures bail with the reason instead.
+            match crate::exec_send::exec_cmd(&server, &peer, relay, opts).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
         Cmd::Reach { dev, json, socks } => {
             if socks {
                 bail!(

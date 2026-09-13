@@ -25,8 +25,8 @@ use crate::{
     consent_token, ctl, daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
     device_name_for_pub, device_set_cap, devices_load, devices_path, devices_remove, devices_store,
     devices_sweep_lapsed, devices_touch, devices_upsert_atomic, direct, direct_ok_for,
-    display_name, enqueue_if_requestable, ensure_self_genesis_header, expire_requests, expose,
-    finalize_incoming, fleet, fleet_identity_pending, fleet_route_ok, fleet_shaped_link,
+    display_name, enqueue_if_requestable, ensure_self_genesis_header, exec_recv, expire_requests,
+    expose, finalize_incoming, fleet, fleet_identity_pending, fleet_route_ok, fleet_shaped_link,
     flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
     handle_identity_expose, handle_list_mounts, handle_list_warm, handle_mount,
     handle_mount_health, handle_unmount, handle_warm_bootstrap, handle_warm_req, human, identity,
@@ -4072,6 +4072,20 @@ pub(crate) async fn recv_cmd(
                     }
                     continue;
                 }
+                // exec-open when serving is off: refuse loudly like l2-open, so
+                // the caller errors instead of hanging on a silent drop.
+                Some("exec-open") if !l2_enabled => {
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "l2-close",
+                                "sid": sid,
+                                "err": crate::capability::SHELL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
                 // NOTE: keep this arm ABOVE the `#[cfg(unix)]` comment block
                 // below. That attribute belongs to `shell-bootstrap`, and an
                 // outer attribute binds to the NEXT arm regardless of any
@@ -4527,6 +4541,20 @@ pub(crate) async fn recv_cmd(
                             mux.drop_pty(sid).await;
                         }
                     }
+                }
+                // Remote command execution: parse, shell-gate, direct-spawn
+                // and serve. The module sends its own ack/close/refusal
+                // replies; the arm only resolves the transport and the mux.
+                Some("exec-open") => {
+                    let Some(t) = conn.transport_of(&pid) else {
+                        continue;
+                    };
+                    let mux = l2_muxes
+                        .entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    exec_recv::handle_exec_open(&mut conn, &pid, t, mux, &v, &shell_policy).await;
+                    continue;
                 }
                 Some("mount-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {

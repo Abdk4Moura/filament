@@ -28,6 +28,7 @@ COMMANDS
     send <file>            send files (mints a one-time code, or --to <device>)
     receive [code]         receive from a code or your nearby network
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
+    exec <device> [--] cmd run a command on a device (argv crosses exactly)
     reach <device>         check if a device is reachable (direct/relay + rtt)
     forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
@@ -680,6 +681,27 @@ pub(crate) enum Cmd {
     /// once by serving `up --shell` (use `up --shell-only a,b` to scope it).
     /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
     /// (reuses your keys, known_hosts, and ~/.ssh/config).
+    /// Run a command on a device. The argument vector crosses exactly;
+    /// opt into a shell explicitly with --shell (never implied).
+    Exec {
+        /// Known device (petname) to run on
+        peer: Option<String>,
+        /// Run under `/bin/sh -c` (cmd /C on Windows) instead of direct spawn
+        #[arg(long)]
+        shell: bool,
+        /// Allocate a pty instead of pipes (refused loudly until supported)
+        #[arg(long)]
+        tty: bool,
+        /// Working directory on the remote (default: the daemon's home)
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+        /// Extra environment as KEY=VALUE (repeatable; TERM/LANG/LC_* pass anyway)
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// The command and its arguments, passed exactly (trailing)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        argv: Vec<String>,
+    },
     Shell {
         /// Known device (petname) to open a shell on
         peer: Option<String>,
