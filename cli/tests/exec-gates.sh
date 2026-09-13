@@ -179,6 +179,21 @@ else
   bad "gateE2: stdin round-trip FAILED (rc=$rcE2 out='$OUTE2')"
 fi
 
+# ================================================================== GATE E3 ==
+# EPIPE: a flooded stdin against an early-exiting child (`yes | head -1`)
+# must end cleanly (output + rc 0), not hang: a write error to the dead
+# child's stdin is treated as EOF and the loop still waits for its exit.
+say E3
+OUTE3=$(yes | timeout 20 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- head -n 1 2>"$WORK/E3.err")
+rcE3=$?
+echo "## (epipe) rc=$rcE3 out='$OUTE3'"
+if [ "$rcE3" = "0" ] && [ "$OUTE3" = "y" ]; then
+  ok "gateE3: flooded stdin vs early exit ended cleanly (output + rc 0)"
+else
+  echo "-- E3.err --"; cat "$WORK/E3.err"
+  bad "gateE3: EPIPE case hung or mis-reported (rc=$rcE3 out='$OUTE3')"
+fi
+
 # ===================================================================== GATE F ==
 # EXIT CODES: remote exit status becomes our exit code.
 say F

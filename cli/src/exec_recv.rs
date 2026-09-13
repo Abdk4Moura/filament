@@ -405,7 +405,13 @@ pub(crate) async fn serve_exec(
                     Some(Some(bytes)) => {
                         if let Some(s) = stdin.as_mut() {
                             if s.write_all(&bytes).await.is_err() {
-                                break;
+                                // Write error (child gone or pipe broken): treat
+                                // as EOF -- drop the write end and CONTINUE.
+                                // break here would skip child.wait() AND the
+                                // exec-close, hanging the initiator (yes |
+                                // exec -- head -1). Only child.wait() (exit)
+                                // or channel death (link gone) ends the loop.
+                                stdin.take();
                             }
                         }
                     }
