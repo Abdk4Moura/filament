@@ -172,7 +172,11 @@ mod tests {
                                 idev: Some([0x42u8; 32]),
                                 iusr: Some([0x11u8; 32]),
                                 binding: BindingStrength::Proven,
-                                expires: None,
+                                // Fixed far-future expiry (not an axis): None
+                                // fail-closes under authoritative, which would
+                                // deny every allow-cell for a reason outside
+                                // the matrix.
+                                expires: Some(9_999_999_999u64),
                                 ak_caps,
                                 own_user: None,
                                 has_grant,
