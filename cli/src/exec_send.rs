@@ -87,15 +87,20 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
         .register_stream(sid)
         .await
         .ok_or_else(|| anyhow::anyhow!("exec open: sid {sid:#x} already in use"))?;
-    let err_sid_holder = mux.alloc_sid();
+    // The stderr sid is initiator-allocated and announced in the open (same
+    // value both ends use, like `sid` itself): the pipe is registered before
+    // the open goes out, so stderr racing the ack finds it. A receiver-side
+    // second allocation would name a stream nobody listens on.
+    let err_sid = mux.alloc_sid();
     let mut err_pipe = mux
-        .register_stream(err_sid_holder)
+        .register_stream(err_sid)
         .await
-        .ok_or_else(|| anyhow::anyhow!("exec open: sid {err_sid_holder:#x} already in use"))?;
+        .ok_or_else(|| anyhow::anyhow!("exec open: sid {err_sid:#x} already in use"))?;
     let frame = {
         let mut f = json!({
             "type": "exec-open",
             "sid": sid,
+            "err_sid": err_sid,
             "argv": opts.argv,
         });
         if let Some(cwd) = &opts.cwd {
@@ -115,25 +120,32 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
         f
     };
     t.send_control(&frame).await?;
-    // Bounded ack wait with pty's four outcomes. Refused carries the
-    // receiver's reason; anything else names what actually happened.
+    // Bounded ack wait with pty's four outcomes. A refusal surfaces the
+    // RECEIVER's reason (dropping it here reported every refusal as a
+    // confusing transport error); anything else names what actually happened.
     let ack: Value = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let ev = match rx.recv().await {
                 Some(ev) => ev,
-                None => break None,
+                None => {
+                    break Err(format!("'{peer}' closed the exec stream before answering"));
+                }
             };
             match ev {
                 crate::net::Ev::Control(_pid, v) => {
                     if v.get("type").and_then(|t| t.as_str()) == Some("exec-open-ack")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
-                        break Some(v);
+                        break Ok(v);
                     }
                     if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
-                        break None;
+                        let reason = v
+                            .get("err")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("closed");
+                        break Err(format!("'{peer}' refused exec: {reason}"));
                     }
                 }
                 crate::net::Ev::Chunk(_pid, got, _offset, data) => {
@@ -149,7 +161,7 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             "no answer from '{peer}' - it may be unresponsive or running a build without exec"
         )
     })?
-    .ok_or_else(|| anyhow::anyhow!("'{peer}' closed the exec stream before answering"))?;
+    .map_err(|reason: String| anyhow::anyhow!(reason))?;
     let _ = ack;
     // Pumps: stdin shared reader (the fd0 singleton pattern from pty -- one
     // consumer for the whole invocation), stdout/stderr to local stdio, close
@@ -162,12 +174,17 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
     // Bytes consumed per stream: the close announces both counts, and the
     // drain below collects stragglers until the counts are met (or bounded
     // time passes). Incremented everywhere a pipe item is consumed.
+    let mut out_recv: u64 = 0;
+    let mut err_recv: u64 = 0;
+    let want_out: Option<u64>;
+    let want_err: Option<u64>;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
     ticker.tick().await;
     loop {
         tokio::select! {
             item = out_pipe.recv() => match item {
                 Some(Some(bytes)) => {
+                    out_recv += bytes.len() as u64;
                     stdout.write_all(&bytes).await?;
                     stdout.flush().await?;
                 }
@@ -182,6 +199,7 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             },
             item = err_pipe.recv() => match item {
                 Some(Some(bytes)) => {
+                    err_recv += bytes.len() as u64;
                     stderr.write_all(&bytes).await?;
                     stderr.flush().await?;
                 }
@@ -213,6 +231,8 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
                         exit_status = v.get("status").and_then(|s| s.as_i64()).map(|s| s as i32);
+                        want_out = v.get("out_bytes").and_then(|n| n.as_u64());
+                        want_err = v.get("err_bytes").and_then(|n| n.as_u64());
                         break;
                     }
                     if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
@@ -225,7 +245,15 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
                 Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
                     mux.on_frame(got, data).await;
                 }
-                _ => {
+                // Bring-up's LOSER keeps emitting on this shared channel after
+                // it returns (a late ChannelReady/DirectReady, Stuck, PcState
+                // ...): pty's pump never polls rx at all, and polling it here
+                // must not mistake those for death -- a late winner-arrival
+                // killed every session living past ~2s with a bogus "link
+                // died". Only a CLOSED channel means the link is really gone;
+                // anything else is ignored, with the 2s ticker as backstop.
+                Some(_) => {}
+                None => {
                     bail!("link to '{peer}' died during exec");
                 }
             },
@@ -236,8 +264,45 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             }
         }
     }
+    // Bounded drain: exec-close travels control while bytes travel frames,
+    // so a fast-exiting child can beat its own tail (observed live: a missing
+    // 8 KiB tail with rc=0). The close announces both byte counts, so the
+    // drain is DETERMINISTIC on a healthy link -- collect until the counts
+    // are met -- with a 3s cap for a dying one. Skipped when the close
+    // carried no status (abnormal end: nothing to collect for).
+    if exit_status.is_some() {
+        let drain_end = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let met = match (want_out, want_err) {
+                (Some(o), Some(e)) => out_recv >= o && err_recv >= e,
+                _ => false,
+            };
+            if met || tokio::time::Instant::now() >= drain_end {
+                break;
+            }
+            tokio::select! {
+                ev = rx.recv() => match ev {
+                    Some(crate::net::Ev::Chunk(_pid, got, _offset, data)) => {
+                        mux.on_frame(got, data).await;
+                    }
+                    _ => {}
+                },
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+            while let Ok(Some(bytes)) = out_pipe.try_recv() {
+                out_recv += bytes.len() as u64;
+                stdout.write_all(&bytes).await?;
+            }
+            while let Ok(Some(bytes)) = err_pipe.try_recv() {
+                err_recv += bytes.len() as u64;
+                stderr.write_all(&bytes).await?;
+            }
+            stdout.flush().await?;
+            stderr.flush().await?;
+        }
+    }
     mux.drop_stream(sid).await;
-    mux.drop_stream(err_sid_holder).await;
+    mux.drop_stream(err_sid).await;
     // No exit-status payload means the process did not exit cleanly: never
     // render that as success (contract). A clean remote 0 falls through to Ok.
     match exit_status {

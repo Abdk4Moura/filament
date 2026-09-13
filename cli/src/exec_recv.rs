@@ -40,6 +40,10 @@ pub(crate) struct ExecOpen {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) tty: bool,
+    /// Initiator-allocated stderr sid, announced in the open so BOTH ends use
+    /// one value (same discipline as `sid` itself -- the initiator registers
+    /// the pipe before the open goes out, so stderr racing the ack finds it).
+    pub(crate) err_sid: u32,
 }
 
 /// Parse and validate an `exec-open` frame. Returns None (caller ignores the
@@ -87,11 +91,20 @@ pub(crate) fn parse_exec_open(v: &Value) -> Option<ExecOpen> {
         }
     }
     let tty = v.get("tty").and_then(|t| t.as_bool()).unwrap_or(false);
+    // Fail closed on a missing/forged stderr sid: defaulting to 0 would alias
+    // a live stream, and allocating a second value the initiator never
+    // listens on silently drops stderr (both observed live). Same
+    // no-truncation discipline as `wire_sid`, plus the L2-half check.
+    let err_sid = u32::try_from(v.get("err_sid")?.as_u64()?).ok()?;
+    if !crate::l2::is_l2_sid(err_sid) {
+        return None;
+    }
     Some(ExecOpen {
         argv,
         cwd,
         env,
         tty,
+        err_sid,
     })
 }
 
@@ -294,10 +307,13 @@ pub(crate) async fn serve_exec(
     t: Arc<dyn Transport>,
     mux: Arc<l2::Mux>,
     sid: u32,
-    err_sid: u32,
     req: ExecOpen,
     stdin_rx: mpsc::Receiver<Option<bytes::Bytes>>,
 ) {
+    // stderr rides the initiator-allocated `err_sid` from the open frame
+    // (same value the initiator registered before sending): allocating a
+    // second sid here would name a stream nobody listens on.
+    let err_sid = req.err_sid;
     let program = match resolve_in_path(&req.argv[0]) {
         Some(p) => p,
         None => {
@@ -376,9 +392,15 @@ pub(crate) async fn serve_exec(
         }
     };
     let mut stdin_rx = stdin_rx;
+    // Pump tasks report bytes SENT: the close carries both counts so the
+    // initiator can drain stragglers deterministically (a fast-exiting child
+    // can beat its own tail frames -- close travels control, bytes travel
+    // frames -- and breaking on close would truncate output, observed live
+    // as a missing 8 KiB tail with rc=0).
     let t_out = t.clone();
     let out_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
+        let mut sent: u64 = 0;
         loop {
             match stdout.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -386,13 +408,16 @@ pub(crate) async fn serve_exec(
                     if send_frames_chunked(&t_out, sid, &buf[..n]).await.is_err() {
                         break;
                     }
+                    sent += n as u64;
                 }
             }
         }
+        sent
     });
     let t_err = t.clone();
     let err_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
+        let mut sent: u64 = 0;
         loop {
             match stderr.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -403,9 +428,11 @@ pub(crate) async fn serve_exec(
                     {
                         break;
                     }
+                    sent += n as u64;
                 }
             }
         }
+        sent
     });
     // stdin: chunks in, EOF shuts the child's write-half (it may still produce
     // output -- EOF is non-terminal, same rule as the pty pumps). Channel
@@ -414,9 +441,9 @@ pub(crate) async fn serve_exec(
     loop {
         tokio::select! {
             status = child.wait() => {
-                let _ = out_task.await;
-                let _ = err_task.await;
-                let mut close = json!({ "type": "exec-close", "sid": sid });
+                let out_bytes = out_task.await.unwrap_or(0);
+                let err_bytes = err_task.await.unwrap_or(0);
+                let mut close = json!({ "type": "exec-close", "sid": sid, "out_bytes": out_bytes, "err_bytes": err_bytes });
                 if let Ok(status) = status {
                     if let Some(code) = exit_status_code(&status) {
                         close["status"] = json!(code);
@@ -502,11 +529,15 @@ pub(crate) async fn handle_exec_open(
             .await;
         return;
     };
-    // Second channel for stderr, named in the ack. Allocated from the
-    // answerer-role sid space, so it cannot collide with initiator sids by
-    // construction (same argument as alloc_sid's own docs).
-    let err_sid = mux.alloc_sid();
-    serve_exec(t, mux, sid, err_sid, req, stdin_rx).await;
+    // Serve DETACHED: awaiting the session inline would park the daemon's
+    // single recv loop for its whole lifetime, so no inbound data frame
+    // could ever be dispatched while a session runs (stdin starves, the
+    // child never exits, every later open hangs behind the parked loop --
+    // observed live as hung stdin sessions wedging the acceptor). The pty
+    // path spawns its session pumps for exactly this reason; validation,
+    // gating and registration above already ran in-hook, so the detached
+    // task owns only owned values from here.
+    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx));
 }
 
 #[cfg(test)]
@@ -516,7 +547,7 @@ mod tests {
     #[test]
     fn parse_keeps_argv_exact() {
         let v = json!({
-            "type": "exec-open", "sid": 1,
+            "type": "exec-open", "sid": 1, "err_sid": 2147483649u64,
             "argv": ["rsync", "-a", "my dir/with spaces", "--exclude='*.tmp'", "*.log"],
             "cwd": "/tmp", "env": ["FOO=bar"], "tty": false,
         });
@@ -534,6 +565,22 @@ mod tests {
         assert_eq!(req.cwd, Some(PathBuf::from("/tmp")));
         assert_eq!(req.env, vec![("FOO".to_string(), "bar".to_string())]);
         assert!(!req.tty);
+        assert_eq!(req.err_sid, 2147483649);
+    }
+
+    #[test]
+    fn parse_rejects_missing_or_forged_err_sid() {
+        let base = json!({"type": "exec-open", "sid": 1, "argv": ["true"]});
+        assert!(parse_exec_open(&base).is_none());
+        let mut low = base.clone();
+        low["err_sid"] = json!(7u64);
+        assert!(parse_exec_open(&low).is_none());
+        let mut big = base.clone();
+        big["err_sid"] = json!(0x1_8000_0000u64);
+        assert!(parse_exec_open(&big).is_none());
+        let mut ok = base.clone();
+        ok["err_sid"] = json!(2147483649u64);
+        assert!(parse_exec_open(&ok).is_some());
     }
 
     #[test]
@@ -551,7 +598,7 @@ mod tests {
     #[test]
     fn parse_drops_malformed_env_and_applies_defaults() {
         let v = json!({
-            "type": "exec-open", "sid": 1,
+            "type": "exec-open", "sid": 1, "err_sid": 2147483649u64,
             "argv": ["true"],
             "env": ["OK=1", "NOEQUALS", "=nokey", "BAD KEY=x"],
         });
