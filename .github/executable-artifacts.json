@@ -23,6 +23,13 @@
       "expires": "2026-09-17"
     },
     {
+      "path": "cli/tests/exec-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
+      "owner": "deepseek-worker",
+      "expires": "2026-10-13"
+    },
+    {
       "path": "cli/tests/forward-refusal-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/forward-refusal-gates.sh",
