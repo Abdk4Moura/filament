@@ -1208,7 +1208,7 @@ pub struct LinkGuard {
 impl LinkGuard {
     /// Keep the link alive forever (leaks sio+peer, as the long-lived tunnels
     /// want). Consumes the guard.
-    fn forget(mut self) {
+    pub(crate) fn forget(mut self) {
         if let Some(sio) = self.sio.take() {
             std::mem::forget(sio);
         }
@@ -1277,7 +1277,7 @@ async fn verify_fleet_identity(
     }
 }
 
-async fn bring_up_to_known(
+pub(crate) async fn bring_up_to_known(
     server: &str,
     peer_name: &str,
     relay: bool,
@@ -2577,7 +2577,7 @@ enum PtyOutcome {
 /// to whichever attach is current over an mpsc channel. An empty Vec is the EOF
 /// sentinel (matches the `send_frame(sid, &[])` FIN convention). The thread ends on
 /// EOF/error; on a clean session exit the process exits right after, reaping it.
-fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+pub(crate) fn spawn_stdin_reader() -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     std::thread::spawn(move || {
         use std::io::Read;
