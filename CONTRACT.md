@@ -307,11 +307,19 @@ stream kinds are refused, never misinterpreted.
   channels under the exec sid), never interleaved into one byte stream. A
   receiver that merges them is non-conformant: exit-status attribution and
   error triage depend on the split.
-- Close payload `{ type: "exec-close", sid, status }` -- `status` is the raw
-  process exit code. Death by signal is reported as `128 + signal number`
-  (the shell convention: 137 for SIGKILL, 143 for SIGTERM), never as 0 and
-  never as a bare code that collides with one. No exit-status payload means
-  the process did not exit cleanly; clients must not render that as success.
+- Close payload `{ type: "exec-close", sid, status, out_bytes, err_bytes }` --
+  `status` is the raw process exit code. Death by signal is reported as
+  `128 + signal number` (the shell convention: 137 for SIGKILL, 143 for
+  SIGTERM), never as 0 and never as a bare code that collides with one.
+  No exit-status payload means the process did not exit cleanly; clients
+  must not render that as success. The byte counts let the initiator drain
+  stragglers deterministically: close travels control while bytes travel
+  frames, so a fast-exiting child can beat its own tail.
+- HALF-CLOSE: stdin EOF is non-terminal. An empty stdin frame shuts the
+  child's write-half (it may still produce output -- EOF ends input, not
+  the session); only the exec-close frame ends the stream. The receiver
+  serves each accepted open as a detached task, so one session's lifetime
+  never blocks the daemon's event loop or another stream.
 - SHELL GATE: an exec stream is allowed exactly where a shell is allowed.
   The receiver enforces the same gate as `up --shell`, and `--shell-only
 a,b` scopes it to the listed peers/devices identically: a peer outside the
