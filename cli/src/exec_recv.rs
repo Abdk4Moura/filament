@@ -170,31 +170,6 @@ pub(crate) fn exit_status_code(status: &std::process::ExitStatus) -> Option<i32>
     }
 }
 
-/// The shell-gate DECISION, factored pure so the matrix is unit-testable: None
-/// for the capability layer means shadow mode (legacy stands in); Some means
-/// authoritative (the cap verdict decides). Mirrors the pty-open tiers exactly
-/// so exec can never be MORE permissive than a shell.
-pub(crate) fn gate_decision(
-    trusted: bool,
-    legacy_ok: bool,
-    cap_allowed: Option<bool>,
-) -> Result<(), &'static str> {
-    if !trusted {
-        return Err("denied");
-    }
-    match cap_allowed {
-        Some(true) => Ok(()),
-        Some(false) => Err("shell capability not granted"),
-        None => {
-            if legacy_ok {
-                Ok(())
-            } else {
-                Err("shell capability not granted")
-            }
-        }
-    }
-}
-
 /// Build the child's environment: env_clear PLUS the allowlist. TERM, LANG and
 /// LC_* pass through from the daemon's own environment; explicit `--env` pairs
 /// are layered on top (explicit wins on collision). Everything else -- notably
@@ -229,9 +204,12 @@ async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> R
     Ok(())
 }
 
-/// Authorize an exec open: the shell gate, evaluated exactly like pty-open (the
-/// same inputs, the same tiers, the same refusal reasons). Returns the label
-/// for user-visible messages on allow, or the wire refusal reason on deny.
+/// Authorize an exec open: the shell gate, evaluated exactly like pty-open.
+/// The capability verdict decides UNCONDITIONALLY (`granted.allowed()` -- no
+/// shadow/authoritative split, no legacy fallback): under the old split a
+/// revoked certificate was still allowed whenever legacy checks passed, so
+/// exec could be MORE permissive than a shell. Returns the label for
+/// user-visible messages on allow, or the wire refusal reason on deny.
 /// Side-effecting tells (ui::say, enqueue) stay with the caller, next to the
 /// send_control that carries the verdict -- same split as the pty-open arm.
 pub(crate) async fn authorize_exec(
@@ -239,6 +217,8 @@ pub(crate) async fn authorize_exec(
     pid: &str,
     shell_policy: &crate::ShellPolicy,
 ) -> Result<String, String> {
+    // `trusted` stays an INPUT to the capability engine (via legacy_ok),
+    // never a separate decision tier: the verdict below is granted alone.
     let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
     let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
     let legacy_ok = trusted
@@ -249,9 +229,9 @@ pub(crate) async fn authorize_exec(
                     && (shell_policy.auto_allows(n) || crate::device_allows(n, "shell"))
             })
             .unwrap_or(false);
-    // Capability layer evaluated unconditionally (shadow samples the
-    // legacy-allowed population); legacy stands in shadow, cap gates under
-    // FILAMENT_CAP_AUTHORITATIVE -- the same block pty-open runs.
+    // Capability inputs, evaluated unconditionally -- the same block pty-open
+    // runs. Unlike the old shadow split, the verdict below does not consult
+    // any legacy fallback: granted.allowed() decides on its own.
     let az = crate::peer_authz(conn, pid);
     let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
     let outcome = crate::capability::cap_authorize(
@@ -285,17 +265,12 @@ pub(crate) async fn authorize_exec(
         has_grant,
         cert_revoked,
     );
-    let cap_allowed = if crate::capability::cap_authoritative() {
-        Some(granted.allowed())
-    } else {
-        None
-    };
-    match gate_decision(trusted, legacy_ok, cap_allowed) {
-        Ok(()) => Ok(dev.unwrap_or_else(|| pid.to_string())),
-        Err(_) => Err(granted
+    if !granted.allowed() {
+        return Err(granted
             .deny_reason("shell capability not granted")
-            .to_string()),
+            .to_string());
     }
+    Ok(dev.unwrap_or_else(|| pid.to_string()))
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login
@@ -631,19 +606,6 @@ mod tests {
         assert_eq!(status_code(None, Some(9)), Some(137));
         assert_eq!(status_code(None, Some(15)), Some(143));
         assert_eq!(status_code(None, None), None);
-    }
-
-    #[test]
-    fn gate_matrix_matches_shell_tiers() {
-        // untrusted is always denied, regardless of anything else
-        assert!(gate_decision(false, true, None).is_err());
-        assert!(gate_decision(false, false, Some(true)).is_err());
-        // shadow: legacy decides
-        assert!(gate_decision(true, true, None).is_ok());
-        assert!(gate_decision(true, false, None).is_err());
-        // authoritative: cap decides
-        assert!(gate_decision(true, false, Some(true)).is_ok());
-        assert!(gate_decision(true, true, Some(false)).is_err());
     }
 
     #[test]
