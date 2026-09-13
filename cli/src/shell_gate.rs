@@ -184,6 +184,10 @@ mod tests {
                                 e, p,
                                 "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
                             );
+                            // Oracle pins (not just equality): absolutes deny in
+                            // every cell, and the two canonical allows hold in
+                            // every cell. A core regression either way fails
+                            // here even if both wrappers still agree.
                             if cert_revoked {
                                 assert!(
                                     e.is_err(),
@@ -194,6 +198,12 @@ mod tests {
                                 assert!(
                                     e.is_err(),
                                     "narrow ceiling must deny: trusted={trusted} grant={has_grant} revoked={cert_revoked} auth={authoritative}"
+                                );
+                            }
+                            if trusted && has_grant && !cert_revoked && ceiling_allows {
+                                assert!(
+                                    e.is_ok(),
+                                    "trusted+granted must allow: ceiling={ceiling_allows} auth={authoritative}"
                                 );
                             }
                         }

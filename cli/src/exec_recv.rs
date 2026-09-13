@@ -529,7 +529,11 @@ pub(crate) async fn handle_exec_open(
     }
     if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
         crate::ui::say(&format!("l2: exec refused: {reason}"));
-        crate::enqueue_if_requestable(&pid.to_string(), "shell");
+        // Enqueue under the verified petname (like pty-open's `who`), never
+        // the raw pid: the queue is keyed by name, and "<unverified>" is a
+        // no-op by design.
+        let who = conn.link(pid).and_then(|l| l.verified_name.clone());
+        crate::enqueue_if_requestable(who.as_deref().unwrap_or("<unverified>"), "shell");
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
             .await;
