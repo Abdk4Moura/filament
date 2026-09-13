@@ -449,6 +449,7 @@ pub(crate) async fn serve_exec(
                         close["status"] = json!(code);
                     }
                 }
+                eprintln!("[TEMP2-exec] serve close sid={sid:#x} status={}", close.get("status").map(|s| s.to_string()).unwrap_or("?".into()));
                 let _ = t.send_control(&close).await;
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
@@ -469,9 +470,11 @@ pub(crate) async fn serve_exec(
                         }
                     }
                     Some(None) => {
+                        eprintln!("[TEMP2-exec] serve eof sid={sid:#x}, shutting child stdin");
                         let _ = stdin.shutdown().await;
                     }
                     None => {
+                        eprintln!("[TEMP2-exec] serve stdin-rx closed sid={sid:#x}, killing child");
                         let _ = child.kill().await;
                         mux.drop_stream(sid).await;
                         mux.drop_stream(err_sid).await;
