@@ -284,3 +284,36 @@ evaporate after 10 minutes.
 ### Part C — `localHelper`
 When `localHelper.available`, optionally show its `peers` as "found on your LAN
 (offline)". It's a presence hint from the native helper; absent by default.
+
+## Exec streams (`filament exec`)
+
+Remote command execution over an established link, as a session-stream kind
+beside `mount-open` / `pty-open`: same sid-keyed streams table, same
+`send_control` framing, same `*-ack` open handshake. Additive -- unknown
+stream kinds are refused, never misinterpreted.
+
+- `exec-open` `{ type: "exec-open", sid, argv: [...], cwd, env, tty }` --
+  open an exec stream. `argv` is carried EXACTLY, element by element: the
+  initiator must send the argument vector as an array and the receiver must
+  spawn exactly those elements, with no joining, no splitting, no quoting
+  pass, and no shell in between. Spaces, quotes and glob characters survive
+  because they are never re-parsed -- that property is load-bearing, not
+  incidental, and the spaces/quotes/glob tests on both platforms pin it.
+  `cwd` is the requested working directory (default: the daemon's home).
+  `env` carries ONLY the allowlist: `TERM`, `LANG`, `LC_*`, plus explicit
+  `--env KEY=VALUE` pairs. Nothing else from either side's environment
+  crosses the link. `tty` requests a pty instead of pipes.
+- Standard output and standard error travel on SEPARATE channels (two stream
+  channels under the exec sid), never interleaved into one byte stream. A
+  receiver that merges them is non-conformant: exit-status attribution and
+  error triage depend on the split.
+- Close payload `{ type: "exec-close", sid, status }` -- `status` is the raw
+  process exit code. Death by signal is reported as `128 + signal number`
+  (the shell convention: 137 for SIGKILL, 143 for SIGTERM), never as 0 and
+  never as a bare code that collides with one. No exit-status payload means
+  the process did not exit cleanly; clients must not render that as success.
+- SHELL GATE: an exec stream is allowed exactly where a shell is allowed.
+  The receiver enforces the same gate as `up --shell`, and `--shell-only
+a,b` scopes it to the listed peers/devices identically: a peer outside the
+  scope gets the open refused, the same verdict an out-of-scope shell
+  attempt receives. Exec adds no new trust -- it rides the shell grant.

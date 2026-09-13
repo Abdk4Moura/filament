@@ -37,6 +37,7 @@ use filament_transfer::{
 mod fleet_enrollment;
 mod fleet_renewal;
 mod exit_route;
+mod exec_recv;
 /// `filament expose`: publish a local port on the L3 overlay. The CLI/config side
 /// is portable; the daemon listeners (Exposer) are Linux-gated with L3.
 mod expose;

@@ -181,7 +181,7 @@ impl Mux {
         self.transport.clone()
     }
 
-    fn alloc_sid(&self) -> u32 {
+    pub(crate) fn alloc_sid(&self) -> u32 {
         // Mask the counter to the low 30 bits so a long-lived link never escapes
         // into the L2 flag (0x80000000) OR the answerer-role bit (0x40000000).
         // The role bit keeps the two ends' sid spaces DISJOINT: each end allocates
@@ -259,7 +259,7 @@ impl Mux {
 
     /// Drop a stream and abort its read pump. Idempotent. Also drops any PTY
     /// resize sender for this sid (H-1: no resizer outlives its stream).
-    async fn drop_stream(&self, sid: u32) {
+    pub(crate) async fn drop_stream(&self, sid: u32) {
         self.resizers.lock().await.remove(&sid);
         self.open_ack_tx.lock().await.remove(&sid);
         if let Some(s) = self.streams.lock().await.remove(&sid) {
