@@ -143,7 +143,9 @@ env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant2.log" 2>&1
 OUTE=$(timeout 30 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo X' 2>"$WORK/E.err" </dev/null)
 rcE=$?
 echo "## (acceptor off) rc=$rcE out='$OUTE'"
-if [ "$rcE" != "0" ] && grep -qi "acceptor off\|not serving" "$WORK/E.err"; then
+# Message is "shell serving is off there..." since the acceptor wording change;
+# match it alongside the older variants.
+if [ "$rcE" != "0" ] && grep -qi "acceptor off\|not serving\|serving is off" "$WORK/E.err"; then
   ok "gateE: acceptor-off shell REFUSED with 'acceptor off' reason (nonzero)"
 else
   echo "-- E.err --"; cat "$WORK/E.err"; tail -5 "$WORK/up.log"
