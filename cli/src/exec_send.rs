@@ -31,6 +31,36 @@ pub(crate) struct ExecOpts {
     pub(crate) env: Vec<(String, String)>,
 }
 
+/// Bounded fd0 reader: the pty shared reader's shape (`spawn_stdin_reader`)
+/// with a 64-chunk cap so unread stdin cannot grow without bound. One
+/// consumer per invocation (same singleton discipline); kept exec-local so
+/// the shared reader's unbounded contract for pty is untouched. When the
+/// link stalls, `blocking_send` parks this thread instead of buffering
+/// forever: file reads pause, pipe writers block -- backpressure end to
+/// end instead of OOM. An empty Vec is the EOF sentinel, same convention.
+fn spawn_bounded_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    let _ = tx.blocking_send(Vec::new()); // EOF sentinel
+                    break;
+                }
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break; // the client hung up
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
 /// Build the final argv: direct spawn passes through untouched; `--shell`
 /// wraps as `/bin/sh -c <joined>` (cmd /C on Windows). The receiver never
 /// invokes a shell on its own -- this wrapping is the ONLY shell in the path,
@@ -163,10 +193,11 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
     })?
     .map_err(|reason: String| anyhow::anyhow!(reason))?;
     let _ = ack;
-    // Pumps: stdin shared reader (the fd0 singleton pattern from pty -- one
-    // consumer for the whole invocation), stdout/stderr to local stdio, close
-    // status out. No reconnect: link death below fails loudly by design.
-    let mut stdin_rx = l2::spawn_stdin_reader();
+    // Pumps: bounded fd0 reader (one consumer for the whole invocation,
+    // same singleton discipline as pty's shared reader), stdout/stderr to
+    // local stdio, close status out. No reconnect: link death below fails
+    // loudly by design.
+    let mut stdin_rx = spawn_bounded_stdin_reader();
     let mut stdin_done = false;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
