@@ -122,10 +122,50 @@ pub(crate) fn resolve_in_path(program: &str) -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(program);
+        if let Some(p) = resolve_bare_in(&dir, program) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Candidate spellings of a bare program name in one directory: the name
+/// itself, plus (Windows only) each PATHEXT suffix in order. Pure so the
+/// ordering is unit-testable on every platform; only used on Windows
+/// (allowed dead elsewhere so the unix build stays warning-neutral).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pathext_candidates(program: &str, exts: &str) -> Vec<String> {
+    let mut out = vec![program.to_string()];
+    for ext in exts.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        out.push(format!("{program}{ext}"));
+    }
+    out
+}
+
+/// Resolve a bare name inside one PATH directory. Unix: the name itself.
+/// Windows: the name itself, then PATHEXT suffixes (.EXE etc.) so `rsync`
+/// finds `rsync.exe` -- still a direct spawn of the resolved path, never a
+/// shell lookup, so argv exactness is unaffected.
+#[cfg(windows)]
+fn resolve_bare_in(dir: &std::path::Path, program: &str) -> Option<PathBuf> {
+    let exts =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for name in pathext_candidates(program, &exts) {
+        let candidate = dir.join(&name);
         if is_executable(&candidate) {
             return Some(candidate);
         }
+    }
+    None
+}
+
+/// Resolve a bare name inside one PATH directory (non-Windows): the name
+/// itself, unchanged from the original loop.
+#[cfg(not(windows))]
+fn resolve_bare_in(dir: &std::path::Path, program: &str) -> Option<PathBuf> {
+    let candidate = dir.join(program);
+    if is_executable(&candidate) {
+        return Some(candidate);
     }
     None
 }
@@ -622,6 +662,19 @@ mod tests {
         assert_eq!(status_code(None, Some(9)), Some(137));
         assert_eq!(status_code(None, Some(15)), Some(143));
         assert_eq!(status_code(None, None), None);
+    }
+
+    #[test]
+    fn pathext_candidates_bare_first_then_suffixes_in_order() {
+        assert_eq!(
+            pathext_candidates("rsync", ".COM;.EXE;.BAT;.CMD"),
+            vec!["rsync", "rsync.COM", "rsync.EXE", "rsync.BAT", "rsync.CMD"]
+        );
+        assert_eq!(pathext_candidates("rsync", ""), vec!["rsync"]);
+        assert_eq!(
+            pathext_candidates("run", " .EXE ; ; .BAT "),
+            vec!["run", "run.EXE", "run.BAT"]
+        );
     }
 
     #[test]

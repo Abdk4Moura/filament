@@ -292,21 +292,31 @@ beside `mount-open` / `pty-open`: same sid-keyed streams table, same
 `send_control` framing, same `*-ack` open handshake. Additive -- unknown
 stream kinds are refused, never misinterpreted.
 
-- `exec-open` `{ type: "exec-open", sid, argv: [...], cwd, env, tty }` --
+- `exec-open` `{ type: "exec-open", sid, err_sid, argv: [...], cwd, env, tty }` --
   open an exec stream. `argv` is carried EXACTLY, element by element: the
   initiator must send the argument vector as an array and the receiver must
   spawn exactly those elements, with no joining, no splitting, no quoting
   pass, and no shell in between. Spaces, quotes and glob characters survive
   because they are never re-parsed -- that property is load-bearing, not
-  incidental, and the spaces/quotes/glob tests on both platforms pin it.
+  incidental, and the spaces/quotes/glob e2e gates pin it on the platforms
+  they run on. `err_sid` is REQUIRED: the initiator-allocated stderr stream
+  id, announced so both ends use one value (same discipline as `sid`); an
+  open with it missing, unparseable, or outside the L2 sid half is refused
+  rather than served with a second locally-allocated sid nobody listens on.
   `cwd` is the requested working directory (default: the daemon's home).
   `env` carries ONLY the allowlist: `TERM`, `LANG`, `LC_*`, plus explicit
   `--env KEY=VALUE` pairs. Nothing else from either side's environment
   crosses the link. `tty` requests a pty instead of pipes.
-- Standard output and standard error travel on SEPARATE channels (two stream
-  channels under the exec sid), never interleaved into one byte stream. A
-  receiver that merges them is non-conformant: exit-status attribution and
-  error triage depend on the split.
+- `exec-open-ack` `{ type: "exec-open-ack", sid, out, err }` -- the
+  receiver's acceptance: `out` (== `sid`) names the stdout stream, `err`
+  (== the open's `err_sid`) the stderr stream. Informational: both pipes
+  are registered before the open goes out, so bytes racing the ack are
+  already routable.
+- Standard output and standard error travel on SEPARATE streams (`out` for
+  stdout, `err` for stderr -- two distinct sids, not two channels under
+  one), never interleaved into one byte stream. A receiver that merges
+  them is non-conformant: exit-status attribution and error triage depend
+  on the split.
 - Close payload `{ type: "exec-close", sid, status, out_bytes, err_bytes }` --
   `status` is the raw process exit code. Death by signal is reported as
   `128 + signal number` (the shell convention: 137 for SIGKILL, 143 for
