@@ -23,7 +23,24 @@ use std::path::Path;
 /// is not a why.
 fn budget() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
-        ("main.rs", 154),
+        // main.rs was 154 before the 2026-09-12 decomposition (26,261 -> 1,845
+        // lines); its prints moved with their code. Sum 337 -> 328.
+        ("main.rs", 1),
+        ("dispatch.rs", 65),
+        ("identity_flow.rs", 20),
+        ("add_for.rs", 12),
+        ("mount_cmd.rs", 8),
+        ("recv_cmd.rs", 8),
+        ("update_cmd.rs", 8),
+        ("send_cmd.rs", 7),
+        ("conn.rs", 4),
+        ("up_logs.rs", 4),
+        ("runtime_support.rs", 3),
+        ("devices_store.rs", 1),
+        ("enrollment.rs", 1),
+        ("pair_cmd.rs", 1),
+        ("recv_files.rs", 1),
+        ("status_cmd.rs", 1),
         ("mount.rs", 47),
         ("doctor.rs", 44),
         ("settings.rs", 37),

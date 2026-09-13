@@ -29,7 +29,28 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // Where every bug listed above came from. Pay this down first: process
         // liveness and daemon control, then the ctl channel, then path
         // stragglers.
-        ("main.rs", 92),
+        //
+        // main.rs was 92 before the 2026-09-12 decomposition. The total grows
+        // 209 -> 252, and that growth is honest, not sloppiness: a cfg-gated
+        // item moved into a child module now carries its attribute at up to
+        // three sites (definition + import + crate-root re-export) where the
+        // monolith needed one. New-module entries below mirror that.
+        ("main.rs", 30),
+        ("recv_cmd.rs", 25),
+        ("daemon_ctl.rs", 19),
+        ("tests.rs", 13),
+        ("recv_files.rs", 10),
+        ("runtime_support.rs", 7),
+        ("exec_recv.rs", 5),
+        ("file_io.rs", 5),
+        ("install_service.rs", 5),
+        ("update_cmd.rs", 5),
+        ("mount_cmd.rs", 4),
+        ("dispatch.rs", 3),
+        ("exec_send.rs", 3),
+        ("shell_support.rs", 3),
+        ("up_logs.rs", 2),
+        ("conn.rs", 1),
         // Largely irreducible: path encoding genuinely differs across platforms
         // and flattening it loses data. Not a target.
         ("mount_proto.rs", 47),
