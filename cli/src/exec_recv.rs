@@ -383,7 +383,7 @@ pub(crate) async fn serve_exec(
         }
     };
     let mut stdin = match child.stdin.take() {
-        Some(s) => s,
+        Some(s) => Some(s),
         None => {
             let _ = t
                 .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "no stdin pipe" }))
@@ -449,7 +449,6 @@ pub(crate) async fn serve_exec(
                         close["status"] = json!(code);
                     }
                 }
-                eprintln!("[TEMP2-exec] serve close sid={sid:#x} status={}", close.get("status").map(|s| s.to_string()).unwrap_or("?".into()));
                 let _ = t.send_control(&close).await;
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
@@ -465,16 +464,22 @@ pub(crate) async fn serve_exec(
                 // past its link's death.
                 match chunk {
                     Some(Some(bytes)) => {
-                        if stdin.write_all(&bytes).await.is_err() {
-                            break;
+                        if let Some(s) = stdin.as_mut() {
+                            if s.write_all(&bytes).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Some(None) => {
-                        eprintln!("[TEMP2-exec] serve eof sid={sid:#x}, shutting child stdin");
-                        let _ = stdin.shutdown().await;
+                        // EOF: CLOSE (drop) the write end. shutdown() is a
+                        // socket operation and silently no-ops on a pipe --
+                        // observed live: the daemon still held the write fd
+                        // open after shutdown(), the child starved forever
+                        // in pipe_wait_readable. EOF stays non-terminal: the
+                        // loop keeps waiting for output and exit.
+                        stdin.take();
                     }
                     None => {
-                        eprintln!("[TEMP2-exec] serve stdin-rx closed sid={sid:#x}, killing child");
                         let _ = child.kill().await;
                         mux.drop_stream(sid).await;
                         mux.drop_stream(err_sid).await;

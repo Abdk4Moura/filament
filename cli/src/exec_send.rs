@@ -207,8 +207,7 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             },
             chunk = stdin_rx.recv(), if !stdin_done => match chunk {
                 Some(c) if c.is_empty() => {
-                    let r = t.send_frame(sid, 0, &[]).await;
-                    eprintln!("[TEMP2-exec] eof frame sid={sid:#x} ok={}", r.is_ok());
+                    let _ = t.send_frame(sid, 0, &[]).await;
                     stdin_done = true;
                 }
                 Some(c) => {
