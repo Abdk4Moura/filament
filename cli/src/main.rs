@@ -1069,7 +1069,7 @@ pub(crate) use dlog;
 
 
 impl ShellPolicy {
-    fn auto_allows(&self, name: &str) -> bool {
+    pub(crate) fn auto_allows(&self, name: &str) -> bool {
         match self {
             ShellPolicy::Granted => false,
             ShellPolicy::All => true,

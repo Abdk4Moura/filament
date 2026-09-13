@@ -278,12 +278,24 @@ pub(crate) async fn authorize_exec(
 /// separate stream channels, feed stdin from the registered pipe, and on child
 /// exit send the exec-close payload and clean up. One-shot by design: unlike a
 /// PTY session there is nothing persistent, so there is nothing to reattach.
+/// Session-scoped authz snapshot for mid-session revoke re-checks: the
+/// verified device name (None when unverified, meaning nothing store-bound
+/// to re-check), its identity device key for cert-revoke checks, and whether
+/// the serving policy auto-allows it (static for the session). Resolved once
+/// in handle_exec_open; the ticker below re-reads the STORE each tick.
+pub(crate) struct ExecSessionAuthz {
+    pub(crate) dev_name: Option<String>,
+    pub(crate) idev: Option<[u8; 32]>,
+    pub(crate) policy_allows: bool,
+}
+
 pub(crate) async fn serve_exec(
     t: Arc<dyn Transport>,
     mux: Arc<l2::Mux>,
     sid: u32,
     req: ExecOpen,
     stdin_rx: mpsc::Receiver<Option<bytes::Bytes>>,
+    authz: ExecSessionAuthz,
 ) {
     // stderr rides the initiator-allocated `err_sid` from the open frame
     // (same value the initiator registered before sending): allocating a
@@ -409,6 +421,11 @@ pub(crate) async fn serve_exec(
         }
         sent
     });
+    // Revoke re-check (pty precedent): a dedicated ticker at the shared
+    // interval re-asks the gate while the child runs. A peer revoked
+    // mid-session -- certificate OR shell grant -- loses the live exec.
+    let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
+    revoke_ticker.tick().await; // consume the immediate first tick
     // stdin: chunks in, EOF shuts the child's write-half (it may still produce
     // output -- EOF is non-terminal, same rule as the pty pumps). Channel
     // death (link gone) kills the child: nobody is left to report to, and an
@@ -460,6 +477,36 @@ pub(crate) async fn serve_exec(
                         mux.drop_stream(err_sid).await;
                         return;
                     }
+                }
+            }
+            _ = revoke_ticker.tick() => {
+                // Re-ask the gate. Cert revoke is re-read from the store
+                // each tick; the shell grant is re-read the same way (the
+                // policy half is static per session). Either way the peer
+                // loses the live exec: kill the child and close with the
+                // revoked reason, so the initiator surfaces nonzero with a
+                // reason instead of hanging or rendering a clean exit.
+                let cert_gone = crate::cert_revoked_for(authz.idev.as_ref());
+                let grant_gone = match authz.dev_name.as_deref() {
+                    Some(n) => {
+                        crate::device_capability_denied(n, "shell")
+                            || !(authz.policy_allows || crate::device_allows(n, "shell"))
+                    }
+                    None => false,
+                };
+                if cert_gone || grant_gone {
+                    crate::ui::critical("exec: peer access revoked, closing live session");
+                    let _ = child.kill().await;
+                    let _ = t
+                        .send_control(&json!({
+                            "type": "l2-close",
+                            "sid": sid,
+                            "err": crate::capability::REVOKED_REASON,
+                        }))
+                        .await;
+                    mux.drop_stream(sid).await;
+                    mux.drop_stream(err_sid).await;
+                    return;
                 }
             }
         }
@@ -519,8 +566,24 @@ pub(crate) async fn handle_exec_open(
     // observed live as hung stdin sessions wedging the acceptor). The pty
     // path spawns its session pumps for exactly this reason; validation,
     // gating and registration above already ran in-hook, so the detached
-    // task owns only owned values from here.
-    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx));
+    // task owns only owned values from here. The revoke ticker needs the
+    // same authz context, resolved once here (re-reads the store per tick).
+    let dev_name = conn.link(pid).and_then(|l| l.verified_name.clone());
+    let policy_allows = dev_name
+        .as_deref()
+        .map(|n| shell_policy.auto_allows(n))
+        .unwrap_or(false);
+    let idev = {
+        let az = crate::peer_authz(conn, pid);
+        let (idev, _, _, _, _, _) = az.parts();
+        idev.copied()
+    };
+    let authz = ExecSessionAuthz {
+        dev_name,
+        idev,
+        policy_allows,
+    };
+    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz));
 }
 
 #[cfg(test)]

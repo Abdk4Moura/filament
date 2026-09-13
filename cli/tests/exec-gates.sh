@@ -260,6 +260,26 @@ else
   bad "gateJ: revoked exec NOT refused (rc=$rcJ)"
 fi
 
+# ===================================================================== GATE K ==
+# REVOKED MID-SESSION: a long exec dies (nonzero + revoked reason) when the
+# shell grant is revoked underneath it -- the receiver ticker re-asks the
+# gate instead of letting the child run out its clock.
+say K
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantK.log" 2>&1
+timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 30 2>"$WORK/K.err" </dev/null &
+KPid=$!
+sleep 5
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revokeK.log" 2>&1
+wait "$KPid"
+rcK=$?
+echo "## (revoked mid-session) rc=$rcK"
+if [ "$rcK" != "0" ] && [ "$rcK" != "124" ] && grep -qi "revoked" "$WORK/K.err"; then
+  ok "gateK: mid-session revoke ended the exec (nonzero + reason)"
+else
+  echo "-- K.err --"; cat "$WORK/K.err"
+  bad "gateK: revoked session NOT ended (rc=$rcK)"
+fi
+
 # ========================================================================= sum =
 echo
 echo "==========================================="
