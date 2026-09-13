@@ -488,6 +488,16 @@
         "windows"
       ],
       "behavior": "Returns success after reporting a platform skip."
+    },
+    {
+      "path": "cli/src/shell_gate.rs",
+      "test": "cert_revoked_live_gate_requires_fleet_enrollment",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "behavior": "Ignored: no live harness exercises cert-revoked exec (secret-paired links never resolve an identity, so cert_revoked is always false there). Requires fleet enrollment in the e2e harness; revoked cells are covered unit-level by exec_matches_pty_across_gate_matrix."
     }
   ]
 }

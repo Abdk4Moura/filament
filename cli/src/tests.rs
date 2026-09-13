@@ -17,8 +17,8 @@ use super::*;
 /// own temp dir must not run concurrently with each other (a second test
 /// overwriting the env mid-test would make it read/write the wrong store).
 /// Every test that sets the var holds this lock for its whole body.
-static TEST_CONFIG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) static TEST_CONFIG_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+pub(crate) fn lock_test_config() -> std::sync::MutexGuard<'static, ()> {
     // Poison-tolerant: a test that panics while holding the lock must not
     // poison every later FILAMENT_CONFIG_DIR test.
     TEST_CONFIG_LOCK

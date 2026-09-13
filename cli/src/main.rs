@@ -154,6 +154,8 @@ pub(crate) use shared_defs::HEAD_BYTES;
 /// Shell authority helpers and daemon/service probes.
 mod shell_support;
 pub(crate) use shell_support::{any_shell_grant, daemon_alive, daemon_running, require_shell_owner_ack, service_manager_for_pid, shell_argv, shell_grant_names, shell_root_note};
+/// The single shell gate shared by pty-open and exec-open.
+mod shell_gate;
 #[cfg(test)]
 pub(crate) use shell_support::service_manager_for_cgroup;
 /// Hashing, time and randomness primitives.

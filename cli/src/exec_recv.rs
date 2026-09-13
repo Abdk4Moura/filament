@@ -204,11 +204,8 @@ async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> R
     Ok(())
 }
 
-/// Authorize an exec open: the shell gate, evaluated exactly like pty-open.
-/// The capability verdict decides UNCONDITIONALLY (`granted.allowed()` -- no
-/// shadow/authoritative split, no legacy fallback): under the old split a
-/// revoked certificate was still allowed whenever legacy checks passed, so
-/// exec could be MORE permissive than a shell. Returns the label for
+/// Authorize an exec open through the shared shell gate (same function, same
+/// inputs as pty-open; no exec-local decision logic). Returns the label for
 /// user-visible messages on allow, or the wire refusal reason on deny.
 /// Side-effecting tells (ui::say, enqueue) stay with the caller, next to the
 /// send_control that carries the verdict -- same split as the pty-open arm.
@@ -217,60 +214,10 @@ pub(crate) async fn authorize_exec(
     pid: &str,
     shell_policy: &crate::ShellPolicy,
 ) -> Result<String, String> {
-    // `trusted` stays an INPUT to the capability engine (via legacy_ok),
-    // never a separate decision tier: the verdict below is granted alone.
-    let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
-    let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
-    let legacy_ok = trusted
-        && dev
-            .as_deref()
-            .map(|n| {
-                !crate::device_capability_denied(n, "shell")
-                    && (shell_policy.auto_allows(n) || crate::device_allows(n, "shell"))
-            })
-            .unwrap_or(false);
-    // Capability inputs, evaluated unconditionally -- the same block pty-open
-    // runs. Unlike the old shadow split, the verdict below does not consult
-    // any legacy fallback: granted.allowed() decides on its own.
-    let az = crate::peer_authz(conn, pid);
-    let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-    let outcome = crate::capability::cap_authorize(
-        &crate::settings::config_dir(),
-        "self",
-        crate::capability::CAP_SHELL,
-        idev,
-        iusr,
-        ak_caps,
-    );
-    let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-        &crate::settings::config_dir(),
-        "self",
-        crate::capability::CAP_SHELL,
-        idev,
-        iusr,
-        ak_caps,
-    );
-    let granted = crate::capability::cap_gate_effective(
-        legacy_ok,
-        &outcome,
-        crate::capability::CAP_SHELL,
-        "self",
-        idev,
-        iusr,
-        binding,
-        expires,
-        ak_caps,
-        own_user.as_ref(),
-        false,
-        has_grant,
-        cert_revoked,
-    );
-    if !granted.allowed() {
-        return Err(granted
-            .deny_reason("shell capability not granted")
-            .to_string());
-    }
-    Ok(dev.unwrap_or_else(|| pid.to_string()))
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
+    crate::shell_gate::exec_gate_decision(&inputs)
+        .map(|()| dev.unwrap_or_else(|| pid.to_string()))
+        .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login

@@ -4312,64 +4312,16 @@ pub(crate) async fn recv_cmd(
                     if !l2::is_l2_sid(sid) {
                         continue;
                     }
-                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    let dev = conn.link(&pid).and_then(|l| l.verified_name.clone());
-                    let legacy_ok = trusted
-                        && dev
-                            .as_deref()
-                            .map(|n| {
-                                !device_capability_denied(n, "shell")
-                                    && (shell_policy.auto_allows(n) || device_allows(n, "shell"))
-                            })
-                            .unwrap_or(false);
-                    // Capability layer evaluated unconditionally (shadow samples the
-                    // legacy-allowed population); legacy stands in shadow, cap gates
-                    // under FILAMENT_CAP_AUTHORITATIVE.
-                    let granted = {
-                        let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let outcome = crate::capability::cap_authorize(
-                            &crate::settings::config_dir(),
-                            "self",
-                            crate::capability::CAP_SHELL,
-                            idev,
-                            iusr,
-                            ak_caps,
-                        );
-                        {
-                            let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                                &crate::settings::config_dir(),
-                                "self",
-                                crate::capability::CAP_SHELL,
-                                idev,
-                                iusr,
-                                ak_caps,
-                            );
-                            // Deliberate tier: `shell` is never a scoped default, so a
-                            // same-owner device gets it ONLY via an explicit grant
-                            // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
-                            crate::capability::cap_gate_effective(
-                                legacy_ok,
-                                &outcome,
-                                crate::capability::CAP_SHELL,
-                                "self",
-                                idev,
-                                iusr,
-                                binding,
-                                expires,
-                                ak_caps,
-                                own_user.as_ref(),
-                                false,
-                                has_grant,
-                                cert_revoked,
-                            )
-                        }
-                    };
-                    if !granted.allowed() {
+                    // One shared shell gate (same function, same inputs as
+                    // exec-open): gather, then the pty entry point. The tells
+                    // below stay local; only the verdict is shared.
+                    let (dev, gate_inputs) =
+                        crate::shell_gate::gather_shell_gate_inputs(&mut conn, &pid, &shell_policy);
+                    if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!(
                             "l2: pty refused: {who}: {}",
-                            granted.deny_reason("no shell cap / untrusted")
+                            cap_reason.as_deref().unwrap_or("no shell cap / untrusted")
                         ));
                         enqueue_if_requestable(who, "shell");
                         // Carry the specific cap reason (e.g. CEILING_REASON,
@@ -4377,7 +4329,7 @@ pub(crate) async fn recv_cmd(
                         // produced and then thrown away before it crossed the wire,
                         // so the initiator read an empty success instead of the
                         // refusal. The fallback stays coarse on purpose.
-                        let reason = granted.deny_reason("shell capability not granted");
+                        let reason = cap_reason.unwrap_or_else(|| "shell capability not granted".to_string());
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
                             .await;
