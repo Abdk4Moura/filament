@@ -99,7 +99,14 @@ pub(crate) fn grant_expiry_secs(
     }
     if let Some(up) = user_pub {
         let key = hex::encode(up);
-        for e in crate::capability::load_cap_store(config_dir).iter().filter(|e| {
+        // Highest-version row per grantor (dispatch.rs:1624 pattern): newer
+        // ops supersede, so an expired v1 must not shadow a live v2 (and a
+        // revoked-then-regranted pair resolves to the live row, because
+        // revokes remove rows outright). Across grantors the tightest wins.
+        let mut latest: std::collections::HashMap<&str, &serde_json::Value> =
+            std::collections::HashMap::new();
+        let store = crate::capability::load_cap_store(config_dir);
+        for e in store.iter().filter(|e| {
             e["type"].as_str() == Some("cap_grant")
                 && e["resource"].as_str() == Some("self")
                 && e["permissions"].as_array().is_some_and(|p| {
@@ -107,6 +114,17 @@ pub(crate) fn grant_expiry_secs(
                 })
                 && e["target"].as_str() == Some(&key)
         }) {
+            let g = e["grantor"].as_str().unwrap_or("");
+            let v = e["version"].as_u64().unwrap_or(0);
+            let cur = latest
+                .get(g)
+                .and_then(|c| c["version"].as_u64())
+                .unwrap_or(0);
+            if v >= cur {
+                latest.insert(g, e);
+            }
+        }
+        for e in latest.values() {
             if let Some(x) = e["expires"].as_u64() {
                 consider(x);
             }
@@ -942,17 +960,21 @@ mod tests {
         assert!(got <= 600 && got >= 590, "10-min grant clamps ttl, got {got}");
         // Fleet cap store with a tighter 5-minute shell grant for the peer key.
         let upub = [0x77u8; 32];
+        let grantor = "aa".repeat(32);
+        let row = |version: u64, expires: u64| {
+            format!(
+                r#"{{"type":"cap_grant","grantor":"{grantor}","version":{version},"resource":"self","permissions":["shell"],"target":"{}","expires":{expires}}}"#,
+                hex::encode(upub)
+            )
+        };
         std::fs::write(
             dir.join("caps.json"),
-            format!(
-                r#"[{{"type":"cap_grant","resource":"self","permissions":["shell"],"target":"{}","expires":{}}}]"#,
-                hex::encode(upub),
-                now + 300
-            ),
+            format!("[{0},{1}]", row(1, now - 10), row(2, now + 300)),
         )
         .unwrap();
+        // Expired v1 must NOT shadow live v2: highest version per grantor wins.
         let got = grant_expiry_secs(&dir, "boxA", Some(upub), now).expect("fleet expiry");
-        assert!(got <= 300 && got >= 290, "tighter fleet grant wins, got {got}");
+        assert!(got <= 300 && got >= 290, "v2 window wins over expired v1, got {got}");
         // Expired clamps to zero (the validity clamp then refuses).
         std::fs::write(
             dir.join("devices.json"),
