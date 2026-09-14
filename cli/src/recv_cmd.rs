@@ -4515,6 +4515,28 @@ pub(crate) async fn recv_cmd(
                     exec_recv::handle_exec_open(&mut conn, &pid, t, mux, &v, &shell_policy).await;
                     continue;
                 }
+                Some("ssh-sign-request") if !l2_enabled => {
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "l2-close",
+                                "sid": sid,
+                                "err": crate::capability::SHELL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
+                // SSH certificate signing: parse, shell-gate (third path),
+                // clamp, sign, reply. Pure control round trip (no stream);
+                // the handler sends its own cert/refusal replies.
+                Some("ssh-sign-request") => {
+                    let Some(t) = conn.transport_of(&pid) else {
+                        continue;
+                    };
+                    crate::ssh_ca::handle_ssh_sign(&mut conn, &pid, t, &v, &shell_policy).await;
+                    continue;
+                }
                 Some("mount-open") if l2_enabled => {
                     let Some(t) = conn.transport_of(&pid) else {
                         continue;

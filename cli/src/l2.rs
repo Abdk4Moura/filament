@@ -4314,15 +4314,19 @@ fn resolve_login(remote_user: Option<String>) -> String {
         .unwrap_or_else(|| "root".into())
 }
 
-/// Spawn the real `ssh`, pointed EXCLUSIVELY at filament-managed key material +
-/// known_hosts, with a `filament netcat` ProxyCommand. Returns ssh's exit code
-/// (so a cached fast-path can detect a 255 connect/auth failure and retry after a
-/// fresh bootstrap). The destination is always `<login>@filament-<peer>`.
-/// Run the ssh session, preferring the resilient L3 overlay. The bootstrap has
-/// already installed our managed key on the peer and pinned host keys, so both
-/// paths use the SAME managed identity; L3 just connects to the stable overlay
-/// address directly (no ProxyCommand), so the session survives a link repair.
+/// Spawn the real `ssh`, pointed EXCLUSIVELY at the ephemeral cert identity
+/// (fresh key + B-signed cert) + known_hosts, with a `filament netcat`
+/// ProxyCommand. Returns ssh's exit code. The cert is acquired FIRST over a
+/// fresh L2 link and the flow fails CLOSED without it (clear error, never a
+/// managed-key fallback: silently downgrading would make the CA decorative).
+/// The destination is always `<login>@filament-<peer>`.
+/// Run the ssh session, preferring the resilient L3 overlay. Both paths use
+/// the SAME cert identity; L3 just connects to the stable overlay address
+/// directly (no ProxyCommand), so the session survives a link repair.
 /// Falls back to the L2 tunnel when L3 isn't viable or its connect fails (255).
+/// The ephemeral tmpdir dies with the flow: explicit cleanup is belt, Drop
+/// is suspenders, and a signal watchdog covers SIGINT/SIGTERM (process::exit
+/// and signals both skip Drop).
 async fn run_ssh(
     server: &str,
     peer: &str,
@@ -4333,6 +4337,15 @@ async fn run_ssh(
     extra: &[String],
     revive: bool,
 ) -> Result<i32> {
+    // Cert identity first: fresh ephemeral key, B-signed cert over an L2
+    // link. Fail closed (no managed-key fallback) when keygen, link, or
+    // signing fails -- the error names the cause.
+    let eph = crate::ssh_ca::EphemeralKey::generate()
+        .map_err(|e| anyhow::anyhow!("ssh cert setup failed (no key fallback): {e}"))?;
+    let _sigwatch = crate::ssh_ca::spawn_cleanup_on_signal(eph.dir().to_path_buf());
+    let ident = crate::ssh_ca::acquire_ssh_cert(server, peer, relay, &eph)
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh cert issuance failed (no key fallback): {e}"))?;
     #[cfg(not(target_os = "linux"))]
     let _ = revive;
     #[cfg(target_os = "linux")]
@@ -4344,7 +4357,7 @@ async fn run_ssh(
                 crate::ui::debug(&format!(
                     "ssh over the L3 overlay ({mesh_host}) - survives link repairs"
                 ));
-                let code = spawn_ssh_direct(login, &mesh_host, extra)?;
+                let code = spawn_ssh_direct(login, &mesh_host, extra, &ident)?;
                 if code != 255 {
                     return Ok(code);
                 }
@@ -4366,20 +4379,26 @@ async fn run_ssh(
             // revive wait twice - go straight to the L2 tunnel below.
         }
     }
-    spawn_ssh(server, peer, relay, host, login, rport, extra)
+    spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)
 }
 
 /// ssh directly to a stable overlay host (no ProxyCommand), reusing the managed
 /// key + known_hosts the L2 path uses. The overlay address is cryptographically
 /// bound to the peer, so accept-new pins the host key on first use.
 #[cfg(target_os = "linux")]
-fn spawn_ssh_direct(login: &str, mesh_host: &str, extra: &[String]) -> Result<i32> {
-    let key = crate::sshkeys::managed_key_path();
+fn spawn_ssh_direct(
+    login: &str,
+    mesh_host: &str,
+    extra: &[String],
+    ident: &crate::ssh_ca::CertIdentity,
+) -> Result<i32> {
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{mesh_host}");
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o")
-        .arg(format!("IdentityFile={}", key.display()))
+        .arg(format!("IdentityFile={}", ident.key_path.display()))
+        .arg("-o")
+        .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
         .arg("-o")
@@ -4419,6 +4438,7 @@ fn spawn_ssh(
     login: &str,
     rport: u16,
     extra: &[String],
+    ident: &crate::ssh_ca::CertIdentity,
 ) -> Result<i32> {
     let exe = std::env::current_exe()?;
     let exe = exe.to_string_lossy();
@@ -4428,14 +4448,15 @@ fn spawn_ssh(
     }
     proxy.push_str(&format!(" forward {peer}:{rport} --stdio"));
 
-    let key = crate::sshkeys::managed_key_path();
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{host}");
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o")
         .arg(format!("ProxyCommand={proxy}"))
         .arg("-o")
-        .arg(format!("IdentityFile={}", key.display()))
+        .arg(format!("IdentityFile={}", ident.key_path.display()))
+        .arg("-o")
+        .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
         .arg("-o")
