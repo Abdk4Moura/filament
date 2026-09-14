@@ -177,17 +177,49 @@ pub(crate) fn build_sign_argv(
 }
 
 /// One issued-cert record: binds a pubkey to the device it was signed for,
-/// so the same key is never re-signed for someone else.
+/// so the same key is never re-signed for someone else. Carries its expiry
+/// so dead entries prune instead of accumulating forever.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IssuedCert {
     pub pubkey: String,
     pub device_id: String,
     pub serial: u64,
+    pub expires: u64,
 }
 
-/// Next monotonic serial: one past the max on record (starts at 1).
+/// Next monotonic serial: one past the max on record (starts at 1). The
+/// counter additionally persists in its own file (below); the record max is
+/// the fallback when that file is absent.
 pub(crate) fn next_serial(records: &[IssuedCert]) -> u64 {
     records.iter().map(|r| r.serial).max().unwrap_or(0) + 1
+}
+
+/// Serial counter path (separate small file, not the record).
+pub(crate) fn serial_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("ssh_ca_serial")
+}
+
+/// Read the persisted serial, falling back to the record max. Garbage reads
+/// as absent (fail closed downstream: a lost counter restarts at record
+/// max + 1, never at zero over live serials).
+pub(crate) fn read_serial(config_dir: &std::path::Path, records: &[IssuedCert]) -> u64 {
+    std::fs::read_to_string(serial_path(config_dir))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| next_serial(records))
+}
+
+/// Persist the NEXT serial atomically (temp + rename). Errors fail closed:
+/// a serial that cannot be persisted must not be issued (a crash between
+/// issue and persist would otherwise repeat it). No lock needed: issuance
+/// runs inline in the daemon's single recv loop, so two signs cannot
+/// interleave the read-increment-write.
+pub(crate) fn write_serial(config_dir: &std::path::Path, next: u64) -> Result<()> {
+    let path = serial_path(config_dir);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, next.to_string())?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Refuse a pubkey already signed for a DIFFERENT device id (key sharing
@@ -206,21 +238,40 @@ pub(crate) fn issued_path(config_dir: &std::path::Path) -> std::path::PathBuf {
     config_dir.join("ssh_ca_issued.json")
 }
 
-/// Load the record (missing file = no issuances yet, not an error).
-pub(crate) fn load_issued(config_dir: &std::path::Path) -> Vec<IssuedCert> {
+/// Load the record (missing file = no issuances yet, not an error),
+/// pruning expired entries so the ledger does not accumulate dead rows.
+/// `now_secs` is a parameter (not read) so tests pin time.
+pub(crate) fn load_issued(config_dir: &std::path::Path, now_secs: u64) -> Vec<IssuedCert> {
     let p = issued_path(config_dir);
     let Ok(raw) = std::fs::read_to_string(&p) else {
         return Vec::new();
     };
-    serde_json::from_str(&raw).unwrap_or_default()
+    let mut v: Vec<IssuedCert> = serde_json::from_str(&raw).unwrap_or_default();
+    let before = v.len();
+    v.retain(|r| r.expires > now_secs);
+    if v.len() != before {
+        let _ = std::fs::write(&p, serde_json::to_string(&v).unwrap_or_default());
+    }
+    v
 }
 
-/// Append one issuance (best-effort persist; a lost record only loses the
-/// re-sign check for old keys, never grants anything).
-pub(crate) fn record_issuance(config_dir: &std::path::Path, rec: &IssuedCert) {
-    let mut v = load_issued(config_dir);
+/// Append one issuance, atomically (temp + rename). Errors fail closed at
+/// the call site: an unrecorded cert must not ship, or the re-sign check
+/// would go blind for it.
+pub(crate) fn record_issuance(
+    config_dir: &std::path::Path,
+    rec: &IssuedCert,
+    now_secs: u64,
+) -> Result<()> {
+    let mut v = load_issued(config_dir, now_secs);
     v.push(rec.clone());
-    let _ = std::fs::write(issued_path(config_dir), serde_json::to_string(&v).unwrap_or_default());
+    let text =
+        serde_json::to_string(&v).map_err(|e| anyhow::anyhow!("issuance record unserializable: {e}"))?;
+    let path = issued_path(config_dir);
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
 }
 
 /// Issuance log line fields (who, principal, serial, expiry), per contract.
@@ -341,12 +392,17 @@ pub(crate) async fn handle_ssh_sign(
     v: &serde_json::Value,
     shell_policy: &crate::ShellPolicy,
 ) {
-    let deny = |t: &std::sync::Arc<dyn crate::net::Transport>, sid: u32, reason: &str| {
+    // Refusals are GENERIC on the wire: every deny looks identical out
+    // there, so a refused peer cannot oracle which check failed. The detail
+    // goes to the local log only (the malformed-frame case below is the
+    // deliberate exception: it names itself so misconfigured peers can
+    // tell a malformed request from a denied one).
+    let refuse = |t: &std::sync::Arc<dyn crate::net::Transport>, sid: u32, detail: String| {
         let t = t.clone();
-        let reason = reason.to_string();
         async move {
+            crate::ui::say(&format!("l2: ssh-sign refused: {detail}"));
             let _ = t
-                .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": reason }))
+                .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": "ssh-sign refused" }))
                 .await;
         }
     };
@@ -359,9 +415,12 @@ pub(crate) async fn handle_ssh_sign(
     // Gate first (same function, same inputs as pty/exec): no grant, no cert.
     let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
     if let Err(cap_reason) = crate::shell_gate::ssh_gate_decision(&inputs) {
-        let reason = cap_reason.unwrap_or_else(|| "shell capability not granted".to_string());
-        crate::ui::say(&format!("l2: ssh-sign refused: {reason}"));
-        deny(&t, sid, &reason).await;
+        refuse(
+            &t,
+            sid,
+            cap_reason.unwrap_or_else(|| "shell capability not granted".to_string()),
+        )
+        .await;
         return;
     }
     // -I always carries the LINK-verified name, never the asserted one: a
@@ -371,29 +430,27 @@ pub(crate) async fn handle_ssh_sign(
     // no name to certify, so they refuse.
     let verified = dev.clone().unwrap_or_default();
     if verified.is_empty() {
-        let reason = "ssh-sign refused: link peer is unverified";
-        crate::ui::say(&format!("l2: {reason}"));
-        deny(&t, sid, reason).await;
+        refuse(&t, sid, "link peer is unverified".to_string()).await;
         return;
     }
     if verified != req.device_id {
+        // {:?}-escaped: the asserted id is attacker-controlled (log
+        // injection via newlines/ANSI), the verified name decides.
         crate::ui::say(&format!(
-            "l2: ssh-sign id mismatch (asserted '{}', verified '{}'): certifying verified",
+            "l2: ssh-sign id mismatch (asserted {:?}, verified '{}'): certifying verified",
             req.device_id, verified
         ));
     }
     let config_dir = crate::settings::config_dir();
     let ca_path = ca_key_path(&config_dir);
     if let Err(e) = check_ca_key(&ca_path) {
-        let reason = format!("ssh-sign refused: {e}");
-        deny(&t, sid, &reason).await;
+        refuse(&t, sid, format!("CA key: {e}")).await;
         return;
     }
     let setting_ttl = match resolve_cert_ttl_secs() {
         Ok(s) => s,
         Err(e) => {
-            let reason = format!("ssh-sign refused: bad ssh.cert_ttl: {e}");
-            deny(&t, sid, &reason).await;
+            refuse(&t, sid, format!("bad ssh.cert_ttl: {e}")).await;
             return;
         }
     };
@@ -410,18 +467,22 @@ pub(crate) async fn handle_ssh_sign(
     let ttl = match clamp_validity_secs(grant_remaining, req.ttl_secs, setting_ttl) {
         Ok(s) => s,
         Err(e) => {
-            let reason = format!("ssh-sign refused: {e}");
-            deny(&t, sid, &reason).await;
+            refuse(&t, sid, format!("validity: {e}")).await;
             return;
         }
     };
-    let records = load_issued(&config_dir);
+    let records = load_issued(&config_dir, now);
     if let Err(e) = refuse_resign(&records, &req.ephemeral_pubkey, &verified) {
-        let reason = format!("ssh-sign refused: {e}");
-        deny(&t, sid, &reason).await;
+        refuse(&t, sid, format!("re-sign check: {e}")).await;
         return;
     }
-    let serial = next_serial(&records);
+    // Persist the serial BEFORE signing (atomic, fail closed): a crash
+    // between issue and persist must never repeat a serial.
+    let serial = read_serial(&config_dir, &records);
+    if let Err(e) = write_serial(&config_dir, serial.saturating_add(1)) {
+        refuse(&t, sid, format!("serial ledger unwritable: {e}")).await;
+        return;
+    }
     let validity = validity_interval(ttl);
     let principal = daemon_username();
     let workdir = std::env::temp_dir().join(format!(
@@ -430,7 +491,7 @@ pub(crate) async fn handle_ssh_sign(
         serial
     ));
     if std::fs::create_dir_all(&workdir).is_err() {
-        deny(&t, sid, "ssh-sign refused: cannot stage signing").await;
+        refuse(&t, sid, "cannot stage signing".to_string()).await;
         return;
     }
     let cert = match sign(
@@ -447,16 +508,28 @@ pub(crate) async fn handle_ssh_sign(
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&workdir);
-            let reason = format!("ssh-sign refused: {e}");
-            deny(&t, sid, &reason).await;
+            refuse(&t, sid, format!("signing failed: {e}")).await;
             return;
         }
     };
     let _ = std::fs::remove_dir_all(&workdir);
-    record_issuance(
+    // Record the issuance (fail closed: an unrecorded cert must not ship,
+    // or the re-sign check would go blind for it).
+    if record_issuance(
         &config_dir,
-        &IssuedCert { pubkey: req.ephemeral_pubkey.clone(), device_id: verified.clone(), serial },
-    );
+        &IssuedCert {
+            pubkey: req.ephemeral_pubkey.clone(),
+            device_id: verified.clone(),
+            serial,
+            expires: now.saturating_add(ttl),
+        },
+        now,
+    )
+    .is_err()
+    {
+        refuse(&t, sid, "issuance ledger unwritable".to_string()).await;
+        return;
+    }
     crate::ui::say(&format!(
         "l2: {}",
         format_issuance(&verified, &principal, serial, &(now + ttl).to_string())
@@ -918,8 +991,8 @@ mod tests {
     #[test]
     fn serials_monotonic_and_resign_bound_to_device() {
         let recs = vec![
-            IssuedCert { pubkey: "k1".into(), device_id: "a".into(), serial: 4 },
-            IssuedCert { pubkey: "k2".into(), device_id: "b".into(), serial: 9 },
+            IssuedCert { pubkey: "k1".into(), device_id: "a".into(), serial: 4, expires: 9_999_999_999 },
+            IssuedCert { pubkey: "k2".into(), device_id: "b".into(), serial: 9, expires: 9_999_999_999 },
         ];
         assert_eq!(next_serial(&recs), 10);
         assert_eq!(next_serial(&[]), 1);
@@ -1012,6 +1085,38 @@ mod tests {
         // Second run returns the same key without touching it.
         let again = ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).await.expect("idempotent");
         assert_eq!(again, key);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ledger_persists_serial_prunes_dead_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("fil-sshca-ledger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 1_800_000_000u64;
+        // Absent serial falls back to record max + 1 (fresh store: 1).
+        assert_eq!(read_serial(&dir, &[]), 1);
+        write_serial(&dir, 41).expect("serial persists");
+        assert_eq!(read_serial(&dir, &[]), 41);
+        // Garbage reads as absent (fail closed downstream, never zero).
+        std::fs::write(serial_path(&dir), "bogus").unwrap();
+        assert_eq!(read_serial(&dir, &[]), 1);
+        // Record round trip; expired rows prune on load.
+        record_issuance(
+            &dir,
+            &IssuedCert { pubkey: "k".into(), device_id: "a".into(), serial: 41, expires: now + 100 },
+            now,
+        )
+        .expect("record persists");
+        record_issuance(
+            &dir,
+            &IssuedCert { pubkey: "old".into(), device_id: "a".into(), serial: 40, expires: now - 1 },
+            now,
+        )
+        .expect("record persists");
+        let v = load_issued(&dir, now);
+        assert_eq!(v.len(), 1, "expired rows prune");
+        assert_eq!(v[0].serial, 41);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
