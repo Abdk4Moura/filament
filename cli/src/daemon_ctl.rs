@@ -156,8 +156,9 @@ pub(crate) async fn handle_mount(
         return;
     }
 
-    // Bootstrap peer connection info.
-    let info = match crate::l2::ensure_peer_bootstrap_port(server, &peer, relay, port).await {
+    // Bootstrap peer connection info (sshfs authenticates with the managed
+    // key: cert mode is `shell --ssh` only).
+    let info = match crate::l2::ensure_peer_bootstrap_port(server, &peer, relay, port, false).await {
         Ok(info) => info,
         Err(e) => {
             req.reject(&format!("bootstrap failed: {e}")).await;

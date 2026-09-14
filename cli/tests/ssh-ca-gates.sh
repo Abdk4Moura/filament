@@ -131,6 +131,13 @@ json.dump(arr,open(p,"w"))
 PY2
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
+# The ONLY authorized_keys on the box that matters here is root's (the
+# temp sshd has no AuthorizedKeysFile line at all). Snapshot it: CB-3
+# asserts cert login leaves it byte-identical (no permanent key install).
+AK_FILE="$HOME/.ssh/authorized_keys"
+AK_BEFORE="$WORK/ak.before"; AK_AFTER="$WORK/ak.after"
+[ -f "$AK_FILE" ] && cp "$AK_FILE" "$AK_BEFORE" || : > "$AK_BEFORE"
+
 # ===================================================================== GATE A ==
 # POSITIVE: cert round trip + real sshd login with the cert. No
 # authorized_keys exists anywhere, so rc=0 with output proves cert auth.
@@ -193,6 +200,18 @@ else
   echo "-- hooked-sshd-config --"; cat "$WORK/hooked-sshd-config" 2>/dev/null
   echo "-- hooked-principals --"; ls -la "$WORK/hooked-principals" 2>/dev/null
   bad "gateC: arming outputs missing"
+fi
+
+# ===================================================================== GATE E ==
+# NO-INSTALL: B's authorized_keys is byte-identical after cert login --
+# `shell --ssh` installed nothing permanent (host-key pinning only).
+say E
+[ -f "$AK_FILE" ] && cp "$AK_FILE" "$AK_AFTER" || : > "$AK_AFTER"
+if cmp -s "$AK_BEFORE" "$AK_AFTER"; then
+  ok "gateE: authorized_keys unchanged by cert login (no key install)"
+else
+  echo "-- diff --"; diff "$AK_BEFORE" "$AK_AFTER" | head -5
+  bad "gateE: authorized_keys CHANGED by cert login"
 fi
 
 # ========================================================================= sum =
