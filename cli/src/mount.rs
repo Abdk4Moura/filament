@@ -365,7 +365,7 @@ pub async fn mount_cmd(
                 let code = s.code().unwrap_or(1);
                 if code == 255 && info.took_fast_path {
                     crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
-                    let retry = crate::l2::rebootstrap_peer(server, peer, relay).await?;
+                    let retry = crate::l2::rebootstrap_peer(server, peer, relay, false).await?;
                     let mut cmd = build_sshfs(&retry, true);
                     cmd.arg(&local_path);
                     if read_only { cmd.arg("-o").arg("ro"); }

@@ -4628,7 +4628,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
 }
 
 /// Invalidate bootstrap cache and re-bootstrap a peer (for retry after exit 255).
-pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
+pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool, cert_only: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let host = format!("filament-{peer}");
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
@@ -4637,7 +4637,7 @@ pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> R
         .unwrap_or(22);
 
     crate::sshkeys::bootstrap_cache_clear(peer);
-    let info = shell_bootstrap(server, peer, relay, rport, false).await?;
+    let info = shell_bootstrap(server, peer, relay, rport, cert_only).await?;
     ensure_sshd(peer, rport, info.sshd).await;
     crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
     crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
@@ -4746,7 +4746,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     // real bootstrap, and retry ssh ONCE.
     if code == 255 && info.took_fast_path {
         crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
-        let retry = rebootstrap_peer(server, peer, relay).await?;
+        let retry = rebootstrap_peer(server, peer, relay, true).await?;
         // revive=false: don't pay the L3 revive-wait twice on the same invocation.
         let code = run_ssh(
             server,

@@ -99,7 +99,8 @@ PermitRootLogin prohibit-password
 LogLevel VERBOSE
 CFG
 /usr/sbin/sshd -f "$SSHD/sshd_config" -E "$SSHD/sshd.log" -D &
-pids+=($!)
+SSHD_PID=$!
+pids+=($SSHD_PID)
 sleep 1
 ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$SSHD/sshd.log"; exit 2; }
 
@@ -214,6 +215,22 @@ if cmp -s "$AK_BEFORE" "$AK_AFTER"; then
 else
   echo "-- diff --"; diff "$AK_BEFORE" "$AK_AFTER" | head -5
   bad "gateE: authorized_keys CHANGED by cert login"
+fi
+
+# E2: kill sshd so the retry path runs: cached bootstrap hits 255, the
+# rebootstrap (cert mode too) retries, ssh fails 255 again -- and STILL
+# nothing is installed. Proves the 255 retry path honors cert-only.
+kill "$SSHD_PID" 2>/dev/null; sleep 1
+OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
+rcE2=$?
+echo "## (forced 255) rc=$rcE2"
+[ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.after2" || : > "$WORK/ak.after2"
+if [ "$rcE2" = "255" ] && cmp -s "$AK_BEFORE" "$WORK/ak.after2"; then
+  ok "gateE2: forced-255 retry installed nothing (cert mode throughout)"
+else
+  echo "-- E2.err --"; tail -5 "$WORK/E2.err"
+  diff "$AK_BEFORE" "$WORK/ak.after2" | head -5
+  bad "gateE2: retry misbehaved (rc=$rcE2)"
 fi
 
 # ========================================================================= sum =
