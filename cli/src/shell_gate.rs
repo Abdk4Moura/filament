@@ -233,11 +233,15 @@ mod tests {
         }
     }
 
-    /// The live cert-revoked e2e gate needs fleet enrollment in the harness
-    /// (secret-paired links never resolve an identity, so cert_revoked is
-    /// always false there); tracked in verdict_debt. Revoked cells ARE
-    /// covered unit-level by the matrix above.
-    #[test]
-    #[ignore = "requires fleet enrollment in the e2e harness (see verdict_debt)"]
-    fn cert_revoked_live_gate_requires_fleet_enrollment() {}
+    // The revoked cells above are fabricated inputs, which is all a unit test
+    // can reach: a secret-paired link resolves no identity, so `cert_revoked`
+    // is false in every such harness whatever the product does. That was
+    // recorded as verdict debt behind an ignored placeholder here. The debt is
+    // paid LIVE instead, by `cli/tests/fleet-cert-gates.sh`, which enrols a
+    // real certified device (`add --for` / `join`), revokes its CERTIFICATE
+    // (`revoke <device> --certificate`) and asserts all three paths -- exec,
+    // pty and ssh-sign -- refuse it, with a restore control so a broken link
+    // cannot pass as a revocation. Keep that gate and this matrix together:
+    // the matrix pins the decision, the gate pins that the decision is reached
+    // with the real input.
 }
