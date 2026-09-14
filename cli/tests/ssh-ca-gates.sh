@@ -17,8 +17,8 @@
 #      (nonzero + reason); no new cert issues.
 #
 # Topology: side B = signer + sshd host, side A = initiator, reciprocal pair
-# secret (same-owner fleet). B's CA key is pre-provisioned at its config dir
-# (0600, like production); B's daemon user is root (this harness runs as
+# secret (same-owner fleet). B's CA key is MINTED by up/grant arming
+# (CC-4 proves the mint path: no hand-provisioning); B's daemon user is root (this harness runs as
 # root, shell-user unset -- the same resolution production uses).
 #
 # PLATFORM NOTE: unix-only in practice (sshd, ssh-keygen, /dev/urandom, ss),
@@ -68,10 +68,8 @@ A_ENV=(env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA)
 B_USER="$(id -un)"
 SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=9123)
 
-# --- B's CA key (operator-provisioned, 0600, at the default path) ---
-mkdir -p "$DB/ssh"
-ssh-keygen -q -t ed25519 -f "$DB/ssh/ssh_ca" -N "" -C "test-ca"
-chmod 600 "$DB/ssh/ssh_ca"
+# NO hand-provisioned CA key: up/grant arming mints it (CC-4 proves the
+# mint path live -- gate A would fail without it).
 
 # --- throwaway sshd on 127.0.0.1:9123 with CA trust ONLY (no
 # AuthorizedKeysFile at all: cert auth is the only way in, which is exactly

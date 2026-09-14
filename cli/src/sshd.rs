@@ -289,18 +289,27 @@ pub fn check_sshd_ca() -> std::result::Result<(), String> {
 /// ensure the CA block plus the daemon principals entry. Loud on any
 /// failure but always Ok: serving must not newly require root. Paths honor
 /// the test overrides, so e2e exercises the real writer, not a stub.
-pub fn arm_ssh_ca_for_serving() {
+pub async fn arm_ssh_ca_for_serving() {
     let Some(user) = crate::ssh_ca::daemon_username() else {
         crate::ui::say("ssh CA arming skipped (cannot determine serving user); cert logins will refuse until applied");
         return;
     };
     let config_dir = crate::settings::config_dir();
-    // Trust anchor first: copy the daemon CA pub where the Match block
+    // CA key first: pre-existing installs never ran init, so mint here
+    // (idempotent). A mint failure stops arming loudly -- without a CA
+    // there is nothing to anchor or trust.
+    if let Err(e) = crate::ssh_ca::ensure_ca_key(&config_dir).await {
+        crate::ui::say(&format!(
+            "ssh CA arming skipped (no CA key: {e}); cert logins will refuse until applied"
+        ));
+        return;
+    }
+    // Trust anchor next: copy the daemon CA pub where the Match block
     // points, so -t validates what sshd will actually read. Unwritable:
     // print the manual steps (including this copy) and stop -- the block
     // below would fail its own -t against a missing anchor.
     let anchor = ca_pub_anchor_path();
-    let ca_src = config_dir.join("ssh").join("ssh_ca.pub");
+    let ca_src = crate::ssh_ca::ca_key_path(&config_dir).with_extension("pub");
     if let Err(e) = install_ca_pub_anchor(&ca_src, &anchor) {
         crate::ui::say(&format!(
             "ssh CA arming skipped (anchor unwritable: {e}); cert logins will refuse until applied:\n{}",
