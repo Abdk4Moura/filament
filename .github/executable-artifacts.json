@@ -287,6 +287,13 @@
       ]
     },
     {
+      "path": "cli/tests/ssh-ca-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
+      "owner": "deepseek-worker",
+      "expires": "2026-10-13"
+    },
+    {
       "path": "cli/tests/ssh-gates.sh",
       "disposition": "required",
       "entrypoint": "bash cli/tests/ssh-gates.sh",

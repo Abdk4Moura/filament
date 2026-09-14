@@ -419,20 +419,21 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
         ),
     }
 
-    // SSH CA trust (sshd side of `shell --ssh`).
+    // SSH CA trust (sshd side of `shell --ssh`). Human-facing row, so
+    // ui::say (not bare println!: the print ratchet counts those).
     match &sshca {
-        Ok(()) => println!(
+        Ok(()) => ui::say(&format!(
             "  {:<13} {}  {}",
             "sshd-ca",
             ui::paint(Tone::Ok, "trusted CA configured"),
             ui::paint(Tone::Dim, "TrustedUserCAKeys + principals present"),
-        ),
-        Err(e) => println!(
+        )),
+        Err(e) => ui::say(&format!(
             "  {:<13} {}  {}",
             "sshd-ca",
             ui::paint(Tone::Warn, "unconfigured"),
             ui::paint(Tone::Dim, e),
-        ),
+        )),
     }
 
     // Interfaces.
