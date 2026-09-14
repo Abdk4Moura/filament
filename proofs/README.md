@@ -184,7 +184,8 @@ preserve-state variant remains live: the sweep says the candidates diverge
 across the full 0.5-5 rung range, so condition instrumentation remains worth
 taking. This is an inventory only; it does not implement state preservation.
 
-Gate 0 also reads `MAX_ATTEMPTS` from `cli/src/main.rs` and `WATCHDOG_SECS` from
+Gate 0 also reads `MAX_ATTEMPTS` from anywhere under `cli/src` (shared_defs.rs
+since the 2026-09-12 decomposition) and `WATCHDOG_SECS` from
 `crates/filament-transport/src/net.rs` (moved out of `cli/src` on 2026-08-27);
 a source change fails the model until its calibration is
 explicitly redone.

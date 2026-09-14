@@ -19,17 +19,16 @@ use crate::l3;
 #[cfg(l3)]
 use crate::{
     AdoptSource, Ceremony, Conn, DaemonMounts, Ev, IncomingFile, MAX_ATTEMPTS, MAX_VERIFY_FAILS,
-    PROVEN_CHALLENGE_DEADLINE, PakeInbound, PartMeta, PendingBootstraps, Presence, RecvState, Rung,
+    PROVEN_CHALLENGE_DEADLINE, PakeInbound, PartMeta, Presence, RecvState, Rung,
     ShellPolicy, TtyGuard, WarmPtys, any_shell_grant, apply_reconfigure, cancelled, channel_of,
-    clear_provisional_identity, codeentry, command_arg, complete_warm_bootstrap, config_get,
+    clear_provisional_identity, codeentry, command_arg, config_get,
     consent_token, ctl, daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
     device_name_for_pub, device_set_cap, devices_load, devices_path, devices_remove, devices_store,
     devices_sweep_lapsed, devices_touch, devices_upsert_atomic, direct, direct_ok_for,
     display_name, enqueue_if_requestable, ensure_self_genesis_header, exec_recv, expire_requests,
     expose, finalize_incoming, fleet, fleet_identity_pending, fleet_route_ok, fleet_shaped_link,
     flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
-    handle_identity_expose, handle_list_mounts, handle_list_warm, handle_mount,
-    handle_mount_health, handle_unmount, handle_warm_bootstrap, handle_warm_req, human, identity,
+    handle_identity_expose, handle_warm_req, human, identity,
     in_binding, interactive_allowed, interactive_requested, is_self_uid,
     issue_proven_challenge_and_hold, issue_signed_bounded_grant, l2, l2_open_allowed,
     l2_target_allowed, link_nonce, load_provisional_identity, load_requests, local_device_cert,
@@ -37,12 +36,20 @@ use crate::{
     merge_owner_cap_ops, mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding,
     overlay, owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz, platform,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
-    reap_warm_bootstraps, record_range, regex_lite_code, relay_banner, resolve_peer_identity,
+    record_range, regex_lite_code, relay_banner, resolve_peer_identity,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
     respond_to_identity_challenge, safe_create_part, safe_incoming_name, safe_resume_part,
     save_requests, sdnotify, session, settings, shell_argv, shutdown, spawn_session_pumps, sshd,
     sshd_listening, sshkeys, store_provisional_identity, subnet_forward, sweep_completed_streams,
-    test_hooks, ui, verify_incoming, warm_link_for, with_devices_mut,
+    test_hooks, ui, verify_incoming, with_devices_mut,
+};
+// Unix-only daemon-control names, gated exactly like their definitions in
+// daemon_ctl.rs. Call sites stay byte-identical to the monolith.
+#[cfg(unix)]
+use crate::{
+    PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm,
+    handle_mount, handle_mount_health, handle_unmount, handle_warm_bootstrap,
+    reap_warm_bootstraps, warm_link_for,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};

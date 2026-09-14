@@ -194,10 +194,15 @@ use renewal_lifecycle::{
     handle_auth_key_enroll_response, handle_cert_renew_ack, maybe_request_cert_renewal,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
 };
+// DaemonMounts/WarmPtys/sshd_listening exist on every target (handle_warm_req
+// has a not(unix) stub); the rest are unix-only, so they need the gate their
+// definitions carry. Call sites stay byte-identical to the monolith.
+use daemon_ctl::{DaemonMounts, WarmPtys, handle_warm_req, sshd_listening};
+#[cfg(unix)]
 use daemon_ctl::{
-    DaemonMounts, PendingBootstraps, WarmPtys, complete_warm_bootstrap, handle_list_mounts,
-    handle_list_warm, handle_mount, handle_mount_health, handle_unmount, handle_warm_bootstrap,
-    handle_warm_req, reap_warm_bootstraps, sshd_listening, warm_link_for,
+    PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm,
+    handle_mount, handle_mount_health, handle_unmount, handle_warm_bootstrap,
+    reap_warm_bootstraps, warm_link_for,
 };
 mod recv_files;
 #[cfg(test)]

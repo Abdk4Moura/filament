@@ -87,11 +87,18 @@ assert_fixed_invariants() {
   done)
   [ -z "$reoffers" ] || fail "tag $tag: DIRECT-OFFER after DIRECT-FALLBACK (born-pending hazard) in: $reoffers"
   ok "no re-offer after fallback"
-  local killer_line kills
-  killer_line=$(awk '/link_dead_for\(/ { armed=1 } armed && /self\.drop_link\(pid\);/ { print NR; exit }' "$L1_CARGO_DIR/cli/src/main.rs")
+  local killer_line kills killer_src
+  # link_dead_for lived in main.rs until the 2026-09-12 decomposition moved it
+  # to conn.rs; search both, first hit wins.
+  killer_src=""
+  for _f in "$L1_CARGO_DIR/cli/src/conn.rs" "$L1_CARGO_DIR/cli/src/main.rs"; do
+    killer_line=$(awk '/link_dead_for\(/ { armed=1 } armed && /self\.drop_link\(pid\);/ { print NR; exit }' "$_f")
+    if [ -n "$killer_line" ]; then killer_src="$_f"; break; fi
+  done
   [ -n "$killer_line" ] || fail "could not locate the link_dead killer site"
-  kills=$(grep -h "ordered by src/main.rs:${killer_line}:" "$work"/send-"$tag"*.log "$work"/recv-"$tag"*.log 2>/dev/null | wc -l)
-  [ "${kills:-0}" -eq 0 ] || fail "tag $tag: killer drop (main.rs:${killer_line}) present, $kills hits"
+  killer_rel="src/${killer_src##*/cli/src/}"
+  kills=$(grep -h "ordered by ${killer_rel}:${killer_line}:" "$work"/send-"$tag"*.log "$work"/recv-"$tag"*.log 2>/dev/null | wc -l)
+  [ "${kills:-0}" -eq 0 ] || fail "tag $tag: killer drop (${killer_rel}:${killer_line}) present, $kills hits"
   ok "no link_dead killer drop"
 }
 

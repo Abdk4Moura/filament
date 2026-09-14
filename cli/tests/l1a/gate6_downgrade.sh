@@ -13,11 +13,12 @@ set -uo pipefail
 #   BIN     path to the release filament binary
 #   SERVER  signaling backend base (port pinned to 8093 below; this gate restarts it)
 #   PY      python that runs the LOCAL fixture backend (a throwaway venv)
-#   MAIN    cli/src/main.rs for the structural (source) assertions
+#   MAIN    cli/src/pair_cmd.rs for the structural (source) assertions
+#           (pair_cmd lived in main.rs until the 2026-09-12 decomposition)
 HERE="$(cd "$(dirname "$0")" && pwd)"
 BIN=${BIN:-$HERE/../../target/release/filament}
 PY=${PY:-${FILAMENT_TEST_VENV:-python3}}
-MAIN=${MAIN:-$HERE/../../src/main.rs}
+MAIN=${MAIN:-$HERE/../../src/pair_cmd.rs}
 BACKEND_DIR=${BACKEND_DIR:-$HERE/../../../backend}
 T=${T:-/tmp/l1a-gate6}
 rm -rf "$T/g6"; mkdir -p "$T/g6/cfg"
