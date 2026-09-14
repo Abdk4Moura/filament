@@ -41,7 +41,10 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("tests.rs", 13),
         ("recv_files.rs", 10),
         ("runtime_support.rs", 7),
-        ("exec_recv.rs", 5),
+        // 5 -> 7 for the exec build: unix/windows splits of resolve_bare_in
+        // (PATHEXT probing lives behind cfg(windows), passthrough behind
+        // cfg(not(windows))).
+        ("exec_recv.rs", 7),
         ("file_io.rs", 5),
         ("install_service.rs", 5),
         ("update_cmd.rs", 5),

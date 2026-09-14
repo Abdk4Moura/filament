@@ -179,6 +179,22 @@ else
   bad "gateE2: stdin round-trip FAILED (rc=$rcE2 out='$OUTE2')"
 fi
 
+# ================================================================== GATE E3 ==
+# EPIPE: a flooded stdin against an early-exiting child (`yes | head -1`)
+# must end cleanly (output + rc 0), not hang: a write error to the dead
+# child's stdin is treated as EOF and the loop still waits for its exit.
+say E3
+yes | timeout 20 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- head -n 1 >"$WORK/E3.out" 2>"$WORK/E3.err"
+rcE3=${PIPESTATUS[1]}
+OUTE3=$(cat "$WORK/E3.out")
+echo "## (epipe) rc=$rcE3 out='$OUTE3'"
+if [ "$rcE3" = "0" ] && [ "$OUTE3" = "y" ]; then
+  ok "gateE3: flooded stdin vs early exit ended cleanly (output + rc 0)"
+else
+  echo "-- E3.err --"; cat "$WORK/E3.err"
+  bad "gateE3: EPIPE case hung or mis-reported (rc=$rcE3 out='$OUTE3')"
+fi
+
 # ===================================================================== GATE F ==
 # EXIT CODES: remote exit status becomes our exit code.
 say F
@@ -258,6 +274,26 @@ if [ "$rcJ" != "0" ] \
 else
   echo "-- J.err --"; cat "$WORK/J.err"
   bad "gateJ: revoked exec NOT refused (rc=$rcJ)"
+fi
+
+# ===================================================================== GATE K ==
+# REVOKED MID-SESSION: a long exec dies (nonzero + revoked reason) when the
+# shell grant is revoked underneath it -- the receiver ticker re-asks the
+# gate instead of letting the child run out its clock.
+say K
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grantK.log" 2>&1
+timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" exec boxB -- /bin/sleep 30 2>"$WORK/K.err" </dev/null &
+KPid=$!
+sleep 5
+env FILAMENT_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revokeK.log" 2>&1
+wait "$KPid"
+rcK=$?
+echo "## (revoked mid-session) rc=$rcK"
+if [ "$rcK" != "0" ] && [ "$rcK" != "124" ] && grep -qi "revoked" "$WORK/K.err"; then
+  ok "gateK: mid-session revoke ended the exec (nonzero + reason)"
+else
+  echo "-- K.err --"; cat "$WORK/K.err"
+  bad "gateK: revoked session NOT ended (rc=$rcK)"
 fi
 
 # ========================================================================= sum =

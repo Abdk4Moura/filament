@@ -292,15 +292,39 @@ impl Mux {
     }
 
     /// Route an inbound data frame to its stream. Empty payload = clean EOF/FIN.
+    /// Never parks: the send is try_send, so a stalled consumer cannot freeze
+    /// the daemon recv loop that calls this (bulk stdin vs a non-reading
+    /// child filled the 256-slot pipe and wedged every stream behind it).
+    /// A full pipe resets the stream LOUDLY -- l2-close with an explicit
+    /// reason, entry dropped -- so the initiator fails fast with a reason
+    /// instead of hanging on silently lost bytes or wedging the daemon.
+    /// Steady consumers never trip it (they drain continuously); only a
+    /// genuinely stalled consumer with a full buffer does.
     pub async fn on_frame(&self, sid: u32, payload: Bytes) {
-        let tx = self.streams.lock().await.get(&sid).map(|s| s.tx.clone());
-        if let Some(tx) = tx {
-            let msg = if payload.is_empty() {
-                None
-            } else {
-                Some(payload)
-            };
-            let _ = tx.send(msg).await; // receiver gone => stream already torn down
+        let tx = match self.streams.lock().await.get(&sid) {
+            Some(s) => s.tx.clone(),
+            None => return,
+        };
+        let msg = if payload.is_empty() {
+            None
+        } else {
+            Some(payload)
+        };
+        match tx.try_send(msg) {
+            Ok(()) => {}
+            // receiver gone => stream already torn down (same as before).
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                let _ = self
+                    .transport
+                    .send_control(&json!({
+                        "type": "l2-close",
+                        "sid": sid,
+                        "err": "stream input flooded (consumer stalled)",
+                    }))
+                    .await;
+                self.drop_stream(sid).await;
+            }
         }
     }
 
@@ -4924,6 +4948,51 @@ mod h1_tests {
             LIVE_PTYS.load(Ordering::SeqCst),
             start,
             "global PTY count must return to baseline"
+        );
+    }
+
+    /// A full pipe resets LOUDLY instead of parking the caller: 256 queued
+    /// frames fill the pipe without blocking, and the 257th drops the entry
+    /// plus an l2-close with the flooded reason. The daemon recv loop calls
+    /// on_frame inline, so parking there would freeze every stream (bulk
+    /// stdin vs a non-reading child did exactly that); steady consumers
+    /// drain continuously and never trip this.
+    #[tokio::test]
+    async fn on_frame_resets_full_pipe_instead_of_parking() {
+        let t = MockTransport::new();
+        let mux = Mux::new(t.clone());
+        let sid = L2_SID_BASE | 77;
+        let _rx = mux.register_stream(sid).await.expect("fresh sid registers");
+        // Fill the 256-slot pipe with NOBODY reading (stalled consumer).
+        for _ in 0..256 {
+            mux.on_frame(sid, bytes::Bytes::from_static(b"x")).await;
+        }
+        assert!(
+            mux.streams.lock().await.contains_key(&sid),
+            "a full-but-live pipe stays registered"
+        );
+        // The 257th frame must reset promptly, never park the caller.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            mux.on_frame(sid, bytes::Bytes::from_static(b"y")),
+        )
+        .await
+        .expect("on_frame never parks, even on a full pipe");
+        assert!(
+            !mux.streams.lock().await.contains_key(&sid),
+            "full pipe resets (drops) the stream"
+        );
+        let controls = t.controls.lock().unwrap();
+        assert!(
+            controls.iter().any(|v| v.get("type").and_then(|x| x.as_str())
+                == Some("l2-close")
+                && v.get("sid").and_then(|x| x.as_u64()) == Some(sid as u64)
+                && v
+                    .get("err")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .contains("flooded")),
+            "reset carries an l2-close naming the flood, got: {controls:?}"
         );
     }
 

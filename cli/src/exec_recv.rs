@@ -122,10 +122,50 @@ pub(crate) fn resolve_in_path(program: &str) -> Option<PathBuf> {
     }
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(program);
+        if let Some(p) = resolve_bare_in(&dir, program) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Candidate spellings of a bare program name in one directory: the name
+/// itself, plus (Windows only) each PATHEXT suffix in order. Pure so the
+/// ordering is unit-testable on every platform; only used on Windows
+/// (allowed dead elsewhere so the unix build stays warning-neutral).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pathext_candidates(program: &str, exts: &str) -> Vec<String> {
+    let mut out = vec![program.to_string()];
+    for ext in exts.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        out.push(format!("{program}{ext}"));
+    }
+    out
+}
+
+/// Resolve a bare name inside one PATH directory. Unix: the name itself.
+/// Windows: the name itself, then PATHEXT suffixes (.EXE etc.) so `rsync`
+/// finds `rsync.exe` -- still a direct spawn of the resolved path, never a
+/// shell lookup, so argv exactness is unaffected.
+#[cfg(windows)]
+fn resolve_bare_in(dir: &std::path::Path, program: &str) -> Option<PathBuf> {
+    let exts =
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for name in pathext_candidates(program, &exts) {
+        let candidate = dir.join(&name);
         if is_executable(&candidate) {
             return Some(candidate);
         }
+    }
+    None
+}
+
+/// Resolve a bare name inside one PATH directory (non-Windows): the name
+/// itself, unchanged from the original loop.
+#[cfg(not(windows))]
+fn resolve_bare_in(dir: &std::path::Path, program: &str) -> Option<PathBuf> {
+    let candidate = dir.join(program);
+    if is_executable(&candidate) {
+        return Some(candidate);
     }
     None
 }
@@ -170,31 +210,6 @@ pub(crate) fn exit_status_code(status: &std::process::ExitStatus) -> Option<i32>
     }
 }
 
-/// The shell-gate DECISION, factored pure so the matrix is unit-testable: None
-/// for the capability layer means shadow mode (legacy stands in); Some means
-/// authoritative (the cap verdict decides). Mirrors the pty-open tiers exactly
-/// so exec can never be MORE permissive than a shell.
-pub(crate) fn gate_decision(
-    trusted: bool,
-    legacy_ok: bool,
-    cap_allowed: Option<bool>,
-) -> Result<(), &'static str> {
-    if !trusted {
-        return Err("denied");
-    }
-    match cap_allowed {
-        Some(true) => Ok(()),
-        Some(false) => Err("shell capability not granted"),
-        None => {
-            if legacy_ok {
-                Ok(())
-            } else {
-                Err("shell capability not granted")
-            }
-        }
-    }
-}
-
 /// Build the child's environment: env_clear PLUS the allowlist. TERM, LANG and
 /// LC_* pass through from the daemon's own environment; explicit `--env` pairs
 /// are layered on top (explicit wins on collision). Everything else -- notably
@@ -229,9 +244,9 @@ async fn send_frames_chunked(t: &Arc<dyn Transport>, sid: u32, data: &[u8]) -> R
     Ok(())
 }
 
-/// Authorize an exec open: the shell gate, evaluated exactly like pty-open (the
-/// same inputs, the same tiers, the same refusal reasons). Returns the label
-/// for user-visible messages on allow, or the wire refusal reason on deny.
+/// Authorize an exec open through the shared shell gate (same function, same
+/// inputs as pty-open; no exec-local decision logic). Returns the label for
+/// user-visible messages on allow, or the wire refusal reason on deny.
 /// Side-effecting tells (ui::say, enqueue) stay with the caller, next to the
 /// send_control that carries the verdict -- same split as the pty-open arm.
 pub(crate) async fn authorize_exec(
@@ -239,63 +254,10 @@ pub(crate) async fn authorize_exec(
     pid: &str,
     shell_policy: &crate::ShellPolicy,
 ) -> Result<String, String> {
-    let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
-    let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
-    let legacy_ok = trusted
-        && dev
-            .as_deref()
-            .map(|n| {
-                !crate::device_capability_denied(n, "shell")
-                    && (shell_policy.auto_allows(n) || crate::device_allows(n, "shell"))
-            })
-            .unwrap_or(false);
-    // Capability layer evaluated unconditionally (shadow samples the
-    // legacy-allowed population); legacy stands in shadow, cap gates under
-    // FILAMENT_CAP_AUTHORITATIVE -- the same block pty-open runs.
-    let az = crate::peer_authz(conn, pid);
-    let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-    let outcome = crate::capability::cap_authorize(
-        &crate::settings::config_dir(),
-        "self",
-        crate::capability::CAP_SHELL,
-        idev,
-        iusr,
-        ak_caps,
-    );
-    let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-        &crate::settings::config_dir(),
-        "self",
-        crate::capability::CAP_SHELL,
-        idev,
-        iusr,
-        ak_caps,
-    );
-    let granted = crate::capability::cap_gate_effective(
-        legacy_ok,
-        &outcome,
-        crate::capability::CAP_SHELL,
-        "self",
-        idev,
-        iusr,
-        binding,
-        expires,
-        ak_caps,
-        own_user.as_ref(),
-        false,
-        has_grant,
-        cert_revoked,
-    );
-    let cap_allowed = if crate::capability::cap_authoritative() {
-        Some(granted.allowed())
-    } else {
-        None
-    };
-    match gate_decision(trusted, legacy_ok, cap_allowed) {
-        Ok(()) => Ok(dev.unwrap_or_else(|| pid.to_string())),
-        Err(_) => Err(granted
-            .deny_reason("shell capability not granted")
-            .to_string()),
-    }
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
+    crate::shell_gate::exec_gate_decision(&inputs)
+        .map(|()| dev.unwrap_or_else(|| pid.to_string()))
+        .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
 }
 
 /// Serve one accepted exec open: spawn argv[] directly (NO shell, NO login
@@ -303,12 +265,24 @@ pub(crate) async fn authorize_exec(
 /// separate stream channels, feed stdin from the registered pipe, and on child
 /// exit send the exec-close payload and clean up. One-shot by design: unlike a
 /// PTY session there is nothing persistent, so there is nothing to reattach.
+/// Session-scoped authz snapshot for mid-session revoke re-checks: the
+/// verified device name (None when unverified, meaning nothing store-bound
+/// to re-check), its identity device key for cert-revoke checks, and whether
+/// the serving policy auto-allows it (static for the session). Resolved once
+/// in handle_exec_open; the ticker below re-reads the STORE each tick.
+pub(crate) struct ExecSessionAuthz {
+    pub(crate) dev_name: Option<String>,
+    pub(crate) idev: Option<[u8; 32]>,
+    pub(crate) policy_allows: bool,
+}
+
 pub(crate) async fn serve_exec(
     t: Arc<dyn Transport>,
     mux: Arc<l2::Mux>,
     sid: u32,
     req: ExecOpen,
     stdin_rx: mpsc::Receiver<Option<bytes::Bytes>>,
+    authz: ExecSessionAuthz,
 ) {
     // stderr rides the initiator-allocated `err_sid` from the open frame
     // (same value the initiator registered before sending): allocating a
@@ -434,6 +408,11 @@ pub(crate) async fn serve_exec(
         }
         sent
     });
+    // Revoke re-check (pty precedent): a dedicated ticker at the shared
+    // interval re-asks the gate while the child runs. A peer revoked
+    // mid-session -- certificate OR shell grant -- loses the live exec.
+    let mut revoke_ticker = tokio::time::interval(crate::revoke_recheck_interval());
+    revoke_ticker.tick().await; // consume the immediate first tick
     // stdin: chunks in, EOF shuts the child's write-half (it may still produce
     // output -- EOF is non-terminal, same rule as the pty pumps). Channel
     // death (link gone) kills the child: nobody is left to report to, and an
@@ -466,7 +445,13 @@ pub(crate) async fn serve_exec(
                     Some(Some(bytes)) => {
                         if let Some(s) = stdin.as_mut() {
                             if s.write_all(&bytes).await.is_err() {
-                                break;
+                                // Write error (child gone or pipe broken): treat
+                                // as EOF -- drop the write end and CONTINUE.
+                                // break here would skip child.wait() AND the
+                                // exec-close, hanging the initiator (yes |
+                                // exec -- head -1). Only child.wait() (exit)
+                                // or channel death (link gone) ends the loop.
+                                stdin.take();
                             }
                         }
                     }
@@ -485,6 +470,36 @@ pub(crate) async fn serve_exec(
                         mux.drop_stream(err_sid).await;
                         return;
                     }
+                }
+            }
+            _ = revoke_ticker.tick() => {
+                // Re-ask the gate. Cert revoke is re-read from the store
+                // each tick; the shell grant is re-read the same way (the
+                // policy half is static per session). Either way the peer
+                // loses the live exec: kill the child and close with the
+                // revoked reason, so the initiator surfaces nonzero with a
+                // reason instead of hanging or rendering a clean exit.
+                let cert_gone = crate::cert_revoked_for(authz.idev.as_ref());
+                let grant_gone = match authz.dev_name.as_deref() {
+                    Some(n) => {
+                        crate::device_capability_denied(n, "shell")
+                            || !(authz.policy_allows || crate::device_allows(n, "shell"))
+                    }
+                    None => false,
+                };
+                if cert_gone || grant_gone {
+                    crate::ui::critical("exec: peer access revoked, closing live session");
+                    let _ = child.kill().await;
+                    let _ = t
+                        .send_control(&json!({
+                            "type": "l2-close",
+                            "sid": sid,
+                            "err": crate::capability::REVOKED_REASON,
+                        }))
+                        .await;
+                    mux.drop_stream(sid).await;
+                    mux.drop_stream(err_sid).await;
+                    return;
                 }
             }
         }
@@ -514,7 +529,11 @@ pub(crate) async fn handle_exec_open(
     }
     if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
         crate::ui::say(&format!("l2: exec refused: {reason}"));
-        crate::enqueue_if_requestable(&pid.to_string(), "shell");
+        // Enqueue under the verified petname (like pty-open's `who`), never
+        // the raw pid: the queue is keyed by name, and "<unverified>" is a
+        // no-op by design.
+        let who = conn.link(pid).and_then(|l| l.verified_name.clone());
+        crate::enqueue_if_requestable(who.as_deref().unwrap_or("<unverified>"), "shell");
         let _ = t
             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
             .await;
@@ -544,8 +563,24 @@ pub(crate) async fn handle_exec_open(
     // observed live as hung stdin sessions wedging the acceptor). The pty
     // path spawns its session pumps for exactly this reason; validation,
     // gating and registration above already ran in-hook, so the detached
-    // task owns only owned values from here.
-    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx));
+    // task owns only owned values from here. The revoke ticker needs the
+    // same authz context, resolved once here (re-reads the store per tick).
+    let dev_name = conn.link(pid).and_then(|l| l.verified_name.clone());
+    let policy_allows = dev_name
+        .as_deref()
+        .map(|n| shell_policy.auto_allows(n))
+        .unwrap_or(false);
+    let idev = {
+        let az = crate::peer_authz(conn, pid);
+        let (idev, _, _, _, _, _) = az.parts();
+        idev.copied()
+    };
+    let authz = ExecSessionAuthz {
+        dev_name,
+        idev,
+        policy_allows,
+    };
+    tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz));
 }
 
 #[cfg(test)]
@@ -634,16 +669,16 @@ mod tests {
     }
 
     #[test]
-    fn gate_matrix_matches_shell_tiers() {
-        // untrusted is always denied, regardless of anything else
-        assert!(gate_decision(false, true, None).is_err());
-        assert!(gate_decision(false, false, Some(true)).is_err());
-        // shadow: legacy decides
-        assert!(gate_decision(true, true, None).is_ok());
-        assert!(gate_decision(true, false, None).is_err());
-        // authoritative: cap decides
-        assert!(gate_decision(true, false, Some(true)).is_ok());
-        assert!(gate_decision(true, true, Some(false)).is_err());
+    fn pathext_candidates_bare_first_then_suffixes_in_order() {
+        assert_eq!(
+            pathext_candidates("rsync", ".COM;.EXE;.BAT;.CMD"),
+            vec!["rsync", "rsync.COM", "rsync.EXE", "rsync.BAT", "rsync.CMD"]
+        );
+        assert_eq!(pathext_candidates("rsync", ""), vec!["rsync"]);
+        assert_eq!(
+            pathext_candidates("run", " .EXE ; ; .BAT "),
+            vec!["run", "run.EXE", "run.BAT"]
+        );
     }
 
     #[test]
