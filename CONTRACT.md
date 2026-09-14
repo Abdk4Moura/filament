@@ -419,10 +419,47 @@ implement them behaves exactly as before, only slower.
   restart or expiry is hygiene. A surviving cache past cert expiry, or a
   cache shared between peers, is non-conformant.
 - MULTIPLEXING: `shell --ssh` passes `-o ControlMaster=auto`,
-  `-o ControlPath=<sockdir>/cm-%r@%h:%p`, `-o ControlPersist=<min(cert
-  ttl, 10m)>` so the first invocation establishes and later ones ride the
-  same connection. The control socket lives beside the cert cache (0700)
-  and dies with it: on expiry, revoke, or grant loss the master is
-  stopped (`ssh -O exit`) before the cache is wiped, so no multiplexed
-  session outlives its authorization. `FILAMENT_NO_SSH_MUX=1` opts out to
-  one-connection-per-invocation for debugging.
+  `-o ControlPath=<sockdir>/cm-%C`, `-o ControlPersist=<min(cert ttl,
+  10m)>` (`%C` hashes the connection parameters so long or odd peer
+  names cannot break socket paths). The first invocation establishes and
+  later ones ride the same connection. The control socket lives beside
+  the cert cache (0700) and dies with it: on expiry, revoke, or grant
+  loss the master is stopped (`ssh -O exit`) before the cache is wiped,
+  so no multiplexed session outlives its authorization.
+  `FILAMENT_NO_SSH_MUX=1` opts out to one-connection-per-invocation for
+  debugging.
+- B-SIDE ENFORCEMENT (the security property; A's cleanup above is
+  hygiene, not enforcement). Revocation happens in B's store and A may
+  never learn of it, so the guarantee lives on B: when B revokes A's
+  shell grant, or A's cert is revoked or expires, B's daemon tears down
+  the L2 stream carrying A's ssh. The stream `forward --stdio B:22`
+  opens is admitted on link trust plus `l2_target_allowed`, and for its
+  lifetime it rides the same revoke ticker as every daemon-served
+  stream: the ticker re-asks `cert_revoked_for` on the stream's resolved
+  peer identity and closes with reason on a hit, so any multiplexed
+  session dies regardless of what A does. The ticker covers cert
+  revocation today; shell-grant revocation is wired into the same tick
+  (a grant check beside the cert check), with a gate pinning it: revoke
+  on B while an ssh session is live -> the session dies within
+  `revoke_recheck_interval`.
+- CACHE KEYS: by peer IDENTITY (device_pub fingerprint), never by name;
+  a re-paired or renamed device gets a cold cache. Also keyed by B's CA
+  public key: a rotated CA deadens the cached cert and the miss reads as
+  "reissue", never as refusal.
+- CACHE LIFECYCLE, explicit: one dir per peer identity, 0600 files
+  inside the 0700 dir; wiped on daemon start (per-restart minting is
+  hygiene), on `revoke`, on refusal, on grant loss, and on `reset`.
+  Setting `ssh.cert_cache` (registry, `on`|`off`, default on) and
+  `--fresh` on `shell --ssh` force reissue.
+- REUSE VALIDATION: before offering a cached cert, check its `-I`
+  equals our device id and its principal equals the expected user. A
+  cache poisoned or swapped by another local process must never be
+  used.
+- WARM IDENTITY: a warm hit must reach the same verified peer identity
+  a fresh establish would reach -- no reuse of a warm link to a device
+  re-paired under the same name. The peer-side gate on a warm-opened
+  stream is identical to the gate on a fresh one.
+- HONEST WIDENING: caching extends A-local credential lifetime from
+  "while the session is open" to "until cert expiry" against a
+  same-user attacker on A. The bound is `ssh.cert_ttl`, and the cache
+  lifecycle plus B-side teardown above exist to hold it.
