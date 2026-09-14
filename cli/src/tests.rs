@@ -663,6 +663,50 @@ fn vouch_write_is_first_writer_wins() {
     );
 }
 
+/// A cert-only write (renewal, certify delivery) must never touch the
+/// persisted ceiling: the ceiling is owner-signed policy, and no network
+/// frame may widen, narrow, or clear it. Pinned here so a persist-path
+/// refactor cannot silently start writing it.
+#[test]
+fn cert_only_upsert_preserves_principal_ceiling() {
+    let _guard = lock_test_config();
+    let dir = td("ceiling-pin");
+    // Seed a delegated record carrying a ceiling, as join/certify would.
+    let rec = serde_json::json!({
+        "name": "spoke",
+        "principalKind": "delegated",
+        "principalCeiling": ["transfer", "shell"],
+        "deviceCert": {
+            "devicePub": hex::encode([0xa1u8; 32]),
+            "userPub": hex::encode([0x11u8; 32]),
+            "expires": 9_999_999_999u64,
+            "issued": 1u64,
+            "sig": hex::encode([0u8; 64]),
+        },
+    });
+    std::fs::write(
+        dir.join("devices.json"),
+        serde_json::to_string(&vec![rec]).unwrap(),
+    )
+    .unwrap();
+    // Renewal-shaped write: new cert, everything else None.
+    let fresh = cert_for(0x11, 0xa1, 9_999_999_998);
+    crate::devices_store::devices_upsert_atomic("spoke", None, Some(&fresh), None, None, None, None)
+        .unwrap();
+    let raw = std::fs::read_to_string(dir.join("devices.json")).unwrap();
+    let arr: Vec<Value> = serde_json::from_str(&raw).unwrap();
+    let got = arr.iter().find(|d| d["name"] == "spoke").unwrap();
+    assert_eq!(
+        got["principalCeiling"],
+        serde_json::json!(["transfer", "shell"]),
+        "cert-only write must preserve the ceiling"
+    );
+    assert_eq!(
+        got["deviceCert"]["expires"], 9_999_999_998u64,
+        "the cert itself must update"
+    );
+}
+
 /// The scope a vouch stores is Device, not User, and the difference is not
 /// cosmetic: `apply_peer_identity` gates its device-pinning branch on
 /// `existing_scope == 0x01`, so storing User silently disarms that check for

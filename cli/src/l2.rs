@@ -781,6 +781,11 @@ pub async fn spawn_pty_session(
     // The peer's device key, for the live session's revocation re-check. `None`
     // (no resolved identity) is treated as not-revoked by `cert_revoked_for`.
     idev: Option<[u8; 32]>,
+    // True when this session was admitted via its enrolment ceiling rather
+    // than an explicit grant: a narrowed ceiling must end it on the next
+    // tick, exactly like a revocation. Grant-admitted sessions ignore the
+    // ceiling (the grant authorizes); uncovered sessions never set this.
+    admitted_via_ceiling: bool,
 ) -> Option<PtySessionHandle> {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
     use std::io::{Read as _, Write as _};
@@ -988,7 +993,14 @@ pub async fn spawn_pty_session(
                     // Re-ask the gate. A revoked peer loses the live shell: tell
                     // the terminal, then close with a reason so the initiator
                     // surfaces a nonzero exit rather than a clean one (#223).
-                    if crate::cert_revoked_for(idev.as_ref()) {
+                    // A ceiling narrowed under a ceiling-admitted session ends
+                    // it the same way (re-read fresh; never cached at open).
+                    let ceiling_gone = admitted_via_ceiling
+                        && !crate::identity_state::ceiling_covers_action(
+                            idev.as_ref(),
+                            crate::capability::CAP_SHELL,
+                        );
+                    if crate::cert_revoked_for(idev.as_ref()) || ceiling_gone {
                         crate::ui::critical("pty: peer revoked, closing the live session");
                         revoked_reason = Some(crate::capability::REVOKED_REASON);
                         if let Some(b) = &bind {
@@ -5398,6 +5410,7 @@ mod h1_tests {
             vec!["/bin/cat".to_string()],
             guard,
             None,
+            false,
         )
         .await
         .expect("spawn");
