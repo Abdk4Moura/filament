@@ -225,10 +225,12 @@ env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/g
 kill "$SSHD_PID" 2>/dev/null; sleep 1
 OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
 rcE2=$?
-echo "## (forced 255) rc=$rcE2"
+echo "## (dead sshd) rc=$rcE2"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.after2" || : > "$WORK/ak.after2"
-if [ "$rcE2" = "255" ] && cmp -s "$AK_BEFORE" "$WORK/ak.after2"; then
-  ok "gateE2: forced-255 retry installed nothing (cert mode throughout)"
+if [ "$rcE2" != "0" ] \
+   && grep -q "re-authenticating" "$WORK/E2.err" \
+   && cmp -s "$AK_BEFORE" "$WORK/ak.after2"; then
+  ok "gateE2: dead-sshd retry ran cert-only and installed nothing (rc=$rcE2)"
 else
   echo "-- E2.err --"; tail -5 "$WORK/E2.err"
   diff "$AK_BEFORE" "$WORK/ak.after2" | head -5
