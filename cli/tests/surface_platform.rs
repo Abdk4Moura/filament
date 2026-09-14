@@ -54,6 +54,11 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("shell_support.rs", 3),
         ("up_logs.rs", 2),
         ("conn.rs", 1),
+        // CA build: unix-gated sshd integration (0600/0700 perm checks +
+        // unix-only subprocess tests) and unix/windows splits of resolve
+        // paths. Measured, not paid down: perm-gating is the feature.
+        ("ssh_ca.rs", 14),
+        ("sshd.rs", 4),
         // Largely irreducible: path encoding genuinely differs across platforms
         // and flattening it loses data. Not a target.
         // mount_proto read 48 against a 47 budget on 2026-09-13 with no code
