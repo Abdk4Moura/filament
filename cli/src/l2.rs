@@ -4358,7 +4358,9 @@ async fn run_ssh(
     // signing fails -- the error names the cause.
     let eph = crate::ssh_ca::EphemeralKey::generate().await
         .map_err(|e| anyhow::anyhow!("ssh cert setup failed (no key fallback): {e}"))?;
-    let _sigwatch = crate::ssh_ca::spawn_cleanup_on_signal(eph.dir().to_path_buf());
+    // Aborted on the normal path below (Drop + explicit cleanup already
+    // covered everything else); left running only while ssh owns the session.
+    let sigwatch = crate::ssh_ca::spawn_cleanup_on_signal(eph.dir().to_path_buf());
     let ident = crate::ssh_ca::acquire_ssh_cert(server, peer, relay, &eph)
         .await
         .map_err(|e| anyhow::anyhow!("ssh cert issuance failed (no key fallback): {e}"))?;
@@ -4375,6 +4377,7 @@ async fn run_ssh(
                 ));
                 let code = spawn_ssh_direct(login, &mesh_host, extra, &ident)?;
                 if code != 255 {
+                    sigwatch.abort();
                     return Ok(code);
                 }
                 crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
@@ -4395,7 +4398,9 @@ async fn run_ssh(
             // revive wait twice - go straight to the L2 tunnel below.
         }
     }
-    spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)
+    let code = spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)?;
+    sigwatch.abort();
+    Ok(code)
 }
 
 /// ssh directly to a stable overlay host (no ProxyCommand), reusing the managed

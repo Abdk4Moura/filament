@@ -163,9 +163,11 @@ pub(crate) fn check_ephemeral_pubkey(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Exact pinned ssh-keygen argv: `-I` device id only, `-n` daemon user only,
-/// absolute `-V` interval, monotonic `-z` serial, `-O clear` + `-O permit-pty`
-/// and nothing else. No shell involved (direct spawn by the caller).
+/// Exact pinned ssh-keygen argv: `-I` device id only, `-n` daemon user only
+/// (single principal: commas/whitespace would certify extra names, so they
+/// refuse here at the tool boundary, not just at the caller), absolute `-V`
+/// interval, monotonic `-z` serial, `-O clear` + `-O permit-pty` and nothing
+/// else. No shell involved (direct spawn by the caller).
 pub(crate) fn build_sign_argv(
     ca_path: &std::path::Path,
     pubkey_file: &std::path::Path,
@@ -390,21 +392,24 @@ pub(crate) async fn ensure_ca_key(config_dir: &std::path::Path) -> Result<std::p
 }
 
 /// Pure core: the daemon serving user is the shell-user setting when set,
-/// else the daemon process user, else root. Never anything the initiator
-/// sent: the principal is B's decision alone (contract pins `-n`).
+/// else the daemon process user. Never anything the initiator sent: the
+/// principal is B's decision alone (contract pins `-n`). Deliberately NO
+/// root fallback: certifying root when the serving user is undeterminable
+/// would mint a root login out of confusion (resolve_login's root fallback
+/// is for the initiator's login GUESS, a harmless hint; a principal is a
+/// security boundary, so unknown means refuse, not root).
 pub(crate) fn daemon_username_from(
     shell_user: Option<&str>,
     env_user: Option<&str>,
-) -> String {
+) -> Option<String> {
     shell_user
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| env_user.filter(|s| !s.is_empty()).map(str::to_string))
-        .unwrap_or_else(|| "root".to_string())
 }
 
 /// Resolve the serving user for signing (thin wrapper over the pure core).
-pub(crate) fn daemon_username() -> String {
+pub(crate) fn daemon_username() -> Option<String> {
     let su = crate::settings::get_str("shell-user", None);
     daemon_username_from(su.as_deref(), std::env::var("USER").ok().as_deref())
 }
@@ -456,12 +461,29 @@ pub(crate) async fn handle_ssh_sign(
                 .await;
         }
     };
-    let Some(req) = parse_sign_request(v) else {
-        return;
-    };
+    // Malformed requests are refused LOUDLY (not silently dropped): a peer
+    // that cannot form the frame learns it immediately instead of timing
+    // out. Only a missing sid stays silent (nothing to correlate the reply
+    // to). Non-L2 sids are malformed here too: the exchange mints proper
+    // L2 sids, so anything else is a foreign or forged frame.
     let Some(sid) = crate::l2::wire_sid(v) else {
         return;
     };
+    let good_sid = crate::l2::is_l2_sid(sid);
+    let Some(req) = parse_sign_request(v) else {
+        if good_sid {
+            let _ = t
+                .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": "malformed ssh-sign-request" }))
+                .await;
+        }
+        return;
+    };
+    if !good_sid {
+        let _ = t
+            .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": "malformed ssh-sign-request" }))
+            .await;
+        return;
+    }
     // Gate first (same function, same inputs as pty/exec): no grant, no cert.
     let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
     if let Err(cap_reason) = crate::shell_gate::ssh_gate_decision(&inputs) {
@@ -534,7 +556,10 @@ pub(crate) async fn handle_ssh_sign(
         return;
     }
     let validity = validity_interval(ttl);
-    let principal = daemon_username();
+    let Some(principal) = daemon_username() else {
+        refuse(&t, sid, "cannot determine serving user".to_string()).await;
+        return;
+    };
     let workdir = match secure_tempdir("ssh-sign") {
         Ok(d) => d,
         Err(_) => {
@@ -831,6 +856,9 @@ pub(crate) async fn sign(
     workdir: &std::path::Path,
 ) -> Result<String> {
     check_ephemeral_pubkey(pubkey_text)?;
+    if principal.bytes().any(|b| b == b',' || b.is_ascii_whitespace()) || principal.is_empty() {
+        bail!("principal must be a single name");
+    }
     let pub_file = workdir.join("key.pub");
     std::fs::write(&pub_file, pubkey_text)?;
     let argv = build_sign_argv(ca_path, &pub_file, key_id, principal, validity, serial);
@@ -1124,10 +1152,10 @@ mod tests {
 
     #[test]
     fn daemon_username_prefers_setting_then_env() {
-        assert_eq!(daemon_username_from(Some("svc"), Some("bob")), "svc");
-        assert_eq!(daemon_username_from(None, Some("bob")), "bob");
-        assert_eq!(daemon_username_from(Some(""), Some("bob")), "bob");
-        assert_eq!(daemon_username_from(None, None), "root");
+        assert_eq!(daemon_username_from(Some("svc"), Some("bob")), Some("svc".to_string()));
+        assert_eq!(daemon_username_from(None, Some("bob")), Some("bob".to_string()));
+        assert_eq!(daemon_username_from(Some(""), Some("bob")), Some("bob".to_string()));
+        assert_eq!(daemon_username_from(None, None), None);
     }
 
     #[cfg(unix)]

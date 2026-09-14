@@ -363,6 +363,11 @@ bulk -- the Bootstrap precedent); all lifetimes are seconds on the wire.
 - REFUSAL WITHOUT GRANT: no shell grant for A on B means no cert, with
   the gate's reason on the wire. A grievance-free `ssh` that falls back
   to installed keys on refusal is non-conformant.
+- REVOCATION WINDOW: revoke stops NEW issuance immediately, but already-
+  issued certs stay valid until their expiry (bounded above by 24h, in
+  practice by the grant window they were clamped to). There is no live
+  revocation list; expiry IS the revocation mechanism, which is why the
+  clamp keeps lifetimes short.
 - EXPIRY CLAMP: validity `-V` is `min(grant expiry, requested ttl,
   ssh.cert_ttl)` where `ssh.cert_ttl` comes through the settings
   registry (default 1h, hard max 24h). No expiry source may extend

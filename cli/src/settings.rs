@@ -1421,6 +1421,24 @@ mod tests {
     }
 
     #[test]
+    fn ssh_cert_ttl_resolves_then_clamps() {
+        // Registry level: the key exists with a 1h default; the clamp lives
+        // in ssh_ca::parse_ttl_secs (unit-covered there). This pins the
+        // handoff: what resolve() yields must parse, and 48h must clamp.
+        with_tmp_cfg(|| {
+            let s = find("ssh.cert_ttl").expect("registered");
+            assert_eq!(resolve(s, None).0, "1h");
+            set("ssh.cert_ttl", "48h", None).unwrap();
+            let (raw, _) = resolve(s, None);
+            assert_eq!(raw, "48h");
+            assert_eq!(crate::ssh_ca::parse_ttl_secs(&raw).unwrap(), 86_400);
+            set("ssh.cert_ttl", "30m", None).unwrap();
+            let (raw, _) = resolve(s, None);
+            assert_eq!(crate::ssh_ca::parse_ttl_secs(&raw).unwrap(), 1800);
+        });
+    }
+
+    #[test]
     fn enum_validates_against_allowed_set() {
         let s = find("relay").unwrap();
         assert_eq!(canonicalize(s, "Always").unwrap(), "always");

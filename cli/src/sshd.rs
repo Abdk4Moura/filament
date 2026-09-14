@@ -259,7 +259,10 @@ pub fn check_sshd_ca() -> std::result::Result<(), String> {
 /// failure but always Ok: serving must not newly require root. Paths honor
 /// the test overrides, so e2e exercises the real writer, not a stub.
 pub fn arm_ssh_ca_for_serving() {
-    let user = crate::ssh_ca::daemon_username();
+    let Some(user) = crate::ssh_ca::daemon_username() else {
+        crate::ui::say("ssh CA arming skipped (cannot determine serving user); cert logins will refuse until applied");
+        return;
+    };
     let principals = principals_file_for(&principals_base_dir(), &user);
     if let Err(e) = ensure_sshd_ca(
         &sshd_config_path(),
