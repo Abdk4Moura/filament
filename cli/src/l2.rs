@@ -4356,7 +4356,7 @@ async fn run_ssh(
     // Cert identity first: fresh ephemeral key, B-signed cert over an L2
     // link. Fail closed (no managed-key fallback) when keygen, link, or
     // signing fails -- the error names the cause.
-    let eph = crate::ssh_ca::EphemeralKey::generate()
+    let eph = crate::ssh_ca::EphemeralKey::generate().await
         .map_err(|e| anyhow::anyhow!("ssh cert setup failed (no key fallback): {e}"))?;
     let _sigwatch = crate::ssh_ca::spawn_cleanup_on_signal(eph.dir().to_path_buf());
     let ident = crate::ssh_ca::acquire_ssh_cert(server, peer, relay, &eph)

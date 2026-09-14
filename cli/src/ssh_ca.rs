@@ -240,7 +240,7 @@ pub(crate) fn ca_key_path(config_dir: &std::path::Path) -> std::path::PathBuf {
 /// ssh-keygen, deleting a half-created key on failure. ssh-keygen itself
 /// missing refuses (the caller warns and continues: init must not fail
 /// for an SSH-CA nicety, and signing fails closed with a clear error).
-pub(crate) fn ensure_ca_key_with(
+pub(crate) async fn ensure_ca_key_with(
     config_dir: &std::path::Path,
     keygen_bin: &std::path::Path,
 ) -> Result<std::path::PathBuf> {
@@ -257,12 +257,17 @@ pub(crate) fn ensure_ca_key_with(
         }
     }
     let created = !key.exists();
-    let status = std::process::Command::new(keygen_bin)
-        .args(["-q", "-t", "ed25519", "-N", "", "-C", "filament-ca", "-f"])
-        .arg(&key)
-        .stdin(std::process::Stdio::null())
-        .status()
-        .map_err(|e| anyhow::anyhow!("CA mint failed to run ssh-keygen: {e}"))?;
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(keygen_bin)
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "filament-ca", "-f"])
+            .arg(&key)
+            .stdin(std::process::Stdio::null())
+            .status(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("CA mint timed out running ssh-keygen"))?
+    .map_err(|e| anyhow::anyhow!("CA mint failed to run ssh-keygen: {e}"))?;
     if !status.success() {
         if created {
             let _ = std::fs::remove_file(&key);
@@ -279,8 +284,8 @@ pub(crate) fn ensure_ca_key_with(
 }
 
 /// Mint with the real ssh-keygen.
-pub(crate) fn ensure_ca_key(config_dir: &std::path::Path) -> Result<std::path::PathBuf> {
-    ensure_ca_key_with(config_dir, std::path::Path::new("ssh-keygen"))
+pub(crate) async fn ensure_ca_key(config_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    ensure_ca_key_with(config_dir, std::path::Path::new("ssh-keygen")).await
 }
 
 /// Pure core: the daemon serving user is the shell-user setting when set,
@@ -437,7 +442,8 @@ pub(crate) async fn handle_ssh_sign(
         &validity,
         serial,
         &workdir,
-    ) {
+    )
+    .await {
         Ok(c) => c,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&workdir);
@@ -578,12 +584,12 @@ pub(crate) struct EphemeralKey {
 
 impl EphemeralKey {
     /// Generate with the real ssh-keygen.
-    pub(crate) fn generate() -> Result<Self> {
-        Self::generate_with(std::path::Path::new("ssh-keygen"))
+    pub(crate) async fn generate() -> Result<Self> {
+        Self::generate_with(std::path::Path::new("ssh-keygen")).await
     }
 
     /// Generate with an injectable keygen binary (tests pass a stub).
-    pub(crate) fn generate_with(keygen_bin: &std::path::Path) -> Result<Self> {
+    pub(crate) async fn generate_with(keygen_bin: &std::path::Path) -> Result<Self> {
         let dir = std::env::temp_dir().join(format!(
             "fil-ssh-ephemeral-{}-{}",
             std::process::id(),
@@ -602,21 +608,26 @@ impl EphemeralKey {
             let _ = std::fs::remove_dir_all(&dir);
         };
         let key = dir.join("key");
-        let status = std::process::Command::new(keygen_bin)
-            .args([
-                "-q",
-                "-t",
-                "ed25519",
-                "-f",
-                &key.to_string_lossy(),
-                "-N",
-                "",
-                "-C",
-                "filament-ephemeral",
-            ])
-            .stdin(std::process::Stdio::null())
-            .status()
-            .map_err(|e| anyhow::anyhow!("ephemeral keygen failed to run: {e}"));
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::process::Command::new(keygen_bin)
+                .args([
+                    "-q",
+                    "-t",
+                    "ed25519",
+                    "-f",
+                    &key.to_string_lossy(),
+                    "-N",
+                    "",
+                    "-C",
+                    "filament-ephemeral",
+                ])
+                .stdin(std::process::Stdio::null())
+                .status(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ephemeral keygen timed out"))?
+        .map_err(|e| anyhow::anyhow!("ephemeral keygen failed to run: {e}"));
         let status = match status {
             Ok(s) => s,
             Err(e) => {
@@ -701,7 +712,7 @@ pub(crate) fn spawn_cleanup_on_signal(dir: std::path::PathBuf) -> tokio::task::J
 /// `<pubkey>-cert.pub` it writes. Nonzero exit, missing output, or any IO
 /// failure refuses with a clear error -- never a cert, never a fallback.
 /// `keygen_bin` is injectable so tests pass a stub instead of the real tool.
-pub(crate) fn sign(
+pub(crate) async fn sign(
     keygen_bin: &std::path::Path,
     ca_path: &std::path::Path,
     pubkey_text: &str,
@@ -715,11 +726,16 @@ pub(crate) fn sign(
     let pub_file = workdir.join("key.pub");
     std::fs::write(&pub_file, pubkey_text)?;
     let argv = build_sign_argv(ca_path, &pub_file, key_id, principal, validity, serial);
-    let status = std::process::Command::new(keygen_bin)
-        .args(&argv)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| anyhow::anyhow!("ssh-keygen failed to run: {e}"))?;
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(keygen_bin)
+            .args(&argv)
+            .stdin(std::process::Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ssh-keygen timed out; refusing"))?
+    .map_err(|e| anyhow::anyhow!("ssh-keygen failed to run: {e}"))?;
     if !status.status.success() {
         bail!(
             "ssh-keygen refused to sign (exit {}): {}",
@@ -804,8 +820,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn relative_validity_accepted_under_foreign_tz() {
+    #[tokio::test]
+    async fn relative_validity_accepted_under_foreign_tz() {
         // ssh-keygen must accept the relative -V under a non-UTC zone (the
         // old absolute stamps shifted with TZ). Nothing in this tree reads
         // localtime, so the set_var window below cannot disturb other tests.
@@ -970,12 +986,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn ca_mint_is_idempotent_and_needs_keygen() {
+    #[tokio::test]
+    async fn ca_mint_is_idempotent_and_needs_keygen() {
         let dir = std::env::temp_dir().join(format!("fil-sshca-mint-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Missing keygen binary refuses without creating anything.
-        assert!(ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).is_err());
+        assert!(ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).await.is_err());
         assert!(!ca_key_path(&dir).exists());
         // Stub that behaves like ssh-keygen -f (writes key + pub).
         let stub = dir.join("stub-keygen");
@@ -987,21 +1003,21 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let key = ensure_ca_key_with(&dir, &stub).expect("stub mints");
+        let key = ensure_ca_key_with(&dir, &stub).await.expect("stub mints");
         assert_eq!(key, ca_key_path(&dir));
         let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "minted CA key must be 0600");
         let mode = std::fs::metadata(dir.join("ssh")).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "ssh dir must be 0700");
         // Second run returns the same key without touching it.
-        let again = ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).expect("idempotent");
+        let again = ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).await.expect("idempotent");
         assert_eq!(again, key);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn ephemeral_key_is_0700_fresh_and_cleaned() {
+    #[tokio::test]
+    async fn ephemeral_key_is_0700_fresh_and_cleaned() {
         let dir = std::env::temp_dir().join(format!("fil-sshca-stub-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let stub = dir.join("stub-keygen");
@@ -1012,7 +1028,7 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let key = EphemeralKey::generate_with(&stub).expect("stub keygen succeeds");
+        let key = EphemeralKey::generate_with(&stub).await.expect("stub keygen succeeds");
         assert_eq!(key.pubkey_text(), "ssh-ed25519 AAAAC3test stub");
         let mode = std::fs::metadata(key.dir()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "ephemeral tmpdir must be 0700");
@@ -1024,14 +1040,14 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn ephemeral_keygen_failure_is_an_error() {
-        assert!(EphemeralKey::generate_with(std::path::Path::new("/bin/false")).is_err());
+    #[tokio::test]
+    async fn ephemeral_keygen_failure_is_an_error() {
+        assert!(EphemeralKey::generate_with(std::path::Path::new("/bin/false")).await.is_err());
     }
 
     #[cfg(unix)]
-    #[test]
-    fn sign_refuses_on_nonzero_and_missing_output() {
+    #[tokio::test]
+    async fn sign_refuses_on_nonzero_and_missing_output() {
         let dir = std::env::temp_dir().join(format!("fil-sshca-sign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0bW9Oq68v6Kz4pGk3Bn2K8R8m4t stunt";
@@ -1041,6 +1057,7 @@ mod tests {
             std::path::Path::new("/ca"),
             key, "boxA", "daemon", "V", 1, &dir,
         )
+        .await
         .unwrap_err();
         assert!(e.to_string().contains("refused to sign"), "{e}");
         // Zero exit but no cert file refuses too (never an empty cert).
@@ -1049,6 +1066,7 @@ mod tests {
             std::path::Path::new("/ca"),
             key, "boxA", "daemon", "V", 1, &dir,
         )
+        .await
         .unwrap_err();
         assert!(e.to_string().contains("wrote no cert"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);

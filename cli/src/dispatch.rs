@@ -447,8 +447,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // fail for an SSH-CA nicety, and signing fails closed later
             // with a clear error until ssh-keygen succeeds.
             if out.is_ok() {
-                if let Err(e) =
-                    crate::ssh_ca::ensure_ca_key(&crate::settings::config_dir())
+                if let Err(e) = crate::ssh_ca::ensure_ca_key(&crate::settings::config_dir()).await
                 {
                     crate::ui::say(&format!(
                         "ssh CA not provisioned ({e}); `shell --ssh` signing will refuse until ssh-keygen succeeds (re-run init)"
