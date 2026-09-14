@@ -193,7 +193,11 @@ mod tests {
                                     // the matrix.
                                     expires: Some(9_999_999_999u64),
                                     ak_caps,
-                                    own_user: None,
+                                    // Same user key as iusr: these cells model the
+                                    // same-owner fleet population the ceiling branch
+                                    // exists for (without it same_owner is false
+                                    // and no covered cell could ever allow).
+                                    own_user: Some([0x11u8; 32]),
                                     has_grant,
                                     cert_revoked,
                                     ceiling_covers,
