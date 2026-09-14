@@ -532,7 +532,7 @@ pub(crate) async fn handle_ssh_sign(
         return;
     }
     // Gate first (same function, same inputs as pty/exec): no grant, no cert.
-    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy, crate::capability::CAP_SHELL);
     if let Err(cap_reason) = crate::shell_gate::ssh_gate_decision(&inputs) {
         refuse(
             &t,
