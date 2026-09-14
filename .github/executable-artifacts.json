@@ -288,10 +288,14 @@
     },
     {
       "path": "cli/tests/ssh-ca-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "deepseek-worker",
-      "expires": "2026-10-13"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/ssh-ca-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/ssh-gates.sh",

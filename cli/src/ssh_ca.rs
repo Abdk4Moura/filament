@@ -381,6 +381,7 @@ pub(crate) async fn ensure_ca_key_with(
     let status = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new(keygen_bin)
+            .kill_on_drop(true)
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "filament-ca", "-f"])
             .arg(&key)
             .stdin(std::process::Stdio::null())
@@ -762,6 +763,7 @@ impl EphemeralKey {
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             tokio::process::Command::new(keygen_bin)
+                .kill_on_drop(true)
                 .args([
                     "-q",
                     "-t",
@@ -883,6 +885,7 @@ pub(crate) async fn sign(
     let status = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio::process::Command::new(keygen_bin)
+            .kill_on_drop(true)
             .args(&argv)
             .stdin(std::process::Stdio::null())
             .output(),
@@ -1041,7 +1044,43 @@ mod tests {
                 .output()
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let text = String::from_utf8_lossy(&out.stdout);
-            assert!(text.contains("Valid: from"), "cert carries a window: {text}");
+            // Bounds, not just presence: parse the window endpoints as naive
+            // datetimes and require width == ttl + skew (3900s). Both ends
+            // render in the same zone, so the zone cancels out -- this holds
+            // under ANY TZ, which is exactly the regression being pinned
+            // (absolute stamps used to shift).
+            let line = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("Valid:"))
+                .ok_or_else(|| anyhow::anyhow!("no Valid line: {text}"))?;
+            let bounds: Vec<&str> = line.split_whitespace().collect();
+            let from = bounds.iter().position(|w| *w == "from").and_then(|i| bounds.get(i + 1));
+            let to = bounds.iter().position(|w| *w == "to").and_then(|i| bounds.get(i + 1));
+            let (Some(from), Some(to)) = (from, to) else {
+                anyhow::bail!("unparseable Valid line: {line}");
+            };
+            fn naive_epoch(s: &str) -> anyhow::Result<i64> {
+                // "2026-09-14T15:57:40" (ssh-keygen renders no zone here).
+                let (d, t) = s.split_once('T').ok_or_else(|| anyhow::anyhow!("no T in {s}"))?;
+                let d: Vec<i64> =
+                    d.split('-').map(|x| x.parse().map_err(|_| anyhow::anyhow!("bad date"))).collect::<Result<_, _>>()?;
+                let t: Vec<i64> =
+                    t.split(':').map(|x| x.parse().map_err(|_| anyhow::anyhow!("bad time"))).collect::<Result<_, _>>()?;
+                if d.len() != 3 || t.len() != 3 {
+                    anyhow::bail!("bad stamp {s}");
+                }
+                // Days-from-civil (Howard Hinnant), then seconds.
+                let (y, m, day) = (d[0], d[1], d[2]);
+                let y = if m <= 2 { y - 1 } else { y };
+                let era = if y >= 0 { y } else { y - 399 } / 400;
+                let yoe = y - era * 400;
+                let mp = (m + 9) % 12;
+                let doy = (153 * mp + 2) / 5 + day - 1;
+                let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+                Ok((era * 146097 + doe - 719468) * 86400 + t[0] * 3600 + t[1] * 60 + t[2])
+            }
+            let width = naive_epoch(to)? - naive_epoch(from)?;
+            assert_eq!(width, 3900, "window must be ttl(3600) + skew(300): {line}");
             Ok(())
         })();
         match prior {
