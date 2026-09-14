@@ -42,10 +42,11 @@ pub(crate) fn resolve_cert_ttl_secs() -> Result<u64> {
     parse_ttl_secs(&raw)
 }
 
-/// Effective validity: min(grant expiry if known, requested ttl, setting).
-/// Requested 0 refuses (meaningless); the setting side is already clamped.
+/// Effective validity: min(grant remaining if known, requested ttl, setting).
+/// All three are durations-from-now, so they compare directly. Requested 0
+/// refuses (meaningless); the setting side is already clamped.
 pub(crate) fn clamp_validity_secs(
-    grant_expiry_secs: Option<u64>,
+    grant_remaining_secs: Option<u64>,
     requested_secs: u64,
     setting_secs: u64,
 ) -> Result<u64> {
@@ -53,7 +54,7 @@ pub(crate) fn clamp_validity_secs(
         bail!("ssh cert ttl must be greater than zero");
     }
     let mut out = requested_secs.min(setting_secs);
-    if let Some(g) = grant_expiry_secs {
+    if let Some(g) = grant_remaining_secs {
         out = out.min(g);
     }
     if out == 0 {
@@ -62,17 +63,56 @@ pub(crate) fn clamp_validity_secs(
     Ok(out)
 }
 
-/// Absolute `-V` interval for ssh-keygen from a ttl: `AFTER:BEFORE` with a
-/// skew allowance on the start. Absolute timestamps (universally accepted),
-/// never relative suffixes.
-pub(crate) fn validity_interval(now_secs: u64, ttl_secs: u64) -> String {
-    format!("{}:{}", stamp(now_secs.saturating_sub(CERT_SKEW_SECS)), stamp(now_secs + ttl_secs))
+/// Relative `-V` interval for ssh-keygen from a ttl: `-5m:+<ttl>s`. Pure
+/// relative form, so there is NOTHING timezone-dependent anywhere in the
+/// path (no timestamps rendered, nothing to shift under TZ=Asia/Lagos).
+/// Verified live against ssh-keygen (seconds suffix accepted, validity
+/// window correct); the skew allowance absorbs clock drift and slow links.
+pub(crate) fn validity_interval(ttl_secs: u64) -> String {
+    format!("-{}m:+{}s", CERT_SKEW_SECS / 60, ttl_secs)
 }
 
-fn stamp(secs: u64) -> String {
-    chrono::DateTime::from_timestamp(secs as i64, 0)
-        .map(|d| d.format("%Y%m%d%H%M%S").to_string())
-        .unwrap_or_else(|| "19700101000000".to_string())
+/// Grant-expiry bound (relative seconds) from both stores: the legacy
+/// device capExpires.shell for the name, plus fleet cap_grant ops for the
+/// peer's user key. Most restrictive wins; absent everywhere means
+/// unexpiring (None). Expired clamps to 0 via saturating_sub, which the
+/// validity clamp then refuses. `now_secs` is a parameter (not read) so
+/// tests pin time instead of racing it.
+pub(crate) fn grant_expiry_secs(
+    config_dir: &std::path::Path,
+    device_name: &str,
+    user_pub: Option<[u8; 32]>,
+    now_secs: u64,
+) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    let mut consider = |exp: u64| {
+        best = Some(best.map_or(exp, |b: u64| b.min(exp)));
+    };
+    if let Ok(raw) = std::fs::read_to_string(config_dir.join("devices.json")) {
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
+            if let Some(d) = arr.iter().find(|d| d["name"].as_str() == Some(device_name)) {
+                if let Some(e) = d["capExpires"]["shell"].as_u64() {
+                    consider(e);
+                }
+            }
+        }
+    }
+    if let Some(up) = user_pub {
+        let key = hex::encode(up);
+        for e in crate::capability::load_cap_store(config_dir).iter().filter(|e| {
+            e["type"].as_str() == Some("cap_grant")
+                && e["resource"].as_str() == Some("self")
+                && e["permissions"].as_array().is_some_and(|p| {
+                    p.iter().any(|c| c.as_str() == Some("shell"))
+                })
+                && e["target"].as_str() == Some(&key)
+        }) {
+            if let Some(x) = e["expires"].as_u64() {
+                consider(x);
+            }
+        }
+    }
+    best.map(|e| e.saturating_sub(now_secs))
 }
 
 /// Check the CA key file: must exist and (unix) be exactly 0600. A group- or
@@ -352,8 +392,17 @@ pub(crate) async fn handle_ssh_sign(
             return;
         }
     };
-    let grant_expiry = conn.link(pid).and_then(|l| l.identity_cert_expires);
-    let ttl = match clamp_validity_secs(grant_expiry, req.ttl_secs, setting_ttl) {
+    let peer_user = {
+        let az = crate::peer_authz(conn, pid);
+        let (_, iusr, _, _, _, _) = az.parts();
+        iusr.copied()
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let grant_remaining = grant_expiry_secs(&config_dir, &verified, peer_user, now);
+    let ttl = match clamp_validity_secs(grant_remaining, req.ttl_secs, setting_ttl) {
         Ok(s) => s,
         Err(e) => {
             let reason = format!("ssh-sign refused: {e}");
@@ -368,11 +417,7 @@ pub(crate) async fn handle_ssh_sign(
         return;
     }
     let serial = next_serial(&records);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let validity = validity_interval(now, ttl);
+    let validity = validity_interval(ttl);
     let principal = daemon_username();
     let workdir = std::env::temp_dir().join(format!(
         "fil-ssh-sign-{}-{}",
@@ -406,10 +451,9 @@ pub(crate) async fn handle_ssh_sign(
         &config_dir,
         &IssuedCert { pubkey: req.ephemeral_pubkey.clone(), device_id: verified.clone(), serial },
     );
-    let valid_before = validity.rsplit(':').next().unwrap_or("");
     crate::ui::say(&format!(
         "l2: {}",
-        format_issuance(&verified, &principal, serial, valid_before)
+        format_issuance(&verified, &principal, serial, &(now + ttl).to_string())
     ));
     let _ = t
         .send_control(&serde_json::json!({ "type": "ssh-sign-response", "sid": sid, "cert": cert }))
@@ -713,12 +757,116 @@ mod tests {
     }
 
     #[test]
-    fn validity_is_absolute_with_skew() {
-        // 2026-09-13T21:20:00Z == 1789334400: start backs off 5m skew.
-        assert_eq!(
-            validity_interval(1789334400, 3600),
-            "20260913211500:20260913222000"
-        );
+    fn validity_is_relative_with_skew() {
+        // Pure relative form: no timestamps rendered, nothing TZ-dependent.
+        assert_eq!(validity_interval(3600), "-5m:+3600s");
+        assert_eq!(validity_interval(60), "-5m:+60s");
+    }
+
+    #[test]
+    fn grant_expiry_reads_both_stores_most_restrictive_wins() {
+        let dir = std::env::temp_dir().join(format!("fil-sshca-exp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = 1_800_000_000u64;
+        // Absent everywhere: unexpiring.
+        assert_eq!(grant_expiry_secs(&dir, "boxA", None, now), None);
+        // Legacy device store: 10-minute shell grant.
+        std::fs::write(
+            dir.join("devices.json"),
+            r#"[{"name":"boxA","secret":"x","caps":["shell"],"capExpires":{"shell":1800000600}}]"#,
+        )
+        .unwrap();
+        let got = grant_expiry_secs(&dir, "boxA", None, now).expect("legacy expiry");
+        assert!(got <= 600 && got >= 590, "10-min grant clamps ttl, got {got}");
+        // Fleet cap store with a tighter 5-minute shell grant for the peer key.
+        let upub = [0x77u8; 32];
+        std::fs::write(
+            dir.join("caps.json"),
+            format!(
+                r#"[{{"type":"cap_grant","resource":"self","permissions":["shell"],"target":"{}","expires":{}}}]"#,
+                hex::encode(upub),
+                now + 300
+            ),
+        )
+        .unwrap();
+        let got = grant_expiry_secs(&dir, "boxA", Some(upub), now).expect("fleet expiry");
+        assert!(got <= 300 && got >= 290, "tighter fleet grant wins, got {got}");
+        // Expired clamps to zero (the validity clamp then refuses).
+        std::fs::write(
+            dir.join("devices.json"),
+            r#"[{"name":"boxA","secret":"x","caps":["shell"],"capExpires":{"shell":1799999999}}]"#,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(dir.join("caps.json"));
+        assert_eq!(grant_expiry_secs(&dir, "boxA", None, now), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_validity_accepted_under_foreign_tz() {
+        // ssh-keygen must accept the relative -V under a non-UTC zone (the
+        // old absolute stamps shifted with TZ). Nothing in this tree reads
+        // localtime, so the set_var window below cannot disturb other tests.
+        let prior = std::env::var("TZ").ok();
+        unsafe { std::env::set_var("TZ", "Asia/Lagos") };
+        let dir =
+            std::env::temp_dir().join(format!("fil-sshca-tz-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = (|| -> anyhow::Result<()> {
+            std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-f"])
+                .arg(dir.join("ca"))
+                .args(["-N", ""])
+                .status()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // ssh-keygen refuses a 0644 signing key (and so does the
+            // product's own check_ca_key): tighten the fixture like the
+            // real mint path does.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    dir.join("ca"),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+            std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-f"])
+                .arg(dir.join("key"))
+                .args(["-N", ""])
+                .status()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let out = std::process::Command::new("ssh-keygen")
+                .args([
+                    "-q", "-s", &dir.join("ca").to_string_lossy(), "-I", "t",
+                    "-n", "root", "-V", &validity_interval(3600), "-z", "1",
+                ])
+                .arg(dir.join("key.pub"))
+                .output()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            assert!(
+                out.status.success(),
+                "relative -V must be accepted: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let out = std::process::Command::new("ssh-keygen")
+                .args(["-L", "-f"])
+                .arg(dir.join("key-cert.pub"))
+                .output()
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains("Valid: from"), "cert carries a window: {text}");
+            Ok(())
+        })();
+        match prior {
+            Some(v) => unsafe { std::env::set_var("TZ", v) },
+            None => unsafe { std::env::remove_var("TZ") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        r.unwrap();
     }
 
     #[test]

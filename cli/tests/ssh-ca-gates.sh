@@ -113,6 +113,18 @@ env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
+# A ~10-minute grant window: the cert clamp must not exceed it (CB-2).
+GRANT_NOW=$(date +%s)
+GRANT_EXP=$((GRANT_NOW + 600))
+python3 - "$DB/devices.json" "$GRANT_EXP" <<'PY2'
+import json,sys
+p,exp=sys.argv[1],int(sys.argv[2])
+arr=json.load(open(p))
+for d in arr:
+    if d.get("name")=="boxA":
+        d.setdefault("capExpires",{})["shell"]=exp
+json.dump(arr,open(p,"w"))
+PY2
 env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
@@ -145,6 +157,24 @@ if [ "$rcB" != "0" ] \
 else
   echo "-- B.err --"; cat "$WORK/B.err"
   bad "gateB: revoked login NOT refused (rc=$rcB)"
+fi
+
+# ===================================================================== GATE D ==
+# CLAMP: with a ~10-minute grant window, the issued cert's validity must be
+# <= that window (ssh-keygen -L reads the actual cert back).
+say D
+CERT_LINE=$(grep -oE 'expiry [0-9]+' "$WORK/up.log" | tail -1 | awk '{print $2}')
+VALID=$(grep -oE 'Valid: from [^ ]+ to [^ ]+' "$WORK/sshd/sshd.log" 2>/dev/null | tail -1)
+echo "## cert expiry epoch: $CERT_LINE"
+if [ -n "$CERT_LINE" ]; then
+  DELTA=$(( CERT_LINE - GRANT_NOW ))
+  if [ "$DELTA" -le 600 ] && [ "$DELTA" -ge 540 ]; then
+    ok "gateD: cert validity clamped to the 10-minute grant (${DELTA}s)"
+  else
+    bad "gateD: cert validity ${DELTA}s exceeds/misses the grant window"
+  fi
+else
+  bad "gateD: no issuance expiry found in B's log"
 fi
 
 # ===================================================================== GATE C ==
