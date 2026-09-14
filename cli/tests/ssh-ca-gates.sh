@@ -90,9 +90,9 @@ SSHD_PORT=9123
 HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals" FILAMENT_SSH_CA_PUB_ANCHOR="$WORK/hooked-ca.pub")
 ssh-keygen -q -t ed25519 -f "$WORK/hooked-hostkey" -N ""
 chmod 600 "$WORK/hooked-hostkey"
-printf 'Port 9123\nHostKey %s\n' "$WORK/hooked-hostkey" > "$WORK/hooked-sshd-config"
+printf 'Port 9123\nHostKey %s\nListenAddress 127.0.0.1\nPidFile %s\nPasswordAuthentication no\nPubkeyAuthentication yes\nUsePAM no\nStrictModes no\nPermitRootLogin prohibit-password\nLogLevel VERBOSE\n' "$WORK/hooked-hostkey" "$SSHD/sshd.pid" > "$WORK/hooked-sshd-config"
 env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
-  FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" \
+  FILAMENT_SSH_HOSTKEY="$WORK/hooked-hostkey.pub" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
@@ -115,16 +115,6 @@ PY2
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # --- temp sshd on the PRODUCT-WRITTEN config (proves the writer output works) ---
-cat >> "$WORK/hooked-sshd-config" <<CFG
-ListenAddress 127.0.0.1
-PidFile $SSHD/sshd.pid
-PasswordAuthentication no
-PubkeyAuthentication yes
-UsePAM no
-StrictModes no
-PermitRootLogin prohibit-password
-LogLevel VERBOSE
-CFG
 /usr/sbin/sshd -f "$WORK/hooked-sshd-config" -E "$SSHD/sshd.log" -D &
 SSHD_PID=$!
 pids+=($SSHD_PID)
