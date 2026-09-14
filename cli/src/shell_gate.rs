@@ -33,6 +33,10 @@ pub(crate) struct ShellGateInputs {
     pub own_user: Option<[u8; 32]>,
     pub has_grant: bool,
     pub cert_revoked: bool,
+    /// Whether the peer's persisted, owner-signed enrolment ceiling covers
+    /// the gated action. Gathered fresh (never cached) via
+    /// `ceiling_covers_action`, keyed by verified device identity.
+    pub ceiling_covers: bool,
 }
 
 /// Gather from live state. Both call sites use this; nothing gate-relevant
@@ -41,6 +45,7 @@ pub(crate) fn gather_shell_gate_inputs(
     conn: &mut Conn,
     pid: &str,
     shell_policy: &crate::ShellPolicy,
+    action: &str,
 ) -> (Option<String>, ShellGateInputs) {
     let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
     let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
@@ -62,6 +67,7 @@ pub(crate) fn gather_shell_gate_inputs(
         iusr,
         ak_caps,
     );
+    let ceiling_covers = crate::identity_state::ceiling_covers_action(idev, action);
     let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
         &crate::settings::config_dir(),
         "self",
@@ -84,6 +90,7 @@ pub(crate) fn gather_shell_gate_inputs(
         own_user,
         has_grant,
         cert_revoked,
+        ceiling_covers,
     };
     (dev, inputs)
 }
@@ -106,7 +113,7 @@ fn decide(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
         inputs.expires,
         inputs.ak_caps.as_deref(),
         inputs.own_user.as_ref(),
-        false,
+        inputs.ceiling_covers,
         inputs.has_grant,
         inputs.cert_revoked,
     );
@@ -160,67 +167,98 @@ mod tests {
                 for has_grant in [false, true] {
                     for cert_revoked in [false, true] {
                         for ceiling_allows in [false, true] {
-                            let outcome = if has_grant {
-                                CapOutcome::Authorized
-                            } else {
-                                CapOutcome::Denied("test: no grant".into())
-                            };
-                            let ak_caps = if ceiling_allows {
-                                None
-                            } else {
-                                Some(vec!["transfer".to_string()])
-                            };
-                            let inputs = ShellGateInputs {
-                                trusted,
-                                denied: false,
-                                policy_allows: false,
-                                store_allows: has_grant,
-                                outcome,
-                                idev: Some([0x42u8; 32]),
-                                iusr: Some([0x11u8; 32]),
-                                binding: BindingStrength::Proven,
-                                // Fixed far-future expiry (not an axis): None
-                                // fail-closes under authoritative, which would
-                                // deny every allow-cell for a reason outside
-                                // the matrix.
-                                expires: Some(9_999_999_999u64),
-                                ak_caps,
-                                own_user: None,
-                                has_grant,
-                                cert_revoked,
-                            };
-                            let e = exec_gate_decision(&inputs);
-                            let p = pty_gate_decision(&inputs);
-                            let s = ssh_gate_decision(&inputs);
-                            assert_eq!(
-                                e, p,
-                                "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
-                            );
-                            assert_eq!(
-                                e, s,
-                                "exec vs ssh-sign disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
-                            );
-                            // Oracle pins (not just equality): absolutes deny in
-                            // every cell, and the two canonical allows hold in
-                            // every cell. A core regression either way fails
-                            // here even if both wrappers still agree.
-                            if cert_revoked {
-                                assert!(
-                                    e.is_err(),
-                                    "revoked cert must deny: trusted={trusted} grant={has_grant} ceiling={ceiling_allows} auth={authoritative}"
+                            for ceiling_covers in [false, true] {
+                                let outcome = if has_grant {
+                                    CapOutcome::Authorized
+                                } else {
+                                    CapOutcome::Denied("test: no grant".into())
+                                };
+                                let ak_caps = if ceiling_allows {
+                                    None
+                                } else {
+                                    Some(vec!["transfer".to_string()])
+                                };
+                                let inputs = ShellGateInputs {
+                                    trusted,
+                                    denied: false,
+                                    policy_allows: false,
+                                    store_allows: has_grant,
+                                    outcome,
+                                    idev: Some([0x42u8; 32]),
+                                    iusr: Some([0x11u8; 32]),
+                                    binding: BindingStrength::Proven,
+                                    // Fixed far-future expiry (not an axis): None
+                                    // fail-closes under authoritative, which would
+                                    // deny every allow-cell for a reason outside
+                                    // the matrix.
+                                    expires: Some(9_999_999_999u64),
+                                    ak_caps,
+                                    // Same user key as iusr: these cells model the
+                                    // same-owner fleet population the ceiling branch
+                                    // exists for (without it same_owner is false
+                                    // and no covered cell could ever allow).
+                                    own_user: Some([0x11u8; 32]),
+                                    has_grant,
+                                    cert_revoked,
+                                    ceiling_covers,
+                                };
+                                let e = exec_gate_decision(&inputs);
+                                let p = pty_gate_decision(&inputs);
+                                let s = ssh_gate_decision(&inputs);
+                                assert_eq!(
+                                    e, p,
+                                    "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
                                 );
-                            }
-                            if !ceiling_allows {
-                                assert!(
-                                    e.is_err(),
-                                    "narrow ceiling must deny: trusted={trusted} grant={has_grant} revoked={cert_revoked} auth={authoritative}"
+                                assert_eq!(
+                                    e, s,
+                                    "exec vs ssh-sign disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
                                 );
-                            }
-                            if trusted && has_grant && !cert_revoked && ceiling_allows {
-                                assert!(
-                                    e.is_ok(),
-                                    "trusted+granted must allow: ceiling={ceiling_allows} auth={authoritative}"
-                                );
+                                // Oracle pins (not just equality): absolutes deny in
+                                // every cell, and the two canonical allows hold in
+                                // every cell. A core regression either way fails
+                                // here even if both wrappers still agree.
+                                if cert_revoked {
+                                    assert!(
+                                        e.is_err(),
+                                        "revoked cert must deny: trusted={trusted} grant={has_grant} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                    );
+                                }
+                                if !ceiling_allows {
+                                    assert!(
+                                        e.is_err(),
+                                        "narrow ceiling must deny: trusted={trusted} grant={has_grant} revoked={cert_revoked} covers={ceiling_covers} auth={authoritative}"
+                                    );
+                                }
+                                if trusted && has_grant && !cert_revoked && ceiling_allows {
+                                    assert!(
+                                        e.is_ok(),
+                                        "trusted+granted must allow: ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                    );
+                                }
+                                // covers=false is the pre-change behavior (scoped_in_bounds
+                                // was hardcoded false): authoritative deliberate-tier cells
+                                // without a grant must still deny, pinning the flip
+                                // blocker exactly where it was.
+                                if !ceiling_covers && authoritative && !has_grant {
+                                    assert!(
+                                        e.is_err(),
+                                        "uncovered deliberate action must deny under authoritative: trusted={trusted} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
+                                    );
+                                }
+                                // covers=true opens exactly one new door: authoritative,
+                                // trusted, Proven, unrevoked, grantless, covered.
+                                if ceiling_covers
+                                    && authoritative
+                                    && trusted
+                                    && !has_grant
+                                    && !cert_revoked
+                                    && ceiling_allows
+                                {
+                                    assert!(
+                                        e.is_ok(),
+                                        "covered enrolment ceiling must allow under authoritative: ceiling={ceiling_allows} auth={authoritative}"
+                                    );
+                                }
                             }
                         }
                     }
