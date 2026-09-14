@@ -77,40 +77,20 @@ chmod 600 "$DB/ssh/ssh_ca"
 # AuthorizedKeysFile at all: cert auth is the only way in, which is exactly
 # what gate A proves). Reached through the mesh tunnel because the dial port
 # below overrides the bootstrap default. ---
-SSHD="$WORK/sshd"; mkdir -p "$SSHD" "$SSHD/principals"
-ssh-keygen -q -t ed25519 -f "$SSHD/hostkey" -N ""
-cp "$DB/ssh/ssh_ca.pub" "$SSHD/ca.pub"
-printf '%s\n' "$B_USER" > "$SSHD/principals/$B_USER"
-chmod 600 "$SSHD/principals/$B_USER"
+# The temp sshd below runs on the HOOK-WRITTEN config (product writer output,
+# not hand-provisioned trust): base Port/HostKey here, Match block +
+# principals + anchor added by up/grant arming through the overrides.
+SSHD="$WORK/sshd"; mkdir -p "$SSHD"
 mkdir -p /run/sshd 2>/dev/null
 SSHD_PORT=9123
-cat > "$SSHD/sshd_config" <<CFG
-Port $SSHD_PORT
-ListenAddress 127.0.0.1
-HostKey $SSHD/hostkey
-PidFile $SSHD/sshd.pid
-TrustedUserCAKeys $SSHD/ca.pub
-AuthorizedPrincipalsFile $SSHD/principals/%u
-PasswordAuthentication no
-PubkeyAuthentication yes
-UsePAM no
-StrictModes no
-PermitRootLogin prohibit-password
-LogLevel VERBOSE
-CFG
-/usr/sbin/sshd -f "$SSHD/sshd_config" -E "$SSHD/sshd.log" -D &
-SSHD_PID=$!
-pids+=($SSHD_PID)
-sleep 1
-ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$SSHD/sshd.log"; exit 2; }
 
 # --- B acceptor (daemon user = root via USER; hostkeys pinned to temp) ---
 # Hook paths overridden to temp files: up/grant arming writes here (real
 # writer code, observable), never to the live /etc/ssh.
-HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals")
+HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals" FILAMENT_SSH_CA_PUB_ANCHOR="$WORK/hooked-ca.pub")
 ssh-keygen -q -t ed25519 -f "$WORK/hooked-hostkey" -N ""
 chmod 600 "$WORK/hooked-hostkey"
-printf 'Port 22\nHostKey %s\n' "$WORK/hooked-hostkey" > "$WORK/hooked-sshd-config"
+printf 'Port 9123\nHostKey %s\n' "$WORK/hooked-hostkey" > "$WORK/hooked-sshd-config"
 env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
   FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
@@ -133,6 +113,23 @@ for d in arr:
 json.dump(arr,open(p,"w"))
 PY2
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
+
+# --- temp sshd on the PRODUCT-WRITTEN config (proves the writer output works) ---
+cat >> "$WORK/hooked-sshd-config" <<CFG
+ListenAddress 127.0.0.1
+PidFile $SSHD/sshd.pid
+PasswordAuthentication no
+PubkeyAuthentication yes
+UsePAM no
+StrictModes no
+PermitRootLogin prohibit-password
+LogLevel VERBOSE
+CFG
+/usr/sbin/sshd -f "$WORK/hooked-sshd-config" -E "$SSHD/sshd.log" -D &
+SSHD_PID=$!
+pids+=($SSHD_PID)
+sleep 1
+ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED (product config?)"; cat "$SSHD/sshd.log"; tail -3 "$WORK/up.log"; exit 2; }
 
 # The ONLY authorized_keys on the box that matters here is root's (the
 # temp sshd has no AuthorizedKeysFile line at all). Snapshot it: CB-3
@@ -197,11 +194,13 @@ fi
 say C
 if grep -q "Match User $B_USER" "$WORK/hooked-sshd-config" \
    && grep -q "TrustedUserCAKeys" "$WORK/hooked-sshd-config" \
-   && [ "$(cat "$WORK/hooked-principals/$B_USER" 2>/dev/null)" = "$B_USER" ]; then
-  ok "gateC: arming wrote the CA block + principals entry (product writer)"
+   && [ "$(cat "$WORK/hooked-principals/$B_USER" 2>/dev/null)" = "$B_USER" ] \
+   && cmp -s "$DB/ssh/ssh_ca.pub" "$WORK/hooked-ca.pub"; then
+  ok "gateC: arming wrote block + principals + anchor copy (product writer)"
 else
   echo "-- hooked-sshd-config --"; cat "$WORK/hooked-sshd-config" 2>/dev/null
   echo "-- hooked-principals --"; ls -la "$WORK/hooked-principals" 2>/dev/null
+  echo "-- anchor vs daemon pub --"; cmp "$DB/ssh/ssh_ca.pub" "$WORK/hooked-ca.pub" 2>&1 | head -2
   bad "gateC: arming outputs missing"
 fi
 

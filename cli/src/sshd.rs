@@ -126,6 +126,31 @@ pub fn principals_base_dir() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_PRINCIPALS_BASE_DEFAULT))
 }
 
+/// Trust-anchor path (where TrustedUserCAKeys points): env-overridable so
+/// e2e asserts the product copy without touching /etc/ssh.
+pub fn ca_pub_anchor_path() -> std::path::PathBuf {
+    std::env::var("FILAMENT_SSH_CA_PUB_ANCHOR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_CA_PUB_DEFAULT))
+}
+
+/// Install the daemon CA pub at the trust anchor (0644), creating parents.
+/// Best-effort like everything here (loud error, Ok): the manual steps
+/// cover the unwritable case.
+pub fn install_ca_pub_anchor(src: &Path, anchor: &Path) -> Result<()> {
+    let pub_text = std::fs::read_to_string(src)?;
+    if let Some(parent) = anchor.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(anchor, pub_text)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(anchor, std::fs::Permissions::from_mode(0o644))?;
+    }
+    Ok(())
+}
+
 /// Principals file for one login user under a base dir.
 pub fn principals_file_for(base: &Path, user: &str) -> std::path::PathBuf {
     base.join(user)
@@ -162,15 +187,20 @@ pub fn render_sshd_ca_block(
 }
 
 /// Manual steps printed when the config is unwritable (operator applies them
-/// with privilege instead). Pure for the same reason as the renderer.
+/// with privilege instead), including the CA-pub copy. Pure for the same
+/// reason as the renderer.
 pub fn sshd_ca_manual_steps(
-    ca_pub_path: &Path,
+    ca_src: &Path,
+    anchor: &Path,
     daemon_user: &str,
     principals_file: &Path,
 ) -> String {
     format!(
-        "sshd_config is not writable; apply as root, then reload sshd:\n{}\n# then: sudo systemctl restart ssh (or: sudo kill -HUP $(pidof sshd))",
-        render_sshd_ca_block(ca_pub_path, daemon_user, principals_file).trim(),
+        "sshd_config is not writable; apply as root, then reload sshd:\n# cp {} {} && chmod 644 {}\n{}\n# then: sudo systemctl restart ssh (or: sudo kill -HUP $(pidof sshd))",
+        ca_src.display(),
+        anchor.display(),
+        anchor.display(),
+        render_sshd_ca_block(anchor, daemon_user, principals_file).trim(),
     )
 }
 
@@ -183,6 +213,7 @@ pub fn ensure_sshd_ca(
     ca_pub_path: &Path,
     daemon_user: &str,
     principals_file: &Path,
+    ca_src: &Path,
     reload: bool,
 ) -> Result<()> {
     let current = std::fs::read_to_string(config_path).map_err(|_| {
@@ -196,7 +227,7 @@ pub fn ensure_sshd_ca(
     let mut file = match std::fs::OpenOptions::new().append(true).open(config_path) {
         Ok(f) => f,
         Err(_) => {
-            crate::ui::say(&sshd_ca_manual_steps(ca_pub_path, daemon_user, principals_file));
+            crate::ui::say(&sshd_ca_manual_steps(ca_src, ca_pub_path, daemon_user, principals_file));
             return Ok(());
         }
     };
@@ -227,7 +258,7 @@ pub fn ensure_sshd_ca(
             }
             anyhow::bail!(
                 "sshd rejected the new config ({detail}) (rolled back, daemon untouched); apply manually: {}",
-                sshd_ca_manual_steps(ca_pub_path, daemon_user, principals_file)
+                sshd_ca_manual_steps(ca_src, ca_pub_path, daemon_user, principals_file)
                     .replace('\n', " | ")
             );
         }
@@ -263,12 +294,32 @@ pub fn arm_ssh_ca_for_serving() {
         crate::ui::say("ssh CA arming skipped (cannot determine serving user); cert logins will refuse until applied");
         return;
     };
+    let config_dir = crate::settings::config_dir();
+    // Trust anchor first: copy the daemon CA pub where the Match block
+    // points, so -t validates what sshd will actually read. Unwritable:
+    // print the manual steps (including this copy) and stop -- the block
+    // below would fail its own -t against a missing anchor.
+    let anchor = ca_pub_anchor_path();
+    let ca_src = config_dir.join("ssh").join("ssh_ca.pub");
+    if let Err(e) = install_ca_pub_anchor(&ca_src, &anchor) {
+        crate::ui::say(&format!(
+            "ssh CA arming skipped (anchor unwritable: {e}); cert logins will refuse until applied:\n{}",
+            sshd_ca_manual_steps(
+                &ca_src,
+                &anchor,
+                &user,
+                &principals_file_for(&principals_base_dir(), &user)
+            )
+        ));
+        return;
+    }
     let principals = principals_file_for(&principals_base_dir(), &user);
     if let Err(e) = ensure_sshd_ca(
         &sshd_config_path(),
-        Path::new(SSHD_CA_PUB_DEFAULT),
+        &anchor,
         &user,
         &principals,
+        &ca_src,
         true,
     ) {
         crate::ui::say(&format!(
@@ -312,6 +363,30 @@ mod tests {
     }
 
     #[test]
+    fn anchor_copy_installs_0644_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("fil-sshd-anchor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("ssh_ca.pub");
+        std::fs::write(&src, "ssh-ed25519 AAAAC3test\n").unwrap();
+        let anchor = dir.join("sub").join("anchor.pub");
+        install_ca_pub_anchor(&src, &anchor).unwrap();
+        install_ca_pub_anchor(&src, &anchor).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&anchor).unwrap(),
+            "ssh-ed25519 AAAAC3test\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&anchor).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644);
+        }
+        assert!(install_ca_pub_anchor(&dir.join("missing"), &anchor).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn principals_entry_lists_exactly_the_daemon_user() {
         let dir = std::env::temp_dir().join(format!("fil-sshd-princ-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -326,11 +401,17 @@ mod tests {
 
     #[test]
     fn manual_steps_contain_both_lines_and_reload() {
-        let steps =
-            sshd_ca_manual_steps(Path::new("/ca.pub"), "daemon", Path::new("/p/%u"));
+        let steps = sshd_ca_manual_steps(
+            Path::new("/ssh/ssh_ca.pub"),
+            Path::new("/ca.pub"),
+            "daemon",
+            Path::new("/p/%u"),
+        );
         assert!(steps.contains("TrustedUserCAKeys /ca.pub"), "{steps}");
         assert!(steps.contains("AuthorizedPrincipalsFile"), "{steps}");
         assert!(steps.contains("systemctl restart ssh"), "{steps}");
+        assert!(steps.contains("/ssh/ssh_ca.pub"), "{steps}");
+        assert!(steps.contains("/ca.pub"), "{steps}");
     }
 
     #[cfg(unix)]
@@ -366,8 +447,8 @@ mod tests {
             format!("Port 22\nHostKey {}\n", dir.join("hostkey").display()),
         )
         .unwrap();
-        ensure_sshd_ca(&cfg, &ca_pub, "daemon", Path::new("/p/%u"), false).unwrap();
-        ensure_sshd_ca(&cfg, &ca_pub, "daemon", Path::new("/p/%u"), false).unwrap();
+        ensure_sshd_ca(&cfg, &ca_pub, "daemon", Path::new("/p/%u"), &ca_pub, false).unwrap();
+        ensure_sshd_ca(&cfg, &ca_pub, "daemon", Path::new("/p/%u"), &ca_pub, false).unwrap();
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert_eq!(
             text.matches(SSHD_CA_MARKER).count(),
@@ -375,8 +456,15 @@ mod tests {
             "second ensure must not duplicate: {text}"
         );
         assert!(check_sshd_ca_at(&cfg).is_ok());
-        assert!(ensure_sshd_ca(&dir.join("nope"), Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false)
-            .is_err());
+        assert!(ensure_sshd_ca(
+            &dir.join("nope"),
+            Path::new("/ca.pub"),
+            "daemon",
+            Path::new("/p/%u"),
+            Path::new("/ssh/ssh_ca.pub"),
+            false
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -399,7 +487,7 @@ mod tests {
         );
         let cfg = dir.join("sshd_config");
         std::fs::write(&cfg, &before).unwrap();
-        let e = ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false)
+        let e = ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), Path::new("/ssh/ssh_ca.pub"), false)
             .unwrap_err();
         assert!(e.to_string().contains("rolled back"), "{e}");
         assert_eq!(
