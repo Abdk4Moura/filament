@@ -4347,7 +4347,7 @@ pub(crate) async fn recv_cmd(
                     // exec-open): gather, then the pty entry point. The tells
                     // below stay local; only the verdict is shared.
                     let (dev, gate_inputs) =
-                        crate::shell_gate::gather_shell_gate_inputs(&mut conn, &pid, &shell_policy);
+                        crate::shell_gate::gather_shell_gate_inputs(&mut conn, &pid, &shell_policy, crate::capability::CAP_SHELL);
                     if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!(
@@ -4501,6 +4501,10 @@ pub(crate) async fn recv_cmd(
                     // revocation re-check (the gate above resolved the same value for
                     // the open decision; this is that same value).
                     let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                    // Ceiling-admitted (covered, grantless) sessions must die
+                    // when the ceiling narrows; grant-admitted ones ignore it.
+                    let admitted_via_ceiling =
+                        gate_inputs.ceiling_covers && !gate_inputs.has_grant;
                     match l2::spawn_pty_session(
                         pty_sessions.clone(),
                         session_id.clone(),
@@ -4512,6 +4516,7 @@ pub(crate) async fn recv_cmd(
                         argv,
                         pty_guard,
                         spawn_idev,
+                        admitted_via_ceiling,
                     )
                     .await
                     {
