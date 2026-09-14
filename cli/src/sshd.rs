@@ -201,6 +201,37 @@ pub fn ensure_sshd_ca(
         }
     };
     std::io::Write::write_all(&mut file, block.as_bytes())?;
+    drop(file);
+    // Test BEFORE reload: a bad config must roll back, never ship behind a
+    // restart. `sshd -t -f` validates without touching the live daemon.
+    // (Unix OpenSSH path; on Windows there is no system sshd to reload --
+    // the writer still renders correct lines for manual application, and
+    // the unwritable branch above is how that surfaces.)
+    let tested = std::process::Command::new("sshd")
+        .args(["-t", "-f"])
+        .arg(config_path)
+        .stdin(std::process::Stdio::null())
+        .output();
+    match tested {
+        Ok(out) if out.status.success() => {}
+        tested => {
+            let detail = match tested {
+                Ok(out) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
+                Err(e) => format!("could not run sshd: {e}"),
+            };
+            if std::fs::write(config_path, &current).is_err() {
+                anyhow::bail!(
+                    "sshd rejected the new config AND rollback failed; {} may be left modified -- restore it by hand",
+                    config_path.display()
+                );
+            }
+            anyhow::bail!(
+                "sshd rejected the new config ({detail}) (rolled back, daemon untouched); apply manually: {}",
+                sshd_ca_manual_steps(ca_pub_path, daemon_user, principals_file)
+                    .replace('\n', " | ")
+            );
+        }
+    }
     crate::ui::say("added SSH CA trust to sshd_config");
     if reload {
         reload_sshd()?;
@@ -299,14 +330,41 @@ mod tests {
         assert!(steps.contains("systemctl restart ssh"), "{steps}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_is_idempotent_and_refuses_missing_file() {
         let dir = std::env::temp_dir().join(format!("fil-sshd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // sshd -t needs real host keys, else every ensure rolls back.
+        for name in ["hostkey", "ca"] {
+            let st = std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-f"])
+                .arg(dir.join(name))
+                .args(["-N", ""])
+                .status()
+                .expect("ssh-keygen present");
+            assert!(st.success());
+        }
+        // sshd -t refuses an unprotected host private key (umask-dependent
+        // otherwise): tighten like production key material.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.join("hostkey"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+        }
+        let ca_pub = dir.join("ca.pub");
         let cfg = dir.join("sshd_config");
-        std::fs::write(&cfg, "Port 22\n").unwrap();
-        ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false).unwrap();
-        ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false).unwrap();
+        std::fs::write(
+            &cfg,
+            format!("Port 22\nHostKey {}\n", dir.join("hostkey").display()),
+        )
+        .unwrap();
+        ensure_sshd_ca(&cfg, &ca_pub, "daemon", Path::new("/p/%u"), false).unwrap();
+        ensure_sshd_ca(&cfg, &ca_pub, "daemon", Path::new("/p/%u"), false).unwrap();
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert_eq!(
             text.matches(SSHD_CA_MARKER).count(),
@@ -316,6 +374,36 @@ mod tests {
         assert!(check_sshd_ca_at(&cfg).is_ok());
         assert!(ensure_sshd_ca(&dir.join("nope"), Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false)
             .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bad_config_rolls_back_and_refuses() {
+        let dir = std::env::temp_dir().join(format!("fil-sshd-rb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let st = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-f"])
+            .arg(dir.join("hostkey"))
+            .args(["-N", ""])
+            .status()
+            .expect("ssh-keygen present");
+        assert!(st.success());
+        let before = format!(
+            "Port 22\nHostKey {}\nBogusDirective yes\n",
+            dir.join("hostkey").display()
+        );
+        let cfg = dir.join("sshd_config");
+        std::fs::write(&cfg, &before).unwrap();
+        let e = ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false)
+            .unwrap_err();
+        assert!(e.to_string().contains("rolled back"), "{e}");
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            before,
+            "failed config must be restored byte-identical"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

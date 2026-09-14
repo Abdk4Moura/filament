@@ -107,7 +107,9 @@ ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$
 # Hook paths overridden to temp files: up/grant arming writes here (real
 # writer code, observable), never to the live /etc/ssh.
 HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals")
-: > "$WORK/hooked-sshd-config"
+ssh-keygen -q -t ed25519 -f "$WORK/hooked-hostkey" -N ""
+chmod 600 "$WORK/hooked-hostkey"
+printf 'Port 22\nHostKey %s\n' "$WORK/hooked-hostkey" > "$WORK/hooked-sshd-config"
 env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
   FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &

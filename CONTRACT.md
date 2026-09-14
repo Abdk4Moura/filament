@@ -381,4 +381,7 @@ bulk -- the Bootstrap precedent); all lifetimes are seconds on the wire.
   `AuthorizedPrincipalsFile`/`AuthorizedPrincipalsCommand` restricted to
   the daemon user. When those lines are unwritable the daemon prints
   both lines plus the reload step instead of silently serving plaintext
-  auth; `filament doctor` checks their presence.
+  auth; `filament doctor` checks their presence. sshd integration (config
+  lines, `sshd -t` validation, reload) targets unix OpenSSH: a bad config
+  rolls back before any reload, and on Windows the writer prints the lines
+  for manual application (no system sshd to drive there).

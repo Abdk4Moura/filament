@@ -136,14 +136,31 @@ pub(crate) fn check_ca_key(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse anything but a bare ed25519 pubkey (options prefixes, other types,
-/// and empty input all fail closed: ssh-keygen would happily sign them).
+/// Refuse anything but a bare ed25519 pubkey, strictly: no newlines/CR
+/// (log injection + multi-key smuggling), exactly 2-3 whitespace fields
+/// (type, base64, optional comment), and the base64 must decode to the
+/// ssh-ed25519 wire prefix (4-byte length 11 + "ssh-ed25519"). A textual
+/// prefix match alone would bless `ssh-ed25519AAA...` garbage or a valid
+/// prefix on non-key bytes; ssh-keygen would happily sign either.
 pub(crate) fn check_ephemeral_pubkey(text: &str) -> Result<()> {
-    if text.starts_with("ssh-ed25519 ") && text.trim().split_whitespace().count() >= 2 {
-        Ok(())
-    } else {
+    if text.bytes().any(|b| b == b'\n' || b == b'\r') {
+        bail!("ephemeral pubkey must be a single line");
+    }
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    if fields.len() < 2 || fields.len() > 3 {
+        bail!("ephemeral pubkey must have 2-3 fields");
+    }
+    if fields[0] != "ssh-ed25519" {
         bail!("only bare ed25519 ephemeral keys are signed");
     }
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(fields[1])
+        .map_err(|_| anyhow::anyhow!("ephemeral pubkey is not valid base64"))?;
+    if raw.len() < 15 || &raw[0..4] != &[0, 0, 0, 11] || &raw[4..15] != b"ssh-ed25519" {
+        bail!("ephemeral pubkey does not decode to an ssh-ed25519 key");
+    }
+    Ok(())
 }
 
 /// Exact pinned ssh-keygen argv: `-I` device id only, `-n` daemon user only,
@@ -277,6 +294,39 @@ pub(crate) fn record_issuance(
 /// Issuance log line fields (who, principal, serial, expiry), per contract.
 pub(crate) fn format_issuance(device_id: &str, principal: &str, serial: u64, valid_before: &str) -> String {
     format!("ssh-ca: signed for '{device_id}' principal '{principal}' serial {serial} expiry {valid_before}")
+}
+
+/// Secure tempdir: random-suffixed, create_dir (fail-if-exists, NOT
+/// create_dir_all), 0700 on unix. Retries on collision; a persistent
+/// collision fails instead of reusing (reusing a predictable dir would let
+/// another user pre-place symlinks). Used for both the client ephemeral dir
+/// and the daemon staging dir.
+pub(crate) fn secure_tempdir(prefix: &str) -> Result<std::path::PathBuf> {
+    let base = std::env::temp_dir();
+    for attempt in 0..10u32 {
+        let dir = base.join(format!(
+            "fil-{prefix}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            attempt
+        ));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+                }
+                return Ok(dir);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    bail!("could not create a fresh tempdir for {prefix}")
 }
 
 /// CA private-key path: beside the managed keys in the ssh dir (which is
@@ -485,15 +535,13 @@ pub(crate) async fn handle_ssh_sign(
     }
     let validity = validity_interval(ttl);
     let principal = daemon_username();
-    let workdir = std::env::temp_dir().join(format!(
-        "fil-ssh-sign-{}-{}",
-        std::process::id(),
-        serial
-    ));
-    if std::fs::create_dir_all(&workdir).is_err() {
-        refuse(&t, sid, "cannot stage signing".to_string()).await;
-        return;
-    }
+    let workdir = match secure_tempdir("ssh-sign") {
+        Ok(d) => d,
+        Err(_) => {
+            refuse(&t, sid, "cannot stage signing".to_string()).await;
+            return;
+        }
+    };
     let cert = match sign(
         std::path::Path::new("ssh-keygen"),
         &ca_path,
@@ -663,20 +711,7 @@ impl EphemeralKey {
 
     /// Generate with an injectable keygen binary (tests pass a stub).
     pub(crate) async fn generate_with(keygen_bin: &std::path::Path) -> Result<Self> {
-        let dir = std::env::temp_dir().join(format!(
-            "fil-ssh-ephemeral-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        let dir = secure_tempdir("ssh-ephemeral")?;
         let cleanup_on_err = || {
             let _ = std::fs::remove_dir_all(&dir);
         };
@@ -817,9 +852,18 @@ pub(crate) async fn sign(
         );
     }
     let cert_file = workdir.join("key-cert.pub");
-    std::fs::read_to_string(&cert_file)
+    let cert = std::fs::read_to_string(&cert_file)
         .map(|s| s.trim().to_string())
-        .map_err(|_| anyhow::anyhow!("ssh-keygen exited 0 but wrote no cert; refusing"))
+        .map_err(|_| anyhow::anyhow!("ssh-keygen exited 0 but wrote no cert; refusing"))?;
+    // Certs are public material, but a multi-user box should not offer them
+    // for harvesting: lock the file down, fail closed if that fails.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cert_file, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("cannot lock down cert file: {e}"))?;
+    }
+    Ok(cert)
 }
 
 #[cfg(test)]
@@ -981,11 +1025,39 @@ mod tests {
     }
 
     #[test]
+    fn secure_tempdir_is_unique_and_private() {
+        let a = secure_tempdir("probe").expect("creates");
+        let b = secure_tempdir("probe").expect("creates again");
+        assert_ne!(a, b, "same prefix must still yield distinct dirs");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for d in [&a, &b] {
+                let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "tmpdir must be 0700");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[test]
     fn ephemeral_accepts_only_bare_ed25519() {
-        assert!(check_ephemeral_pubkey("ssh-ed25519 AAAAC3xyz box").is_ok());
+        // Real ed25519 body (decodes to the ssh-ed25519 wire prefix).
+        let good = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIILzAe0+efgsfT1oeQP5UeMfhXaoRd/jKUNU9Ol2oub5 stunt";
+        assert!(check_ephemeral_pubkey(good).is_ok());
+        assert!(check_ephemeral_pubkey("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIILzAe0+efgsfT1oeQP5UeMfhXaoRd/jKUNU9Ol2oub5").is_ok());
         assert!(check_ephemeral_pubkey("ssh-rsa AAAAB3xyz box").is_err());
         assert!(check_ephemeral_pubkey("no-touch-cert-request ssh-ed25519 AAAAC3xyz").is_err());
         assert!(check_ephemeral_pubkey("").is_err());
+        // Smuggling shapes: interior newline/CR, single field, four fields.
+        assert!(check_ephemeral_pubkey("ssh-ed25519 AAAAC3xyz\nssh-ed25519 AAAAC3xyz").is_err());
+        assert!(check_ephemeral_pubkey("ssh-ed25519 AAAAC3xyz\r").is_err());
+        assert!(check_ephemeral_pubkey("ssh-ed25519").is_err());
+        assert!(check_ephemeral_pubkey("ssh-ed25519 AAAA b c d").is_err());
+        // Valid prefix on non-key bytes, and non-base64 body.
+        assert!(check_ephemeral_pubkey("ssh-ed25519 !!!not-base64!!!").is_err());
+        assert!(check_ephemeral_pubkey("ssh-ed25519 c3NoLXJzYQ==").is_err());
     }
 
     #[test]
@@ -1155,7 +1227,7 @@ mod tests {
     async fn sign_refuses_on_nonzero_and_missing_output() {
         let dir = std::env::temp_dir().join(format!("fil-sshca-sign-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0bW9Oq68v6Kz4pGk3Bn2K8R8m4t stunt";
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIILzAe0+efgsfT1oeQP5UeMfhXaoRd/jKUNU9Ol2oub5 stunt";
         // Nonzero exit refuses with the stderr attached.
         let e = sign(
             std::path::Path::new("/bin/false"),
