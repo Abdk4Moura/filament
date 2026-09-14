@@ -463,3 +463,24 @@ implement them behaves exactly as before, only slower.
   "while the session is open" to "until cert expiry" against a
   same-user attacker on A. The bound is `ssh.cert_ttl`, and the cache
   lifecycle plus B-side teardown above exist to hold it.
+
+## Capability ceilings (who may write them)
+
+The persisted per-device ceiling (the record field `principal_ceiling_for`
+reads) is owner-signed policy, and only three paths may write it -- all of
+them local consequences of owner-signed artifacts, never network input:
+
+- `join` writes the ceiling from the invitation, and only after the
+  invitation's owner signature verifies;
+- `certify --scope` writes it as an owner-signed CapOp through the grant
+  path on the owner side;
+- renewal writes the CERTIFICATE only, never the ceiling.
+
+In particular: `identity-cert-delivery` and cert renewal persist the cert
+and must not touch the ceiling field (pinned by test); no control frame
+carries a ceiling, a grant, or a role -- the receiver resolves everything
+from its local stores. The shell/exec gate reads the ceiling fresh at
+gate time and on every revoke tick (never cached at link open), keyed by
+the peer's verified device identity, and checks the requested action
+against it (`ceiling_covers_action`). Anything outside the ceiling needs
+an explicit grant exactly as before.
