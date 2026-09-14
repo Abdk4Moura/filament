@@ -327,6 +327,31 @@ pub(crate) fn principal_ceiling_for(name: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Gate input: does the peer's persisted, owner-signed enrolment ceiling
+/// cover `action`? Keyed by the peer's VERIFIED device identity, never by
+/// display name (a name is a label; the key is what the certificate proved).
+/// None identity, unknown device, non-delegated record, or missing ceiling
+/// all mean "not covered" -- fail closed. Read fresh at every call:
+/// ceiling narrowing (re-enrolment, certify --scope) must take effect on
+/// the next gate evaluation, never at link-open time.
+pub(crate) fn ceiling_covers_action(idev: Option<&[u8; 32]>, action: &str) -> bool {
+    let hex = idev.map(hex::encode).unwrap_or_default();
+    let covered = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|arr| {
+            arr.as_array()?
+                .iter()
+                .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))
+                .cloned()
+        })
+        .filter(|record| record["principalKind"].as_str() == Some("delegated"))
+        .and_then(|record| record["principalCeiling"].as_array().cloned())
+        .map(|items| items.iter().any(|item| item.as_str() == Some(action)))
+        .unwrap_or(false);
+    idev.is_some() && covered
+}
+
 pub(crate) fn capability_list_summary(caps: &[String]) -> String {
     caps.iter()
         .map(|cap| match cap.as_str() {

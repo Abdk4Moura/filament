@@ -254,7 +254,7 @@ pub(crate) async fn authorize_exec(
     pid: &str,
     shell_policy: &crate::ShellPolicy,
 ) -> Result<String, String> {
-    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy, crate::capability::CAP_SHELL);
     crate::shell_gate::exec_gate_decision(&inputs)
         .map(|()| dev.unwrap_or_else(|| pid.to_string()))
         .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
@@ -274,6 +274,10 @@ pub(crate) struct ExecSessionAuthz {
     pub(crate) dev_name: Option<String>,
     pub(crate) idev: Option<[u8; 32]>,
     pub(crate) policy_allows: bool,
+    /// True when this session was admitted via its enrolment ceiling rather
+    /// than an explicit grant: a narrowed ceiling must end it on the next
+    /// tick, exactly like a revocation.
+    pub(crate) admitted_via_ceiling: bool,
 }
 
 pub(crate) async fn serve_exec(
@@ -487,7 +491,14 @@ pub(crate) async fn serve_exec(
                     }
                     None => false,
                 };
-                if cert_gone || grant_gone {
+                // A ceiling narrowed under a ceiling-admitted session ends
+                // it (re-read fresh; grant-admitted sessions ignore this).
+                let ceiling_gone = authz.admitted_via_ceiling
+                    && !crate::identity_state::ceiling_covers_action(
+                        authz.idev.as_ref(),
+                        crate::capability::CAP_SHELL,
+                    );
+                if cert_gone || grant_gone || ceiling_gone {
                     crate::ui::critical("exec: peer access revoked, closing live session");
                     let _ = child.kill().await;
                     let _ = t
@@ -575,10 +586,20 @@ pub(crate) async fn handle_exec_open(
         let (idev, _, _, _, _, _) = az.parts();
         idev.copied()
     };
+    let covered = crate::identity_state::ceiling_covers_action(idev.as_ref(), crate::capability::CAP_SHELL);
+    let (_, has_grant_now) = crate::capability::cap_fleet_inputs(
+        &crate::settings::config_dir(),
+        "self",
+        crate::capability::CAP_SHELL,
+        idev.as_ref(),
+        None,
+        None,
+    );
     let authz = ExecSessionAuthz {
         dev_name,
         idev,
         policy_allows,
+        admitted_via_ceiling: covered && !has_grant_now,
     };
     tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz));
 }
