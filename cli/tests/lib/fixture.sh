@@ -125,12 +125,18 @@ sys.exit(0 if d.get('role')=='owner' and any(x['name']==sys.argv[1] and x.get('d
     bad "enrolment: owner holds no certificate for '$name'"
   fi
 
-  if printf '%s' "$sjson" | python3 -c "
-import json,sys
-d=json.load(sys.stdin)
-sys.exit(0 if d.get('configured') and d.get('role')=='joined-device' and d.get('holdsOwnerSigningKey') is False else 1)
+  # The fingerprint is the first 8 hex of the user pubkey on BOTH surfaces
+  # (owner: its own key; joined device: the user_pub inside its certificate),
+  # so comparing them is what proves the spoke's certificate chains to THIS
+  # owner rather than merely existing.
+  if OJ="$ojson" SJ="$sjson" python3 -c "
+import json,os,sys
+o=json.loads(os.environ['OJ']); s=json.loads(os.environ['SJ'])
+sys.exit(0 if (s.get('configured') and s.get('role')=='joined-device'
+               and s.get('holdsOwnerSigningKey') is False
+               and s.get('fingerprint') and s['fingerprint']==o.get('fingerprint')) else 1)
 " 2>/dev/null; then
-    ok "enrolment: '$name' holds a joined certificate (no owner signing key)"
+    ok "enrolment: '$name' holds a joined certificate chained to the owner's key"
   else
     echo "-- spoke id --json --"; printf '%s\n' "$sjson"
     bad "enrolment: '$name' did not end up as a joined device"

@@ -46,11 +46,12 @@
 #   enrolment x3  both ends resolved a certified identity (lib/fixture.sh)
 #   A   POSITIVE exec    -- the certified spoke runs a remote command, rc=0
 #   A2  POSITIVE shell   -- and opens a remote shell (the pty path)
-#   A3  POSITIVE ssh-sign-- and the owner SIGNS an ssh certificate for it
+#   A3  POSITIVE ssh-cert-- and the owner SIGNS an ssh certificate for it
 #   B   the revoke changes ONLY certRevoked; the shell ceiling survives it
 #   C   NEGATIVE exec    -- refused, nonzero, "revoked" on both ends
-#   D   NEGATIVE shell   -- refused, nonzero, reason
-#   E   NEGATIVE ssh-sign-- refused AT THE GATE (owner log names the reason)
+#   D   NEGATIVE shell   -- refused, nonzero, owner names the reason
+#   E   NEGATIVE ssh     -- `shell --ssh` refused with the revoked reason and
+#       NO further certificate is issued
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
@@ -58,6 +59,23 @@
 # G is the gate that stops this suite passing for the wrong reason. Without it
 # "everything is refused after the revoke" is equally satisfied by a harness
 # that simply broke its own link.
+#
+# THE SSH ARM, STATED HONESTLY. `shell --ssh` asks the same capability engine
+# twice, in order: the shell-BOOTSTRAP gate (recv_cmd.rs, which hands back host
+# keys) and then the ssh-SIGN gate (ssh_ca.rs, the third shell_gate entry
+# point). Which one a revoked device meets first depends on whether its
+# bootstrap answer is still cached from gate A3, so gate E accepts either --
+# they are the same engine reaching the same verdict for the same reason, and
+# pinning one would make the gate flaky about something it is not testing.
+# What gate E does pin is that the reason is the REVOCATION, and that no
+# further certificate is issued; gate A3 is what makes that absence meaningful,
+# by proving the signing step runs for a certified device on this same setup.
+#
+# The listener on $SSHD_STANDIN_PORT is a stand-in for sshd and nothing more:
+# the daemon probes "is anything listening" before handing back host keys, and
+# without that probe passing the client stops before the signing step. The ssh
+# LOGIN is not under test here (ssh-ca-gates.sh owns that, against a real
+# throwaway sshd); this harness only needs the signing half to run.
 #
 # PLATFORM: unix-only in practice (ss, /bin/echo, the fixture backend), like
 # every other *-gates.sh here. The property is platform-independent.
@@ -77,15 +95,26 @@ DS="$WORK/$SPOKE"
 source "$HERE/lib/fixture.sh"
 trap fixture_cleanup EXIT
 
-# `shell --ssh` must never reach a real sshd: the dial port is redirected to
-# the discard port so the SIGNING half (the part these gates are about) runs
-# and the login half fails fast, touching nothing on the host.
-SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=9)
+# `shell --ssh` must never reach a real sshd. The dial port is a throwaway
+# listener that accepts and closes at once: the peer's "is sshd up" probe
+# passes (so the SIGNING half runs, which is what these gates are about) and
+# ssh itself fails immediately, touching nothing on the host.
+SSHD_STANDIN_PORT=9124
+SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=$SSHD_STANDIN_PORT)
 AK_FILE="$HOME/.ssh/authorized_keys"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.before" || : > "$WORK/ak.before"
 
 O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
 S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
+
+python3 -c "
+import socket
+s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $SSHD_STANDIN_PORT)); s.listen(16)
+while True:
+    c, _ = s.accept(); c.close()
+" >/dev/null 2>&1 &
+FIX_PIDS+=($!)
 
 start_backend
 init_owner "$DA"
@@ -115,15 +144,28 @@ else
 fi
 
 # ==================================================================== GATE A2 ==
-say "A2: and opens a remote shell (the pty path)"
-OUTA2=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" shell alpha -- 'echo FLEET-SHELL-OK' 2>"$WORK/A2.err" </dev/null)
-rcA2=$?
-echo "## (shell) rc=$rcA2"
-if [ "$rcA2" = "0" ] && echo "$OUTA2" | grep -q "FLEET-SHELL-OK"; then
-  ok "gateA2: certified spoke opened a remote shell"
+# The pty gate's ALLOW half, asserted at the gate rather than at the client.
+#
+# Deliberate, and the reason matters: a scripted `shell <peer> -- <cmd>` from a
+# device that is running its own daemon takes the WARM one-shot pty path, and
+# that path's first-frame verification is a separate surface with its own
+# behaviour (measured here: the acceptor logs `pty granted` and the warm
+# client still reports "the peer closed the shell request"). Asserting the
+# client's exit code would make this gate fail for a transport reason and
+# report it as a capability verdict, which is the confusion the whole file
+# exists to avoid. What this gate is about is the DECISION, and the decision is
+# observable exactly where it is made. Gate D asserts the other half of the
+# same line, at the same place, after the revoke.
+say "A2: the pty gate ALLOWS the certified spoke"
+timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" shell alpha -- 'echo FLEET-SHELL-OK; sleep 2' \
+  >"$WORK/A2.out" 2>"$WORK/A2.err" </dev/null
+echo "## (shell) client rc=$? out='$(cat "$WORK/A2.out")'"
+if grep -q "l2: pty granted to '$SPOKE'" "$WORK/up.log"; then
+  ok "gateA2: the pty gate ALLOWED the certified spoke (owner: pty granted)"
 else
   echo "-- A2.err --"; cat "$WORK/A2.err"
-  bad "gateA2: certified shell did not run (rc=$rcA2)"
+  echo "-- owner log --"; grep -i "pty" "$WORK/up.log" | tail -5
+  bad "gateA2: the pty gate did not allow the certified spoke"
 fi
 
 # ==================================================================== GATE A3 ==
@@ -204,20 +246,23 @@ say "D: the revoked spoke's shell is refused"
 OUTD=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" shell alpha -- 'echo SHOULD-NOT-RUN' 2>"$WORK/D.err" </dev/null)
 rcD=$?
 echo "## (shell after revoke) rc=$rcD"
-if [ "$rcD" != "0" ] && ! echo "$OUTD" | grep -q "SHOULD-NOT-RUN"; then
-  ok "gateD: revoked certificate REFUSED the shell (nonzero, nothing ran)"
+if [ "$rcD" != "0" ] \
+   && ! echo "$OUTD" | grep -q "SHOULD-NOT-RUN" \
+   && grep -q "pty refused: $SPOKE: device revoked" "$WORK/up.log"; then
+  ok "gateD: revoked certificate REFUSED the shell (nonzero, owner names the reason)"
 else
   echo "-- D.err --"; cat "$WORK/D.err"
+  echo "-- owner log --"; grep -i "refused" "$WORK/up.log" | tail -5
   bad "gateD: revoked shell NOT refused (rc=$rcD)"
 fi
 
 # ===================================================================== GATE E ==
-# The wire refusal for ssh-sign is deliberately generic ("ssh-sign refused")
-# so a denied peer cannot oracle which check failed; the REASON goes to the
-# owner's log only. So assert there, and assert it names the revocation --
-# a refusal from any later stage (CA key, clamp, re-sign ledger) would read
-# differently and would not prove the gate ran.
-say "E: the revoked spoke's ssh-sign is refused at the gate"
+# The refusal reason is deliberately generic on the wire so a denied peer
+# cannot oracle which check failed; the REASON goes to the owner's log only,
+# so assert there. Asserting the issuance count is the other half: it is what
+# turns "the flow stopped" into "no certificate for a revoked device exists",
+# and A3 is what makes that absence meaningful.
+say "E: the revoked spoke's shell --ssh is refused, and nothing is signed"
 timeout 60 "${SSH_ENV[@]}" FILAMENT_CONFIG_DIR="$DS" "$BIN" --server "$SERVER" \
   shell --ssh alpha -- 'echo SHOULD-NOT-RUN' >"$WORK/E.out" 2>"$WORK/E.err" </dev/null
 rcE=$?
@@ -225,13 +270,13 @@ SIGNED_AFTER=$(grep -c "ssh-ca: signed for '$SPOKE'" "$WORK/up.log")
 echo "## (ssh sign after revoke) rc=$rcE issuances=$SIGNED_BEFORE -> $SIGNED_AFTER"
 if [ "$rcE" != "0" ] \
    && ! grep -q "SHOULD-NOT-RUN" "$WORK/E.out" \
-   && grep -q "ssh-sign refused: device revoked" "$WORK/up.log" \
+   && grep -qE "(ssh-sign refused: device revoked|shell bootstrap refused: $SPOKE: device revoked)" "$WORK/up.log" \
    && [ "$SIGNED_AFTER" = "$SIGNED_BEFORE" ]; then
-  ok "gateE: revoked certificate REFUSED ssh-sign at the gate (no further issuance)"
+  ok "gateE: revoked certificate REFUSED shell --ssh and issued no certificate"
 else
   echo "-- E.err --"; tail -5 "$WORK/E.err"
-  echo "-- owner log (ssh) --"; grep -i "ssh-sign\|ssh-ca" "$WORK/up.log" | tail -5
-  bad "gateE: revoked ssh-sign NOT refused at the gate (rc=$rcE issuances=$SIGNED_BEFORE -> $SIGNED_AFTER)"
+  echo "-- owner log (ssh) --"; grep -i "ssh-sign\|ssh-ca\|bootstrap" "$WORK/up.log" | tail -5
+  bad "gateE: revoked shell --ssh NOT refused (rc=$rcE issuances=$SIGNED_BEFORE -> $SIGNED_AFTER)"
 fi
 
 # ===================================================================== GATE F ==
