@@ -2285,7 +2285,7 @@ pub(crate) async fn open_pty_stream_verified(
     cmd: &str,
     verify: std::time::Duration,
 ) -> WarmPtyVerdict {
-    let (sid, rx) = match open_pty_stream(mux, session, cols, rows, term, cmd).await {
+    let (sid, mut rx) = match open_pty_stream(mux, session, cols, rows, term, cmd).await {
         Ok(v) => v,
         // Local open failure (sid collision is ours; a send failure means the
         // link is already gone): fall back rather than report a refusal the
