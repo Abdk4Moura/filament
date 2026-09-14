@@ -335,3 +335,58 @@ stream kinds are refused, never misinterpreted.
 a,b` scopes it to the listed peers/devices identically: a peer outside the
   scope gets the open refused, the same verdict an out-of-scope shell
   attempt receives. Exec adds no new trust -- it rides the shell grant.
+
+## SSH certificates (`filament shell --ssh` via local CA)
+
+Passwordless ssh between fleet devices without installed keys: the
+initiator A mints a fresh ephemeral ed25519 key per invocation, asks the
+target daemon B to sign it, and logs into B's sshd with the returned
+certificate. The CA key is B's own permanent key (0600 beside the
+identity key, passed by path); v1 shells out to `ssh-keygen -s`. Both
+frames ride L2 control on the established link (request/response, no
+bulk -- the Bootstrap precedent); all lifetimes are seconds on the wire.
+
+- `ssh-sign-request` `{ type: "ssh-sign-request", sid, device_id,
+  ephemeral_pubkey, ttl_secs }` -- A asks B to certify a key.
+  `device_id` is A's device id (verified name); `ephemeral_pubkey` is the
+  OpenSSH wire form of an ed25519 key; `ttl_secs` is A's requested
+  lifetime (may be clamped down, never up).
+- `ssh-sign-response` `{ type: "ssh-sign-response", sid, cert }` -- B's
+  answer: the OpenSSH certificate string, or (on refusal) an `l2-close`
+  carrying the reason instead of a cert. No cert, clear error, and NEVER
+  an authorized_keys fallback: a failed signing reports failure, it does
+  not silently downgrade the auth.
+- INVARIANT: a certificate is B's statement about A, issued ONLY against
+  B's LOCAL grant store; no capability crosses the wire. The request
+  carries no grant, no ceiling, no role -- B resolves everything from its
+  own store at sign time, through the same shell gate as pty/exec.
+- REFUSAL WITHOUT GRANT: no shell grant for A on B means no cert, with
+  the gate's reason on the wire. A grievance-free `ssh` that falls back
+  to installed keys on refusal is non-conformant.
+- REVOCATION WINDOW: revoke stops NEW issuance immediately, but already-
+  issued certs stay valid until their expiry (bounded above by 24h, in
+  practice by the grant window they were clamped to). There is no live
+  revocation list; expiry IS the revocation mechanism, which is why the
+  clamp keeps lifetimes short.
+- EXPIRY CLAMP: validity `-V` is `min(grant expiry, requested ttl,
+  ssh.cert_ttl)` where `ssh.cert_ttl` comes through the settings
+  registry (default 1h, hard max 24h). No expiry source may extend
+  another: the cert always dies with the first of them.
+- PINNING (passed to `ssh-keygen -s` verbatim): `-I` A's device id and
+  nothing else; `-n` B's daemon user and nothing else; `-z` a monotonic
+  serial (reused serials are refused); `-O clear` plus `-O permit-pty`
+  and no other options; ed25519 keys only. A pubkey already signed for a
+  DIFFERENT device id is refused, never re-signed.
+- ISSUANCE LOG: B logs one line per signing (who/device id, principal,
+  serial, expiry) so cert issuance is auditable without sniffing the link.
+- CLIENT HYGIENE: the ephemeral key lives in a 0700 tmpdir, fresh per
+  invocation, removed by a scope guard on exit AND on signal. A reused
+  or surviving ephemeral key is non-conformant.
+- DAEMON SSHD: B's sshd trusts the CA via `TrustedUserCAKeys` plus
+  `AuthorizedPrincipalsFile`/`AuthorizedPrincipalsCommand` restricted to
+  the daemon user. When those lines are unwritable the daemon prints
+  both lines plus the reload step instead of silently serving plaintext
+  auth; `filament doctor` checks their presence. sshd integration (config
+  lines, `sshd -t` validation, reload) targets unix OpenSSH: a bad config
+  rolls back before any reload, and on Windows the writer prints the lines
+  for manual application (no system sshd to drive there).

@@ -32,6 +32,7 @@ on:
     paths:
       - 'cli/src/**'
       - 'cli/tests/*revoke-gates.sh'
+      - 'cli/tests/ssh-ca-gates.sh'
       - 'cli/tests/exec-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
@@ -104,6 +105,7 @@ jobs:
           # gates while leaving them indistinguishable from unwired ones. Wiring
           # that a machine cannot see is the thing #249 exists to catch.
           declare -A EXPECT=(
+            [cli/tests/ssh-ca-gates.sh]=6
             [cli/tests/exec-gates.sh]=13
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
@@ -112,7 +114,8 @@ jobs:
             [cli/tests/forward-refusal-gates.sh]=5
           )
           rc=0
-          for g in cli/tests/exec-gates.sh \
+          for g in cli/tests/ssh-ca-gates.sh \
+                   cli/tests/exec-gates.sh \
                    cli/tests/pty-revoke-gates.sh \
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \

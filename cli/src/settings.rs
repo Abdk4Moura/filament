@@ -357,6 +357,17 @@ pub fn registry() -> &'static [Setting] {
             daemon: false,
             help: "Default verbosity level: quiet (errors only), info (progress + results), debug (-v equivalent, route/tunnel), trace (-vv equivalent, ICE/per-frame). CLI flags override.",
         },
+        Setting {
+            key: "ssh.cert_ttl",
+            aliases: &[],
+            store: "ssh_cert_ttl",
+            kind: Kind::Str,
+            default: "1h",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_SSH_CERT_TTL"),
+            daemon: false,
+            help: "SSH certificate lifetime for `shell --ssh` (e.g. 30m, 1h, or 3600); clamped to 24h max, garbage refuses to sign.",
+        },
     ];
     R
 }
@@ -1407,6 +1418,24 @@ mod tests {
         assert_eq!(canonicalize(s, "YES").unwrap(), "on");
         assert_eq!(canonicalize(s, "0").unwrap(), "off");
         assert!(canonicalize(s, "maybe").is_err());
+    }
+
+    #[test]
+    fn ssh_cert_ttl_resolves_then_clamps() {
+        // Registry level: the key exists with a 1h default; the clamp lives
+        // in ssh_ca::parse_ttl_secs (unit-covered there). This pins the
+        // handoff: what resolve() yields must parse, and 48h must clamp.
+        with_tmp_cfg(|| {
+            let s = find("ssh.cert_ttl").expect("registered");
+            assert_eq!(resolve(s, None).0, "1h");
+            set("ssh.cert_ttl", "48h", None).unwrap();
+            let (raw, _) = resolve(s, None);
+            assert_eq!(raw, "48h");
+            assert_eq!(crate::ssh_ca::parse_ttl_secs(&raw).unwrap(), 86_400);
+            set("ssh.cert_ttl", "30m", None).unwrap();
+            let (raw, _) = resolve(s, None);
+            assert_eq!(crate::ssh_ca::parse_ttl_secs(&raw).unwrap(), 1800);
+        });
     }
 
     #[test]

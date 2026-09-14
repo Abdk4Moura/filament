@@ -287,6 +287,17 @@
       ]
     },
     {
+      "path": "cli/tests/ssh-ca-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/ssh-ca-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/ssh-gates.sh",
       "disposition": "required",
       "entrypoint": "bash cli/tests/ssh-gates.sh",

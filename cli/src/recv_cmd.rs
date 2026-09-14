@@ -4225,12 +4225,43 @@ pub(crate) async fn recv_cmd(
                         continue;
                     }
                     let device = dev.unwrap();
+                    // CERT MODE: `shell --ssh` with the local CA authenticates with
+                    // a short-lived certificate, so the requesting side asks for
+                    // HOST KEYS ONLY and nothing is written to authorized_keys. The
+                    // capability gate above is unchanged (a cert request is still a
+                    // shell-class request); only the permanent key install is
+                    // skipped. Absent flag = the historical install path, so older
+                    // initiators keep working byte-for-byte.
+                    let cert_only = v.get("cert").and_then(|c| c.as_bool()).unwrap_or(false);
                     let pubkey = v["pubkey"].as_str().unwrap_or_default().to_string();
                     // M-3 (authorized_keys injection): a single, well-formed key
                     // line ONLY. validate_pubkey rejects interior newlines / CR /
                     // control chars and multi-line payloads, so a trusted+shell
                     // peer can't inject extra authorized_keys lines. Enforced here
                     // AND again inside install_authorized_key (defense in depth).
+                    if cert_only {
+                        let hostkeys = sshkeys::host_pubkeys();
+                        let login = std::env::var("USER").unwrap_or_else(|_| "root".into());
+                        let ssh_port = v["ssh_port"]
+                            .as_u64()
+                            .and_then(|n| u16::try_from(n).ok())
+                            .unwrap_or(22);
+                        let sshd = sshd_listening(ssh_port).await;
+                        ui::say(&format!(
+                            "l2: shell (cert) granted to '{device}', no key installed"
+                        ));
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "shell-bootstrap-ack",
+                                "hostkeys": hostkeys,
+                                "user": login,
+                                "sshd": sshd,
+                                "ssh_port": ssh_port,
+                                "cert": true
+                            }))
+                            .await;
+                        continue;
+                    }
                     let pubkey = match sshkeys::validate_pubkey(&pubkey) {
                         Ok(k) => k,
                         Err(e) => {
@@ -4513,6 +4544,28 @@ pub(crate) async fn recv_cmd(
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();
                     exec_recv::handle_exec_open(&mut conn, &pid, t, mux, &v, &shell_policy).await;
+                    continue;
+                }
+                Some("ssh-sign-request") if !l2_enabled => {
+                    if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+                        let _ = t
+                            .send_control(&json!({
+                                "type": "l2-close",
+                                "sid": sid,
+                                "err": crate::capability::SHELL_OFF_REASON,
+                            }))
+                            .await;
+                    }
+                    continue;
+                }
+                // SSH certificate signing: parse, shell-gate (third path),
+                // clamp, sign, reply. Pure control round trip (no stream);
+                // the handler sends its own cert/refusal replies.
+                Some("ssh-sign-request") => {
+                    let Some(t) = conn.transport_of(&pid) else {
+                        continue;
+                    };
+                    crate::ssh_ca::handle_ssh_sign(&mut conn, &pid, t, &v, &shell_policy).await;
                     continue;
                 }
                 Some("mount-open") if l2_enabled => {

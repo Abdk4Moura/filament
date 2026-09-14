@@ -1,4 +1,4 @@
-//! The single shell gate shared by pty-open and exec-open.
+//! The single shell gate shared by pty-open, exec-open, and ssh-sign.
 //!
 //! Both paths resolve the same inputs (link trust, device naming, legacy
 //! store checks, capability inputs) and then the same verdict: the
@@ -36,7 +36,7 @@ pub(crate) struct ShellGateInputs {
 }
 
 /// Gather from live state. Both call sites use this; nothing gate-relevant
-/// is resolved anywhere else, so the two paths cannot drift in inputs.
+/// is resolved anywhere else, so the three paths cannot drift in inputs.
 pub(crate) fn gather_shell_gate_inputs(
     conn: &mut Conn,
     pid: &str,
@@ -126,6 +126,13 @@ pub(crate) fn pty_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<S
     decide(inputs)
 }
 
+/// SSH-sign's entry point: the certificate signer asks the same gate before
+/// signing (a cert is B's statement about A, so the shell grant gates it
+/// like any shell-class open). Delegates to the shared core (no local logic).
+pub(crate) fn ssh_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
+    decide(inputs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,7 +140,7 @@ mod tests {
 
     /// Cross-path equivalence: exec's decision == pty-open's for every cell
     /// of trusted x has_grant x cert_revoked x delegated-ceiling x
-    /// authoritative(on/off), calling both entry points. Fabricated inputs
+    /// authoritative(on/off), calling all three entry points. Fabricated inputs
     /// mirror production gathering (store_allows tracks the grant, outcome
     /// tracks it the way cap_authorize's grant dependence does, legacy folds
     /// trust with store fixed grant-leaning); authoritative toggles via env
@@ -184,9 +191,14 @@ mod tests {
                             };
                             let e = exec_gate_decision(&inputs);
                             let p = pty_gate_decision(&inputs);
+                            let s = ssh_gate_decision(&inputs);
                             assert_eq!(
                                 e, p,
                                 "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
+                            );
+                            assert_eq!(
+                                e, s,
+                                "exec vs ssh-sign disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
                             );
                             // Oracle pins (not just equality): absolutes deny in
                             // every cell, and the two canonical allows hold in

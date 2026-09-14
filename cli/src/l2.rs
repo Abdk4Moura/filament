@@ -4116,9 +4116,18 @@ async fn shell_bootstrap(
     peer: &str,
     relay: bool,
     ssh_port: u16,
+    cert_only: bool,
 ) -> Result<BootstrapInfo> {
-    // Managed keypair lives under the filament config dir, NEVER ~/.ssh.
-    let pubkey = crate::sshkeys::ensure_managed_key()?;
+    // Managed keypair lives under the filament config dir, NEVER ~/.ssh. In
+    // cert mode it is NOT generated and NOT offered: `shell --ssh` now
+    // authenticates with an ephemeral certificate, so this exchange exists
+    // only to learn the peer's host keys and sshd status (the acceptor
+    // skips its authorized_keys write on the same flag).
+    let pubkey = if cert_only {
+        String::new()
+    } else {
+        crate::sshkeys::ensure_managed_key()?
+    };
 
     // Bound the connect so an unreachable peer fails with a clear, actionable
     // message instead of looping forever (the heartbeat inside reports progress
@@ -4163,7 +4172,13 @@ async fn shell_bootstrap(
     // ssh data link is a SEPARATE netcat span instrumented in its own right.
     diag.up("tunnel", "datachannel-or-direct");
     t.send_control(
-        &json!({ "type": "shell-bootstrap", "v": 1, "pubkey": pubkey, "ssh_port": ssh_port }),
+        &json!({
+            "type": "shell-bootstrap",
+            "v": 1,
+            "pubkey": pubkey,
+            "ssh_port": ssh_port,
+            "cert": cert_only
+        }),
     )
     .await?;
 
@@ -4273,9 +4288,10 @@ async fn bootstrap_key(
     peer: &str,
     relay: bool,
     ssh_port: u16,
+    cert_only: bool,
 ) -> Result<BootstrapInfo> {
     #[cfg(unix)]
-    if !relay {
+    if !relay && !cert_only {
         let pubkey = crate::sshkeys::ensure_managed_key()?;
         if let Some(v) = crate::ctl::try_bootstrap(peer, &pubkey, ssh_port).await {
             let hostkeys: Vec<String> = v["hostkeys"]
@@ -4298,7 +4314,7 @@ async fn bootstrap_key(
             }
         }
     }
-    shell_bootstrap(server, peer, relay, ssh_port).await
+    shell_bootstrap(server, peer, relay, ssh_port, cert_only).await
 }
 
 /// The login account for the ssh destination: FILAMENT_SSH_USER wins, else the
@@ -4314,15 +4330,19 @@ fn resolve_login(remote_user: Option<String>) -> String {
         .unwrap_or_else(|| "root".into())
 }
 
-/// Spawn the real `ssh`, pointed EXCLUSIVELY at filament-managed key material +
-/// known_hosts, with a `filament netcat` ProxyCommand. Returns ssh's exit code
-/// (so a cached fast-path can detect a 255 connect/auth failure and retry after a
-/// fresh bootstrap). The destination is always `<login>@filament-<peer>`.
-/// Run the ssh session, preferring the resilient L3 overlay. The bootstrap has
-/// already installed our managed key on the peer and pinned host keys, so both
-/// paths use the SAME managed identity; L3 just connects to the stable overlay
-/// address directly (no ProxyCommand), so the session survives a link repair.
+/// Spawn the real `ssh`, pointed EXCLUSIVELY at the ephemeral cert identity
+/// (fresh key + B-signed cert) + known_hosts, with a `filament netcat`
+/// ProxyCommand. Returns ssh's exit code. The cert is acquired FIRST over a
+/// fresh L2 link and the flow fails CLOSED without it (clear error, never a
+/// managed-key fallback: silently downgrading would make the CA decorative).
+/// The destination is always `<login>@filament-<peer>`.
+/// Run the ssh session, preferring the resilient L3 overlay. Both paths use
+/// the SAME cert identity; L3 just connects to the stable overlay address
+/// directly (no ProxyCommand), so the session survives a link repair.
 /// Falls back to the L2 tunnel when L3 isn't viable or its connect fails (255).
+/// The ephemeral tmpdir dies with the flow: explicit cleanup is belt, Drop
+/// is suspenders, and a signal watchdog covers SIGINT/SIGTERM (process::exit
+/// and signals both skip Drop).
 async fn run_ssh(
     server: &str,
     peer: &str,
@@ -4333,6 +4353,23 @@ async fn run_ssh(
     extra: &[String],
     revive: bool,
 ) -> Result<i32> {
+    // Cert identity first: fresh ephemeral key, B-signed cert over an L2
+    // link. Fail closed (no managed-key fallback) when keygen, link, or
+    // signing fails -- the error names the cause.
+    let eph = crate::ssh_ca::EphemeralKey::generate().await
+        .map_err(|e| anyhow::anyhow!("ssh cert setup failed (no key fallback): {e}"))?;
+    // Aborted on the normal path below (Drop + explicit cleanup already
+    // covered everything else); left running only while ssh owns the session.
+    let sigwatch = crate::ssh_ca::spawn_cleanup_on_signal(eph.dir().to_path_buf());
+    // Abort the watchdog on early exits too (Drop already covers the dir;
+    // leaving the task running would only matter in a long-lived caller).
+    let ident = match crate::ssh_ca::acquire_ssh_cert(server, peer, relay, &eph).await {
+        Ok(id) => id,
+        Err(e) => {
+            sigwatch.abort();
+            return Err(anyhow::anyhow!("ssh cert issuance failed (no key fallback): {e}"));
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     let _ = revive;
     #[cfg(target_os = "linux")]
@@ -4344,8 +4381,9 @@ async fn run_ssh(
                 crate::ui::debug(&format!(
                     "ssh over the L3 overlay ({mesh_host}) - survives link repairs"
                 ));
-                let code = spawn_ssh_direct(login, &mesh_host, extra)?;
+                let code = spawn_ssh_direct(login, &mesh_host, extra, &ident)?;
                 if code != 255 {
+                    sigwatch.abort();
                     return Ok(code);
                 }
                 crate::ui::say("filament: L3 ssh failed, falling back to the tunnel");
@@ -4366,20 +4404,28 @@ async fn run_ssh(
             // revive wait twice - go straight to the L2 tunnel below.
         }
     }
-    spawn_ssh(server, peer, relay, host, login, rport, extra)
+    let code = spawn_ssh(server, peer, relay, host, login, rport, extra, &ident)?;
+    sigwatch.abort();
+    Ok(code)
 }
 
 /// ssh directly to a stable overlay host (no ProxyCommand), reusing the managed
 /// key + known_hosts the L2 path uses. The overlay address is cryptographically
 /// bound to the peer, so accept-new pins the host key on first use.
 #[cfg(target_os = "linux")]
-fn spawn_ssh_direct(login: &str, mesh_host: &str, extra: &[String]) -> Result<i32> {
-    let key = crate::sshkeys::managed_key_path();
+fn spawn_ssh_direct(
+    login: &str,
+    mesh_host: &str,
+    extra: &[String],
+    ident: &crate::ssh_ca::CertIdentity,
+) -> Result<i32> {
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{mesh_host}");
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o")
-        .arg(format!("IdentityFile={}", key.display()))
+        .arg(format!("IdentityFile={}", ident.key_path.display()))
+        .arg("-o")
+        .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
         .arg("-o")
@@ -4419,6 +4465,7 @@ fn spawn_ssh(
     login: &str,
     rport: u16,
     extra: &[String],
+    ident: &crate::ssh_ca::CertIdentity,
 ) -> Result<i32> {
     let exe = std::env::current_exe()?;
     let exe = exe.to_string_lossy();
@@ -4428,14 +4475,15 @@ fn spawn_ssh(
     }
     proxy.push_str(&format!(" forward {peer}:{rport} --stdio"));
 
-    let key = crate::sshkeys::managed_key_path();
     let kh = crate::sshkeys::known_hosts_path();
     let dest_token = format!("{login}@{host}");
     let mut cmd = std::process::Command::new("ssh");
     cmd.arg("-o")
         .arg(format!("ProxyCommand={proxy}"))
         .arg("-o")
-        .arg(format!("IdentityFile={}", key.display()))
+        .arg(format!("IdentityFile={}", ident.key_path.display()))
+        .arg("-o")
+        .arg(format!("CertificateFile={}", ident.cert_path.display()))
         .arg("-o")
         .arg("IdentitiesOnly=yes")
         .arg("-o")
@@ -4543,7 +4591,8 @@ pub(crate) async fn ensure_peer_bootstrap(
         .and_then(|s| s.parse().ok())
         .unwrap_or(22);
 
-    ensure_peer_bootstrap_port(server, peer, relay, rport).await
+    // sshfs/rsync still authenticate with the managed key.
+    ensure_peer_bootstrap_port(server, peer, relay, rport, false).await
 }
 
 /// Ensure our managed key is installed on the peer with a specific port.
@@ -4552,6 +4601,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
     peer: &str,
     relay: bool,
     rport: u16,
+    cert_only: bool,
 ) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let host = format!("filament-{peer}");
@@ -4565,7 +4615,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
     let (login, took_fast_path) = match cached {
         Some(cached_user) => (resolve_login(cached_user), true),
         None => {
-            let info = bootstrap_key(server, peer, relay, rport).await?;
+            let info = bootstrap_key(server, peer, relay, rport, cert_only).await?;
             ensure_sshd(peer, rport, info.sshd).await;
             crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
             crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
@@ -4584,7 +4634,7 @@ pub(crate) async fn ensure_peer_bootstrap_port(
 }
 
 /// Invalidate bootstrap cache and re-bootstrap a peer (for retry after exit 255).
-pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> Result<PeerSshInfo> {
+pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool, cert_only: bool) -> Result<PeerSshInfo> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
     let host = format!("filament-{peer}");
     let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
@@ -4593,7 +4643,7 @@ pub(crate) async fn rebootstrap_peer(server: &str, peer: &str, relay: bool) -> R
         .unwrap_or(22);
 
     crate::sshkeys::bootstrap_cache_clear(peer);
-    let info = shell_bootstrap(server, peer, relay, rport).await?;
+    let info = shell_bootstrap(server, peer, relay, rport, cert_only).await?;
     ensure_sshd(peer, rport, info.sshd).await;
     crate::sshkeys::pin_host_keys(&host, &info.hostkeys)?;
     crate::sshkeys::bootstrap_cache_put(peer, info.user.as_deref());
@@ -4676,7 +4726,14 @@ pub(crate) fn l3_dest(info: &PeerSshInfo) -> Option<String> {
 pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) -> Result<()> {
     let peer = peer.strip_suffix(".mesh").unwrap_or(peer);
 
-    let info = ensure_peer_bootstrap(server, peer, relay).await?;
+    // CERT MODE: `shell --ssh` authenticates with an ephemeral certificate,
+    // so this bootstrap fetches host keys + sshd status only and installs
+    // NOTHING into the peer's authorized_keys.
+    let rport: u16 = std::env::var("FILAMENT_SSH_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(22);
+    let info = ensure_peer_bootstrap_port(server, peer, relay, rport, true).await?;
 
     let code = run_ssh(
         server,
@@ -4695,7 +4752,7 @@ pub async fn ssh_cmd(server: &str, peer: &str, extra: &[String], relay: bool) ->
     // real bootstrap, and retry ssh ONCE.
     if code == 255 && info.took_fast_path {
         crate::ui::say(&format!("filament: re-authenticating with '{peer}'..."));
-        let retry = rebootstrap_peer(server, peer, relay).await?;
+        let retry = rebootstrap_peer(server, peer, relay, true).await?;
         // revive=false: don't pay the L3 revive-wait twice on the same invocation.
         let code = run_ssh(
             server,

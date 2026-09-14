@@ -431,7 +431,7 @@ pub(crate) async fn async_main() -> Result<()> {
             background,
             no_background,
         } => {
-            init_experience(
+            let out = init_experience(
                 &ui_caps,
                 &server,
                 relay,
@@ -442,7 +442,19 @@ pub(crate) async fn async_main() -> Result<()> {
                 background,
                 no_background,
             )
-            .await
+            .await;
+            // Mint the SSH CA key idempotently. Warn-only: init must not
+            // fail for an SSH-CA nicety, and signing fails closed later
+            // with a clear error until ssh-keygen succeeds.
+            if out.is_ok() {
+                if let Err(e) = crate::ssh_ca::ensure_ca_key(&crate::settings::config_dir()).await
+                {
+                    crate::ui::say(&format!(
+                        "ssh CA not provisioned ({e}); `shell --ssh` signing will refuse until ssh-keygen succeeds (re-run init)"
+                    ));
+                }
+            }
+            out
         }
         Cmd::Send {
             paths,
@@ -809,6 +821,12 @@ pub(crate) async fn async_main() -> Result<()> {
                 (Some(list), false) => Some(format!("{list},{}", peer_shell.join(","))),
                 (None, false) => Some(peer_shell.join(",")),
             };
+            // Arm SSH-CA sshd trust when serving shell (best-effort, loud):
+            // the daemon needs the CA lines + principals entry before cert
+            // logins can land. Never fails the command (no new root rule).
+            if shell || shell_only.as_ref().is_some_and(|s| !s.is_empty()) {
+                crate::sshd::arm_ssh_ca_for_serving().await;
+            }
             up_cmd(
                 &server,
                 install,
@@ -1678,6 +1696,9 @@ pub(crate) async fn async_main() -> Result<()> {
                         }
                     }
                 }
+            }
+            if capability == "shell" {
+                crate::sshd::arm_ssh_ca_for_serving().await;
             }
             println!(
                 "granted '{capability}' to '{device}'. {}",

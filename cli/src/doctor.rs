@@ -369,9 +369,11 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
     let (sig, ice) = tokio::join!(check_signaling(server), check_stun(server));
     let ifaces = list_interfaces();
     let history = diag::summarize(HISTORY_LIMIT);
+    // Local file read (fast, no IO worth joining): sshd CA trust presence.
+    let sshca = crate::sshd::check_sshd_ca();
 
     if json_out {
-        println!("{}", preflight_json(server, &sig, &ice, &ifaces, &history).to_string());
+        println!("{}", preflight_json(server, &sig, &ice, &ifaces, &history, &sshca).to_string());
         return Ok(());
     }
 
@@ -415,6 +417,23 @@ async fn preflight_mode(server: &str, json_out: bool) -> Result<()> {
             ui::paint(Tone::Warn, "FAILED"),
             ui::paint(Tone::Dim, &format!("no srflx learned: {e}")),
         ),
+    }
+
+    // SSH CA trust (sshd side of `shell --ssh`). Human-facing row, so
+    // ui::say (not bare println!: the print ratchet counts those).
+    match &sshca {
+        Ok(()) => ui::say(&format!(
+            "  {:<13} {}  {}",
+            "sshd-ca",
+            ui::paint(Tone::Ok, "trusted CA configured"),
+            ui::paint(Tone::Dim, "TrustedUserCAKeys + principals present"),
+        )),
+        Err(e) => ui::say(&format!(
+            "  {:<13} {}  {}",
+            "sshd-ca",
+            ui::paint(Tone::Warn, "unconfigured"),
+            ui::paint(Tone::Dim, e),
+        )),
     }
 
     // Interfaces.
@@ -690,6 +709,7 @@ fn preflight_json(
     ice: &IceResult,
     ifaces: &[Iface],
     history: &diag::Summary,
+    sshca: &std::result::Result<(), String>,
 ) -> Value {
     let sig_json = match sig {
         Ok(ms) => json!({ "reachable": true, "round_trip_ms": ms }),
@@ -700,12 +720,17 @@ fn preflight_json(
         IceResult::NoServer => json!({ "works": false, "reason": "no stun server in config" }),
         IceResult::Failed(e) => json!({ "works": false, "error": e }),
     };
+    let sshca_json = match sshca {
+        Ok(()) => json!({ "configured": true }),
+        Err(e) => json!({ "configured": false, "detail": e }),
+    };
     json!({
         "kind": "filament-doctor-preflight",
         "server": server,
         "signaling": sig_json,
         "ice": ice_json,
         "interfaces": ifaces.iter().map(|i| json!({ "name": i.name, "ip": i.ip.to_string(), "vpn": i.vpn })).collect::<Vec<_>>(),
+        "sshd_ca": sshca_json,
         "history": {
             "considered": history.considered,
             "ups": history.ups,
