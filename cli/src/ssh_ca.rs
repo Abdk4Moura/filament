@@ -287,7 +287,15 @@ pub(crate) fn load_issued(config_dir: &std::path::Path, now_secs: u64) -> Vec<Is
     let before = v.len();
     v.retain(|r| r.expires > now_secs);
     if v.len() != before {
-        let _ = std::fs::write(&p, serde_json::to_string(&v).unwrap_or_default());
+        // Atomic like every other ledger write: a torn prune must not eat
+        // live rows (best-effort here -- a failed prune just retries next
+        // load; issuance itself already landed).
+        if let Ok(text) = serde_json::to_string(&v) {
+            let tmp = p.with_extension("tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
     }
     v
 }
@@ -433,6 +441,26 @@ pub(crate) fn daemon_username() -> Option<String> {
     daemon_username_from(su.as_deref(), std::env::var("USER").ok().as_deref())
 }
 
+/// Single-name check shared by every place a name enters sshd config (Match
+/// User, principals file) or a certificate (`-n`): slashes enable path
+/// traversal through the principals file; whitespace and commas would
+/// certify or match extra names.
+pub(crate) fn is_single_name(s: &str) -> bool {
+    !s.is_empty() && !s.bytes().any(|b| b == b',' || b == b'/' || b.is_ascii_whitespace())
+}
+
+/// The single validated principal used EVERYWHERE: resolved once, checked
+/// once. Unknown stays unknown (refuse) rather than becoming root.
+pub(crate) fn valid_principal() -> Result<String> {
+    let Some(name) = daemon_username() else {
+        bail!("cannot determine serving user");
+    };
+    if !is_single_name(&name) {
+        bail!("serving user is not a single name");
+    }
+    Ok(name)
+}
+
 /// A validated `ssh-sign-request`: asserted device id, ephemeral pubkey,
 /// requested ttl. Semantic checks (ed25519 shape, ttl range) run in sign()
 /// so every layer fails closed independently; parse only enforces shape.
@@ -575,9 +603,12 @@ pub(crate) async fn handle_ssh_sign(
         return;
     }
     let validity = validity_interval(ttl);
-    let Some(principal) = daemon_username() else {
-        refuse(&t, sid, "cannot determine serving user".to_string()).await;
-        return;
+    let principal = match valid_principal() {
+        Ok(p) => p,
+        Err(e) => {
+            refuse(&t, sid, format!("cannot determine serving user: {e}")).await;
+            return;
+        }
     };
     let workdir = match secure_tempdir("ssh-sign") {
         Ok(d) => d,
@@ -876,7 +907,7 @@ pub(crate) async fn sign(
     workdir: &std::path::Path,
 ) -> Result<String> {
     check_ephemeral_pubkey(pubkey_text)?;
-    if principal.bytes().any(|b| b == b',' || b.is_ascii_whitespace()) || principal.is_empty() {
+    if !is_single_name(principal) {
         bail!("principal must be a single name");
     }
     let pub_file = workdir.join("key.pub");
@@ -1208,6 +1239,15 @@ mod tests {
             serde_json::json!({"device_id": "a", "ephemeral_pubkey": "k", "ttl_secs": "soon"}),
         ] {
             assert!(parse_sign_request(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn single_name_rejects_compounds_and_paths() {
+        assert!(is_single_name("daemon"));
+        assert!(is_single_name("svc-1"));
+        for bad in ["", "a,b", "a b", "a/b", "\tlead", "trail\n"] {
+            assert!(!is_single_name(bad), "{bad:?} must not certify");
         }
     }
 

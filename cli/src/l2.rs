@@ -4361,9 +4361,15 @@ async fn run_ssh(
     // Aborted on the normal path below (Drop + explicit cleanup already
     // covered everything else); left running only while ssh owns the session.
     let sigwatch = crate::ssh_ca::spawn_cleanup_on_signal(eph.dir().to_path_buf());
-    let ident = crate::ssh_ca::acquire_ssh_cert(server, peer, relay, &eph)
-        .await
-        .map_err(|e| anyhow::anyhow!("ssh cert issuance failed (no key fallback): {e}"))?;
+    // Abort the watchdog on early exits too (Drop already covers the dir;
+    // leaving the task running would only matter in a long-lived caller).
+    let ident = match crate::ssh_ca::acquire_ssh_cert(server, peer, relay, &eph).await {
+        Ok(id) => id,
+        Err(e) => {
+            sigwatch.abort();
+            return Err(anyhow::anyhow!("ssh cert issuance failed (no key fallback): {e}"));
+        }
+    };
     #[cfg(not(target_os = "linux"))]
     let _ = revive;
     #[cfg(target_os = "linux")]
