@@ -217,9 +217,11 @@ else
   bad "gateE: authorized_keys CHANGED by cert login"
 fi
 
-# E2: kill sshd so the retry path runs: cached bootstrap hits 255, the
-# rebootstrap (cert mode too) retries, ssh fails 255 again -- and STILL
-# nothing is installed. Proves the 255 retry path honors cert-only.
+# E2: re-grant (gate B revoked), then kill sshd so the retry path runs:
+# cached bootstrap hits 255, the rebootstrap (cert mode too) retries, ssh
+# fails 255 again -- and STILL nothing is installed. Proves the 255 retry
+# path honors cert-only.
+env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grantE2.log" 2>&1
 kill "$SSHD_PID" 2>/dev/null; sleep 1
 OUTE2=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo NOPE' 2>"$WORK/E2.err" </dev/null)
 rcE2=$?
