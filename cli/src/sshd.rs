@@ -105,38 +105,75 @@ pub fn is_configured() -> bool {
 }
 
 const SSHD_CA_MARKER: &str = "# Added by filament for SSH certificates (shell --ssh)";
-#[allow(dead_code)] // CA-2: wired later (see module note)
-/// Principals file consulted per authenticating user; restricted to the
-/// daemon user by the Match block below. Its CONTENT (which principals are
-/// allowed) is maintained by the sign flow, not here.
-pub const SSHD_PRINCIPALS_FILE: &str = "/etc/ssh/filament_principals/%u";
-#[allow(dead_code)] // CA-2: wired later (see module note)
 /// Default location of the CA public key the TrustedUserCAKeys line points at.
+/// (The operator places the daemon's CA pub here out of band.)
 pub const SSHD_CA_PUB_DEFAULT: &str = "/etc/ssh/filament_ca.pub";
 const SSHD_CONFIG_DEFAULT: &str = "/etc/ssh/sshd_config";
+const SSHD_PRINCIPALS_BASE_DEFAULT: &str = "/etc/ssh/filament_principals";
 
-#[allow(dead_code)] // CA-2: wired later (see module note)
+/// sshd_config path: env-overridable so e2e exercises the real writer
+/// against temp files instead of the live config.
+pub fn sshd_config_path() -> std::path::PathBuf {
+    std::env::var("FILAMENT_SSH_SSHD_CONFIG")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_CONFIG_DEFAULT))
+}
+
+/// Principals base dir (per-user files under it): env-overridable likewise.
+pub fn principals_base_dir() -> std::path::PathBuf {
+    std::env::var("FILAMENT_SSH_PRINCIPALS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(SSHD_PRINCIPALS_BASE_DEFAULT))
+}
+
+/// Principals file for one login user under a base dir.
+pub fn principals_file_for(base: &Path, user: &str) -> std::path::PathBuf {
+    base.join(user)
+}
+
+/// Ensure the principals file lists exactly the daemon principal (single
+/// line, idempotent): without it even a valid cert fails at sshd, so the
+/// arming flows write it in the same breath. Best-effort (loud error,
+/// Ok): up/grant must not newly require root.
+pub fn ensure_principals_entry(base: &Path, user: &str) -> Result<()> {
+    std::fs::create_dir_all(base)?;
+    let path = principals_file_for(base, user);
+    let want = format!("{user}\n");
+    let have = std::fs::read_to_string(&path).unwrap_or_default();
+    if have != want {
+        std::fs::write(&path, want)?;
+    }
+    Ok(())
+}
+
 /// Exact CA block: a Match-User scope (everything restricted to the daemon
 /// user) with the trust anchor plus the principals line. Rendered pure so
 /// the text is unit-tested byte-exact without touching a real sshd_config.
-pub fn render_sshd_ca_block(ca_pub_path: &Path, daemon_user: &str) -> String {
+pub fn render_sshd_ca_block(
+    ca_pub_path: &Path,
+    daemon_user: &str,
+    principals_file: &Path,
+) -> String {
     format!(
-        "\n{SSHD_CA_MARKER}\nMatch User {daemon_user}\n    TrustedUserCAKeys {}\n    AuthorizedPrincipalsFile {SSHD_PRINCIPALS_FILE}\n",
+        "\n{SSHD_CA_MARKER}\nMatch User {daemon_user}\n    TrustedUserCAKeys {}\n    AuthorizedPrincipalsFile {}\n",
         ca_pub_path.display(),
+        principals_file.display(),
     )
 }
 
-#[allow(dead_code)] // CA-2: wired later (see module note)
 /// Manual steps printed when the config is unwritable (operator applies them
 /// with privilege instead). Pure for the same reason as the renderer.
-pub fn sshd_ca_manual_steps(ca_pub_path: &Path, daemon_user: &str) -> String {
+pub fn sshd_ca_manual_steps(
+    ca_pub_path: &Path,
+    daemon_user: &str,
+    principals_file: &Path,
+) -> String {
     format!(
         "sshd_config is not writable; apply as root, then reload sshd:\n{}\n# then: sudo systemctl restart ssh (or: sudo kill -HUP $(pidof sshd))",
-        render_sshd_ca_block(ca_pub_path, daemon_user).trim(),
+        render_sshd_ca_block(ca_pub_path, daemon_user, principals_file).trim(),
     )
 }
 
-#[allow(dead_code)] // CA-2: wired later (see module note)
 /// Ensure the CA block is present (idempotent via marker). Writable: append
 /// and optionally reload. Unwritable: print both lines plus the reload step
 /// and succeed -- the operator applies them, nothing fails silently.
@@ -145,6 +182,7 @@ pub fn ensure_sshd_ca(
     config_path: &Path,
     ca_pub_path: &Path,
     daemon_user: &str,
+    principals_file: &Path,
     reload: bool,
 ) -> Result<()> {
     let current = std::fs::read_to_string(config_path).map_err(|_| {
@@ -154,11 +192,11 @@ pub fn ensure_sshd_ca(
         crate::ui::say("sshd CA trust already configured");
         return Ok(());
     }
-    let block = render_sshd_ca_block(ca_pub_path, daemon_user);
+    let block = render_sshd_ca_block(ca_pub_path, daemon_user, principals_file);
     let mut file = match std::fs::OpenOptions::new().append(true).open(config_path) {
         Ok(f) => f,
         Err(_) => {
-            crate::ui::say(&sshd_ca_manual_steps(ca_pub_path, daemon_user));
+            crate::ui::say(&sshd_ca_manual_steps(ca_pub_path, daemon_user, principals_file));
             return Ok(());
         }
     };
@@ -185,6 +223,32 @@ pub fn check_sshd_ca() -> std::result::Result<(), String> {
     check_sshd_ca_at(Path::new(SSHD_CONFIG_DEFAULT))
 }
 
+/// Best-effort arming for shell-serving flows (`up --shell`, `grant shell`):
+/// ensure the CA block plus the daemon principals entry. Loud on any
+/// failure but always Ok: serving must not newly require root. Paths honor
+/// the test overrides, so e2e exercises the real writer, not a stub.
+pub fn arm_ssh_ca_for_serving() {
+    let user = crate::ssh_ca::daemon_username();
+    let principals = principals_file_for(&principals_base_dir(), &user);
+    if let Err(e) = ensure_sshd_ca(
+        &sshd_config_path(),
+        Path::new(SSHD_CA_PUB_DEFAULT),
+        &user,
+        &principals,
+        true,
+    ) {
+        crate::ui::say(&format!(
+            "ssh CA arming skipped ({e}); cert logins will refuse until applied"
+        ));
+        return;
+    }
+    if let Err(e) = ensure_principals_entry(&principals_base_dir(), &user) {
+        crate::ui::say(&format!(
+            "ssh principals entry skipped ({e}); cert logins will refuse until applied"
+        ));
+    }
+}
+
 /// Same against an explicit path (tests use temp files, never the live one).
 pub fn check_sshd_ca_at(path: &Path) -> std::result::Result<(), String> {
     let text = std::fs::read_to_string(path)
@@ -202,7 +266,11 @@ mod tests {
 
     #[test]
     fn ca_block_is_a_daemon_user_match_with_both_lines() {
-        let block = render_sshd_ca_block(Path::new("/etc/ssh/filament_ca.pub"), "filament");
+        let block = render_sshd_ca_block(
+            Path::new("/etc/ssh/filament_ca.pub"),
+            "filament",
+            Path::new("/etc/ssh/filament_principals/%u"),
+        );
         assert_eq!(
             block,
             "\n# Added by filament for SSH certificates (shell --ssh)\nMatch User filament\n    TrustedUserCAKeys /etc/ssh/filament_ca.pub\n    AuthorizedPrincipalsFile /etc/ssh/filament_principals/%u\n"
@@ -210,8 +278,22 @@ mod tests {
     }
 
     #[test]
+    fn principals_entry_lists_exactly_the_daemon_user() {
+        let dir = std::env::temp_dir().join(format!("fil-sshd-princ-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_principals_entry(&dir, "daemon").unwrap();
+        ensure_principals_entry(&dir, "daemon").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(principals_file_for(&dir, "daemon")).unwrap(),
+            "daemon\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn manual_steps_contain_both_lines_and_reload() {
-        let steps = sshd_ca_manual_steps(Path::new("/ca.pub"), "daemon");
+        let steps =
+            sshd_ca_manual_steps(Path::new("/ca.pub"), "daemon", Path::new("/p/%u"));
         assert!(steps.contains("TrustedUserCAKeys /ca.pub"), "{steps}");
         assert!(steps.contains("AuthorizedPrincipalsFile"), "{steps}");
         assert!(steps.contains("systemctl restart ssh"), "{steps}");
@@ -223,8 +305,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg = dir.join("sshd_config");
         std::fs::write(&cfg, "Port 22\n").unwrap();
-        ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", false).unwrap();
-        ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", false).unwrap();
+        ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false).unwrap();
+        ensure_sshd_ca(&cfg, Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false).unwrap();
         let text = std::fs::read_to_string(&cfg).unwrap();
         assert_eq!(
             text.matches(SSHD_CA_MARKER).count(),
@@ -232,7 +314,8 @@ mod tests {
             "second ensure must not duplicate: {text}"
         );
         assert!(check_sshd_ca_at(&cfg).is_ok());
-        assert!(ensure_sshd_ca(&dir.join("nope"), Path::new("/ca.pub"), "daemon", false).is_err());
+        assert!(ensure_sshd_ca(&dir.join("nope"), Path::new("/ca.pub"), "daemon", Path::new("/p/%u"), false)
+            .is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -240,7 +323,7 @@ mod tests {
     fn status_distinguishes_missing_halves() {
         let (t, p) = sshd_ca_status("Port 22\n");
         assert!(!t && !p);
-        let full = render_sshd_ca_block(Path::new("/ca.pub"), "d");
+        let full = render_sshd_ca_block(Path::new("/ca.pub"), "d", Path::new("/p/%u"));
         let (t, p) = sshd_ca_status(&full);
         assert!(t && p);
         let mut partial = full.replace("AuthorizedPrincipalsFile", "AuthorizedKeysFile");

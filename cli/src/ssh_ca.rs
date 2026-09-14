@@ -7,10 +7,6 @@
 //! already signed for another device all refuse with a clear error -- never
 //! a cert, never an authorized_keys fallback.
 //!
-//! CA-1 lands the signer ahead of its callers (sign-request handler arrives
-//! in CA-3), so unused items are allowed dead here, not warning-neutral
-//! debt: remove this attribute once the handler wires them.
-#![allow(dead_code)]
 
 use anyhow::{bail, Result};
 
@@ -192,10 +188,59 @@ pub(crate) fn format_issuance(device_id: &str, principal: &str, serial: u64, val
     format!("ssh-ca: signed for '{device_id}' principal '{principal}' serial {serial} expiry {valid_before}")
 }
 
-/// Default CA private-key path: beside the identity key in the config dir
-/// (operator-provisioned; never temp-copied, always passed by path).
-pub(crate) fn default_ca_key_path(config_dir: &std::path::Path) -> std::path::PathBuf {
-    config_dir.join("ssh_ca")
+/// CA private-key path: beside the managed keys in the ssh dir (which is
+/// 0700 by construction). Operator-provisioned or minted at init; never
+/// temp-copied, always passed by path.
+pub(crate) fn ca_key_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("ssh").join("ssh_ca")
+}
+
+/// Mint the CA key idempotently (0700 dir, 0600 key, 0644 pub): exists →
+/// return as-is (perm problems fail closed later at sign time); missing →
+/// ssh-keygen, deleting a half-created key on failure. ssh-keygen itself
+/// missing refuses (the caller warns and continues: init must not fail
+/// for an SSH-CA nicety, and signing fails closed with a clear error).
+pub(crate) fn ensure_ca_key_with(
+    config_dir: &std::path::Path,
+    keygen_bin: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let key = ca_key_path(config_dir);
+    if key.exists() {
+        return Ok(key);
+    }
+    if let Some(dir) = key.parent() {
+        std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    let created = !key.exists();
+    let status = std::process::Command::new(keygen_bin)
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", "filament-ca", "-f"])
+        .arg(&key)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| anyhow::anyhow!("CA mint failed to run ssh-keygen: {e}"))?;
+    if !status.success() {
+        if created {
+            let _ = std::fs::remove_file(&key);
+            let _ = std::fs::remove_file(key.with_extension("pub"));
+        }
+        bail!("ssh-keygen refused to mint the CA key");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(key)
+}
+
+/// Mint with the real ssh-keygen.
+pub(crate) fn ensure_ca_key(config_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    ensure_ca_key_with(config_dir, std::path::Path::new("ssh-keygen"))
 }
 
 /// Pure core: the daemon serving user is the shell-user setting when set,
@@ -293,7 +338,7 @@ pub(crate) async fn handle_ssh_sign(
         ));
     }
     let config_dir = crate::settings::config_dir();
-    let ca_path = default_ca_key_path(&config_dir);
+    let ca_path = ca_key_path(&config_dir);
     if let Err(e) = check_ca_key(&ca_path) {
         let reason = format!("ssh-sign refused: {e}");
         deny(&t, sid, &reason).await;
@@ -774,6 +819,36 @@ mod tests {
         assert_eq!(daemon_username_from(None, Some("bob")), "bob");
         assert_eq!(daemon_username_from(Some(""), Some("bob")), "bob");
         assert_eq!(daemon_username_from(None, None), "root");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ca_mint_is_idempotent_and_needs_keygen() {
+        let dir = std::env::temp_dir().join(format!("fil-sshca-mint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Missing keygen binary refuses without creating anything.
+        assert!(ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).is_err());
+        assert!(!ca_key_path(&dir).exists());
+        // Stub that behaves like ssh-keygen -f (writes key + pub).
+        let stub = dir.join("stub-keygen");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nf=\"\";prev=\"\";for a in \"$@\";do if [ \"$prev\" = \"-f\" ];then f=\"$a\";fi;prev=\"$a\";done\necho PRIVATE > \"$f\"\necho PUBLIC > \"$f.pub\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let key = ensure_ca_key_with(&dir, &stub).expect("stub mints");
+        assert_eq!(key, ca_key_path(&dir));
+        let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "minted CA key must be 0600");
+        let mode = std::fs::metadata(dir.join("ssh")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "ssh dir must be 0700");
+        // Second run returns the same key without touching it.
+        let again = ensure_ca_key_with(&dir, std::path::Path::new("/bin/false")).expect("idempotent");
+        assert_eq!(again, key);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

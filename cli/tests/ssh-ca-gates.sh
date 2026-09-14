@@ -69,8 +69,9 @@ B_USER="$(id -un)"
 SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=9123)
 
 # --- B's CA key (operator-provisioned, 0600, at the default path) ---
-ssh-keygen -q -t ed25519 -f "$DB/ssh_ca" -N "" -C "test-ca"
-chmod 600 "$DB/ssh_ca"
+mkdir -p "$DB/ssh"
+ssh-keygen -q -t ed25519 -f "$DB/ssh/ssh_ca" -N "" -C "test-ca"
+chmod 600 "$DB/ssh/ssh_ca"
 
 # --- throwaway sshd on 127.0.0.1:9123 with CA trust ONLY (no
 # AuthorizedKeysFile at all: cert auth is the only way in, which is exactly
@@ -78,7 +79,7 @@ chmod 600 "$DB/ssh_ca"
 # below overrides the bootstrap default. ---
 SSHD="$WORK/sshd"; mkdir -p "$SSHD" "$SSHD/principals"
 ssh-keygen -q -t ed25519 -f "$SSHD/hostkey" -N ""
-cp "$DB/ssh_ca.pub" "$SSHD/ca.pub"
+cp "$DB/ssh/ssh_ca.pub" "$SSHD/ca.pub"
 printf '%s\n' "$B_USER" > "$SSHD/principals/$B_USER"
 chmod 600 "$SSHD/principals/$B_USER"
 mkdir -p /run/sshd 2>/dev/null
@@ -103,12 +104,16 @@ sleep 1
 ss -tlnp 2>/dev/null | grep -q ":$SSHD_PORT " || { echo "## sshd FAILED"; cat "$SSHD/sshd.log"; exit 2; }
 
 # --- B acceptor (daemon user = root via USER; hostkeys pinned to temp) ---
+# Hook paths overridden to temp files: up/grant arming writes here (real
+# writer code, observable), never to the live /etc/ssh.
+HOOK_ENV=(env FILAMENT_SSH_SSHD_CONFIG="$WORK/hooked-sshd-config" FILAMENT_SSH_PRINCIPALS_DIR="$WORK/hooked-principals")
+: > "$WORK/hooked-sshd-config"
 env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
   FILAMENT_SSH_HOSTKEY="$SSHD/hostkey.pub" \
-  "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
+  "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # ===================================================================== GATE A ==
@@ -129,7 +134,7 @@ fi
 # ===================================================================== GATE B ==
 # NEGATIVE revoked: same command refused after the grant goes (nonzero).
 say B
-env FILAMENT_CONFIG_DIR="$DB" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
+env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" revoke boxA shell -y >"$WORK/revoke.log" 2>&1
 OUTB=$(timeout 90 "${SSH_ENV[@]}" "${A_ENV[@]}" "$BIN" --server "$SERVER" shell --ssh boxB -- 'echo SHOULD-NOT-RUN' 2>"$WORK/B.err" </dev/null)
 rcB=$?
 echo "## (revoked) rc=$rcB out='$OUTB'"
@@ -140,6 +145,21 @@ if [ "$rcB" != "0" ] \
 else
   echo "-- B.err --"; cat "$WORK/B.err"
   bad "gateB: revoked login NOT refused (rc=$rcB)"
+fi
+
+# ===================================================================== GATE C ==
+# WIRING: up/grant arming wrote the Match block + daemon principals entry
+# through the product writer (temp paths above prove it without touching
+# /etc/ssh).
+say C
+if grep -q "Match User $B_USER" "$WORK/hooked-sshd-config" \
+   && grep -q "TrustedUserCAKeys" "$WORK/hooked-sshd-config" \
+   && [ "$(cat "$WORK/hooked-principals/$B_USER" 2>/dev/null)" = "$B_USER" ]; then
+  ok "gateC: arming wrote the CA block + principals entry (product writer)"
+else
+  echo "-- hooked-sshd-config --"; cat "$WORK/hooked-sshd-config" 2>/dev/null
+  echo "-- hooked-principals --"; ls -la "$WORK/hooked-principals" 2>/dev/null
+  bad "gateC: arming outputs missing"
 fi
 
 # ========================================================================= sum =
