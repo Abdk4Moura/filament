@@ -825,7 +825,7 @@ pub(crate) async fn async_main() -> Result<()> {
             // the daemon needs the CA lines + principals entry before cert
             // logins can land. Never fails the command (no new root rule).
             if shell || shell_only.as_ref().is_some_and(|s| !s.is_empty()) {
-                crate::sshd::arm_ssh_ca_for_serving();
+                crate::sshd::arm_ssh_ca_for_serving().await;
             }
             up_cmd(
                 &server,
@@ -1698,7 +1698,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 }
             }
             if capability == "shell" {
-                crate::sshd::arm_ssh_ca_for_serving();
+                crate::sshd::arm_ssh_ca_for_serving().await;
             }
             println!(
                 "granted '{capability}' to '{device}'. {}",
