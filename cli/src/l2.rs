@@ -2260,6 +2260,22 @@ async fn open_pty_stream(
 /// yields nothing within `verify` and we `Err` so the caller drops it + falls
 /// back to a cold pty instead of handing the user a dead terminal.
 #[cfg(unix)]
+/// Verdict of a verified warm pty open, decided where the sid is in scope
+/// (the caller never sees it on failure, so reason/link checks that need it
+/// live here, not at the call site).
+/// - Opened: first frame arrived, session bridged from here.
+/// - Refused: the peer answered with a close reason (definitive; report it).
+/// - LinkDead: our link died under the verify (or the open never left):
+///   the caller drops it and falls back to cold, which re-verifies there.
+/// - Silent: stream closed with no reason on a live link (legacy refusal
+///   wording preserved by the caller).
+pub(crate) enum WarmPtyVerdict {
+    Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
+    Refused(String),
+    LinkDead,
+    Silent,
+}
+
 pub(crate) async fn open_pty_stream_verified(
     mux: &Arc<Mux>,
     session: &str,
@@ -2268,10 +2284,43 @@ pub(crate) async fn open_pty_stream_verified(
     term: &str,
     cmd: &str,
     verify: std::time::Duration,
-) -> Result<(u32, PipeItem, mpsc::Receiver<PipeItem>)> {
-    let (sid, rx) = open_pty_stream(mux, session, cols, rows, term, cmd).await?;
-    let (first, rx) = verify_first_frame(mux, sid, rx, verify).await?;
-    Ok((sid, first, rx))
+) -> WarmPtyVerdict {
+    let (sid, rx) = match open_pty_stream(mux, session, cols, rows, term, cmd).await {
+        Ok(v) => v,
+        // Local open failure (sid collision is ours; a send failure means the
+        // link is already gone): fall back rather than report a refusal the
+        // peer never sent.
+        Err(_) => return WarmPtyVerdict::LinkDead,
+    };
+    // Same wait as verify_first_frame (kept inline so the verdict, which
+    // needs the sid, is decided here; mount keeps the shared helper).
+    match tokio::time::timeout(verify, rx.recv()).await {
+        Ok(Some(first)) => WarmPtyVerdict::Opened(sid, first, rx),
+        Ok(None) => {
+            // Pipe closed with no frames: a recorded close reason means the
+            // peer answered (refusal); a dead link means the verify raced a
+            // flap (the mux entry dies with the link) -- fall back. Silent
+            // close on a live link stays the legacy refusal.
+            if let Some(reason) = mux.take_close_err(sid).await {
+                WarmPtyVerdict::Refused(reason)
+            } else if !mux.transport().is_alive() {
+                WarmPtyVerdict::LinkDead
+            } else {
+                WarmPtyVerdict::Silent
+            }
+        }
+        Err(_) => {
+            // Timeout (zombie): same teardown verify_first_frame performs --
+            // free the half-open sid, tell the peer, and let the caller drop
+            // the link and fall back.
+            mux.streams.lock().await.remove(&sid);
+            let _ = mux
+                .transport
+                .send_control(&json!({ "type": "l2-close", "sid": sid }))
+                .await;
+            WarmPtyVerdict::LinkDead
+        }
+    }
 }
 
 /// Bridge an already-opened L2 stream (`sid` + its inbound `rx`) to a local

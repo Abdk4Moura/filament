@@ -632,7 +632,7 @@ async fn handle_warm_pty(
     // blocks the event loop (F8).
     tokio::spawn(async move {
         match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
-            Ok((sid, first, rx_pipe)) => {
+            l2::WarmPtyVerdict::Opened(sid, first, rx_pipe) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));
                 }
@@ -647,50 +647,28 @@ async fn handle_warm_pty(
                     }
                 }
             }
-            Err(e) => {
-                let msg = e.to_string();
-                // A peer that CLOSED the stream ANSWERED us. That is not a zombie,
-                // and treating it as one does two harmful things: it tears down a
-                // perfectly healthy link, and it hides an authorization answer
-                // behind a reachability story ("unresponsive", then a 45s cold
-                // establish, then "may be offline"). Only a link that said
-                // NOTHING inside the verify window is a zombie.
-                if msg.contains("closed before any frame") {
-                    // Disambiguate the close (F9): a recorded close reason means
-                    // the peer answered (refusal -- report it, definitively).
-                    // A dead link means the verify raced a flap (the mux entry
-                    // dies with the link, orphaning the pipe): fall back so the
-                    // client re-establishes cold, which re-verifies there. A
-                    // silent close on a LIVE link stays a refusal (unchanged).
-                    if let Some(reason) = mux.take_close_err(sid).await {
-                        ui::debug(&format!(
-                            "filament: warm pty to '{peer}' refused by the peer ({reason})"
-                        ));
-                        req.reject(&format!("refused: {reason}")).await;
-                    } else if !mux.transport().is_alive() {
-                        ui::debug(&format!(
-                            "filament: warm pty link to '{peer}' died mid-verify ({msg}); dropping + establishing fresh"
-                        ));
-                        let _ = tx.send(Ev::DropLink(pid));
-                        req.reject("warm link unresponsive; establishing fresh")
-                            .await;
-                    } else {
-                        ui::debug(&format!(
-                            "filament: warm pty to '{peer}' refused by the peer ({msg})"
-                        ));
-                        req.reject(
-                            "refused: the peer closed the shell request (capability not granted?)",
-                        )
-                        .await;
-                    }
-                } else {
-                    ui::debug(&format!(
-                        "filament: warm pty link to '{peer}' is a zombie ({msg}); dropping + establishing fresh"
-                    ));
-                    let _ = tx.send(Ev::DropLink(pid));
-                    req.reject("warm link unresponsive; establishing fresh")
-                        .await;
-                }
+            l2::WarmPtyVerdict::Refused(reason) => {
+                ui::debug(&format!(
+                    "filament: warm pty to '{peer}' refused by the peer ({reason})"
+                ));
+                req.reject(&format!("refused: {reason}")).await;
+            }
+            l2::WarmPtyVerdict::LinkDead => {
+                ui::debug(&format!(
+                    "filament: warm pty link to '{peer}' died; dropping + establishing fresh"
+                ));
+                let _ = tx.send(Ev::DropLink(pid));
+                req.reject("warm link unresponsive; establishing fresh")
+                    .await;
+            }
+            l2::WarmPtyVerdict::Silent => {
+                ui::debug(&format!(
+                    "filament: warm pty to '{peer}' closed the shell request with no reason"
+                ));
+                req.reject(
+                    "refused: the peer closed the shell request (capability not granted?)",
+                )
+                .await;
             }
         }
     });
