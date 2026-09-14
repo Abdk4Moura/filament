@@ -357,6 +357,17 @@ pub fn registry() -> &'static [Setting] {
             daemon: false,
             help: "Default verbosity level: quiet (errors only), info (progress + results), debug (-v equivalent, route/tunnel), trace (-vv equivalent, ICE/per-frame). CLI flags override.",
         },
+        Setting {
+            key: "ssh.cert_ttl",
+            aliases: &[],
+            store: "ssh_cert_ttl",
+            kind: Kind::Str,
+            default: "1h",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_SSH_CERT_TTL"),
+            daemon: false,
+            help: "SSH certificate lifetime for `shell --ssh` (e.g. 30m, 1h, or 3600); clamped to 24h max, garbage refuses to sign.",
+        },
     ];
     R
 }
