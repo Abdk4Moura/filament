@@ -113,7 +113,11 @@ env FILAMENT_L2=1 FILAMENT_CONFIG_DIR="$DB" FILAMENT_NAME=boxB USER="$B_USER" \
   "${HOOK_ENV[@]}" "$BIN" up --dir "$WORK/Bdrop" --server "$SERVER" >"$WORK/up.log" 2>&1 &
 pids+=($!)
 sleep 3
-# A ~10-minute grant window: the cert clamp must not exceed it (CB-2).
+env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
+
+# A ~10-minute grant window, seeded AFTER the grant (grant rewrites the
+# device record and would wipe a pre-seeded capExpires -- gate D caught
+# exactly that): the cert clamp must not exceed it (CB-2).
 GRANT_NOW=$(date +%s)
 GRANT_EXP=$((GRANT_NOW + 600))
 python3 - "$DB/devices.json" "$GRANT_EXP" <<'PY2'
@@ -125,7 +129,6 @@ for d in arr:
         d.setdefault("capExpires",{})["shell"]=exp
 json.dump(arr,open(p,"w"))
 PY2
-env FILAMENT_CONFIG_DIR="$DB" "${HOOK_ENV[@]}" "$BIN" grant boxA shell >"$WORK/grant.log" 2>&1
 grep -q '"shell"' "$DB/devices.json" || { echo "## grant did not persist"; cat "$DB/devices.json"; }
 
 # ===================================================================== GATE A ==
