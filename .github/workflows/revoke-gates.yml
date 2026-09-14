@@ -14,6 +14,15 @@
 # A2 is the one that matters most. Without it a gate passes by closing
 # everything always, which would "prove" revocation while breaking the product.
 #
+# fleet-cert-gates is the arm that asks the same question of a CERTIFIED
+# device. The others pair their daemons with a hand-written shared secret, and
+# such a link resolves no identity at all, so `cert_revoked` is false there
+# whatever the product does: revoking a CERTIFICATE (rather than a grant) had
+# no live coverage anywhere, only a unit matrix over fabricated inputs. That
+# arm enrols through `add --for` / `join` and revokes with
+# `revoke <device> --certificate`, and carries its own restore control so a
+# broken link cannot masquerade as a revocation.
+#
 # Also carries forward-refusal-gates (#232/#268): the same question, asked of a
 # peer that refuses an l2-open rather than one that revokes. It lives here
 # because it is the same fixture family and the same property, what filament
@@ -34,6 +43,7 @@ on:
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/ssh-ca-gates.sh'
       - 'cli/tests/exec-gates.sh'
+      - 'cli/tests/fleet-cert-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
       - 'cli/tests/lib/fixture.sh'
@@ -107,6 +117,7 @@ jobs:
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=6
             [cli/tests/exec-gates.sh]=13
+            [cli/tests/fleet-cert-gates.sh]=12
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3
@@ -116,6 +127,7 @@ jobs:
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
                    cli/tests/exec-gates.sh \
+                   cli/tests/fleet-cert-gates.sh \
                    cli/tests/pty-revoke-gates.sh \
                    cli/tests/mount-revoke-gates.sh \
                    cli/tests/l2-revoke-gates.sh \

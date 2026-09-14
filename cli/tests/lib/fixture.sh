@@ -80,3 +80,70 @@ fs_bounded() {  # $1 = seconds, rest = command
   cat "$out" 2>/dev/null
 }
 fs_state() { cat "$WORK/fs.state" 2>/dev/null; }
+
+# --- certified fleet pair (two daemons, real enrolment) ----------------------
+#
+# `enroll_delegate` above stops at the join: it leaves the spoke's certificate
+# on disk but no daemon behind it, and it asserts nothing about whether either
+# end actually RESOLVED an identity. Both matter for any gate about
+# certificates, because a secret-paired link resolves no identity at all, so
+# `cert_revoked_for(None)` is false there and a cert-revocation gate written on
+# such a link passes whatever the product does. The two helpers below close
+# that: one brings the spoke's own daemon up (the product topology is two
+# daemons, not a daemon plus a one-shot client), the other asserts the
+# certified relationship BEFORE any gate leans on it.
+
+# $1 = spoke config dir, $2 = spoke name. Start the joined device's daemon.
+start_spoke() {
+  env FILAMENT_CONFIG_DIR="$1" "$BIN" --server "$SERVER" up --dir "$WORK/$2-drop" \
+    >"$WORK/up-$2.log" 2>&1 &
+  FIX_PIDS+=($!)
+  sleep 2
+}
+
+# $1 = owner config dir, $2 = spoke config dir, $3 = spoke name.
+# Three verdicts, all of them about identity rather than reachability:
+#   the owner holds a certificate for the spoke, chained to the owner user key
+#   the spoke holds its own joined certificate under the same user fingerprint
+#   the owner's device list does NOT file the spoke as uncertified
+# The third is the one that catches a harness that "worked" by hand-seeding a
+# pair secret: such a device shows up as "uncertified, trusted in full".
+assert_certified() {
+  local odir="$1" sdir="$2" name="$3"
+  local ojson sjson
+  ojson=$(env FILAMENT_CONFIG_DIR="$odir" "$BIN" id --json 2>/dev/null)
+  sjson=$(env FILAMENT_CONFIG_DIR="$sdir" "$BIN" id --json 2>/dev/null)
+
+  if printf '%s' "$ojson" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+sys.exit(0 if d.get('role')=='owner' and any(x['name']==sys.argv[1] and x.get('devicePub') for x in d.get('devices',[])) else 1)
+" "$name" 2>/dev/null; then
+    ok "enrolment: owner certified '$name' (filament id lists its device key)"
+  else
+    echo "-- owner id --json --"; printf '%s\n' "$ojson"
+    bad "enrolment: owner holds no certificate for '$name'"
+  fi
+
+  if printf '%s' "$sjson" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+sys.exit(0 if d.get('configured') and d.get('role')=='joined-device' and d.get('holdsOwnerSigningKey') is False else 1)
+" 2>/dev/null; then
+    ok "enrolment: '$name' holds a joined certificate (no owner signing key)"
+  else
+    echo "-- spoke id --json --"; printf '%s\n' "$sjson"
+    bad "enrolment: '$name' did not end up as a joined device"
+  fi
+
+  local list
+  list=$(env FILAMENT_CONFIG_DIR="$odir" "$BIN" devices 2>&1)
+  if printf '%s' "$list" | grep -q "$name" \
+     && ! printf '%s' "$list" | grep -q "NEEDS REVIEW" \
+     && ! printf '%s' "$list" | grep -qi "uncertified"; then
+    ok "enrolment: owner files '$name' as certified, not 'uncertified, trusted in full'"
+  else
+    echo "-- owner devices --"; printf '%s\n' "$list"
+    bad "enrolment: owner still sees '$name' as uncertified"
+  fi
+}
