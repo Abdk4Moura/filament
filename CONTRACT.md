@@ -416,10 +416,25 @@ owner exactly what changed in one plain sentence.
   through owner-signed CapOps only; nothing in this command writes to the
   cap store from the network.
 - DELIVERY: the certified device receives its cert over the authenticated
-  link as `identity-cert-delivery { cert }`, stored through the same
-  persist path as a renewal ack. If the device is offline, certification
-  still completes locally and the cert is delivered on next contact;
-  until then the owner-side ceiling already governs what it can do to us.
+  link as `identity-cert-delivery { cert }`. The receiver accepts it ONLY
+  if (a) the cert's subject device_pub equals the receiver's OWN
+  device_pub, (b) the signature verifies against the owner public key the
+  receiver already trusts from pairing/enrolment, (c) the cert is not
+  expired, and (d) it does not downgrade: a replayed OLDER cert (lower
+  serial/issued-at than the stored one) is refused. Otherwise the frame
+  is dropped with a logged reason and NOTHING is written. This is the
+  same validation the renewal-ack persist path performs, so the frame
+  adds no new network write into the identity store beyond one the
+  contract already permits.
+- PENDING DELIVERY: the owner keeps a "cert issued, not yet delivered"
+  flag on the device record. Redelivery is idempotent (the receiver
+  applies (a)-(d) and treats an identical cert as a no-op), and the
+  pending state is visible in `devices` ("certified, cert not yet
+  delivered") so the owner is never confused by a device that still
+  presents as uncertified elsewhere. If the device is offline,
+  certification still completes locally and the cert is delivered on
+  next contact; until then the owner-side ceiling already governs what
+  it can do to us.
 - AUDIT: one issuance line (name, device_pub fingerprint, scope, expiry).
   `devices` drops the NEEDS REVIEW tier immediately; `doctor` stops
   nagging for it.
