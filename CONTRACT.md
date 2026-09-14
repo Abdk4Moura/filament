@@ -390,3 +390,39 @@ bulk -- the Bootstrap precedent); all lifetimes are seconds on the wire.
   lines, `sshd -t` validation, reload) targets unix OpenSSH: a bad config
   rolls back before any reload, and on Windows the writer prints the lines
   for manual application (no system sshd to drive there).
+
+## Warm forward + ssh session reuse (`forward --stdio`, `shell --ssh`)
+
+Every `shell --ssh` invocation today pays the full price: fresh ephemeral
+key, fresh cert issuance over a fresh link, fresh ssh handshake. These rules
+make the second invocation cost milliseconds. Additive: a peer that does not
+implement them behaves exactly as before, only slower.
+
+- WARM FIRST: `forward --stdio` (the ssh ProxyCommand shape) asks the local
+  daemon for a stream first (control socket, unix). On a hit, stdio bridges
+  the daemon-opened stream with no new signaling and no new establishment;
+  on a miss it falls back to a fresh establish with the existing clear
+  errors. The fallback order (warm, then fresh) is load-bearing: callers
+  must never skip the warm attempt, and a warm miss must never read as a
+  refusal.
+- CERT REUSE (amends the "fresh per invocation" rule in SSH certificates
+  above, deliberately): the issued cert plus its ephemeral key are cached
+  per peer in a 0700 dir and reused while the cert is valid (bounds read
+  from the cert itself via `ssh-keygen -L`, never from wall-clock
+  arithmetic on issuance time). Reissue happens only when no cached cert
+  exists or the cached one is expired or within 5 minutes of expiry. The
+  cache dir is wiped on `revoke`, on `--ssh` refusal, and when the shell
+  grant disappears. Rationale for the amendment: a cached key is usable
+  exactly as long as the cert the CA already bounded, so reuse adds no
+  window theft of a live session does not already have; minting a fresh
+  key per keystroke-typing human is ceremony, minting one per daemon
+  restart or expiry is hygiene. A surviving cache past cert expiry, or a
+  cache shared between peers, is non-conformant.
+- MULTIPLEXING: `shell --ssh` passes `-o ControlMaster=auto`,
+  `-o ControlPath=<sockdir>/cm-%r@%h:%p`, `-o ControlPersist=<min(cert
+  ttl, 10m)>` so the first invocation establishes and later ones ride the
+  same connection. The control socket lives beside the cert cache (0700)
+  and dies with it: on expiry, revoke, or grant loss the master is
+  stopped (`ssh -O exit`) before the cache is wiped, so no multiplexed
+  session outlives its authorization. `FILAMENT_NO_SSH_MUX=1` opts out to
+  one-connection-per-invocation for debugging.
