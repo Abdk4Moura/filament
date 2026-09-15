@@ -111,11 +111,16 @@ fi
 # (inbound L2 frames misrouted on a non-serving daemon closed the verify
 # pipe). Asserts CLIENT rc/output, never the server log.
 say A2
+# Own PID variable (NOT pids+=): gate E kills pids[-1] expecting the
+# acceptor, and a lingering initiator daemon would also reroute later
+# gates onto the warm path. Clean up at the end of this gate.
 env FILAMENT_CONFIG_DIR="$DA" FILAMENT_NAME=boxA "$BIN" up --dir "$WORK/Adrop" --server "$SERVER" >"$WORK/upA.log" 2>&1 &
-pids+=($!)
+ADPID=$!
 sleep 3
 OUTA2=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo DAEMON-WARM-OK' 2>"$WORK/A2.err" </dev/null)
 rcA2=$?
+kill "$ADPID" 2>/dev/null
+wait "$ADPID" 2>/dev/null
 echo "## (daemon warm) rc=$rcA2 out='$OUTA2'"
 if [ "$rcA2" = "0" ] && echo "$OUTA2" | grep -q "DAEMON-WARM-OK"; then
   ok "gateA2: daemon-mediated one-shot shell ran (rc=0, output)"
