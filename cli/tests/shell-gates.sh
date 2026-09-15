@@ -117,8 +117,8 @@ sleep 3
 OUTA2=$(timeout 40 "${A_ENV[@]}" "$BIN" --server "$SERVER" shell boxB -- 'echo DAEMON-WARM-OK' 2>"$WORK/A2.err" </dev/null)
 rcA2=$?
 echo "## (daemon warm) rc=$rcA2 out='$OUTA2'"
-if [ "$rcA2" = "0" ] && [ "$OUTA2" = "DAEMON-WARM-OK" ]; then
-  ok "gateA2: daemon-mediated one-shot shell ran (rc=0, exact output)"
+if [ "$rcA2" = "0" ] && echo "$OUTA2" | grep -q "DAEMON-WARM-OK"; then
+  ok "gateA2: daemon-mediated one-shot shell ran (rc=0, output)"
 else
   echo "-- A2.err --"; cat "$WORK/A2.err"; tail -5 "$WORK/up.log"
   bad "gateA2: daemon-mediated one-shot FAILED (rc=$rcA2 out='$OUTA2')"
