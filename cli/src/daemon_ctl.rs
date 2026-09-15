@@ -632,7 +632,7 @@ async fn handle_warm_pty(
     // blocks the event loop (F8).
     tokio::spawn(async move {
         match l2::open_pty_stream_verified(&mux, &session, cols, rows, &term, &cmd, verify).await {
-            Ok((sid, first, rx_pipe)) => {
+            l2::WarmPtyVerdict::Opened(sid, first, rx_pipe) => {
                 if let Ok(mut m) = warm_ptys.lock() {
                     m.insert(session.clone(), (pid, sid));
                 }
@@ -647,30 +647,28 @@ async fn handle_warm_pty(
                     }
                 }
             }
-            Err(e) => {
-                let msg = e.to_string();
-                // A peer that CLOSED the stream ANSWERED us. That is not a zombie,
-                // and treating it as one does two harmful things: it tears down a
-                // perfectly healthy link, and it hides an authorization answer
-                // behind a reachability story ("unresponsive", then a 45s cold
-                // establish, then "may be offline"). Only a link that said
-                // NOTHING inside the verify window is a zombie.
-                if msg.contains("closed before any frame") {
-                    ui::debug(&format!(
-                        "filament: warm pty to '{peer}' refused by the peer ({msg})"
-                    ));
-                    req.reject(
-                        "refused: the peer closed the shell request (capability not granted?)",
-                    )
+            l2::WarmPtyVerdict::Refused(reason) => {
+                ui::debug(&format!(
+                    "filament: warm pty to '{peer}' refused by the peer ({reason})"
+                ));
+                req.reject(&format!("refused: {reason}")).await;
+            }
+            l2::WarmPtyVerdict::LinkDead => {
+                ui::debug(&format!(
+                    "filament: warm pty link to '{peer}' died; dropping + establishing fresh"
+                ));
+                let _ = tx.send(Ev::DropLink(pid));
+                req.reject("warm link unresponsive; establishing fresh")
                     .await;
-                } else {
-                    ui::debug(&format!(
-                        "filament: warm pty link to '{peer}' is a zombie ({msg}); dropping + establishing fresh"
-                    ));
-                    let _ = tx.send(Ev::DropLink(pid));
-                    req.reject("warm link unresponsive; establishing fresh")
-                        .await;
-                }
+            }
+            l2::WarmPtyVerdict::Silent => {
+                // Clean end, no output: accept and drop at once so the
+                // client reads EOF as exit 0 (the cold path's Exited).
+                // Nothing is recorded (no live session exists to reattach).
+                ui::debug(&format!(
+                    "filament: warm pty to '{peer}' exited cleanly with no output"
+                ));
+                let _sock = req.accept().await;
             }
         }
     });
