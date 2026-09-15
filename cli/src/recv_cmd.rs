@@ -6079,7 +6079,13 @@ pub(crate) async fn recv_cmd(
                 // L2 streams live in the HIGH half of the sid space, route them
                 // to the tunnel mux, never the file-transfer table (the pure
                 // high-bit prefix check keeps file send/recv byte-identical).
-                if l2_enabled && l2::is_l2_sid(sid) {
+                // No serving-posture gate here: l2_enabled says whether WE
+                // serve L2 opens, but inbound frames also carry replies to
+                // streams WE opened (a plain-`up` daemon's warm pty open gets
+                // its output dropped as "unknown sid" otherwise, and the
+                // verify then misreports a granted session as refused). The
+                // mux-map miss below still drops anything truly unknown.
+                if l2::is_l2_sid(sid) {
                     if let Some(mux) = l2_muxes.get(&pid) {
                         mux.on_frame(sid, data).await;
                     }
