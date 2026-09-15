@@ -92,10 +92,15 @@ say "B2: after a roster refresh, the sibling no longer lists the revoked device,
 # epoch bump) and push to charlie.
 sleep 8
 charlie_after=$(env FILAMENT_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" devices 2>&1)
-if echo "$charlie_after" | grep -q "bravo"; then
-  bad "gateB2: charlie still lists revoked bravo after the refresh (out: $charlie_after)"
+# Assert on the MESH section (the pushed roster) ONLY: cert-revoke removes
+# bravo from what the owner re-issues, never from charlie's LOCAL pairing
+# (FLEET section -- only `forget` removes that). Grepping the whole output
+# made this gate fail forever: the local record correctly persists.
+mesh_block=$(echo "$charlie_after" | sed -n '/MESH/,/^$/p')
+if echo "$mesh_block" | grep -q "bravo"; then
+  bad "gateB2: pushed roster still lists revoked bravo after the refresh (mesh: $mesh_block)"
 else
-  ok "gateB2: charlie no longer lists revoked bravo after the roster refresh"
+  ok "gateB2: pushed roster no longer lists revoked bravo after the refresh"
 fi
 # And the acceptor still refuses bravo if presented again (both halves).
 again=$(env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1)
