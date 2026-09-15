@@ -2267,8 +2267,10 @@ async fn open_pty_stream(
 /// - Refused: the peer answered with a close reason (definitive; report it).
 /// - LinkDead: our link died under the verify (or the open never left):
 ///   the caller drops it and falls back to cold, which re-verifies there.
-/// - Silent: stream closed with no reason on a live link (legacy refusal
-///   wording preserved by the caller).
+/// - Silent: stream closed with no reason on a live link. Every refusal
+///   carries err, so this is a CLEAN session end with no output (fast
+///   `true`), never a denial: the caller accepts and closes at once so
+///   the client reads EOF as a clean exit, mirroring the cold path.
 pub(crate) enum WarmPtyVerdict {
     Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
     Refused(String),

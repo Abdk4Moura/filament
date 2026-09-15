@@ -662,13 +662,13 @@ async fn handle_warm_pty(
                     .await;
             }
             l2::WarmPtyVerdict::Silent => {
+                // Clean end, no output: accept and drop at once so the
+                // client reads EOF as exit 0 (the cold path's Exited).
+                // Nothing is recorded (no live session exists to reattach).
                 ui::debug(&format!(
-                    "filament: warm pty to '{peer}' closed the shell request with no reason"
+                    "filament: warm pty to '{peer}' exited cleanly with no output"
                 ));
-                req.reject(
-                    "refused: the peer closed the shell request (capability not granted?)",
-                )
-                .await;
+                let _sock = req.accept().await;
             }
         }
     });
