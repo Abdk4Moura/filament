@@ -330,9 +330,17 @@ fi
 # byte comparison pins the store.)
 MALLORY=mallory
 DM="$WORK/$MALLORY"
+# The impostor is a FORGOTTEN enrollee: enrolled (so it holds a valid
+# owner-signed cert and the fleet channel), then forgotten on the owner.
+# A still-enrolled impostor resolves its proven name and never reaches
+# the transplant branch -- testing with one would assert nothing. The
+# forgotten-but-certified shape is the real squat threat: valid cert,
+# no record, claimed name of the ceilinged victim.
 enroll_delegate "$MALLORY" --allow transfer
 start_spoke "$DM" "$MALLORY"
 sleep 6
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$MALLORY" >"$WORK/forget.log" 2>&1
+sleep 2
 # Stable fields only (timestamps/last_seen drift between snapshots, so a
 # whole-record comparison would fail spuriously -- gate B does the same).
 python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" >"$WORK/victim.before" <<'PY'
@@ -344,7 +352,7 @@ print(json.dumps({
   "victim_pub":v.get("deviceCert",{}).get("devicePub"),
   "victim_ceiling":v.get("principalCeiling"),
   "victim_revoked":v.get("certRevoked",False),
-  "mallory_key":(rec.get(sys.argv[3]) or {}).get("deviceCert",{}).get("devicePub"),
+  "mallory_absent":sys.argv[3] not in rec,
 },sort_keys=True))
 PY
 M_ENV=(env FILAMENT_CONFIG_DIR="$DM")
@@ -370,11 +378,11 @@ now=json.dumps({
   "victim_pub":v.get("deviceCert",{}).get("devicePub"),
   "victim_ceiling":v.get("principalCeiling"),
   "victim_revoked":v.get("certRevoked",False),
-  "mallory_key":(rec.get(sys.argv[3]) or {}).get("deviceCert",{}).get("devicePub"),
+  "mallory_absent":sys.argv[3] not in rec,
 },sort_keys=True)
 before=json.load(open(sys.argv[4]))
 print(now)
-# victim identity+ceiling identical AND mallory still keyed to its own key
+# victim identity+ceiling identical AND no record re-created for mallory
 sys.exit(0 if now==json.dumps(before,sort_keys=True) else 1)
 PY
   [ "$?" = "0" ] && intact=1
