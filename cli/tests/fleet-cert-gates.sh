@@ -360,15 +360,21 @@ run_impostor_variant() {
   local variant="$1" tag="$2"
   # Per-variant refusal counting: the owner log accumulates, so record the
   # count before and require it to GROW (a stale line must not pass this).
-  local refused_before=$(grep -c "not indexed" "$WORK/up.log" || true)
+  local refused_before=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
   sleep 2
   env FILAMENT_CONFIG_DIR="$DM" FILAMENT_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
   FIX_PIDS+=($!)
   sleep 8
-  local refused=0 intact=0 execref=0
-  local refused_after=$(grep -c "not indexed" "$WORK/up.log" || true)
+  local refused=0 intact=0 execref=0 attempted=0 victim_ok=0
+  local refused_after=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
   [ "$refused_after" -gt "$refused_before" ] && refused=1
+  # NON-VACUITY, two ways. Containment means nothing unless (i) this impostor
+  # actually reached the owner (a daemon that never started satisfies "exec
+  # refused" via a plain connection failure) and (ii) the victim snapshot
+  # really held a keyed record (comparing two empty records passes).
+  grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log" && attempted=1
+  [ -n "$(python3 -c "import json;print(json.load(open('$WORK/victim.before')).get('victim_pub') or '')")" ] && victim_ok=1
   python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" "$WORK/victim.before" >"$WORK/victim.$tag.after" <<'PY'
 import json,sys
 arr=json.load(open(sys.argv[1]))
@@ -388,21 +394,23 @@ PY
   [ "$?" = "0" ] && intact=1
   OUTI=$(timeout 60 "${M_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/I-$tag.err" </dev/null)
   [ "$?" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
-  echo "## (impostor $tag) refused=$refused intact=$intact execref=$execref"
-  # TWO verdicts on purpose. CONTAINMENT is what the gate is for (the victim
-  # record is untouched and the squatting peer cannot exec); the refusal LINE
-  # is a separate assertion, so a log-plumbing or log-level difference between
-  # environments can neither fake a pass nor mask a containment failure.
-  if [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
-    ok "gateI-$tag: squat as '$variant' CONTAINED (victim byte-identical, exec refused)"
+  echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
+  if [ "$attempted" = "1" ] && [ "$victim_ok" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
+    ok "gateI-$tag: squat as '$variant' CONTAINED (victim keyed + byte-identical, impostor reached the owner, exec refused)"
   else
-    echo "-- owner log --"; grep -i "not indexed\|fleet peer" "$WORK/up.log" | tail -3
-    bad "gateI-$tag: impostor as '$variant' NOT contained (intact=$intact execref=$execref refused=$refused)"
+    # Print what the gate actually knows: CI's empty `grep | tail -3` was the
+    # least informative possible failure output and cost a whole run to read.
+    echo "-- impostor log ($tag) --"; tail -5 "$WORK/up-$MALLORY-$tag.log" 2>/dev/null
+    echo "-- forget log --"; cat "$WORK/forget.log" 2>/dev/null
+    echo "-- owner log (fleet) --"; grep -i "fleet" "$WORK/up.log" | tail -5
+    bad "gateI-$tag: impostor as '$variant' NOT contained (attempted=$attempted victim=$victim_ok intact=$intact execref=$execref refused=$refused)"
   fi
+  # The refusal line is its OWN verdict: a log-environment difference must
+  # never fake a containment pass or mask a containment failure.
   if [ "$refused" = "1" ]; then
-    ok "gateI-$tag: transplant refusal logged ('not indexed' line seen)"
+    ok "gateI-$tag: transplant refusal emitted (reason=name-taken seen)"
   else
-    bad "gateI-$tag: transplant refusal line NOT logged (containment held; the log level or plumbing differs)"
+    bad "gateI-$tag: transplant refusal line absent (containment=$([ "$attempted$victim_ok$intact$execref" = "1111" ] && echo held || echo broken); no refusal emitted for this attempt)"
   fi
 }
 say "I1: exact-name squat refused"

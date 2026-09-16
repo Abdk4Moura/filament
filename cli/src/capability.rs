@@ -694,6 +694,26 @@ pub fn cap_gate_effective(
         // legacy refused that cap authorizes, which the flip will newly permit.
         // Unprovisioned is logged once per resource so a fresh node never floods.
         match (legacy_allowed, outcome) {
+            // A covered same-owner peer denied ONLY because its possession
+            // proof has not settled yet is NOT breakage: after the flip the
+            // same open is allowed once the link proves (the ceiling class is
+            // counted in CEILING_ADMITTED for exactly this population). Crying
+            // CRITICAL here reported a transient as a regression, and the
+            // settle path's whole job is to wait that transient out.
+            (true, CapOutcome::Denied(_))
+                if ceiling_admitted_class(ceiling_ok, has_explicit_grant) =>
+            {
+                log_once(
+                    format!(
+                        "pend|{action}|{}",
+                        hex::encode(device_pub.copied().unwrap_or([0u8; 32]))
+                    ),
+                    &format!(
+                        "CAP-SHADOW PENDING-PROOF: a covered fleet open on '{action}' is denied by the capability layer only because the link is not Proven yet; the flip ALLOWS it once settled (counted in ceiling_admitted). Not a breakage."
+                    ),
+                    true, // informational: debug-level only
+                );
+            }
             (true, CapOutcome::Denied(reason)) => {
                 // #231 asks for exactly one thing to go quiet: the
                 // `[unprovisioned]` line, "which by its own text is the normal

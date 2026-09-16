@@ -107,16 +107,32 @@ fn settle_retryable(err: &anyhow::Error) -> bool {
 }
 
 pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOpts) -> Result<i32> {
-    const ATTEMPTS: u32 = 3;
+    // Bounded by BOTH count and wall clock. Measured: the window in which a
+    // challenge is unanswered is the peer's own reconnect churn (a daemon
+    // restart on either side), which lasts seconds to tens of seconds; three
+    // attempts at 300ms land inside it every time. A retry budget the daemon
+    // itself asked for ("identity not proven within N ms; retry") is bounded
+    // and honest; the count cap keeps a permanently unprovable peer from
+    // spinning forever.
+    const ATTEMPTS: u32 = 12;
+    let started = std::time::Instant::now();
     let mut attempt = 0;
     loop {
         attempt += 1;
         match exec_once(server, peer, relay, &opts).await {
             Ok(code) => return Ok(code),
-            Err(e) if attempt < ATTEMPTS && settle_retryable(&e) => {
-                crate::ui::say(&format!(
-                    "filament: {e} -- re-establishing the link (attempt {attempt}/{ATTEMPTS})"
-                ));
+            Err(e)
+                if attempt < ATTEMPTS
+                    && started.elapsed() < std::time::Duration::from_secs(20)
+                    && settle_retryable(&e) =>
+            {
+                if attempt <= 2 {
+                    crate::ui::say(&format!(
+                        "filament: {e} -- re-establishing the link (attempt {attempt})"
+                    ));
+                } else {
+                    crate::ui::debug(&format!("filament: {e} -- retry {attempt}"));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
             Err(e) => return Err(e),

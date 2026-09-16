@@ -134,6 +134,10 @@ jobs:
                    cli/tests/shell-posture-gates.sh \
                    cli/tests/forward-refusal-gates.sh; do
             echo "::group::$g"
+            # Label the tree the gates actually run against: CI checks out
+            # GitHub's MERGE ref (pull/N/merge) by default, so "CI ran sha X"
+            # is a false premise unless it is printed. This cost a run.
+            echo "gate tree: $(git rev-parse HEAD) ($g)"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
             # The runner invokes this step with `bash -e`, so a bare
             # `out=$(...); code=$?` is a trap: a FAILING gate makes the
