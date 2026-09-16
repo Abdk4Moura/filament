@@ -38,6 +38,11 @@ Owner: whoever writes the flip commit. Cite the evidence in that commit.
       Caveat: this proves it for resources exercised, not all resources. Tight today
       (all gates pass "self", one resource); becomes a sampled claim when resources
       multiply, revisit then.
+- [ ] `ceiling_admitted` reviewed (informational, not a gate): opens allowed
+      by fleet auto-trust WITHOUT an explicit grant (enrolment-ceiling
+      admission). Widening is reviewed, not gated -- cite the count alongside
+      the `ld_authorized` numbers and enumerate which opens it names before
+      the flip, same as any other newly-permitted population.
 
 Read these from the running daemon via the shadow-status surface (task #16), since
 the counters are process-global and a fresh CLI invocation reads zeros.

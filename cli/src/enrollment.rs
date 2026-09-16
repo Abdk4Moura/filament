@@ -42,9 +42,10 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
     let assigned_name = v["name"]
         .as_str()
         .ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
-    let owner_name = v["owner_name"]
-        .as_str()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the owner name"))?;
+    // The owner name comes from the SIGNED invitation, never from the
+    // acknowledgement frame: a network peer must not choose whose fleet
+    // we think we joined.
+    let owner_name = inv.owner_name.as_str();
     let secret = v["secret"]
         .as_str()
         .ok_or_else(|| anyhow!("join acknowledgement omitted the reconnect secret"))?;

@@ -184,6 +184,27 @@ pub(crate) fn upsert_peer_record(
 /// indexing path must always pass false -- a peer-asserted name may never
 /// take over a pinned identity, which is the transplant the pin exists to
 /// stop. Default to false unless the call site names the owner decision.
+/// Whether `name` is pinned to a DIFFERENT device identity than `device_pub_hex`:
+/// an exact-name record exists whose deviceCert.devicePub differs. Used by
+/// enrollment to suffix to a fresh name instead of taking over (or refusing
+/// outright) -- the check and the write are separate calls, so a concurrent
+/// writer racing between them can only cause a refused enrollment, never a
+/// takeover: the pin inside the write still refuses.
+pub(crate) fn name_pinned_by_other(name: &str, device_pub_hex: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else {
+        return false;
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        return false;
+    };
+    arr.iter().any(|d| {
+        d["name"].as_str() == Some(name)
+            && d["deviceCert"]["devicePub"]
+                .as_str()
+                .is_some_and(|p| p != device_pub_hex)
+    })
+}
+
 pub(crate) fn devices_upsert_atomic(
     name: &str,
     secret: Option<&str>,
@@ -202,21 +223,25 @@ pub(crate) fn devices_upsert_atomic(
     }
     with_devices_mut(|arr| {
         // Identity pinning: records are keyed by identity, names are
-        // presentation. A cert write whose device key differs from the
-        // record's pinned one is a takeover (e.g. a fleet sibling naming
-        // itself after a ceilinged device), so it is refused HERE, in the
-        // writer, in the SAME lock cycle as the write -- never delegated
-        // to callers and with no TOCTOU window between check and write.
-        // Records with no pinned cert yet (secret-only pairs) accept.
+        // presentation. A cert write under an existing name is refused
+        // unless the incoming key matches the record's pinned one, or the
+        // caller holds the owner-decision opt-out: a fleet sibling naming
+        // itself after a ceilinged device is a takeover, and a record with
+        // NO pinned cert yet is not a free slot either (secret-only and
+        // vouched records would re-key silently -- userKey, deviceCert and
+        // scope overwritten, caps cleared). Refused HERE, in the writer,
+        // in the SAME lock cycle as the write -- never delegated to callers
+        // and with no TOCTOU window between check and write.
         if let Some(c) = cert {
             if let Some(existing) = arr.iter().find(|d| d["name"].as_str() == Some(name)) {
-                if let Some(pinned) = existing["deviceCert"]["devicePub"].as_str() {
-                    let incoming = hex::encode(c.device_pub);
-                    if pinned != incoming.as_str() && !allow_reanchor {
-                        anyhow::bail!(
-                            "refusing to re-anchor record '{name}': pinned device key {pinned} != presented key {incoming}"
-                        );
-                    }
+                let incoming = hex::encode(c.device_pub);
+                let pinned_matches = existing["deviceCert"]["devicePub"]
+                    .as_str()
+                    .is_some_and(|pinned| pinned == incoming.as_str());
+                if !pinned_matches && !allow_reanchor {
+                    anyhow::bail!(
+                        "refusing to re-anchor record '{name}': presented key {incoming} is not the pinned identity"
+                    );
                 }
             }
         }

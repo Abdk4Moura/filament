@@ -1287,9 +1287,9 @@ async fn verify_fleet_identity(
     rx: &mut mpsc::UnboundedReceiver<Ev>,
     expected: &str,
 ) -> Result<()> {
-    let cb = t
-        .channel_binding()
-        .ok_or_else(|| anyhow!("cannot verify '{expected}': this link exposes no channel binding"))?;
+    let cb = t.channel_binding().ok_or_else(|| {
+        anyhow!("cannot verify '{expected}': this link exposes no channel binding")
+    })?;
     let owner = crate::fleet::my_owner_pub()
         .ok_or_else(|| anyhow!("cannot verify '{expected}': this device holds no owner key"))?;
     let hello = crate::fleet::make_hello(&cb, &crate::display_name())?;
@@ -1371,7 +1371,9 @@ pub(crate) async fn bring_up_to_known(
                 }
                 None => match (crate::fleet_indexed_name(peer_name), crate::fleet::rv()) {
                     (true, Some(rv)) => (rv, true),
-                    _ => bail!("no known device named '{peer_name}', run `filament add` first (see `filament devices`)"),
+                    _ => bail!(
+                        "no known device named '{peer_name}', run `filament add` first (see `filament devices`)"
+                    ),
                 },
             }
         }
@@ -2936,7 +2938,10 @@ async fn try_warm_pty(
     let sock = match crate::ctl::try_pty_reason(peer, session, cols, rows, term, cmd).await {
         Ok(sock) => sock,
         Err(Some(reason)) if reason.starts_with("refused:") => {
-            return Some(Err(anyhow!("{}", reason.trim_start_matches("refused:").trim())));
+            return Some(Err(anyhow!(
+                "{}",
+                reason.trim_start_matches("refused:").trim()
+            )));
         }
         Err(_) => return None, // no warm path; the cold path is the right answer
     };
@@ -3198,7 +3203,10 @@ pub async fn pty_cmd(server: &str, peer: &str, relay: bool, cmd: Vec<String>) ->
                                 ),
                                 format!(
                                     "or on {peer}, grant it outright: {}",
-                                    crate::ui::paint(crate::ui::Tone::Brand, "filament grant <this device> shell")
+                                    crate::ui::paint(
+                                        crate::ui::Tone::Brand,
+                                        "filament grant <this device> shell"
+                                    )
                                 ),
                             ],
                         );
@@ -4186,15 +4194,13 @@ async fn shell_bootstrap(
     // mux), so the link being usable IS the end of this span. Record `up`; the
     // ssh data link is a SEPARATE netcat span instrumented in its own right.
     diag.up("tunnel", "datachannel-or-direct");
-    t.send_control(
-        &json!({
-            "type": "shell-bootstrap",
-            "v": 1,
-            "pubkey": pubkey,
-            "ssh_port": ssh_port,
-            "cert": cert_only
-        }),
-    )
+    t.send_control(&json!({
+        "type": "shell-bootstrap",
+        "v": 1,
+        "pubkey": pubkey,
+        "ssh_port": ssh_port,
+        "cert": cert_only
+    }))
     .await?;
 
     // Await the verdict (bounded, a daemon without FILAMENT_L2 / without the cap
@@ -4371,7 +4377,8 @@ async fn run_ssh(
     // Cert identity first: fresh ephemeral key, B-signed cert over an L2
     // link. Fail closed (no managed-key fallback) when keygen, link, or
     // signing fails -- the error names the cause.
-    let eph = crate::ssh_ca::EphemeralKey::generate().await
+    let eph = crate::ssh_ca::EphemeralKey::generate()
+        .await
         .map_err(|e| anyhow::anyhow!("ssh cert setup failed (no key fallback): {e}"))?;
     // Aborted on the normal path below (Drop + explicit cleanup already
     // covered everything else); left running only while ssh owns the session.
@@ -4382,7 +4389,9 @@ async fn run_ssh(
         Ok(id) => id,
         Err(e) => {
             sigwatch.abort();
-            return Err(anyhow::anyhow!("ssh cert issuance failed (no key fallback): {e}"));
+            return Err(anyhow::anyhow!(
+                "ssh cert issuance failed (no key fallback): {e}"
+            ));
         }
     };
     #[cfg(not(target_os = "linux"))]
@@ -5056,14 +5065,14 @@ mod h1_tests {
         );
         let controls = t.controls.lock().unwrap();
         assert!(
-            controls.iter().any(|v| v.get("type").and_then(|x| x.as_str())
-                == Some("l2-close")
-                && v.get("sid").and_then(|x| x.as_u64()) == Some(sid as u64)
-                && v
-                    .get("err")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .contains("flooded")),
+            controls.iter().any(
+                |v| v.get("type").and_then(|x| x.as_str()) == Some("l2-close")
+                    && v.get("sid").and_then(|x| x.as_u64()) == Some(sid as u64)
+                    && v.get("err")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .contains("flooded")
+            ),
             "reset carries an l2-close naming the flood, got: {controls:?}"
         );
     }
