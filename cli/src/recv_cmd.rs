@@ -1870,9 +1870,14 @@ pub(crate) async fn recv_cmd(
             // (the peer's own stream died with its old link anyway).
 
             for p in expire {
+                // Name the link AND the fact that no proof arrived. A bare
+                // "timed out settling" hid the single most important fact about
+                // this failure for hours: the peer answered no challenge at all
+                // (it is usually still re-establishing), as opposed to answering
+                // with something we rejected.
                 crate::ui::say(&format!(
-                    "l2: {:?} open timed out settling ({}ms); denying",
-                    p.kind, p.settle_ms,
+                    "l2: {:?} open timed out settling ({}ms); denying -- {} answered no possession challenge",
+                    p.kind, p.settle_ms, p.pid,
                 ));
                 if conn.link(&p.pid).map(|l| l.generation) == Some(p.generation) {
                     if let Some(t) = conn.transport_of(&p.pid) {
