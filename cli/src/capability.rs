@@ -421,18 +421,34 @@ pub fn cap_fleet_inputs(
     (Some(hdr.owner_pub), explicit)
 }
 
+/// Whether this decision belongs to the ceiling-admitted population: the
+/// opens the authoritative flip newly permits WITHOUT an explicit grant.
+/// Pure, so the accounting rule is unit-testable.
+fn ceiling_admitted_class(ceiling_ok: bool, has_explicit_grant: bool) -> bool {
+    ceiling_ok && !has_explicit_grant
+}
+
+/// A covered, unrevoked, same-owner fleet peer whose ONLY obstacle is that its
+/// possession proof has not settled yet. The flip admits this open once the
+/// link proves, so reporting shadow CRITICAL here would report a transient
+/// (the peer is mid-reconnect) as permanent breakage. Measured: the challenge/
+/// expose exchange stays unanswered for seconds to tens of seconds while a peer
+/// re-establishes after a restart, and the settle path exists to wait that out.
+fn ceiling_pending_proof(
+    ceiling_authorizes: bool,
+    same_owner: bool,
+    cert_revoked: bool,
+    binding_proven: bool,
+    has_explicit_grant: bool,
+) -> bool {
+    ceiling_authorizes && same_owner && !cert_revoked && !binding_proven && !has_explicit_grant
+}
+
 /// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
 /// modes (so observability survives the flip), logs, and returns the effective gate
 /// decision. `binding` and `cert_expires` are transport/policy facts composed under
 /// authoritative (purely restrictive).
 #[allow(clippy::too_many_arguments)]
-/// Whether this decision belongs to the ceiling-admitted population: the
-/// opens the authoritative flip newly permits WITHOUT an explicit grant.
-/// Pure, so the accounting rule is unit-testable.
-pub fn ceiling_admitted_class(ceiling_ok: bool, has_explicit_grant: bool) -> bool {
-    ceiling_ok && !has_explicit_grant
-}
-
 pub fn cap_gate_effective(
     legacy_allowed: bool,
     outcome: &CapOutcome,
@@ -701,7 +717,13 @@ pub fn cap_gate_effective(
             // CRITICAL here reported a transient as a regression, and the
             // settle path's whole job is to wait that transient out.
             (true, CapOutcome::Denied(_))
-                if ceiling_admitted_class(ceiling_ok, has_explicit_grant) =>
+                if ceiling_pending_proof(
+                    ceiling_authorizes,
+                    same_owner,
+                    cert_revoked,
+                    binding == BindingStrength::Proven,
+                    has_explicit_grant,
+                ) =>
             {
                 log_once(
                     format!(
@@ -880,6 +902,18 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_proof_is_only_the_unsettled_covered_class() {
+        // The transient: covered, same owner, unrevoked, merely unproven.
+        assert!(ceiling_pending_proof(true, true, false, false, false));
+        // Every other combination must still reach the CRITICAL branch:
+        assert!(!ceiling_pending_proof(false, true, false, false, false)); // not covered
+        assert!(!ceiling_pending_proof(true, false, false, false, false)); // different owner
+        assert!(!ceiling_pending_proof(true, true, true, false, false)); // revoked
+        assert!(!ceiling_pending_proof(true, true, false, true, false)); // already proven
+        assert!(!ceiling_pending_proof(true, true, false, false, true)); // grant present
+    }
+
     #[test]
     fn ceiling_admitted_counts_the_covered_ungranted_class() {
         // The flip-review population: covered by the owner-signed ceiling and
