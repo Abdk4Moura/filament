@@ -336,6 +336,163 @@ a,b` scopes it to the listed peers/devices identically: a peer outside the
   scope gets the open refused, the same verdict an out-of-scope shell
   attempt receives. Exec adds no new trust -- it rides the shell grant.
 
+## Capability ledger (append-only signed ops)
+
+Authorization is a **log**, not a mutable store. Every authorization fact is an
+append-only signed operation; the decision is a **pure function** of the log,
+the request, and the current instant. This replaces today's destructive model
+(`CapOpKind::Revoke` deletes the grant row, `apply_cap_op` -> `store.remove`),
+where the reason an action is refused stops existing the moment it takes
+effect. The ops below (`Deny`, `Pause`, `Accept`) are new primitives, not
+renamings of anything in `crates/filament-cap`: there is no deny object, no
+pause, and no subject counter-signature in the engine today.
+
+```
+Op      { id, author: key, subject: key, capability: (action, resource),
+          interval: [not_before, not_after),   // half-open, UTC seconds
+          kind: Grant | Deny | Ceiling | Certify | Pass | Pause | Accept,
+          version: u64,                        // per author, monotone
+          sig }
+Facts   { now, subject: key, binding: None|Inferred|Proven,
+          cert: Option<{ device_pub, user_pub, expires, revoked }>,
+          held_author_key: Option<key>, ops: verified ops }
+Request { action, resource }                   // DAEMON-derived, never peer-supplied
+Verdict { decision: Allow | Deny(reason), valid_until: Option<u64>,
+          because: [op id] }
+```
+
+`decide(facts, request) -> Verdict`. A `ResourceLattice::covers(claim, pattern)`
+supplied by the caller decides "within" for device / port / path / tag
+patterns; the library itself knows no verbs. **Forget is a STORAGE action** --
+it removes a record and every op about it from the log, and it is not an op:
+nothing in the log can describe its own erasure.
+
+### The laws
+
+**L1 -- Pure and deterministic.** `decide` reads no clock, no store, no
+network, no environment. `now` is an argument; UTC seconds at the boundary.
+Two calls with equal arguments return equal verdicts, byte for byte. A
+`decide` that consults `SystemTime::now()`, a file, or an env var is
+non-conformant however correct its answer.
+
+**L2 -- Keys are identity, names are presentation.** The library never sees a
+display name, a petname, or a device label. Every `author` and `subject` is a
+key. Renaming a device changes no verdict; re-pairing one (a new key) changes
+every verdict about it. `Facts.binding`, `Facts.cert` and
+`Facts.held_author_key` are carried for the CLI's view layer and for
+boundary-side ingest, and `decide` does **not** read them: the verdict is a
+function of `now`, `ops` and `request` alone. Widening that -- making the
+verdict depend on the cert or the binding -- is a contract change, not an
+implementation detail.
+
+**L3 -- Time is first-class.** Every op carries a half-open interval
+`[not_before, not_after)`; an op is live at `t` iff `not_before <= t <
+not_after`. Every verdict returns `valid_until`: the next instant at which the
+verdict could change if nothing else does. ONE generic re-evaluation scheduled
+at `valid_until` replaces every per-path revoke ticker; a subsystem that wants
+its own expiry timer is duplicating this and will drift from it.
+
+**L4 -- Composition.** `Deny` is absolute over any overlapping `Grant` /
+`Pass` / `Accept`. `Ceiling` only ever narrows: an allow must lie within EVERY
+live ceiling on that subject, and a ceiling can never make an otherwise-denied
+request allowed. Newest version per author wins -- for a given op id, only the
+highest version is effective and older versions by the same author are
+ignored entirely, never merged. A widening op **never** erases an earlier
+`Deny`.
+
+**L5 -- Widening needs two signatures.** A `Grant` (and a `Pass`) is effective
+only while a subject-signed `Accept` naming that op's id is itself live.
+Narrowing needs only the author's signature: `Deny`, `Pause`, a `Ceiling` that
+narrows, and a newer version of the author's own op with a shorter interval
+all take effect unilaterally. The asymmetry is the point -- you can always
+reduce what you have handed out, and you can never hand out more alone.
+
+**L6 -- Verification at the boundary.** Ops enter the log only after signature
+and version checks. Ingest refuses an op whose signature does not verify,
+whose id is already held under a DIFFERENT author, or whose version is not
+strictly greater than the highest version already recorded for that author.
+A refused op is refused, not silently sorted to the back of the log: the
+evaluator trusts the log completely and has no second line of defence.
+
+**L7 -- Explainable.** `because` is a MINIMAL SUFFICIENT CAUSE of the decision
+and its reason: evaluating the request against only the ops in `because`
+yields the same decision and reason, and removing any one of them does not.
+It explains the decision, not `valid_until`, which is derived from the whole
+log. The selection is canonical, so the same log always produces the same
+`because`.
+
+**L8 -- Verb-agnostic, with a lattice.** Capabilities are opaque
+`(action, resource)` pairs. Containment is `covers(claim, pattern)`, supplied
+by the caller: exact match, `*`, and prefix patterns for paths and ports.
+Mapping a verb onto another (exec riding the shell grant, `ssh-sign` riding
+the same gate -- see `cli/src/shell_gate.rs`) happens at the BOUNDARY, before
+`decide` is called. The ledger does not know that `exec` and `pty` are the
+same thing; the gate does.
+
+**L9 -- `valid_until` soundness.** Given unchanged facts, the verdict for the
+same request cannot change at any instant strictly between `now` and
+`valid_until`. At `valid_until` it may. `None` means it can never change
+again for those facts. A `valid_until` later than the first instant of change
+is a correctness bug, not a performance tuning knob.
+
+**L10 -- No widening by combination.** Ops that each deny do not combine into
+an allow. `Deny` is a TOMBSTONE: only its own author can lift it, and only by
+publishing a newer version of that same op with a shorter interval. No other
+author, no accumulation of grants, and no ceiling can retire someone else's
+deny. The single deliberate exception is the L5 pair: a `Grant` alone denies
+(unaccepted) and its `Accept` alone denies (nothing to accept), and together
+they allow. That pair is the ONLY combination of individually-denying ops
+that may allow, and an implementation that admits a second one is
+non-conformant.
+
+**L11 -- Idempotence and order independence.** Replaying the same op set in
+any arrival order, with any duplicates, yields the same verdict and the same
+`because`. The log is a set with versions, not a sequence: nothing about a
+decision may depend on which op arrived first.
+
+**L12 -- Pause.** Author-only, subject is the counterpart key,
+interval-bounded. A live `Pause` suppresses every allow its author would
+otherwise give for that subject during its interval, and the refusal carries
+reason `paused`, DISTINCT from `denied`. A pause is not a deny: it needs no
+lifting op, it expires on its own, and it leaves the author's grants intact
+underneath.
+
+**L13 -- Accept.** An `Accept` references exactly one `Grant` or `Pass` op id,
+is signed by that op's subject, and is meaningful only while both it and the
+referenced op are live. An `Accept` naming an op that does not exist, or
+signed by anyone but the subject, authorizes nothing.
+
+### Tiers are views, not state
+
+`external` / `paired` / `fleet` / `dormant` / `paused` are **computed by the
+CLI** from verdicts plus `Facts` (binding, cert, whether any op exists at
+all). They are never stored, never signed, and never an input to `decide`. A
+tier is a way of describing the answer to a human; a change in vocabulary is a
+change to the CLI, never a migration of the log. This matches the engine today
+(`PrincipalKind`, `BindingStrength` and `same_owner` are all derived per call
+and nothing persists a tier field) and the ledger must not regress it.
+
+### Deliberately unresolved
+
+Two points are recorded here rather than resolved, because resolving them
+silently would be worse than naming them:
+
+- `Certify` and `Pass` are op kinds with no law constraining them. This
+  contract pins the conservative reading and no more: `Certify` is an
+  attestation that contributes nothing to a verdict and never appears in
+  `because`, and `Pass` is a widening op governed by exactly the L5 rules that
+  govern `Grant`. WHO may `Pass` WHAT -- the delegation rule -- is not pinned
+  by L1..L13 and must be decided before `Pass` is implemented.
+- L10's plain-English form ("ops that each deny never combine into an allow")
+  is contradicted by L5, whose whole mechanism is two individually-denying ops
+  combining into an allow. L10 above states the restriction WITH its single
+  exception named. `proofs/capability_ledger_model.py` checks exactly that: it
+  enumerates every pair of individually-denying ops that allows together and
+  fails unless each one is a grant/pass and its own accept.
+
+The model checker for all thirteen laws is `proofs/capability_ledger_model.py`,
+a required gate in `.github/workflows/proof.yml`.
+
 ## SSH certificates (`filament shell --ssh` via local CA)
 
 Passwordless ssh between fleet devices without installed keys: the
