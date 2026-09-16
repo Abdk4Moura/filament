@@ -237,6 +237,19 @@ pub(crate) fn revoke_recheck_interval() -> std::time::Duration {
     std::time::Duration::from_millis(ms.clamp(250, 300_000))
 }
 
+/// How long a shell-class open waits for identity proof before denying it
+/// outright. Setting `gate.settle_ms` (default 2000, hard max 5000); 0 and
+/// garbage mean "default", never "wait forever" -- an unbounded hold would
+/// be a parked-open DoS surface, which the per-link/per-daemon count bounds
+/// below then could not mitigate.
+pub(crate) fn gate_settle_ms() -> u64 {
+    crate::settings::get_str("gate.settle_ms", None)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2_000)
+        .clamp(250, 5_000)
+}
+
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
 pub(crate) fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {

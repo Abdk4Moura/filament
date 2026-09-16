@@ -358,6 +358,17 @@ pub fn registry() -> &'static [Setting] {
             help: "Default verbosity level: quiet (errors only), info (progress + results), debug (-v equivalent, route/tunnel), trace (-vv equivalent, ICE/per-frame). CLI flags override.",
         },
         Setting {
+            key: "gate.settle_ms",
+            aliases: &[],
+            store: "gate_settle_ms",
+            kind: Kind::Str,
+            default: "2000",
+            scope: ScopeKind::GlobalOnly,
+            env: Some("FILAMENT_GATE_SETTLE_MS"),
+            daemon: false,
+            help: "How long a shell-class open waits for identity proof before denying (ms); clamped to 5000 max, garbage means default.",
+        },
+        Setting {
             key: "ssh.cert_ttl",
             aliases: &[],
             store: "ssh_cert_ttl",
