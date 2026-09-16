@@ -86,8 +86,12 @@ pub(crate) enum ParkKind {
 pub(crate) struct ParkedOpen {
     pub pid: String,
     pub device_pub: [u8; 32],
+    /// Link generation at park time (Conn::next_gen, bumped on every
+    /// reconnect/repair). Release requires equality: a proof on a later
+    /// link, or a binding carried over across a transport swap, denies
+    /// instead of releasing into a stale transport.
+    pub generation: u32,
     pub kind: ParkKind,
-    pub t: Arc<dyn crate::net::Transport>,
     pub v: Value,
     pub sid: u32,
     pub deadline: Instant,
@@ -121,13 +125,16 @@ async fn deny_unsettled(
         .await;
 }
 
-/// Settle-then-evaluate for one shell-class open, called after sid parsing
-/// and before gating. Proven links proceed (returns false). Otherwise the
-/// open parks for re-drive on proof, or is denied fast: unknown identity
-/// (nothing to bind a hold to -- retry on the warm link is cheap) and
-/// over-budget parks both deny with retryable reasons. Returns true when
-/// the caller must return immediately (parked or denied).
-pub(crate) async fn park_unproven_open(
+/// Settle-then-evaluate, called with an ALREADY-DENIED verdict: decide
+/// first, park only when the deny is attributable to the unproven binding.
+/// Allows proceed untouched (this fn never runs for them), so legacy
+/// shadow allows -- including secret-paired granted peers with no resolved
+/// cert -- behave exactly as before. Parks only when ALL hold: binding not
+/// Proven, a known device key that can become Proven, neither revoked nor
+/// explicitly denied (durable states keep their live verdict), and budget
+/// remains. Returns true when the caller must return immediately, having
+/// either parked or sent the fast deny itself.
+pub(crate) async fn park_on_deny(
     parked: &mut Vec<ParkedOpen>,
     conn: &Conn,
     pid: &str,
@@ -136,20 +143,32 @@ pub(crate) async fn park_unproven_open(
     sid: u32,
     v: &Value,
 ) -> bool {
-    let (proven, device_pub) = match conn.link(pid) {
+    let (binding_proven, device_pub, generation, name) = match conn.link(pid) {
         Some(l) => (
             l.identity_binding == crate::capability::BindingStrength::Proven,
             l.identity_device_pub,
+            l.generation,
+            l.verified_name.clone(),
         ),
-        None => (false, None),
+        None => (false, None, 0, None),
     };
-    if proven {
+    // Settled, revoked, or explicitly denied: the live verdict stands,
+    // whatever it was. Only an unproven, known, revocable identity parks.
+    if binding_proven {
         return false;
     }
     let Some(device_pub) = device_pub else {
         deny_unsettled(t, sid, kind, "identity not proven; retry").await;
         return true;
     };
+    if crate::identity_state::cert_revoked_for(Some(&device_pub)) {
+        return false;
+    }
+    if let Some(n) = name.as_deref() {
+        if crate::device_capability_denied(n, "shell") {
+            return false;
+        }
+    }
     let per_link = parked.iter().filter(|p| p.pid == pid).count();
     if !park_budget_ok(per_link, parked.len()) {
         deny_unsettled(t, sid, kind, "identity settling, retry").await;
@@ -159,8 +178,8 @@ pub(crate) async fn park_unproven_open(
     parked.push(ParkedOpen {
         pid: pid.to_string(),
         device_pub,
+        generation,
         kind,
-        t: t.clone(),
         v: v.clone(),
         sid,
         deadline: Instant::now() + Duration::from_millis(ms),
@@ -195,16 +214,6 @@ async fn handle_forward_open(
     let Some(t) = conn.transport_of(&pid) else {
         return;
     };
-    // Settle-then-evaluate: hold unproven opens for re-drive on proof
-    // instead of deciding on stale state (l2-close frames skip this:
-    // tearing down is never gated).
-    if v["type"].as_str() == Some("l2-open") {
-        if let Some(sid) = l2::wire_sid(&v).filter(|s| l2::is_l2_sid(*s)) {
-            if park_unproven_open(parked, conn, &pid, ParkKind::Forward, &t, sid, v).await {
-                return;
-            }
-        }
-    }
     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
     // Per-device authorization for a NEW open (an l2-close just
     // tears a stream down, so it is never gated here). In a blanket
@@ -273,6 +282,14 @@ async fn handle_forward_open(
         // wire_sid (not a wrapping cast) so the l2-close we echo
         // back names the real sid; 0 only if absent/out-of-range.
         let sid = l2::wire_sid(&v).unwrap_or(0);
+        // Settle-then-evaluate: the verdict above may rest on stale
+        // (unproven) identity. Park for re-drive on proof when the deny
+        // is attributable to it; otherwise the live verdict stands.
+        if l2::is_l2_sid(sid)
+            && park_on_deny(parked, conn, &pid, ParkKind::Forward, &t, sid, v).await
+        {
+            return;
+        }
         let diag = l2_deny_reason
             .as_deref()
             .unwrap_or("device not granted shell");
@@ -374,10 +391,6 @@ async fn handle_pty_open(
     if !l2::is_l2_sid(sid) {
         return;
     }
-    // Settle-then-evaluate: hold unproven opens for re-drive on proof.
-    if park_unproven_open(parked, conn, &pid, ParkKind::Pty, &t, sid, v).await {
-        return;
-    }
     // One shared shell gate (same function, same inputs as
     // exec-open): gather, then the pty entry point. The tells
     // below stay local; only the verdict is shared.
@@ -388,6 +401,11 @@ async fn handle_pty_open(
         crate::capability::CAP_SHELL,
     );
     if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
+        // Settle-then-evaluate: park for re-drive on proof when this deny
+        // is attributable to the unproven binding; else the live verdict.
+        if park_on_deny(parked, conn, &pid, ParkKind::Pty, &t, sid, v).await {
+            return;
+        }
         let who = dev.as_deref().unwrap_or("<unverified>");
         ui::say(&format!(
             "l2: pty refused: {who}: {}",
@@ -1719,15 +1737,42 @@ pub(crate) async fn recv_cmd(
             let now = Instant::now();
             let mut fire = Vec::new();
             let mut expire = Vec::new();
+            let mut stale = Vec::new();
             parked_opens.retain(|p| {
-                let st = conn
-                    .link(&p.pid)
-                    .map(|l| (l.identity_binding, l.identity_device_pub));
+                let st = conn.link(&p.pid).map(|l| {
+                    (
+                        l.identity_binding,
+                        l.identity_device_pub,
+                        l.generation,
+                    )
+                });
                 match st {
-                    Some((crate::capability::BindingStrength::Proven, Some(pub_)))
-                        if pub_ == p.device_pub =>
+                    // Release ONLY on the same link generation proving the
+                    // same device key: a proof on a later link, or a
+                    // re-keyed peer, denies instead (condition 2). The
+                    // re-driven handler re-gathers everything fresh, so a
+                    // revoke during the hold denies there.
+                    Some((crate::capability::BindingStrength::Proven, Some(pub_acting), link_gen))
+                        if pub_acting == p.device_pub && link_gen == p.generation =>
                     {
                         fire.push(p.clone());
+                        false
+                    }
+                    // Same link, different key: the peer re-keyed under us.
+                    Some((_, Some(pub_acting), _)) if pub_acting != p.device_pub => {
+                        stale.push((p.clone(), "peer identity changed during hold"));
+                        false
+                    }
+                    // Same key but a newer link generation: the transport was
+                    // swapped (reconnect/repair) under the hold. The parked
+                    // open belongs to the dead transport; deny at once rather
+                    // than serving it there or lingering to expiry.
+                    Some((_, _, link_gen)) if link_gen != p.generation => {
+                        stale.push((p.clone(), "link replaced during hold"));
+                        false
+                    }
+                    None => {
+                        stale.push((p.clone(), "link dropped during hold"));
                         false
                     }
                     _ if now >= p.deadline => {
@@ -1737,31 +1782,51 @@ pub(crate) async fn recv_cmd(
                     _ => true,
                 }
             });
+            // Transports are ALWAYS derived fresh: a parked transport may
+            // belong to a dead link (reconnect swaps it). If the link is
+            // gone there is nobody to answer, so drop silently.
             for p in expire {
                 crate::ui::say(&format!(
                     "l2: {:?} open timed out settling ({}ms); denying",
                     p.kind, p.settle_ms,
                 ));
-                let _ =
-                    p.t.send_control(&serde_json::json!({
-                        "type": "l2-close",
-                        "sid": p.sid,
-                        "err": settle_timeout_reason(p.settle_ms),
-                    }))
-                    .await;
+                if let Some(t) = conn.transport_of(&p.pid) {
+                    let _ = t
+                        .send_control(&serde_json::json!({
+                            "type": "l2-close",
+                            "sid": p.sid,
+                            "err": settle_timeout_reason(p.settle_ms),
+                        }))
+                        .await;
+                }
+            }
+            for (p, reason) in stale {
+                crate::ui::say(&format!("l2: {:?} open dropped: {reason}", p.kind));
+                if let Some(t) = conn.transport_of(&p.pid) {
+                    let _ = t
+                        .send_control(&serde_json::json!({
+                            "type": "l2-close",
+                            "sid": p.sid,
+                            "err": reason,
+                        }))
+                        .await;
+                }
             }
             for p in fire {
                 crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
+                let Some(t) = conn.transport_of(&p.pid) else {
+                    continue;
+                };
                 match p.kind {
                     ParkKind::Exec => {
                         let mux = l2_muxes
                             .entry(p.pid.clone())
-                            .or_insert_with(|| l2::Mux::new(p.t.clone()))
+                            .or_insert_with(|| l2::Mux::new(t.clone()))
                             .clone();
                         exec_recv::handle_exec_open(
                             &mut conn,
                             &p.pid,
-                            p.t.clone(),
+                            t,
                             mux,
                             &p.v,
                             &shell_policy,
@@ -1788,7 +1853,7 @@ pub(crate) async fn recv_cmd(
                         crate::ssh_ca::handle_ssh_sign(
                             &mut conn,
                             &p.pid,
-                            p.t.clone(),
+                            t,
                             &p.v,
                             &shell_policy,
                             &mut parked_opens,
