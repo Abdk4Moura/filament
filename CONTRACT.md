@@ -540,7 +540,10 @@ for a hold to bind to.
   flip PERMITS those opens rather than breaking them: classifying them as
   denials produced a false BREAKAGE alarm on a population the flip is meant
   to admit. Shadow decisions are unchanged by construction -- shadow always
-  decides on the legacy fold.
+  decides on the legacy fold. The ceiling class needs no LINK trust: it is
+  owner-signed policy plus a Proven possession proof (and the identity may
+  never be revoked), so a fleet sibling admitted without the legacy
+  `trusted` flag is exactly the case it exists for.
 - KNOWN DEVIATION, deliberate: for ssh-sign the settle denials use their
   own retryable reasons rather than the intentionally-generic "ssh-sign
   refused". The generic wording exists so a denied peer cannot oracle which
