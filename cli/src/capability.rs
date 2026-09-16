@@ -446,6 +446,16 @@ pub fn cap_gate_effective(
     // bypass legacy, where denied lived, so a denied-but-covered device
     // was allowed). Callers with no deny list for their path pass false.
     denied: bool,
+    // Owner-signed enrolment ceiling covers this action. Distinct from
+    // `scoped_in_bounds` on purpose. `scoped_in_bounds` is the SCOPE DEFAULT
+    // class (transfer into the drop dir, a forward to an exposed port),
+    // which has always auto-authorized same-owner Proven devices in BOTH
+    // modes -- that is documented fleet behaviour. The ceiling is new and
+    // authorizes a DELIBERATE-tier action (shell/exec/pty/ssh-sign), so it
+    // decides only under authoritative mode while still being counted as
+    // would-allow in shadow: counting it as a denial was a false BREAKAGE
+    // alarm (the flip PERMITS this open, it does not break it).
+    ceiling_authorizes: bool,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
 
@@ -537,6 +547,10 @@ pub fn cap_gate_effective(
     let peer_user = user_pub.copied().unwrap_or([0u8; 32]);
     let same_owner = own_user_pub.map_or(false, |o| o == &peer_user) && peer_user != [0u8; 32];
     let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds, !cert_revoked);
+    // The ceiling path mirrors the scoped default's preconditions (my key,
+    // Proven, not revoked) but is authoritative-only for the DECISION below.
+    let ceiling_ok =
+        ceiling_authorizes && same_owner && binding == BindingStrength::Proven && !cert_revoked;
     // Observability for the Proven-precondition — do NOT tighten blind. A
     // same-owner peer authorized ONLY by an explicit grant while its binding is
     // below Proven is EXACTLY the population that would lose access if
@@ -568,7 +582,7 @@ pub fn cap_gate_effective(
     let base_outcome = if denied {
         CapOutcome::Denied("explicitly denied by owner (deniedCaps)".into())
     } else if same_owner {
-        if fleet_ok || has_explicit_grant {
+        if fleet_ok || ceiling_ok || has_explicit_grant {
             CapOutcome::Authorized
         } else {
             CapOutcome::Denied(
@@ -590,8 +604,10 @@ pub fn cap_gate_effective(
     // just works regardless of the flag. It still respects cert expiry (the
     // standard expiry composer is a no-op in shadow, so re-check it here) and,
     // via fleet_auto_trust, the Proven binding.
+    // Which of the two auto-trust classes may OVERRIDE the legacy decision:
+    // the scoped default always could; the ceiling only under authoritative.
     let fleet_allow = !denied
-        && fleet_ok
+        && (fleet_ok || (authoritative && ceiling_ok))
         && matches!(
             cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
             CapOutcome::Authorized
@@ -1069,6 +1085,7 @@ mod tests {
             false,
             true,
             false,
+            false,
         );
         assert!(
             !resolved_revoked.allowed(),
@@ -1087,6 +1104,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1119,6 +1137,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         assert!(
             matches!(decision, GateDecision::Allow),
@@ -1145,6 +1164,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             false,
         );
         assert!(
@@ -1189,6 +1209,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
@@ -1207,6 +1228,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         // Legacy-denied, cap authorizes → ld_authorized (widening)
         cap_gate_effective(
@@ -1220,6 +1242,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1310,6 +1333,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
@@ -1332,6 +1356,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1362,6 +1387,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1384,6 +1410,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1414,6 +1441,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1440,6 +1468,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1462,6 +1491,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1903,6 +1933,7 @@ mod tests {
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
             false,
+            false,
         );
         assert!(
             d.allowed(),
@@ -1931,6 +1962,7 @@ mod tests {
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
             false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1957,6 +1989,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
             false,
         );
         assert!(
@@ -1989,6 +2022,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ true,
             /*cert_revoked*/ true,
+            false,
             false,
         );
         assert!(
@@ -2024,6 +2058,7 @@ mod tests {
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ true,
             false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2055,6 +2090,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ true,
             /*cert_revoked*/ true,
+            false,
             false,
         );
         if prior.is_empty() {
@@ -2090,6 +2126,7 @@ mod tests {
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
             false,
+            false,
         );
         assert!(!d.allowed(), "same-owner Proven out-of-scope must DENY");
     }
@@ -2115,6 +2152,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
             false,
         );
         assert!(
@@ -2144,6 +2182,7 @@ mod tests {
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
             false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2169,6 +2208,7 @@ mod tests {
             true,
             false,
             true,
+            false,
             false,
         );
         assert!(
