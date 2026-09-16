@@ -431,16 +431,24 @@ run_impostor_variant "$SPOKE$(printf '\007')" ctrl
 # log CAP-SHADOW CRITICAL (a header denying what legacy allowed). The owner
 # log accumulates the whole run above, so any covered open that disagreed
 # would already be recorded.
-say "D-sh: shadow run of the covered exec logs zero CRITICAL denials"
+# The delta is what matters. A global count conflates THIS exec with every
+# earlier section -- including the impostor gates, whose refusals are recorded
+# as shadow disagreements ON PURPOSE (legacy would let a secret-paired peer in;
+# the capability layer refuses it, which is the flip narrowing a legacy hole,
+# not breakage). Counting globally made this gate fail on other gates' events.
+say "D-sh: shadow run of the covered exec adds zero CRITICAL denials"
+CRITS_BEFORE=$(grep -c "CAP-SHADOW CRITICAL" "$WORK/up.log" || true)
 OUTSH=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo FLEET-SHADOW-OK 2>"$WORK/SH.err" </dev/null)
 rcSH=$?
-CRITS=$(grep -c "CAP-SHADOW CRITICAL" "$WORK/up.log" || true)
-echo "## (shadow covered exec) rc=$rcSH out='$OUTSH' criticals=$CRITS"
+CRITS_ALL=$(grep -c "CAP-SHADOW CRITICAL" "$WORK/up.log" || true)
+CRITS=$((CRITS_ALL - CRITS_BEFORE))
+echo "## (shadow covered exec) rc=$rcSH out='$OUTSH' criticals_delta=$CRITS (total $CRITS_ALL, pre-existing $CRITS_BEFORE)"
 if [ "$rcSH" = "0" ] && [ "$OUTSH" = "FLEET-SHADOW-OK" ] && [ "$CRITS" = "0" ]; then
-  ok "gateD-sh: covered exec clean in shadow, zero CRITICAL lines (la_denied evidence)"
+  ok "gateD-sh: covered exec clean in shadow, zero NEW CRITICAL lines from its own open (la_denied evidence)"
 else
-  echo "-- up.log criticals --"; grep "CAP-SHADOW CRITICAL" "$WORK/up.log" | tail -3
-  bad "gateD-sh: shadow covered exec unclean (rc=$rcSH out='$OUTSH' criticals=$CRITS)"
+  echo "-- new criticals --"; grep "CAP-SHADOW CRITICAL" "$WORK/up.log" | tail -3
+  echo "-- pre-existing (earlier sections, incl. intended impostor refusals) --"; grep "CAP-SHADOW CRITICAL" "$WORK/up.log" | head -3
+  bad "gateD-sh: shadow covered exec unclean (rc=$rcSH out='$OUTSH' new_criticals=$CRITS of $CRITS_ALL total)"
 fi
 
 say "restarting the owner acceptor under FILAMENT_CAP_AUTHORITATIVE=1"

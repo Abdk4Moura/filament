@@ -154,7 +154,11 @@ async fn send_identity_challenge(
             });
             // MUST await: send_control is async; dropping the future would leave
             // the challenge unsent (the peer never learns it must prove Proven).
-            let _ = t.send_control(&challenge).await;
+            if let Err(e) = t.send_control(&challenge).await {
+                crate::ui::say(&format!(
+                    "l2: identity challenge to {pid} could NOT be sent ({e})"
+                ));
+            }
         }
     }
 }
@@ -234,7 +238,14 @@ pub(crate) async fn resend_identity_challenge(
         "nonce": hex::encode(nonce),
         "receiver_device_pub": hex::encode(recv_dpub)
     });
-    let _ = t.send_control(&challenge).await;
+    if let Err(e) = t.send_control(&challenge).await {
+        // A challenge we could not write is indistinguishable, from the
+        // challenger's side, from a peer that ignores us. Name it.
+        crate::ui::say(&format!(
+            "l2: identity challenge to {pid} could NOT be sent ({e}); the peer cannot prove until this link carries frames"
+        ));
+        return false;
+    }
     true
 }
 
@@ -503,8 +514,12 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
             "cert": local_cert.to_json(),
             "possession_sig": hex::encode(sig)
         });
-        let _ = t.send_control(&payload).await;
-        crate::ui::debug("identity challenge answered (identity-expose sent)");
+        match t.send_control(&payload).await {
+            Ok(()) => crate::ui::debug("identity challenge answered (identity-expose sent)"),
+            Err(e) => crate::ui::say(&format!(
+                "l2: identity-expose could NOT be sent ({e}); the challenger will see no proof"
+            )),
+        }
     } else {
         crate::ui::debug("identity challenge NOT answered: possession signing failed");
     }
