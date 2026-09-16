@@ -68,6 +68,394 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+/// Accept one `l2-open` forward frame: validate, shell-gate (expose bound),
+/// dial and serve. Extracted verbatim from the recv loop arm so unsettled
+/// opens can be parked and re-driven through this same function.
+async fn handle_forward_open(
+    conn: &mut Conn,
+    pid: String,
+    v: &Value,
+    shell_policy: &ShellPolicy,
+    l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    l2_enabled: bool,
+) {
+    // TODO(diag acceptor): emit a diag::Attempt with role
+    // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
+    // because the acceptor has no per-connect span here: this fires
+    // on an ALREADY-established shared link inside the big up/recv
+    // loop (the link's bring-up lives in the file-transfer/recv
+    // machinery upstream), so a clean span would mean threading an
+    // Attempt through the whole loop. The initiator path (l2.rs) is
+    // fully instrumented and is the side that exhibits the stall.
+    let Some(t) = conn.transport_of(&pid) else {
+        return;
+    };
+    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
+    // Per-device authorization for a NEW open (an l2-close just
+    // tears a stream down, so it is never gated here). In a blanket
+    // mode any trusted peer may open; in grant-only mode the opening
+    // peer must hold the shell grant itself.
+    let mut l2_deny_reason: Option<String> = None;
+    let authorized = v["type"].as_str() != Some("l2-open") || {
+        // Fourth shell-gated path, through the shared gather
+        // and verdict core like pty/exec/ssh-sign. Two path-
+        // specific pieces stay HERE, not in the gate: the
+        // legacy fold (blanket L2 mode has no shell-gate
+        // equivalent -- dropping it would newly deny default
+        // setups in shadow) and the bound (expose.json, not
+        // the enrolment ceiling). A forward --stdio to an
+        // exposed sshd is shell-equivalent in reach (any byte
+        // stream, incl. an ssh session).
+        let (_dev, mut gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
+            &mut *conn,
+            &pid,
+            &shell_policy,
+            crate::capability::CAP_SHELL,
+        );
+        // Ports arrive as u64; a value that does not fit u16 is
+        // not addressable, so deny rather than truncate it into
+        // a different (possibly exposed) port.
+        let reach_port = v["rport"]
+            .as_u64()
+            .or_else(|| v["port"].as_u64())
+            .and_then(|p| u16::try_from(p).ok());
+        let (reach_port, port_ok) = match reach_port {
+            Some(p) => (p, true),
+            None => {
+                l2_deny_reason = Some("port out of range".to_string());
+                (0, false)
+            }
+        };
+        gate_inputs.ceiling_covers =
+            reach_port != 0 && crate::expose::load().iter().any(|b| b.port == reach_port);
+        let legacy_ok = {
+            let blanket = shell_policy.enables_l2()
+                || std::env::var("FILAMENT_L2")
+                    .map(|x| x == "1")
+                    .unwrap_or(false);
+            let (peer_has_shell, peer_denied) = conn
+                .link(&pid)
+                .and_then(|l| l.verified_name.as_deref())
+                .map(|n| {
+                    (
+                        device_allows(n, "shell"),
+                        device_capability_denied(n, "shell"),
+                    )
+                })
+                .unwrap_or((false, false));
+            l2_open_allowed(blanket, peer_has_shell, peer_denied)
+        };
+        let d = crate::shell_gate::forward_gate_decision(&gate_inputs, legacy_ok);
+        if let Err(Some(r)) = &d {
+            l2_deny_reason = Some(r.clone());
+        }
+        // port_ok is ANDed last: an out-of-range port denies
+        // even for a granted peer (there is nothing valid to
+        // open), while keeping the recorded reason specific.
+        d.is_ok() && port_ok
+    };
+    if !authorized {
+        // wire_sid (not a wrapping cast) so the l2-close we echo
+        // back names the real sid; 0 only if absent/out-of-range.
+        let sid = l2::wire_sid(&v).unwrap_or(0);
+        let diag = l2_deny_reason
+            .as_deref()
+            .unwrap_or("device not granted shell");
+        ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
+        let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
+                .await;
+    } else {
+        // Opt-in gateway: if the target is non-loopback, allow it
+        // only when the operator's l2-allow.json lists it for this
+        // device (or "*"). Loopback ignores this (always allowed).
+        let allow_nonloopback = {
+            let host = v["host"].as_str().unwrap_or("127.0.0.1");
+            // Same truncation rule as the gate above: an
+            // out-of-range port matches no allowlist entry.
+            let port = v["rport"]
+                .as_u64()
+                .or_else(|| v["port"].as_u64())
+                .and_then(|p| u16::try_from(p).ok())
+                .unwrap_or(0);
+            let name = conn
+                .link(&pid)
+                .and_then(|l| l.verified_name.clone())
+                .unwrap_or_default();
+            l2_target_allowed(&name, host, port)
+        };
+        let mux = l2_muxes
+            .entry(pid.clone())
+            .or_insert_with(|| l2::Mux::new(t.clone()))
+            .clone();
+        match mux.accept_control(&v, trusted, allow_nonloopback).await {
+            l2::OpenVerdict::Accept {
+                sid,
+                host,
+                port,
+                rx,
+            } => {
+                // The peer's device key, resolved again for the live
+                // stream's revocation re-check (the gate above resolved
+                // the same value for the open decision).
+                let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+                tokio::spawn(mux.clone().dial_and_serve(sid, host, port, rx, spawn_idev));
+            }
+            l2::OpenVerdict::Deny { sid, err } => {
+                // Log refused dials at INFO (visible by default,
+                // suppressed under -q) - a refused SSRF/port-scan or
+                // untrusted/over-cap open is a security event the
+                // operator should see, mirroring the
+                // shell-bootstrap-deny path (`ui::say`). Normal
+                // initiators always dial 127.0.0.1, so this is silent
+                // in normal operation and only fires on an anomaly.
+                ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
+                let _ = t
+                    .send_control(&json!({ "type": "l2-close", "sid": sid, "err": err }))
+                    .await;
+            }
+            l2::OpenVerdict::Ignore => {}
+        }
+    }
+    // A PTY stream closing frees its resize channel, handled by
+    // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
+    // the mux now, so it can't leak past the stream).
+}
+
+/// Accept one `pty-open` frame: validate, shell-gate, attach or spawn,
+/// acknowledge. Extracted verbatim from the recv loop arm so unsettled opens
+/// can be parked and re-driven through this same function.
+async fn handle_pty_open(
+    conn: &mut Conn,
+    pid: String,
+    v: &Value,
+    shell_policy: &ShellPolicy,
+    shell_user: &Option<String>,
+    pty_sessions: &Arc<l2::PtySessions>,
+    l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
+    pty_bindings: &mut HashMap<String, HashMap<u32, String>>,
+    l2_enabled: bool,
+) {
+    let Some(t) = conn.transport_of(&pid) else {
+        return;
+    };
+    // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
+    // no FILAMENT_L2). The peer is visibly up but cannot serve a
+    // shell, and dropping the open silently made `shell` hang with
+    // no output. Say so, so the initiator errors instead of waiting.
+    if !l2_enabled {
+        let sid = l2::wire_sid(&v).unwrap_or(0);
+        let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `filament up --shell` on that device" }))
+                .await;
+        return;
+    }
+    // wire_sid rejects a missing OR out-of-range sid instead of
+    // defaulting to 0 / wrapping into a forged is_l2_sid value.
+    let Some(sid) = l2::wire_sid(&v) else {
+        return;
+    };
+    if !l2::is_l2_sid(sid) {
+        return;
+    }
+    // One shared shell gate (same function, same inputs as
+    // exec-open): gather, then the pty entry point. The tells
+    // below stay local; only the verdict is shared.
+    let (dev, gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
+        &mut *conn,
+        &pid,
+        &shell_policy,
+        crate::capability::CAP_SHELL,
+    );
+    if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
+        let who = dev.as_deref().unwrap_or("<unverified>");
+        ui::say(&format!(
+            "l2: pty refused: {who}: {}",
+            cap_reason.as_deref().unwrap_or("no shell cap / untrusted")
+        ));
+        enqueue_if_requestable(who, "shell");
+        // Carry the specific cap reason (e.g. CEILING_REASON,
+        // "device revoked") to the peer; the generic string was
+        // produced and then thrown away before it crossed the wire,
+        // so the initiator read an empty success instead of the
+        // refusal. The fallback stays coarse on purpose.
+        let reason = cap_reason.unwrap_or_else(|| "shell capability not granted".to_string());
+        let _ = t
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
+            .await;
+        return;
+    }
+    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
+    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
+    // #4: a stable, client-chosen session id binds reconnects to
+    // the same persistent PTY. DEVICE-SCOPED: prefixed with the
+    // verified device so a client id from device A can never
+    // address device B's session (no cross-device collision or
+    // hijack) - the random per-invocation client id then only
+    // needs to be unique per device. Absent (older client) -> a
+    // per-sid id that never reattaches (old behavior).
+    let session_id = match v["session"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+    {
+        Some(s) => format!("{}\u{1}{}", dev.as_deref().unwrap_or(&pid), s),
+        None => format!("{pid}:{sid:#x}"),
+    };
+    // $TERM forwarded by the client (so the remote matches the
+    // user's actual terminal); validated + capped, sane default.
+    let term = v["term"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| b.is_ascii_graphic()))
+        .unwrap_or("xterm-256color")
+        .to_string();
+    // One-shot command (non-empty when pty one-shot was requested).
+    let pty_cmd = v["cmd"].as_str().unwrap_or("").to_string();
+    // RESUME-ONLY (warm-drop fall-through): the client wants to
+    // REATTACH an existing session and never start a fresh shell, so a
+    // clean warm exit can't turn into a surprise re-login.
+    let resume = v["resume"].as_bool().unwrap_or(false);
+    let mux = l2_muxes
+        .entry(pid.clone())
+        .or_insert_with(|| l2::Mux::new(t.clone()))
+        .clone();
+    // #4 REATTACH: a live session for this id means a reconnect.
+    // Rebind its output to THIS link+sid and replay its buffer; do
+    // not spawn a new shell. Register the input pump + resizer for
+    // the new sid so typing and SIGWINCH reach the surviving PTY.
+    if let Some(sess) = pty_sessions.get_live(&session_id).await {
+        if mux.at_stream_cap().await {
+            ui::say("l2: pty reattach refused: too many streams on this link");
+            let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
+                .await;
+            return;
+        }
+        // Collision-safe: if this sid is already live (peer reused
+        // a live forward/pty/mount sid) register refuses; deny the
+        // reattach rather than displacing the existing stream.
+        let Some(rx) = mux.register_stream(sid).await else {
+            ui::say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
+            let _ = t
+                .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
+                .await;
+            return;
+        };
+        let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        mux.register_resizer(sid, rtx).await;
+        let _ = t
+            .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
+            .await;
+        sess.attach(t.clone(), sid);
+        sess.resize(cols, rows);
+        pty_bindings
+            .entry(pid.clone())
+            .or_default()
+            .insert(sid, session_id.clone());
+        spawn_session_pumps(sess.clone(), rx, rrx);
+        ui::say(&format!(
+            "l2: pty REATTACHED to '{}', {cols}x{rows}",
+            dev.unwrap_or_default()
+        ));
+        return;
+    }
+    // Resume-only + no live session: the client is a warm-drop
+    // fall-through and the session is gone (the shell exited cleanly).
+    // Close instead of spawning a fresh shell, so the client exits
+    // cleanly rather than getting a surprise re-login.
+    if resume {
+        let _ = t
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "no such session" }))
+            .await;
+        return;
+    }
+    // H-1 (DoS): refuse over the per-link stream cap or the global
+    // PTY cap BEFORE spawning a shell. A flaky/hostile paired
+    // device can otherwise flood `pty-open` and exhaust threads.
+    if mux.at_stream_cap().await {
+        ui::say("l2: pty refused: too many streams on this link");
+        let _ = t
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
+            .await;
+        return;
+    }
+    let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
+        ui::say(&format!(
+            "l2: pty refused: too many PTYs (global cap {})",
+            l2::MAX_PTYS_GLOBAL
+        ));
+        let _ = t
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" }))
+            .await;
+        return;
+    };
+    // before spawn (race fix). Collision-safe: refuse (don't
+    // displace) if the peer named an already-live sid. `pty_guard`
+    // drops on `continue`, freeing the global PTY slot it reserved.
+    let Some(rx) = mux.register_stream(sid).await else {
+        ui::say(&format!("l2: pty refused: sid {sid:#x} in use"));
+        let _ = t
+            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }))
+            .await;
+        return;
+    };
+    let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+    // Resizer is owned by the mux so it is freed on EVERY teardown
+    // path (inbound l2-close, link death), H-1.
+    mux.register_resizer(sid, rtx).await;
+    let _ = t
+        .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
+        .await;
+    // #4: spawn the PTY as a PERSISTENT session keyed by session_id,
+    // not a link-bound serve_pty. It outlives this link; a drop
+    // detaches it, a reconnect reattaches above.
+    // Resolve the shell and build interactive or one-shot argv.
+    let (shell_argv, _can_use_user) = shell_argv(None, shell_user.as_deref());
+    let host = platform::ShellHost::new(&shell_argv);
+    let argv = if pty_cmd.is_empty() {
+        host.interactive_args()
+    } else {
+        host.exec_cmd_args(&pty_cmd)
+    };
+    // The peer's device key, resolved again for the live session's
+    // revocation re-check (the gate above resolved the same value for
+    // the open decision; this is that same value).
+    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
+    // Ceiling-admitted (covered, grantless) sessions must die
+    // when the ceiling narrows; grant-admitted ones ignore it.
+    let admitted_via_ceiling = gate_inputs.ceiling_covers && !gate_inputs.has_grant;
+    match l2::spawn_pty_session(
+        pty_sessions.clone(),
+        session_id.clone(),
+        t.clone(),
+        sid,
+        cols,
+        rows,
+        &term,
+        argv,
+        pty_guard,
+        spawn_idev,
+        admitted_via_ceiling,
+    )
+    .await
+    {
+        Some(sess) => {
+            pty_bindings
+                .entry(pid.clone())
+                .or_default()
+                .insert(sid, session_id.clone());
+            spawn_session_pumps(sess, rx, rrx);
+            ui::say(&format!(
+                "l2: pty granted to '{}', {cols}x{rows}",
+                dev.unwrap_or_default()
+            ));
+        }
+        None => {
+            // spawn already sent an l2-close{err}; free the stream.
+            mux.drop_pty(sid).await;
+        }
+    }
+}
+
 pub(crate) async fn recv_cmd(
     server: &str,
     mut code: Option<String>,
@@ -3906,152 +4294,15 @@ pub(crate) async fn recv_cmd(
                 Some("l2-close") | Some("l2-open")
                     if l2_enabled || v["type"].as_str() == Some("l2-close") =>
                 {
-                    // TODO(diag acceptor): emit a diag::Attempt with role
-                    // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
-                    // because the acceptor has no per-connect span here: this fires
-                    // on an ALREADY-established shared link inside the big up/recv
-                    // loop (the link's bring-up lives in the file-transfer/recv
-                    // machinery upstream), so a clean span would mean threading an
-                    // Attempt through the whole loop. The initiator path (l2.rs) is
-                    // fully instrumented and is the side that exhibits the stall.
-                    let Some(t) = conn.transport_of(&pid) else {
-                        continue;
-                    };
-                    let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
-                    // Per-device authorization for a NEW open (an l2-close just
-                    // tears a stream down, so it is never gated here). In a blanket
-                    // mode any trusted peer may open; in grant-only mode the opening
-                    // peer must hold the shell grant itself.
-                    let mut l2_deny_reason: Option<String> = None;
-                    let authorized = v["type"].as_str() != Some("l2-open") || {
-                        // Fourth shell-gated path, through the shared gather
-                        // and verdict core like pty/exec/ssh-sign. Two path-
-                        // specific pieces stay HERE, not in the gate: the
-                        // legacy fold (blanket L2 mode has no shell-gate
-                        // equivalent -- dropping it would newly deny default
-                        // setups in shadow) and the bound (expose.json, not
-                        // the enrolment ceiling). A forward --stdio to an
-                        // exposed sshd is shell-equivalent in reach (any byte
-                        // stream, incl. an ssh session).
-                        let (_dev, mut gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
-                            &mut conn,
-                            &pid,
-                            &shell_policy,
-                            crate::capability::CAP_SHELL,
-                        );
-                        // Ports arrive as u64; a value that does not fit u16 is
-                        // not addressable, so deny rather than truncate it into
-                        // a different (possibly exposed) port.
-                        let reach_port = v["rport"]
-                            .as_u64()
-                            .or_else(|| v["port"].as_u64())
-                            .and_then(|p| u16::try_from(p).ok());
-                        let (reach_port, port_ok) = match reach_port {
-                            Some(p) => (p, true),
-                            None => {
-                                l2_deny_reason = Some("port out of range".to_string());
-                                (0, false)
-                            }
-                        };
-                        gate_inputs.ceiling_covers = reach_port != 0
-                            && crate::expose::load().iter().any(|b| b.port == reach_port);
-                        let legacy_ok = {
-                            let blanket = shell_policy.enables_l2()
-                                || std::env::var("FILAMENT_L2")
-                                    .map(|x| x == "1")
-                                    .unwrap_or(false);
-                            let (peer_has_shell, peer_denied) = conn
-                                .link(&pid)
-                                .and_then(|l| l.verified_name.as_deref())
-                                .map(|n| {
-                                    (
-                                        device_allows(n, "shell"),
-                                        device_capability_denied(n, "shell"),
-                                    )
-                                })
-                                .unwrap_or((false, false));
-                            l2_open_allowed(blanket, peer_has_shell, peer_denied)
-                        };
-                        let d = crate::shell_gate::forward_gate_decision(&gate_inputs, legacy_ok);
-                        if let Err(Some(r)) = &d {
-                            l2_deny_reason = Some(r.clone());
-                        }
-                        // port_ok is ANDed last: an out-of-range port denies
-                        // even for a granted peer (there is nothing valid to
-                        // open), while keeping the recorded reason specific.
-                        d.is_ok() && port_ok
-                    };
-                    if !authorized {
-                        // wire_sid (not a wrapping cast) so the l2-close we echo
-                        // back names the real sid; 0 only if absent/out-of-range.
-                        let sid = l2::wire_sid(&v).unwrap_or(0);
-                        let diag = l2_deny_reason
-                            .as_deref()
-                            .unwrap_or("device not granted shell");
-                        ui::say(&format!("l2: refused stream {sid:#x}: {diag}"));
-                        let _ = t
-                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "not authorized: device lacks shell grant" }))
-                            .await;
-                    } else {
-                        // Opt-in gateway: if the target is non-loopback, allow it
-                        // only when the operator's l2-allow.json lists it for this
-                        // device (or "*"). Loopback ignores this (always allowed).
-                        let allow_nonloopback = {
-                            let host = v["host"].as_str().unwrap_or("127.0.0.1");
-                            // Same truncation rule as the gate above: an
-                            // out-of-range port matches no allowlist entry.
-                            let port = v["rport"]
-                                .as_u64()
-                                .or_else(|| v["port"].as_u64())
-                                .and_then(|p| u16::try_from(p).ok())
-                                .unwrap_or(0);
-                            let name = conn
-                                .link(&pid)
-                                .and_then(|l| l.verified_name.clone())
-                                .unwrap_or_default();
-                            l2_target_allowed(&name, host, port)
-                        };
-                        let mux = l2_muxes
-                            .entry(pid.clone())
-                            .or_insert_with(|| l2::Mux::new(t.clone()))
-                            .clone();
-                        match mux.accept_control(&v, trusted, allow_nonloopback).await {
-                            l2::OpenVerdict::Accept {
-                                sid,
-                                host,
-                                port,
-                                rx,
-                            } => {
-                                // The peer's device key, resolved again for the live
-                                // stream's revocation re-check (the gate above resolved
-                                // the same value for the open decision).
-                                let spawn_idev =
-                                    conn.link(&pid).and_then(|l| l.identity_device_pub);
-                                tokio::spawn(
-                                    mux.clone().dial_and_serve(sid, host, port, rx, spawn_idev),
-                                );
-                            }
-                            l2::OpenVerdict::Deny { sid, err } => {
-                                // Log refused dials at INFO (visible by default,
-                                // suppressed under -q) - a refused SSRF/port-scan or
-                                // untrusted/over-cap open is a security event the
-                                // operator should see, mirroring the
-                                // shell-bootstrap-deny path (`ui::say`). Normal
-                                // initiators always dial 127.0.0.1, so this is silent
-                                // in normal operation and only fires on an anomaly.
-                                ui::say(&format!("l2: refused stream {sid:#x}: {err}"));
-                                let _ = t
-                                    .send_control(
-                                        &json!({ "type": "l2-close", "sid": sid, "err": err }),
-                                    )
-                                    .await;
-                            }
-                            l2::OpenVerdict::Ignore => {}
-                        }
-                    }
-                    // A PTY stream closing frees its resize channel, handled by
-                    // the mux's `on_close`/`drop_stream` (H-1: resizer is owned by
-                    // the mux now, so it can't leak past the stream).
+                    handle_forward_open(
+                        &mut conn,
+                        pid.clone(),
+                        &v,
+                        &shell_policy,
+                        &mut l2_muxes,
+                        l2_enabled,
+                    )
+                    .await;
                 }
                 // Seamless-shell bootstrap (acceptor). Opt-in (FILAMENT_L2=1).
                 // DENY-BY-DEFAULT: install the initiator's managed pubkey ONLY
@@ -4358,225 +4609,18 @@ pub(crate) async fn recv_cmd(
                 // shell-bootstrap, a PTY is a superset of ssh-key access, so it
                 // reuses the `shell` cap / --shell policy and requires `trusted`.
                 Some("pty-open") => {
-                    let Some(t) = conn.transport_of(&pid) else {
-                        continue;
-                    };
-                    // #219: the acceptor is OFF (plain `up`, no --shell/--shell-only,
-                    // no FILAMENT_L2). The peer is visibly up but cannot serve a
-                    // shell, and dropping the open silently made `shell` hang with
-                    // no output. Say so, so the initiator errors instead of waiting.
-                    if !l2_enabled {
-                        let sid = l2::wire_sid(&v).unwrap_or(0);
-                        let _ = t
-                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": "shell serving is off there; run `filament up --shell` on that device" }))
-                            .await;
-                        continue;
-                    }
-                    // wire_sid rejects a missing OR out-of-range sid instead of
-                    // defaulting to 0 / wrapping into a forged is_l2_sid value.
-                    let Some(sid) = l2::wire_sid(&v) else {
-                        continue;
-                    };
-                    if !l2::is_l2_sid(sid) {
-                        continue;
-                    }
-                    // One shared shell gate (same function, same inputs as
-                    // exec-open): gather, then the pty entry point. The tells
-                    // below stay local; only the verdict is shared.
-                    let (dev, gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
+                    handle_pty_open(
                         &mut conn,
-                        &pid,
+                        pid.clone(),
+                        &v,
                         &shell_policy,
-                        crate::capability::CAP_SHELL,
-                    );
-                    if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
-                        let who = dev.as_deref().unwrap_or("<unverified>");
-                        ui::say(&format!(
-                            "l2: pty refused: {who}: {}",
-                            cap_reason.as_deref().unwrap_or("no shell cap / untrusted")
-                        ));
-                        enqueue_if_requestable(who, "shell");
-                        // Carry the specific cap reason (e.g. CEILING_REASON,
-                        // "device revoked") to the peer; the generic string was
-                        // produced and then thrown away before it crossed the wire,
-                        // so the initiator read an empty success instead of the
-                        // refusal. The fallback stays coarse on purpose.
-                        let reason = cap_reason
-                            .unwrap_or_else(|| "shell capability not granted".to_string());
-                        let _ = t
-                            .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
-                            .await;
-                        continue;
-                    }
-                    let cols = v["cols"].as_u64().unwrap_or(80) as u16;
-                    let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                    // #4: a stable, client-chosen session id binds reconnects to
-                    // the same persistent PTY. DEVICE-SCOPED: prefixed with the
-                    // verified device so a client id from device A can never
-                    // address device B's session (no cross-device collision or
-                    // hijack) - the random per-invocation client id then only
-                    // needs to be unique per device. Absent (older client) -> a
-                    // per-sid id that never reattaches (old behavior).
-                    let session_id = match v["session"]
-                        .as_str()
-                        .filter(|s| !s.is_empty() && s.len() <= 128)
-                    {
-                        Some(s) => format!("{}\u{1}{}", dev.as_deref().unwrap_or(&pid), s),
-                        None => format!("{pid}:{sid:#x}"),
-                    };
-                    // $TERM forwarded by the client (so the remote matches the
-                    // user's actual terminal); validated + capped, sane default.
-                    let term = v["term"]
-                        .as_str()
-                        .filter(|s| {
-                            !s.is_empty()
-                                && s.len() <= 64
-                                && s.bytes().all(|b| b.is_ascii_graphic())
-                        })
-                        .unwrap_or("xterm-256color")
-                        .to_string();
-                    // One-shot command (non-empty when pty one-shot was requested).
-                    let pty_cmd = v["cmd"].as_str().unwrap_or("").to_string();
-                    // RESUME-ONLY (warm-drop fall-through): the client wants to
-                    // REATTACH an existing session and never start a fresh shell, so a
-                    // clean warm exit can't turn into a surprise re-login.
-                    let resume = v["resume"].as_bool().unwrap_or(false);
-                    let mux = l2_muxes
-                        .entry(pid.clone())
-                        .or_insert_with(|| l2::Mux::new(t.clone()))
-                        .clone();
-                    // #4 REATTACH: a live session for this id means a reconnect.
-                    // Rebind its output to THIS link+sid and replay its buffer; do
-                    // not spawn a new shell. Register the input pump + resizer for
-                    // the new sid so typing and SIGWINCH reach the surviving PTY.
-                    if let Some(sess) = pty_sessions.get_live(&session_id).await {
-                        if mux.at_stream_cap().await {
-                            ui::say("l2: pty reattach refused: too many streams on this link");
-                            let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
-                            continue;
-                        }
-                        // Collision-safe: if this sid is already live (peer reused
-                        // a live forward/pty/mount sid) register refuses; deny the
-                        // reattach rather than displacing the existing stream.
-                        let Some(rx) = mux.register_stream(sid).await else {
-                            ui::say(&format!("l2: pty reattach refused: sid {sid:#x} in use"));
-                            let _ = t
-                                .send_control(
-                                    &json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }),
-                                )
-                                .await;
-                            continue;
-                        };
-                        let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-                        mux.register_resizer(sid, rtx).await;
-                        let _ = t
-                            .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
-                            .await;
-                        sess.attach(t.clone(), sid);
-                        sess.resize(cols, rows);
-                        pty_bindings
-                            .entry(pid.clone())
-                            .or_default()
-                            .insert(sid, session_id.clone());
-                        spawn_session_pumps(sess.clone(), rx, rrx);
-                        ui::say(&format!(
-                            "l2: pty REATTACHED to '{}', {cols}x{rows}",
-                            dev.unwrap_or_default()
-                        ));
-                        continue;
-                    }
-                    // Resume-only + no live session: the client is a warm-drop
-                    // fall-through and the session is gone (the shell exited cleanly).
-                    // Close instead of spawning a fresh shell, so the client exits
-                    // cleanly rather than getting a surprise re-login.
-                    if resume {
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "no such session" })).await;
-                        continue;
-                    }
-                    // H-1 (DoS): refuse over the per-link stream cap or the global
-                    // PTY cap BEFORE spawning a shell. A flaky/hostile paired
-                    // device can otherwise flood `pty-open` and exhaust threads.
-                    if mux.at_stream_cap().await {
-                        ui::say("l2: pty refused: too many streams on this link");
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
-                        continue;
-                    }
-                    let Some(pty_guard) = l2::PtyGuard::try_acquire() else {
-                        ui::say(&format!(
-                            "l2: pty refused: too many PTYs (global cap {})",
-                            l2::MAX_PTYS_GLOBAL
-                        ));
-                        let _ = t.send_control(&json!({ "type": "l2-close", "sid": sid, "err": "too many streams" })).await;
-                        continue;
-                    };
-                    // before spawn (race fix). Collision-safe: refuse (don't
-                    // displace) if the peer named an already-live sid. `pty_guard`
-                    // drops on `continue`, freeing the global PTY slot it reserved.
-                    let Some(rx) = mux.register_stream(sid).await else {
-                        ui::say(&format!("l2: pty refused: sid {sid:#x} in use"));
-                        let _ = t
-                            .send_control(
-                                &json!({ "type": "l2-close", "sid": sid, "err": "sid in use" }),
-                            )
-                            .await;
-                        continue;
-                    };
-                    let (rtx, rrx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
-                    // Resizer is owned by the mux so it is freed on EVERY teardown
-                    // path (inbound l2-close, link death), H-1.
-                    mux.register_resizer(sid, rtx).await;
-                    let _ = t
-                        .send_control(&json!({ "type": "pty-open-ack", "sid": sid }))
-                        .await;
-                    // #4: spawn the PTY as a PERSISTENT session keyed by session_id,
-                    // not a link-bound serve_pty. It outlives this link; a drop
-                    // detaches it, a reconnect reattaches above.
-                    // Resolve the shell and build interactive or one-shot argv.
-                    let (shell_argv, _can_use_user) = shell_argv(None, shell_user.as_deref());
-                    let host = platform::ShellHost::new(&shell_argv);
-                    let argv = if pty_cmd.is_empty() {
-                        host.interactive_args()
-                    } else {
-                        host.exec_cmd_args(&pty_cmd)
-                    };
-                    // The peer's device key, resolved again for the live session's
-                    // revocation re-check (the gate above resolved the same value for
-                    // the open decision; this is that same value).
-                    let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
-                    // Ceiling-admitted (covered, grantless) sessions must die
-                    // when the ceiling narrows; grant-admitted ones ignore it.
-                    let admitted_via_ceiling = gate_inputs.ceiling_covers && !gate_inputs.has_grant;
-                    match l2::spawn_pty_session(
-                        pty_sessions.clone(),
-                        session_id.clone(),
-                        t.clone(),
-                        sid,
-                        cols,
-                        rows,
-                        &term,
-                        argv,
-                        pty_guard,
-                        spawn_idev,
-                        admitted_via_ceiling,
+                        &shell_user,
+                        &pty_sessions,
+                        &mut l2_muxes,
+                        &mut pty_bindings,
+                        l2_enabled,
                     )
-                    .await
-                    {
-                        Some(sess) => {
-                            pty_bindings
-                                .entry(pid.clone())
-                                .or_default()
-                                .insert(sid, session_id.clone());
-                            spawn_session_pumps(sess, rx, rrx);
-                            ui::say(&format!(
-                                "l2: pty granted to '{}', {cols}x{rows}",
-                                dev.unwrap_or_default()
-                            ));
-                        }
-                        None => {
-                            // spawn already sent an l2-close{err}; free the stream.
-                            mux.drop_pty(sid).await;
-                        }
-                    }
+                    .await;
                 }
                 // Remote command execution: parse, shell-gate, direct-spawn
                 // and serve. The module sends its own ack/close/refusal
