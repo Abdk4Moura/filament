@@ -189,9 +189,18 @@ pub(crate) async fn issue_proven_challenge_and_hold(
     // before the await — never hold a std Mutex across .await).
     {
         let mut pend = pending_proven.lock().unwrap();
-        if let Some((_, deadline)) = pend.get(pid) {
-            if Instant::now() < *deadline {
-                return; // challenge already in flight; do not clobber its nonce
+        // A hold counts as live only when it is BOTH unexpired AND bound to
+        // the link we would send on now. A hold recorded for a transport
+        // that has since been replaced (reconnect/repair re-adopts the pid
+        // with a new transport) is unusable: the peer's answer would arrive
+        // on the new link while the nonce it used was issued for the old
+        // one, so the proof could never land and the link would never reach
+        // Proven. Treat that exactly like an expired hold -- re-challenge --
+        // which is what makes a parked open's wait terminate in a proof
+        // instead of a timeout.
+        if let Some((held_t, deadline)) = pend.get(pid) {
+            if Instant::now() < *deadline && Arc::ptr_eq(held_t, t) {
+                return; // challenge already in flight on THIS link; do not clobber its nonce
             }
         }
         pend.insert(

@@ -3997,8 +3997,14 @@ pub(crate) async fn recv_cmd(
                                             // name -- the store keys on the sanitized
                                             // form, so "laptop " or control-char variants
                                             // must match "laptop" here, not slip past to
-                                            // land on it in the write below.
-                                            let shown = crate::sanitize_device_name(&shown);
+                                            // land on it in the write below. Bounded to
+                                            // the same length the other network-supplied
+                                            // strings get: the name is peer-controlled, and
+                                            // an unbounded one would be a log/record flood.
+                                            let shown: String = crate::sanitize_device_name(&shown)
+                                                .chars()
+                                                .take(64)
+                                                .collect();
                                             // A claimed name matching an EXISTING record
                                             // is never indexed under. The store pin
                                             // below would refuse the write anyway; this
