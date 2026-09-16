@@ -211,6 +211,60 @@ pub(crate) async fn issue_proven_challenge_and_hold(
     send_identity_challenge(conn, pid, identity_nonces).await;
 }
 
+/// Re-send the challenge already held for this link, SAME nonce: idempotent
+/// for the peer, and the reason it exists is a measurement -- installing a
+/// fresh nonce on every retry races the peer's reply whenever the reply's
+/// RTT exceeds the retry cadence (200-400ms on relay paths), which drops
+/// every answer and trades a deterministic timeout for a probabilistic one.
+/// A fresh nonce is minted only when the held one has expired or belongs to
+/// a different transport (see the settle caller).
+pub(crate) async fn resend_identity_challenge(
+    conn: &crate::Conn,
+    pid: &str,
+    identity_nonces: &std::collections::HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) -> bool {
+    let Some((nonce, _issued, recv_dpub)) = identity_nonces.get(pid) else {
+        return false;
+    };
+    let Some(t) = conn.transport_of(pid) else {
+        return false;
+    };
+    let challenge = serde_json::json!({
+        "type": "identity-nonce-challenge",
+        "nonce": hex::encode(nonce),
+        "receiver_device_pub": hex::encode(recv_dpub)
+    });
+    let _ = t.send_control(&challenge).await;
+    true
+}
+
+/// A dropped proof is a SECURITY verdict and must never be invisible -- but
+/// it is also peer-triggerable, so it is deduped per (link, reason) with a
+/// cap: the operator sees the first one (at default level, like the other
+/// refusals), and a peer replaying bad exposes cannot flood the log.
+fn drop_once(pid: &str, why: &str) {
+    const DROP_ONCE_CAP: usize = 512;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut g) = seen.lock() {
+        let key = format!("{pid}|{why}");
+        if g.contains(&key) || g.len() >= DROP_ONCE_CAP {
+            return;
+        }
+        g.insert(key);
+    }
+    crate::ui::say(&format!(
+        "l2: identity-expose dropped for {pid}: {why} (not repeated for this link)"
+    ));
+}
+
+/// Whether a recorded challenge hold has served its whole deadline. Pure so
+/// the expiry rule is testable without a Conn or a sleeping test.
+pub(crate) fn hold_expired(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
 /// #161: how long the possession challenge stays LIVE. Must be raised in
 /// lockstep with the offer hold (RECV_IDENTITY_HOLD_DEADLINE) and the nonce
 /// lifetime: if the challenge entry expires first, a re-issue clobbers the
@@ -235,7 +289,8 @@ pub(crate) fn handle_identity_expose(
     // indistinguishable from a link nobody challenged: the whole identity
     // path looked idle while a peer's proof was being discarded. Debug
     // level, so it costs nothing unless asked for.
-    let fail = |why: &str| {
+    let fail = |why: &'static str| {
+        drop_once(pid, why);
         crate::ui::debug(&format!("identity-expose dropped for {pid}: {why}"));
         false
     };

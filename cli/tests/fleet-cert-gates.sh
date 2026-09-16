@@ -389,11 +389,20 @@ PY
   OUTI=$(timeout 60 "${M_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/I-$tag.err" </dev/null)
   [ "$?" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
   echo "## (impostor $tag) refused=$refused intact=$intact execref=$execref"
-  if [ "$refused" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
-    ok "gateI-$tag: squat as '$variant' refused, victim byte-identical, exec refused"
+  # TWO verdicts on purpose. CONTAINMENT is what the gate is for (the victim
+  # record is untouched and the squatting peer cannot exec); the refusal LINE
+  # is a separate assertion, so a log-plumbing or log-level difference between
+  # environments can neither fake a pass nor mask a containment failure.
+  if [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
+    ok "gateI-$tag: squat as '$variant' CONTAINED (victim byte-identical, exec refused)"
   else
     echo "-- owner log --"; grep -i "not indexed\|fleet peer" "$WORK/up.log" | tail -3
-    bad "gateI-$tag: impostor as '$variant' NOT contained (refused=$refused intact=$intact execref=$execref)"
+    bad "gateI-$tag: impostor as '$variant' NOT contained (intact=$intact execref=$execref refused=$refused)"
+  fi
+  if [ "$refused" = "1" ]; then
+    ok "gateI-$tag: transplant refusal logged ('not indexed' line seen)"
+  else
+    bad "gateI-$tag: transplant refusal line NOT logged (containment held; the log level or plumbing differs)"
   fi
 }
 say "I1: exact-name squat refused"

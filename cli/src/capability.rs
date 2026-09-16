@@ -426,6 +426,13 @@ pub fn cap_fleet_inputs(
 /// decision. `binding` and `cert_expires` are transport/policy facts composed under
 /// authoritative (purely restrictive).
 #[allow(clippy::too_many_arguments)]
+/// Whether this decision belongs to the ceiling-admitted population: the
+/// opens the authoritative flip newly permits WITHOUT an explicit grant.
+/// Pure, so the accounting rule is unit-testable.
+pub fn ceiling_admitted_class(ceiling_ok: bool, has_explicit_grant: bool) -> bool {
+    ceiling_ok && !has_explicit_grant
+}
+
 pub fn cap_gate_effective(
     legacy_allowed: bool,
     outcome: &CapOutcome,
@@ -612,7 +619,12 @@ pub fn cap_gate_effective(
             cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
             CapOutcome::Authorized
         );
-    if fleet_allow && !has_explicit_grant {
+    // Counted on the CEILING's own precondition, mode-independently: the
+    // population the flip newly permits is "covered by the owner-signed
+    // enrolment ceiling, with no explicit grant", and it must be visible in
+    // shadow too -- that is the number the flip review cites. (`fleet_allow`
+    // is the wrong source here: it is mode-dependent for this class.)
+    if ceiling_admitted_class(ceiling_ok, has_explicit_grant) {
         CEILING_ADMITTED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -848,6 +860,17 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ceiling_admitted_counts_the_covered_ungranted_class() {
+        // The flip-review population: covered by the owner-signed ceiling and
+        // NOT separately granted. A granted covered device belongs to the
+        // grant population, not this one.
+        assert!(super::ceiling_admitted_class(true, false));
+        assert!(!super::ceiling_admitted_class(true, true));
+        assert!(!super::ceiling_admitted_class(false, false));
+        assert!(!super::ceiling_admitted_class(false, true));
+    }
+
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};

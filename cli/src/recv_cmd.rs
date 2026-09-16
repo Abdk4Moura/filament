@@ -1944,9 +1944,38 @@ pub(crate) async fn recv_cmd(
                     .lock()
                     .unwrap()
                     .get(&p.pid)
-                    .map(|(held_t, deadline)| now < *deadline && Arc::ptr_eq(held_t, &t))
+                    .map(|(held_t, deadline)| {
+                        !crate::identity_lifecycle::hold_expired(*deadline, now)
+                            && Arc::ptr_eq(held_t, &t)
+                    })
                     .unwrap_or(false);
-                if held_same_link && !retry_due {
+                // A held nonce is still usable: RE-SEND the same challenge
+                // (idempotent for the peer, and it cannot race the reply the
+                // way a fresh nonce would). A fresh nonce is minted only when
+                // the hold is absent, expired, or belonged to another
+                // transport, which is exactly when the old nonce is dead.
+                let nonce_alive = identity_nonces
+                    .get(&p.pid)
+                    .map(|(_, issued, _)| {
+                        now.duration_since(*issued)
+                            < crate::identity_lifecycle::PROVEN_CHALLENGE_DEADLINE
+                    })
+                    .unwrap_or(false);
+                if held_same_link && nonce_alive {
+                    if retry_due {
+                        if crate::identity_lifecycle::resend_identity_challenge(
+                            &conn,
+                            &p.pid,
+                            &identity_nonces,
+                        )
+                        .await
+                        {
+                            crate::ui::debug(&format!(
+                                "settle: re-sent the held identity challenge to {}",
+                                p.pid
+                            ));
+                        }
+                    }
                     continue;
                 }
                 issue_proven_challenge_and_hold(
@@ -1957,6 +1986,28 @@ pub(crate) async fn recv_cmd(
                     &mut identity_nonces,
                 )
                 .await;
+                // The hold must not outlive its own deadline: the readiness
+                // sites spawn this timer, and the settle re-drive has to as
+                // well, or an expired hold lingers and suppresses later
+                // challenges for the same link. Remove only if the deadline
+                // we just installed is the one still there (a newer hold for
+                // the same link must survive our timer).
+                let pending = st.pending_proven.clone();
+                let hold_pid = p.pid.clone();
+                let installed = st
+                    .pending_proven
+                    .lock()
+                    .unwrap()
+                    .get(&hold_pid)
+                    .map(|(_, d)| *d)
+                    .unwrap_or_else(Instant::now);
+                tokio::spawn(async move {
+                    tokio::time::sleep(crate::identity_lifecycle::PROVEN_CHALLENGE_DEADLINE).await;
+                    let mut m = pending.lock().unwrap();
+                    if m.get(&hold_pid).map(|(_, d)| *d) == Some(installed) {
+                        m.remove(&hold_pid);
+                    }
+                });
             }
             for p in fire {
                 crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
@@ -4502,13 +4553,21 @@ pub(crate) async fn recv_cmd(
                 Some("identity-nonce-challenge") => {
                     // #30: shared responder (also used by send_cmd) proves
                     // device-key possession so the challenger upgrades us to Proven.
-                    if let Some(t) = conn.transport_of(&pid) {
-                        respond_to_identity_challenge(&t, &v).await;
+                    // A challenge that cannot be answered because the link has no
+                    // transport is a DROP, and it used to be silent: the challenger
+                    // then times out while we look idle, which is exactly the
+                    // asymmetry that made an unprovable link invisible.
+                    match conn.transport_of(&pid) {
+                        Some(t) => respond_to_identity_challenge(&t, &v).await,
+                        None => crate::ui::say(&format!(
+                            "l2: identity challenge received for {pid} but that link has no transport; not answered"
+                        )),
                     }
                 }
                 // #30: received possession-sig from peer after our challenge.
                 // Verify, upgrade binding to Proven so capability gates pass.
                 Some("identity-expose") => {
+                    crate::ui::debug(&format!("identity-expose received on {pid}"));
                     if handle_identity_expose(&mut conn, &pid, &v, &mut identity_nonces) {
                         // Release held ChannelReady — Proven settled before timeout.
                         if let Some((held_t, _deadline)) =
@@ -7190,6 +7249,24 @@ mod settle_tests {
         assert!(matches!(
             sweep_arm(key_a, 7, None, now, deadline),
             SweepArm::Dropped
+        ));
+    }
+
+    /// A hold must expire on its own deadline: the settle re-drive installs
+    /// one and spawns a removal timer, and the pure rule behind both is this.
+    #[test]
+    fn challenge_hold_expires_at_its_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(20);
+        assert!(!crate::identity_lifecycle::hold_expired(deadline, now));
+        assert!(!crate::identity_lifecycle::hold_expired(
+            deadline,
+            now + Duration::from_secs(19)
+        ));
+        assert!(crate::identity_lifecycle::hold_expired(deadline, deadline));
+        assert!(crate::identity_lifecycle::hold_expired(
+            deadline,
+            deadline + Duration::from_secs(1)
         ));
     }
 
