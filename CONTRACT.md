@@ -531,6 +531,16 @@ for a hold to bind to.
 - Applies to exec-open, pty-open, ssh-sign-request and l2-open (forward).
   Forward parses and validates its port range BEFORE the gate, so an
   out-of-range port keeps its own immediate denial instead of parking.
+- AUTO-TRUST CLASSES, DISTINCT ON PURPOSE: `scoped_in_bounds` is the
+  SCOPE DEFAULT class (a transfer into the drop dir, a forward to an exposed
+  port) and has always auto-authorized a same-owner Proven device in BOTH
+  modes. The enrolment CEILING is a separate input and authorizes a
+  deliberate-tier action (shell/exec/pty/ssh-sign) only in authoritative
+  mode. It still counts as *would-allow* in shadow accounting, because the
+  flip PERMITS those opens rather than breaking them: classifying them as
+  denials produced a false BREAKAGE alarm on a population the flip is meant
+  to admit. Shadow decisions are unchanged by construction -- shadow always
+  decides on the legacy fold.
 - KNOWN DEVIATION, deliberate: for ssh-sign the settle denials use their
   own retryable reasons rather than the intentionally-generic "ssh-sign
   refused". The generic wording exists so a denied peer cannot oracle which

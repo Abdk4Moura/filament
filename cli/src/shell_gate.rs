@@ -38,8 +38,15 @@ pub(crate) struct ShellGateInputs {
     pub action: String,
     /// Whether the peer's persisted, owner-signed enrolment ceiling covers
     /// the gated action. Gathered fresh (never cached) via
-    /// `ceiling_covers_action`, keyed by verified device identity.
+    /// `ceiling_covers_action`, keyed by verified device identity. Feeds the
+    /// engine's `ceiling_authorizes`, which decides only under authoritative
+    /// mode (shadow must decide exactly as it did before this feature).
     pub ceiling_covers: bool,
+    /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
+    /// forward to an exposed port). Distinct from the ceiling: this class has
+    /// always auto-authorized same-owner Proven devices in BOTH modes.
+    /// False for the shell-class paths, which are deliberate-tier.
+    pub scoped_default: bool,
 }
 
 /// Gather from live state. Both call sites use this; nothing gate-relevant
@@ -94,6 +101,7 @@ pub(crate) fn gather_shell_gate_inputs(
         has_grant,
         cert_revoked,
         ceiling_covers,
+        scoped_default: false,
         action: action.to_string(),
     };
     (dev, inputs)
@@ -116,12 +124,10 @@ fn decide(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
 /// which the shell fold cannot express -- dropping it would newly deny
 /// default setups in shadow). Same engine, same inputs otherwise.
 fn decide_with_legacy(inputs: &ShellGateInputs, legacy_ok: bool) -> Result<(), Option<String>> {
-    // The enrolment-ceiling substitution is an AUTHORITATIVE-mode behavior
-    // only: in shadow the gate decides exactly as before this change (the
-    // flip is the moment covered-without-grant opens become allows, never
-    // before). Gating here rather than in the engine keeps every other
-    // caller (transfer, forward) on its existing mode behavior.
-    let scoped = inputs.ceiling_covers && crate::capability::cap_authoritative();
+    // Two auto-trust classes travel separately: `scoped_default` (mode
+    // independent, pre-existing) and `ceiling_covers` (authoritative-only
+    // for the decision; counted as would-allow in shadow so the ceiling
+    // population is not mistaken for breakage).
     let granted = crate::capability::cap_gate_effective(
         legacy_ok,
         &inputs.outcome,
@@ -133,10 +139,11 @@ fn decide_with_legacy(inputs: &ShellGateInputs, legacy_ok: bool) -> Result<(), O
         inputs.expires,
         inputs.ak_caps.as_deref(),
         inputs.own_user.as_ref(),
-        scoped,
+        inputs.scoped_default,
         inputs.has_grant,
         inputs.cert_revoked,
         inputs.denied,
+        inputs.ceiling_covers,
     );
     match granted {
         GateDecision::Allow => Ok(()),
@@ -244,6 +251,7 @@ mod tests {
                                             has_grant,
                                             cert_revoked,
                                             ceiling_covers,
+                                            scoped_default: false,
                                             action: CAP_SHELL.to_string(),
                                         };
                                         let e = exec_gate_decision(&inputs);

@@ -303,8 +303,11 @@ async fn handle_forward_open(
             &shell_policy,
             crate::capability::CAP_SHELL,
         );
-        gate_inputs.ceiling_covers =
+        // Forward's auto-trust bound is the EXPOSE list (a scoped default,
+        // mode-independent); the enrolment ceiling plays no part here.
+        gate_inputs.scoped_default =
             reach_port != 0 && crate::expose::load().iter().any(|b| b.port == reach_port);
+        gate_inputs.ceiling_covers = false;
         let legacy_ok = {
             let blanket = shell_policy.enables_l2()
                 || std::env::var("FILAMENT_L2")
@@ -1897,6 +1900,33 @@ pub(crate) async fn recv_cmd(
                             }))
                             .await;
                     }
+                }
+            }
+            // An open can outlive the challenge issued for it: the link may
+            // have churned (re-adopted pid, replaced transport) between the
+            // challenge and the park, and a proof nobody solicited never
+            // arrives. Re-issue while it waits; the issuer dedupes on a LIVE
+            // hold, so this cannot clobber an in-flight nonce.
+            for p in &parked_opens {
+                let held = st
+                    .pending_proven
+                    .lock()
+                    .unwrap()
+                    .get(&p.pid)
+                    .map(|(_, deadline)| now < *deadline)
+                    .unwrap_or(false);
+                if held {
+                    continue;
+                }
+                if let Some(t) = conn.transport_of(&p.pid) {
+                    issue_proven_challenge_and_hold(
+                        &conn,
+                        &p.pid,
+                        &t,
+                        &st.pending_proven,
+                        &mut identity_nonces,
+                    )
+                    .await;
                 }
             }
             for p in fire {
@@ -3989,8 +4019,12 @@ pub(crate) async fn recv_cmd(
                                             })
                                             .unwrap_or(false);
                                             if name_taken {
-                                                ui::debug(&format!(
-                                                    "fleet peer claiming existing name '{shown}' not indexed: this is not the device paired under that name"
+                                                // A REFUSAL, not chatter: a peer tried to
+                                                // take over another device's identity. Visible
+                                                // at the default level (like the other
+                                                // refusals the gates assert on), not debug.
+                                                ui::say(&format!(
+                                                    "l2: fleet peer claiming existing name '{shown}' not indexed: this is not the device paired under that name"
                                                 ));
                                             } else if let Some(cert) =
                                                 identity::DeviceCert::from_json(&v["cert"])
@@ -4875,6 +4909,7 @@ pub(crate) async fn recv_cmd(
                                 has_grant,
                                 cert_revoked,
                                 denied,
+                                false,
                             )
                         }
                     };
@@ -5148,6 +5183,7 @@ pub(crate) async fn recv_cmd(
                             mount_scoped_default,
                             has_grant,
                             cert_revoked,
+                            false,
                             false,
                         );
                         (d, read_only)
@@ -5978,6 +6014,7 @@ pub(crate) async fn recv_cmd(
                             scoped_in_bounds,
                             has_grant,
                             cert_revoked,
+                            false,
                             false,
                         );
                         let reason =
