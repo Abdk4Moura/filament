@@ -1868,14 +1868,13 @@ pub(crate) async fn recv_cmd(
             // the new link -- sending there would kill someone else's
             // stream. When the generation moved, the denial is local-only
             // (the peer's own stream died with its old link anyway).
-            let can_answer =
-                |p: &ParkedOpen| conn.link(&p.pid).map(|l| l.generation) == Some(p.generation);
+
             for p in expire {
                 crate::ui::say(&format!(
                     "l2: {:?} open timed out settling ({}ms); denying",
                     p.kind, p.settle_ms,
                 ));
-                if can_answer(&p) {
+                if conn.link(&p.pid).map(|l| l.generation) == Some(p.generation) {
                     if let Some(t) = conn.transport_of(&p.pid) {
                         let _ = t
                             .send_control(&serde_json::json!({
@@ -1891,10 +1890,19 @@ pub(crate) async fn recv_cmd(
                         p.kind
                     ));
                 }
+                // The link just failed its own identity probe for the whole
+                // window, which is the strongest evidence we get that it is
+                // stale (a live peer answers in milliseconds; observed live:
+                // the peer answers, the frame never arrives, because the
+                // connection it answers on is not the one we hold). Dropping
+                // it stops `warm_link_for` from selecting it again, so the
+                // caller's retry -- we send a RETRYABLE reason -- establishes
+                // a fresh link instead of parking on the same corpse.
+                conn.drop_link(&p.pid);
             }
             for (p, reason) in stale {
                 crate::ui::say(&format!("l2: {:?} open dropped: {reason}", p.kind));
-                if can_answer(&p) {
+                if conn.link(&p.pid).map(|l| l.generation) == Some(p.generation) {
                     if let Some(t) = conn.transport_of(&p.pid) {
                         let _ = t
                             .send_control(&serde_json::json!({
