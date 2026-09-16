@@ -1908,26 +1908,33 @@ pub(crate) async fn recv_cmd(
             // arrives. Re-issue while it waits; the issuer dedupes on a LIVE
             // hold, so this cannot clobber an in-flight nonce.
             for p in &parked_opens {
+                let Some(t) = conn.transport_of(&p.pid) else {
+                    continue;
+                };
+                // "Already challenged" means live AND on THIS transport --
+                // the same rule the issuer applies. Checking liveness alone
+                // made the issuer's transport check unreachable from here,
+                // so a hold recorded for a replaced link suppressed the
+                // re-challenge that would have let the park terminate in a
+                // proof instead of a timeout.
                 let held = st
                     .pending_proven
                     .lock()
                     .unwrap()
                     .get(&p.pid)
-                    .map(|(_, deadline)| now < *deadline)
+                    .map(|(held_t, deadline)| now < *deadline && Arc::ptr_eq(held_t, &t))
                     .unwrap_or(false);
                 if held {
                     continue;
                 }
-                if let Some(t) = conn.transport_of(&p.pid) {
-                    issue_proven_challenge_and_hold(
-                        &conn,
-                        &p.pid,
-                        &t,
-                        &st.pending_proven,
-                        &mut identity_nonces,
-                    )
-                    .await;
-                }
+                issue_proven_challenge_and_hold(
+                    &conn,
+                    &p.pid,
+                    &t,
+                    &st.pending_proven,
+                    &mut identity_nonces,
+                )
+                .await;
             }
             for p in fire {
                 crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
