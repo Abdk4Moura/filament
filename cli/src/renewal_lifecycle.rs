@@ -110,7 +110,18 @@ pub(crate) async fn respond_to_cert_renew_request(conn: &mut Conn, pid: String) 
             // see is how "renews in 87d" became a lie the first time.
             if let Some(record) = devices_find_by_device_pub(&device_pub) {
                 if let Some(name) = record["name"].as_str() {
-                    let _ = devices_upsert_atomic(name, None, Some(&fresh), None, None, None, None);
+                    // Strict: renewal must never re-anchor (the proven link
+                    // key always matches the pinned record in production).
+                    let _ = devices_upsert_atomic(
+                        name,
+                        None,
+                        Some(&fresh),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
                 }
             }
             if let Some(t) = conn.transport_of(&pid) {
@@ -452,6 +463,8 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // Invitation::to_auth_key does that conversion once, so nothing here
             // has to reassemble it.
             let stored_name = if persistent {
+                // allow_reanchor: the owner minted this enrollment (invitation
+                // flow), which is the owner decision permitting this name.
                 match devices_upsert_atomic(
                     &requested_name,
                     Some(&secret),
@@ -460,6 +473,7 @@ pub(crate) async fn handle_auth_key_enroll_response(
                     Some(identity::IntroScope::Device.to_byte()),
                     None,
                     Some((&ak.caps, ak.expires, ak.max_offline, ak.max_offline)),
+                    true,
                 ) {
                     Ok(name) => name,
                     Err(error) => {

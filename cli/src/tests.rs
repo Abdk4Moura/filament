@@ -691,8 +691,17 @@ fn cert_only_upsert_preserves_principal_ceiling() {
     .unwrap();
     // Renewal-shaped write: new cert, everything else None.
     let fresh = cert_for(0x11, 0xa1, 9_999_999_998);
-    crate::devices_store::devices_upsert_atomic("spoke", None, Some(&fresh), None, None, None, None)
-        .unwrap();
+    crate::devices_store::devices_upsert_atomic(
+        "spoke",
+        None,
+        Some(&fresh),
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     let raw = std::fs::read_to_string(dir.join("devices.json")).unwrap();
     let arr: Vec<Value> = serde_json::from_str(&raw).unwrap();
     let got = arr.iter().find(|d| d["name"] == "spoke").unwrap();
@@ -705,6 +714,45 @@ fn cert_only_upsert_preserves_principal_ceiling() {
         got["deviceCert"]["expires"], 9_999_999_998u64,
         "the cert itself must update"
     );
+}
+
+/// A cert write under an existing name with a DIFFERENT device key is a
+/// takeover (e.g. a fleet sibling naming itself after a ceilinged device):
+/// the store must refuse it and leave the victim record byte-identical.
+/// Records are keyed by identity; names are presentation.
+#[test]
+fn upsert_refuses_cert_reanchor_under_existing_name() {
+    let _guard = lock_test_config();
+    let dir = td("reanchor");
+    let victim = serde_json::json!({
+        "name": "laptop",
+        "principalKind": "delegated",
+        "principalCeiling": ["transfer", "shell"],
+        "deviceCert": {
+            "devicePub": hex::encode([0xa1u8; 32]),
+            "userPub": hex::encode([0x11u8; 32]),
+            "expires": 9_999_999_999u64,
+            "issued": 1u64,
+            "sig": hex::encode([0u8; 64]),
+        },
+    });
+    let before = serde_json::to_string(&vec![victim]).unwrap();
+    std::fs::write(dir.join("devices.json"), &before).unwrap();
+    // Attacker's cert: same name, different device key.
+    let impostor = cert_for(0x11, 0xb2, 9_999_999_999);
+    let res = crate::devices_store::devices_upsert_atomic(
+        "laptop",
+        None,
+        Some(&impostor),
+        None,
+        None,
+        None,
+        None,
+        false,
+    );
+    assert!(res.is_err(), "re-anchoring write must be refused");
+    let after = std::fs::read_to_string(dir.join("devices.json")).unwrap();
+    assert_eq!(after, before, "victim record must be byte-identical");
 }
 
 /// The scope a vouch stores is Device, not User, and the difference is not
@@ -1922,6 +1970,7 @@ fn fresh_join_bounds_win_over_revived_record() {
         false,
         true,
         false,
+        false,
     );
     assert!(
         matches!(decision, crate::capability::GateDecision::Deny { .. }),
@@ -3076,8 +3125,28 @@ fn revoked_device_survives_cert_renewal() {
         device_cert_revoked(&cert_a.device_pub),
         "revoked immediately"
     );
-    // Ordinary cert renewal path: a plain cert update, no delegated arg.
-    devices_upsert_atomic("quietbox", None, Some(&cert_b), None, None, None, None).unwrap();
+    // Ordinary cert renewal path: a FRESH cert for the SAME device key, no
+    // delegated arg. (A rotated key is a re-enrollment, which goes through
+    // the invitation path with allow_reanchor -- never a renewal.)
+    let cert_b = identity::DeviceCert::from_json(&serde_json::json!({
+        "devicePub": hex::encode([0xa1u8; 32]),
+        "userPub": hex::encode([0x11u8; 32]),
+        "expires": 9_999_999_999u64,
+        "issued": 2u64,
+        "sig": hex::encode([0u8; 64]),
+    }))
+    .unwrap();
+    devices_upsert_atomic(
+        "quietbox",
+        None,
+        Some(&cert_b),
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
     assert!(
         device_cert_revoked(&cert_b.device_pub),
         "a cert renewal must NOT clear a durable revoke"
@@ -3098,6 +3167,7 @@ fn revoked_device_survives_cert_renewal() {
         true,
         true, // has_explicit_grant: revocation must still win
         true, // cert_revoked
+        false,
     );
     assert!(
         matches!(decision, crate::capability::GateDecision::Deny { .. }),
@@ -3370,6 +3440,7 @@ fn delegated_ceiling_survives_record_roundtrip() {
         Some(&cert.user_pub),
         false,
         true,
+        false,
         false,
     );
     assert!(matches!(

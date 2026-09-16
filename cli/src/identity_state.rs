@@ -347,9 +347,41 @@ pub(crate) fn ceiling_covers_action(idev: Option<&[u8; 32]>, action: &str) -> bo
         })
         .filter(|record| record["principalKind"].as_str() == Some("delegated"))
         .and_then(|record| record["principalCeiling"].as_array().cloned())
-        .map(|items| items.iter().any(|item| item.as_str() == Some(action)))
+        // Case-insensitive, matching the auth-key ceiling check in
+        // cap_gate_effective: two spellings of one capability must agree.
+        .map(|items| {
+            let want = action.to_lowercase();
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .any(|item| item.to_lowercase() == want)
+        })
         .unwrap_or(false);
     idev.is_some() && covered
+}
+
+/// Liveness re-check for live sessions: recompose the delegated deadline
+/// (cert expiry, absolute stop, offline budget) for the peer's STORED cert
+/// and report whether it is still ahead. None means unresolvable (no
+/// identity, no record, unparsable cert) -- no opinion, never a kill;
+/// revocation has its own check. Some(false) ends the session.
+pub(crate) fn peer_liveness_alive(idev: Option<&[u8; 32]>) -> Option<bool> {
+    let idev = idev?;
+    let hex = hex::encode(idev);
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let record = arr
+        .iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
+    let cert = identity::DeviceCert::from_json(&record["deviceCert"])?;
+    let now = crate::identity::now_secs();
+    if cert.verify(now).is_err() {
+        return Some(false);
+    }
+    let (_, not_after, max_offline, last_seen) = persisted_principal_for_cert(&cert);
+    let (deadline, _) =
+        effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+    Some(deadline > now)
 }
 
 pub(crate) fn capability_list_summary(caps: &[String]) -> String {

@@ -101,6 +101,8 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         )?,
     )?;
     let transfer_caps = vec!["transfer".to_string()];
+    // allow_reanchor: joining under an owner-signed invitation is the owner
+    // decision that permits recording under this name.
     devices_upsert_atomic(
         owner_name,
         Some(secret),
@@ -109,6 +111,7 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         Some(identity::IntroScope::Device.to_byte()),
         None,
         None,
+        true,
     )?;
     // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
     // not a failure, it just means no auto-mesh (an older owner, or a join that

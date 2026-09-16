@@ -1000,7 +1000,10 @@ pub async fn spawn_pty_session(
                             idev.as_ref(),
                             crate::capability::CAP_SHELL,
                         );
-                    if crate::cert_revoked_for(idev.as_ref()) || ceiling_gone {
+                    // A lapsed deadline ends it too; unresolvable is no opinion.
+                    let lapsed =
+                        matches!(crate::identity_state::peer_liveness_alive(idev.as_ref()), Some(false));
+                    if crate::cert_revoked_for(idev.as_ref()) || ceiling_gone || lapsed {
                         crate::ui::critical("pty: peer revoked, closing the live session");
                         revoked_reason = Some(crate::capability::REVOKED_REASON);
                         if let Some(b) = &bind {

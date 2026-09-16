@@ -472,14 +472,16 @@ them local consequences of owner-signed artifacts, never network input:
 
 - `join` writes the ceiling from the invitation, and only after the
   invitation's owner signature verifies;
-- `certify --scope` writes it as an owner-signed CapOp through the grant
-  path on the owner side;
+- `certify --scope` (planned; not yet built) will write it as an
+  owner-signed CapOp through the grant path on the owner side -- until
+  then, only renewal_lifecycle's post-verify ceiling write does;
 - renewal writes the CERTIFICATE only, never the ceiling.
 
 In particular: `identity-cert-delivery` and cert renewal persist the cert
-and must not touch the ceiling field (pinned by test); no control frame
-carries a ceiling, a grant, or a role -- the receiver resolves everything
-from its local stores. The shell/exec gate reads the ceiling fresh at
+and must not touch the ceiling field (pinned by test); no UNSIGNED frame
+carries a ceiling, a grant, or a role -- `fleet-policy` push carries
+owner-signed ops verified against the held owner key, and every other
+frame's receiver resolves everything from its local stores. The shell/exec gate reads the ceiling fresh at
 gate time and on every revoke tick (never cached at link open), keyed by
 the peer's verified device identity, and checks the requested action
 against it (`ceiling_covers_action`). Anything outside the ceiling needs
