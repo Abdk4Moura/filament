@@ -2259,7 +2259,6 @@ async fn open_pty_stream(
 /// peer sends it unprompted, so a healthy link costs nothing here; a zombie link
 /// yields nothing within `verify` and we `Err` so the caller drops it + falls
 /// back to a cold pty instead of handing the user a dead terminal.
-#[cfg(unix)]
 /// Verdict of a verified warm pty open, decided where the sid is in scope
 /// (the caller never sees it on failure, so reason/link checks that need it
 /// live here, not at the call site).
@@ -2271,6 +2270,7 @@ async fn open_pty_stream(
 ///   carries err, so this is a CLEAN session end with no output (fast
 ///   `true`), never a denial: the caller accepts and closes at once so
 ///   the client reads EOF as a clean exit, mirroring the cold path.
+#[cfg(unix)]
 pub(crate) enum WarmPtyVerdict {
     Opened(u32, PipeItem, mpsc::Receiver<PipeItem>),
     Refused(String),
@@ -2278,6 +2278,7 @@ pub(crate) enum WarmPtyVerdict {
     Silent,
 }
 
+#[cfg(unix)]
 pub(crate) async fn open_pty_stream_verified(
     mux: &Arc<Mux>,
     session: &str,
