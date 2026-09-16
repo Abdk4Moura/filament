@@ -55,6 +55,10 @@
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
+#   I1/I2/I3 IMPOSTOR (F1 acceptance, live): a sibling daemon hellos as the
+#       ceilinged device's exact name, trailing-space name, and control-char
+#       name; each is refused, the victim record is byte-identical, and the
+#       sibling's exec is refused.
 #   D-sh SHADOW EVIDENCE for the flip checklist: a covered fleet exec in
 #       shadow mode logs zero CAP-SHADOW CRITICAL lines.
 #   AUTH-A/B/C under FILAMENT_CAP_AUTHORITATIVE=1 on a restarted owner
@@ -312,6 +316,84 @@ else
   echo "-- restore.log --"; cat "$WORK/restore.log"
   bad "gateG: exec did not come back after restore (rc=$rcG out='$OUTG')"
 fi
+
+# =================================================== IMPOSTOR GATES ==
+# F1 acceptance, live: a sibling daemon with a DIFFERENT device key hellos
+# as the ceilinged device's name. The owner must refuse to index it, leave
+# the victim record byte-identical, and refuse its exec. Three variants:
+# the exact name, a trailing space, and a control character -- the latter
+# two must land on the same record after sanitizing, not slip past it.
+# (The store-level variants of this live as unit tests; these prove the
+# fleet-hello path end to end. The exec refusal is asserted as the
+# end-to-end property -- the link stays unverified, so the refusal may
+# also rest on that; the log line pins the transplant mechanism and the
+# byte comparison pins the store.)
+MALLORY=mallory
+DM="$WORK/$MALLORY"
+enroll_delegate "$MALLORY" --allow transfer
+start_spoke "$DM" "$MALLORY"
+sleep 6
+# Stable fields only (timestamps/last_seen drift between snapshots, so a
+# whole-record comparison would fail spuriously -- gate B does the same).
+python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" >"$WORK/victim.before" <<'PY'
+import json,sys
+arr=json.load(open(sys.argv[1]))
+rec={d.get("name"):d for d in arr}
+v=rec.get(sys.argv[2]) or {}
+print(json.dumps({
+  "victim_pub":v.get("deviceCert",{}).get("devicePub"),
+  "victim_ceiling":v.get("principalCeiling"),
+  "victim_revoked":v.get("certRevoked",False),
+  "mallory_key":(rec.get(sys.argv[3]) or {}).get("deviceCert",{}).get("devicePub"),
+},sort_keys=True))
+PY
+M_ENV=(env FILAMENT_CONFIG_DIR="$DM")
+run_impostor_variant() {
+  local variant="$1" tag="$2"
+  # Per-variant refusal counting: the owner log accumulates, so record the
+  # count before and require it to GROW (a stale line must not pass this).
+  local refused_before=$(grep -c "not indexed" "$WORK/up.log" || true)
+  pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
+  sleep 2
+  env FILAMENT_CONFIG_DIR="$DM" FILAMENT_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
+  FIX_PIDS+=($!)
+  sleep 8
+  local refused=0 intact=0 execref=0
+  local refused_after=$(grep -c "not indexed" "$WORK/up.log" || true)
+  [ "$refused_after" -gt "$refused_before" ] && refused=1
+  python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" "$WORK/victim.before" >"$WORK/victim.$tag.after" <<'PY'
+import json,sys
+arr=json.load(open(sys.argv[1]))
+rec={d.get("name"):d for d in arr}
+v=rec.get(sys.argv[2]) or {}
+now=json.dumps({
+  "victim_pub":v.get("deviceCert",{}).get("devicePub"),
+  "victim_ceiling":v.get("principalCeiling"),
+  "victim_revoked":v.get("certRevoked",False),
+  "mallory_key":(rec.get(sys.argv[3]) or {}).get("deviceCert",{}).get("devicePub"),
+},sort_keys=True)
+before=json.load(open(sys.argv[4]))
+print(now)
+# victim identity+ceiling identical AND mallory still keyed to its own key
+sys.exit(0 if now==json.dumps(before,sort_keys=True) else 1)
+PY
+  [ "$?" = "0" ] && intact=1
+  OUTI=$(timeout 60 "${M_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/I-$tag.err" </dev/null)
+  [ "$?" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
+  echo "## (impostor $tag) refused=$refused intact=$intact execref=$execref"
+  if [ "$refused" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
+    ok "gateI-$tag: squat as '$variant' refused, victim byte-identical, exec refused"
+  else
+    echo "-- owner log --"; grep -i "not indexed\|fleet peer" "$WORK/up.log" | tail -3
+    bad "gateI-$tag: impostor as '$variant' NOT contained (refused=$refused intact=$intact execref=$execref)"
+  fi
+}
+say "I1: exact-name squat refused"
+run_impostor_variant "$SPOKE" exact
+say "I2: trailing-space squat refused"
+run_impostor_variant "$SPOKE " space
+say "I3: control-char squat refused"
+run_impostor_variant "$SPOKE$(printf '\007')" ctrl
 
 # ================================================== AUTHORITATIVE MODE ==
 # The same questions under FILAMENT_CAP_AUTHORITATIVE=1 on the owner

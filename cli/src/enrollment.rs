@@ -102,6 +102,15 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         )?,
     )?;
     let transfer_caps = vec!["transfer".to_string()];
+    // The invitation names the fleet, but it must not re-key a DIFFERENT
+    // fleet already recorded under this name (stale join, or a hostile
+    // invitation): refuse instead of silently replacing the owner's
+    // identity. Same key re-joining passes through below.
+    if crate::devices_store::name_pinned_by_other(owner_name, &hex::encode(owner_cert.device_pub)) {
+        anyhow::bail!(
+            "already have a different fleet owner recorded as '{owner_name}': forget it first, then join"
+        );
+    }
     // allow_reanchor: joining under an owner-signed invitation is the owner
     // decision that permits recording under this name.
     devices_upsert_atomic(
