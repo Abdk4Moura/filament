@@ -559,6 +559,7 @@ pub(crate) async fn handle_exec_open(
             &t,
             sid,
             v,
+            &reason,
         )
         .await
         {

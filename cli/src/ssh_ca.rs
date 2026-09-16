@@ -550,6 +550,7 @@ pub(crate) async fn handle_ssh_sign(
             &t,
             sid,
             v,
+            cap_reason.as_deref().unwrap_or("shell capability not granted"),
         )
         .await
         {
