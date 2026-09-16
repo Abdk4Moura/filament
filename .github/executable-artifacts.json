@@ -442,6 +442,17 @@
       "invoked_by": []
     },
     {
+      "path": "proofs/capability_ledger_model.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/capability_ledger_model.py",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "model-checker"
+        }
+      ]
+    },
+    {
       "path": "proofs/establishment_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/establishment_model.py",

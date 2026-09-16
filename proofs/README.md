@@ -118,7 +118,7 @@ a transition only a rebuild emits. They imply different fixes, so nothing here
 should be read as asserting A. The discriminator is whether the sender ever
 *attempted* to send file data on the retained link.
 
-All four proofs are required CI gates (`.github/workflows/proof.yml`).
+All of these proofs are required CI gates (`.github/workflows/proof.yml`).
 
 ## Companion: the stall-ladder model
 
@@ -247,6 +247,79 @@ mode we have chased (zombie links, ghost presence, the 15s stall) is a violation
 of a Tier-1 assumption — a real network fault — and Tier-1 proves each one
 recovers in bounded time. There is no GoodNet failure.** New protocol changes
 should update the model + mapping first, re-run this, and stay green.
+
+## Companion: the capability-ledger proof
+
+`capability_ledger_model.py` checks the authorization plane defined by
+CONTRACT.md's **Capability ledger (append-only signed ops)** section: an
+append-only log of signed ops, and `decide(facts, request)` as a pure function
+of it. Run it:
+
+```
+python3 capability_ledger_model.py              # the laws
+python3 capability_ledger_model.py --self-test  # break one law at a time
+```
+
+It is the only model here that checks a design **before** the code exists. The
+engine today (`crates/filament-cap/src/capability.rs`, `cli/src/shell_gate.rs`)
+has no deny, no pause, and no subject-signed accept: `CapOpKind` is
+`Grant | Revoke | Modify` and `Revoke` deletes the row. So gate 0 reproduces
+only the behaviour that DOES exist -- the oracle rows of
+`exec_matches_pty_across_gate_matrix` (revoked must deny, a narrow ceiling must
+deny, trusted-plus-granted must allow) and CONTRACT.md's "expiry IS the
+revocation mechanism" -- and prints the new primitives as new rather than
+claiming to have reproduced them.
+
+Thirteen laws, each a numbered clause in CONTRACT.md and a named check here:
+
+| Law | What it pins |
+|---|---|
+| L1 / L2 | purity, and that `binding`, `cert`, `held_author_key` and display names move no verdict |
+| L3 / L9 | every op has an interval; `valid_until` is returned, and the verdict cannot change before it |
+| L4 | deny absolute, ceiling only narrows, newest version per author wins |
+| L5 | widening needs a Grant AND a subject-signed Accept; narrowing needs one signature |
+| L6 | signature and version checks at ingest, never inside the evaluator |
+| L7 | `because` is a minimal sufficient cause, verified by deletion |
+| L8 | capabilities are opaque `(action, resource)` pairs plus `covers()` |
+| L10 | no widening by combination; a deny is a tombstone only its author lifts |
+| L11 | arrival order and replay change nothing |
+| L12 / L13 | pause is author-only and reads `paused`, not `denied`; accept names one live grant |
+
+Two properties of the run matter as much as the green:
+
+**Vacuity is a failure, not a footnote.** The run asserts that every verdict
+shape -- `Allow`, `denied`, `paused`, `above-ceiling`, `unaccepted`,
+`no-grant` -- was actually produced, and that the checks guarding the rarest of
+them ran at least once. The first version of this model never reached `paused`
+or `above-ceiling` at all: at N=2 a grant and its accept fill the log, leaving
+no slot for a ceiling or a pause, so both checks passed without being tested.
+That is the `S1`-under-tier-0 failure from the fleet model in a new costume,
+and the N=3 tier exists because of it.
+
+**The checker is validated by mutation.** `--self-test` breaks one rule at a
+time -- deny no longer absolute, accept no longer required, a ceiling that
+grants, stale versions winning, `valid_until` pushed past the change point,
+`because` returned unminimised, ingest admitting a stale op or a bad
+signature, the evaluator reading the cert or the display name -- and requires
+the law that each breach violates to go red. The ceiling mutation had to be
+rewritten to make it bite: making a ceiling merely INERT still satisfies "only
+narrows" (it narrows by nothing), so the mutation had to be a ceiling that
+actually grants. A mutation that does not violate the law it targets proves
+nothing about the check.
+
+The model states its reading of three under-constrained points rather than
+resolving them quietly: `Certify` carries no authority, `Pass` is widening
+under L5's rules with its delegation rule left open, and a `Pause` is scoped
+by its own capability pattern. It also records that L10's plain-English form
+is contradicted by L5 -- a Grant and an Accept each deny alone and allow
+together -- and checks the restricted form, requiring that pair to be the
+ONLY widening combination in the whole universe.
+
+### Latest result
+
+```
+2,591,593 cells, 0 violations, 6.1 s      12/12 mutations caught
+```
 
 ## Companion: the fleet auto-mesh proof
 
