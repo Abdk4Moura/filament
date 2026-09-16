@@ -55,6 +55,12 @@
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
+#   D-sh SHADOW EVIDENCE for the flip checklist: a covered fleet exec in
+#       shadow mode logs zero CAP-SHADOW CRITICAL lines.
+#   AUTH-A/B/C under FILAMENT_CAP_AUTHORITATIVE=1 on a restarted owner
+#       daemon: shell within the enrolment ceiling succeeds (A); exec
+#       outside the ceiling (transfer-only enrolment) is refused with the
+#       grant reason (B); revoke --certificate refuses too (C).
 #
 # G is the gate that stops this suite passing for the wrong reason. Without it
 # "everything is refused after the revoke" is equally satisfied by a harness
@@ -305,6 +311,85 @@ else
   echo "-- G.err --"; cat "$WORK/G.err"
   echo "-- restore.log --"; cat "$WORK/restore.log"
   bad "gateG: exec did not come back after restore (rc=$rcG out='$OUTG')"
+fi
+
+# ================================================== AUTHORITATIVE MODE ==
+# The same questions under FILAMENT_CAP_AUTHORITATIVE=1 on the owner
+# daemon. The daemon reads the flag at startup, so the owner acceptor is
+# restarted with it (same config dir, fresh log); the spokes are untouched.
+# Gate D-sh runs FIRST, while the daemons are still in shadow mode.
+
+# ================================================================== GATE D-sh =
+# Shadow-mode evidence for the flip checklist: a covered fleet exec must not
+# log CAP-SHADOW CRITICAL (a header denying what legacy allowed). The owner
+# log accumulates the whole run above, so any covered open that disagreed
+# would already be recorded.
+say "D-sh: shadow run of the covered exec logs zero CRITICAL denials"
+OUTSH=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo FLEET-SHADOW-OK 2>"$WORK/SH.err" </dev/null)
+rcSH=$?
+CRITS=$(grep -c "CAP-SHADOW CRITICAL" "$WORK/up.log" || true)
+echo "## (shadow covered exec) rc=$rcSH out='$OUTSH' criticals=$CRITS"
+if [ "$rcSH" = "0" ] && [ "$OUTSH" = "FLEET-SHADOW-OK" ] && [ "$CRITS" = "0" ]; then
+  ok "gateD-sh: covered exec clean in shadow, zero CRITICAL lines (la_denied evidence)"
+else
+  echo "-- up.log criticals --"; grep "CAP-SHADOW CRITICAL" "$WORK/up.log" | tail -3
+  bad "gateD-sh: shadow covered exec unclean (rc=$rcSH out='$OUTSH' criticals=$CRITS)"
+fi
+
+say "restarting the owner acceptor under FILAMENT_CAP_AUTHORITATIVE=1"
+pkill -f "up --dir $WORK/Adrop" 2>/dev/null || true
+sleep 2
+env FILAMENT_CONFIG_DIR="$DA" FILAMENT_CAP_AUTHORITATIVE=1 FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-auth.log" 2>&1 &
+FIX_PIDS+=($!)
+sleep 6
+
+# ================================================================== GATE AUTH-A =
+say "AUTH-A: shell within the enrolment ceiling succeeds under authoritative"
+OUTAA=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo FLEET-AUTH-OK 2>"$WORK/AA.err" </dev/null)
+rcAA=$?
+echo "## (authoritative covered exec) rc=$rcAA out='$OUTAA'"
+if [ "$rcAA" = "0" ] && [ "$OUTAA" = "FLEET-AUTH-OK" ]; then
+  ok "gateAUTH-A: covered exec allowed under authoritative (no grant needed)"
+else
+  echo "-- AA.err --"; cat "$WORK/AA.err"; grep -i "deny\|refus" "$WORK/up-auth.log" | tail -5
+  bad "gateAUTH-A: covered exec refused under authoritative (rc=$rcAA)"
+fi
+
+# ================================================================== GATE AUTH-B =
+# A second spoke enrolled WITHOUT shell in its ceiling: exec must be refused
+# with the ceiling/grant reason, proving the ceiling (not mere membership)
+# is what authorizes.
+SPOKE2=spoke2
+DS2="$WORK/$SPOKE2"
+enroll_delegate "$SPOKE2" --allow transfer
+start_spoke "$DS2" "$SPOKE2"
+sleep 6
+say "AUTH-B: exec outside the enrolment ceiling is refused under authoritative"
+OUTAB=$(timeout 60 env FILAMENT_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
+rcAB=$?
+echo "## (authoritative uncovered exec) rc=$rcAB out='$OUTAB'"
+if [ "$rcAB" != "0" ] \
+   && ! echo "$OUTAB" | grep -q "SHOULD-NOT-RUN" \
+   && grep -qi "explicit grant" "$WORK/up-auth.log"; then
+  ok "gateAUTH-B: uncovered exec refused under authoritative (grant reason, no output)"
+else
+  echo "-- AB.err --"; cat "$WORK/AB.err"
+  echo "-- owner auth log --"; grep -i "deny\|refus" "$WORK/up-auth.log" | tail -5
+  bad "gateAUTH-B: uncovered exec NOT refused under authoritative (rc=$rcAB)"
+fi
+
+# ================================================================== GATE AUTH-C =
+say "AUTH-C: revoke --certificate refuses under authoritative too"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" revoke "$SPOKE" --certificate --yes >"$WORK/revoke-auth.log" 2>&1
+sleep 3
+OUTAC=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AC.err" </dev/null)
+rcAC=$?
+echo "## (authoritative exec after revoke) rc=$rcAC out='$OUTAC'"
+if [ "$rcAC" != "0" ] && ! echo "$OUTAC" | grep -q "SHOULD-NOT-RUN"; then
+  ok "gateAUTH-C: revoked spoke refused under authoritative"
+else
+  echo "-- AC.err --"; cat "$WORK/AC.err"
+  bad "gateAUTH-C: revoked exec NOT refused under authoritative (rc=$rcAC)"
 fi
 
 # ========================================================================= sum =
