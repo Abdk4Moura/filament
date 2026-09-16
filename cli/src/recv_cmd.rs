@@ -68,6 +68,110 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+/// A shell-class open parked while its link's possession proof is in flight
+/// (settle-then-evaluate). The link is identified by pid AND the device key
+/// known at park time: only a proof for the same identity on the same link
+/// releases it, so a re-keyed peer or another link's proof denies instead.
+/// Re-drive calls the same handler the live path uses, which re-gathers
+/// everything fresh -- a revoke during the hold therefore denies.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ParkKind {
+    Exec,
+    Pty,
+    SshSign,
+    Forward,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ParkedOpen {
+    pub pid: String,
+    pub device_pub: [u8; 32],
+    pub kind: ParkKind,
+    pub t: Arc<dyn crate::net::Transport>,
+    pub v: Value,
+    pub sid: u32,
+    pub deadline: Instant,
+    pub settle_ms: u64,
+}
+
+/// Pure budget check, unit-tested: at most 2 parked opens per link and 32
+/// per daemon, so parking can never become a DoS surface. Counts CURRENTLY
+/// parked opens.
+pub(crate) fn park_budget_ok(per_link: usize, total: usize) -> bool {
+    per_link < 2 && total < 32
+}
+
+/// The settle timeout reason, shared by the expiry deny and the client.
+pub(crate) fn settle_timeout_reason(ms: u64) -> String {
+    format!("identity not proven within {ms} ms; retry")
+}
+
+/// Refusal send for unsettled opens (park-time fast denies and sweep
+/// expiry): always an l2-close carrying the specific reason, so the
+/// initiator can retry cheaply instead of timing out.
+async fn deny_unsettled(
+    t: &Arc<dyn crate::net::Transport>,
+    sid: u32,
+    kind: ParkKind,
+    reason: &str,
+) {
+    crate::ui::say(&format!("l2: {kind:?} unsettled open denied: {reason}"));
+    let _ = t
+        .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": reason }))
+        .await;
+}
+
+/// Settle-then-evaluate for one shell-class open, called after sid parsing
+/// and before gating. Proven links proceed (returns false). Otherwise the
+/// open parks for re-drive on proof, or is denied fast: unknown identity
+/// (nothing to bind a hold to -- retry on the warm link is cheap) and
+/// over-budget parks both deny with retryable reasons. Returns true when
+/// the caller must return immediately (parked or denied).
+pub(crate) async fn park_unproven_open(
+    parked: &mut Vec<ParkedOpen>,
+    conn: &Conn,
+    pid: &str,
+    kind: ParkKind,
+    t: &Arc<dyn crate::net::Transport>,
+    sid: u32,
+    v: &Value,
+) -> bool {
+    let (proven, device_pub) = match conn.link(pid) {
+        Some(l) => (
+            l.identity_binding == crate::capability::BindingStrength::Proven,
+            l.identity_device_pub,
+        ),
+        None => (false, None),
+    };
+    if proven {
+        return false;
+    }
+    let Some(device_pub) = device_pub else {
+        deny_unsettled(t, sid, kind, "identity not proven; retry").await;
+        return true;
+    };
+    let per_link = parked.iter().filter(|p| p.pid == pid).count();
+    if !park_budget_ok(per_link, parked.len()) {
+        deny_unsettled(t, sid, kind, "identity settling, retry").await;
+        return true;
+    }
+    let ms = crate::identity_state::gate_settle_ms();
+    parked.push(ParkedOpen {
+        pid: pid.to_string(),
+        device_pub,
+        kind,
+        t: t.clone(),
+        v: v.clone(),
+        sid,
+        deadline: Instant::now() + Duration::from_millis(ms),
+        settle_ms: ms,
+    });
+    crate::ui::say(&format!(
+        "l2: {kind:?} open parked {ms}ms for identity proof"
+    ));
+    true
+}
+
 /// Accept one `l2-open` forward frame: validate, shell-gate (expose bound),
 /// dial and serve. Extracted verbatim from the recv loop arm so unsettled
 /// opens can be parked and re-driven through this same function.
@@ -78,6 +182,7 @@ async fn handle_forward_open(
     shell_policy: &ShellPolicy,
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     l2_enabled: bool,
+    parked: &mut Vec<ParkedOpen>,
 ) {
     // TODO(diag acceptor): emit a diag::Attempt with role
     // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
@@ -90,6 +195,16 @@ async fn handle_forward_open(
     let Some(t) = conn.transport_of(&pid) else {
         return;
     };
+    // Settle-then-evaluate: hold unproven opens for re-drive on proof
+    // instead of deciding on stale state (l2-close frames skip this:
+    // tearing down is never gated).
+    if v["type"].as_str() == Some("l2-open") {
+        if let Some(sid) = l2::wire_sid(&v).filter(|s| l2::is_l2_sid(*s)) {
+            if park_unproven_open(parked, conn, &pid, ParkKind::Forward, &t, sid, v).await {
+                return;
+            }
+        }
+    }
     let trusted = conn.link(&pid).map(|l| l.trusted).unwrap_or(false);
     // Per-device authorization for a NEW open (an l2-close just
     // tears a stream down, so it is never gated here). In a blanket
@@ -235,6 +350,7 @@ async fn handle_pty_open(
     l2_muxes: &mut HashMap<String, Arc<l2::Mux>>,
     pty_bindings: &mut HashMap<String, HashMap<u32, String>>,
     l2_enabled: bool,
+    parked: &mut Vec<ParkedOpen>,
 ) {
     let Some(t) = conn.transport_of(&pid) else {
         return;
@@ -256,6 +372,10 @@ async fn handle_pty_open(
         return;
     };
     if !l2::is_l2_sid(sid) {
+        return;
+    }
+    // Settle-then-evaluate: hold unproven opens for re-drive on proof.
+    if park_unproven_open(parked, conn, &pid, ParkKind::Pty, &t, sid, v).await {
         return;
     }
     // One shared shell gate (same function, same inputs as
@@ -1171,6 +1291,10 @@ pub(crate) async fn recv_cmd(
     // l2-open seen on that link. `l2_enabled` is computed once above (it also
     // gates the direct-QUIC path); reused here for the mux/cap machinery.
     let mut l2_muxes: HashMap<String, Arc<l2::Mux>> = HashMap::new();
+    // Shell-class opens parked while their link's possession proof is in
+    // flight (settle-then-evaluate): re-driven on proof, denied at the
+    // settle bound. Bounded (2 per link, 32 per daemon) at park time.
+    let mut parked_opens: Vec<ParkedOpen> = Vec::new();
     // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
     let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
@@ -1582,6 +1706,110 @@ pub(crate) async fn recv_cmd(
                 Err(_) => None, // 2s tick, run the fallback quiet-check below
             },
         };
+
+        // Settle sweep: re-drive parked shell-class opens whose link proved
+        // since parking (same link AND same device key, else the proof is
+        // for someone else), deny those past their settle bound. Zero cost
+        // when nothing is parked. Re-drive calls the same handler the live
+        // path uses, which re-gathers everything fresh -- a revoke during
+        // the hold therefore denies. Never blocks: releases and denies are
+        // ordinary handler calls in this loop's turn, not spawned tasks
+        // awaiting anything (the loop must stay live; see serve_exec).
+        if !parked_opens.is_empty() {
+            let now = Instant::now();
+            let mut fire = Vec::new();
+            let mut expire = Vec::new();
+            parked_opens.retain(|p| {
+                let st = conn
+                    .link(&p.pid)
+                    .map(|l| (l.identity_binding, l.identity_device_pub));
+                match st {
+                    Some((crate::capability::BindingStrength::Proven, Some(pub_)))
+                        if pub_ == p.device_pub =>
+                    {
+                        fire.push(p.clone());
+                        false
+                    }
+                    _ if now >= p.deadline => {
+                        expire.push(p.clone());
+                        false
+                    }
+                    _ => true,
+                }
+            });
+            for p in expire {
+                crate::ui::say(&format!(
+                    "l2: {:?} open timed out settling ({}ms); denying",
+                    p.kind, p.settle_ms,
+                ));
+                let _ =
+                    p.t.send_control(&serde_json::json!({
+                        "type": "l2-close",
+                        "sid": p.sid,
+                        "err": settle_timeout_reason(p.settle_ms),
+                    }))
+                    .await;
+            }
+            for p in fire {
+                crate::ui::say(&format!("l2: {:?} open proven; re-driving", p.kind));
+                match p.kind {
+                    ParkKind::Exec => {
+                        let mux = l2_muxes
+                            .entry(p.pid.clone())
+                            .or_insert_with(|| l2::Mux::new(p.t.clone()))
+                            .clone();
+                        exec_recv::handle_exec_open(
+                            &mut conn,
+                            &p.pid,
+                            p.t.clone(),
+                            mux,
+                            &p.v,
+                            &shell_policy,
+                            &mut parked_opens,
+                        )
+                        .await;
+                    }
+                    ParkKind::Pty => {
+                        handle_pty_open(
+                            &mut conn,
+                            p.pid.clone(),
+                            &p.v,
+                            &shell_policy,
+                            &shell_user,
+                            &pty_sessions,
+                            &mut l2_muxes,
+                            &mut pty_bindings,
+                            l2_enabled,
+                            &mut parked_opens,
+                        )
+                        .await;
+                    }
+                    ParkKind::SshSign => {
+                        crate::ssh_ca::handle_ssh_sign(
+                            &mut conn,
+                            &p.pid,
+                            p.t.clone(),
+                            &p.v,
+                            &shell_policy,
+                            &mut parked_opens,
+                        )
+                        .await;
+                    }
+                    ParkKind::Forward => {
+                        handle_forward_open(
+                            &mut conn,
+                            p.pid.clone(),
+                            &p.v,
+                            &shell_policy,
+                            &mut l2_muxes,
+                            l2_enabled,
+                            &mut parked_opens,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
 
         // C30: converge session state (no-op unless diverged/stale/unconfirmed).
         sess.tick(&sio).await;
@@ -4301,6 +4529,7 @@ pub(crate) async fn recv_cmd(
                         &shell_policy,
                         &mut l2_muxes,
                         l2_enabled,
+                        &mut parked_opens,
                     )
                     .await;
                 }
@@ -4619,6 +4848,7 @@ pub(crate) async fn recv_cmd(
                         &mut l2_muxes,
                         &mut pty_bindings,
                         l2_enabled,
+                        &mut parked_opens,
                     )
                     .await;
                 }
@@ -4633,7 +4863,16 @@ pub(crate) async fn recv_cmd(
                         .entry(pid.clone())
                         .or_insert_with(|| l2::Mux::new(t.clone()))
                         .clone();
-                    exec_recv::handle_exec_open(&mut conn, &pid, t, mux, &v, &shell_policy).await;
+                    exec_recv::handle_exec_open(
+                        &mut conn,
+                        &pid,
+                        t,
+                        mux,
+                        &v,
+                        &shell_policy,
+                        &mut parked_opens,
+                    )
+                    .await;
                     continue;
                 }
                 Some("ssh-sign-request") if !l2_enabled => {
@@ -4655,7 +4894,15 @@ pub(crate) async fn recv_cmd(
                     let Some(t) = conn.transport_of(&pid) else {
                         continue;
                     };
-                    crate::ssh_ca::handle_ssh_sign(&mut conn, &pid, t, &v, &shell_policy).await;
+                    crate::ssh_ca::handle_ssh_sign(
+                        &mut conn,
+                        &pid,
+                        t,
+                        &v,
+                        &shell_policy,
+                        &mut parked_opens,
+                    )
+                    .await;
                     continue;
                 }
                 Some("mount-open") if l2_enabled => {
@@ -6640,5 +6887,30 @@ pub(crate) async fn recv_cmd(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod settle_tests {
+    use super::*;
+
+    #[test]
+    fn park_budget_bounds() {
+        // Empty: park.
+        assert!(park_budget_ok(0, 0));
+        // Room: park.
+        assert!(park_budget_ok(1, 31));
+        // Per-link cap (2): third concurrent open on the same link denies.
+        assert!(!park_budget_ok(2, 2));
+        // Per-daemon cap (32): the 33rd concurrent open denies.
+        assert!(!park_budget_ok(0, 32));
+        assert!(!park_budget_ok(1, 32));
+    }
+
+    #[test]
+    fn settle_timeout_reason_names_the_bound() {
+        let r = settle_timeout_reason(2000);
+        assert!(r.contains("2000"), "reason must name the bound: {r}");
+        assert!(r.contains("retry"), "reason must offer the retry: {r}");
     }
 }

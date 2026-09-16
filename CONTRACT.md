@@ -486,3 +486,24 @@ gate time and on every revoke tick (never cached at link open), keyed by
 the peer's verified device identity, and checks the requested action
 against it (`ceiling_covers_action`). Anything outside the ceiling needs
 an explicit grant exactly as before.
+
+## Settle-then-evaluate for shell-class opens
+
+An open arriving on a link whose possession proof is still in flight is
+HELD up to `gate.settle_ms` (registry, default 2000, hard max 5000) and
+decided on the settled state -- never allowed during the window. A later
+optimization may move the wait client-side (the client holds for a
+"proven" ack before opening); until then the server parks.
+
+- Parked opens carry (pid, device key, kind, transport, frame, sid,
+  deadline). Release requires the SAME link proven for the SAME device
+  key; a proof on another link, or a re-keyed peer, denies instead.
+- Bounds: at most 2 parked opens per link, 32 per daemon; excess denies
+  immediately with "identity settling, retry". Unknown identity (no key
+  to bind the hold to) denies fast with "identity not proven; retry".
+- Timeout denies with "identity not proven within N ms; retry" (never
+  silently, never as success). One log line per outcome (parked,
+  proven-in-N-ms, timed-out, bound-hit).
+- Applies uniformly to exec-open, pty-open, ssh-sign-request and l2-open
+  (forward). The re-drive calls the same handler the live path uses,
+  which re-gathers everything fresh -- a revoke during the hold denies.
