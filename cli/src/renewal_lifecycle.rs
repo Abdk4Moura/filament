@@ -451,7 +451,7 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // identity's record -- the invitation authorizes enrollment,
             // not name-squatting.
             let mut candidate = crate::sanitize_device_name(&requested_name);
-            let mut allow_reanchor =
+            let allow_reanchor =
                 prior.as_ref().and_then(|r| r["name"].as_str()) == Some(candidate.as_str());
             if !allow_reanchor {
                 let base = candidate.clone();

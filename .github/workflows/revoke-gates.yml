@@ -117,7 +117,7 @@ jobs:
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=6
             [cli/tests/exec-gates.sh]=13
-            [cli/tests/fleet-cert-gates.sh]=16
+            [cli/tests/fleet-cert-gates.sh]=19
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3

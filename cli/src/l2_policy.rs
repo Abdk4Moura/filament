@@ -85,7 +85,10 @@ mod tests {
         assert!(l2_open_allowed(true, true, false));
         // Grant-only mode (L2 on solely because SOME device has a shell grant):
         // the opening peer must itself hold the grant.
-        assert!(l2_open_allowed(false, true, false), "granted device may open");
+        assert!(
+            l2_open_allowed(false, true, false),
+            "granted device may open"
+        );
         assert!(
             !l2_open_allowed(false, false, false),
             "ungranted device denied in grant mode"
