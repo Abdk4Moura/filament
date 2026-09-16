@@ -135,10 +135,19 @@ jobs:
                    cli/tests/forward-refusal-gates.sh; do
             echo "::group::$g"
             [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
-            out="$(bash "$g" 2>&1)"; code=$?
+            # The runner invokes this step with `bash -e`, so a bare
+            # `out=$(...); code=$?` is a trap: a FAILING gate makes the
+            # assignment itself fail, errexit kills the step before the next
+            # line, and the gate's output is never printed -- red runs were
+            # reported with an EMPTY group, which is the worst possible
+            # property for a diagnostic harness. `|| code=$?` keeps the
+            # failing status while suppressing errexit; `|| true` on the
+            # count does the same for grep's exit 1 on zero matches.
+            code=0
+            out="$(bash "$g" 2>&1)" || code=$?
             echo "$out"
             echo "::endgroup::"
-            got=$(printf '%s\n' "$out" | grep -c '^PASS:')
+            got=$(printf '%s\n' "$out" | grep -c '^PASS:' || true)
             want=${EXPECT[$g]}
             if [ "$code" -ne 0 ]; then
               echo "::error::$g exited $code"; rc=1
