@@ -142,6 +142,7 @@ pub(crate) async fn park_on_deny(
     t: &Arc<dyn crate::net::Transport>,
     sid: u32,
     v: &Value,
+    gate_reason: &str,
 ) -> bool {
     let (binding_proven, device_pub, generation, name) = match conn.link(pid) {
         Some(l) => (
@@ -186,7 +187,7 @@ pub(crate) async fn park_on_deny(
         settle_ms: ms,
     });
     crate::ui::say(&format!(
-        "l2: {kind:?} open parked {ms}ms for identity proof"
+        "l2: {kind:?} open parked {ms}ms for identity proof (gate said: {gate_reason})"
     ));
     true
 }
@@ -286,7 +287,19 @@ async fn handle_forward_open(
         // (unproven) identity. Park for re-drive on proof when the deny
         // is attributable to it; otherwise the live verdict stands.
         if l2::is_l2_sid(sid)
-            && park_on_deny(parked, conn, &pid, ParkKind::Forward, &t, sid, v).await
+            && park_on_deny(
+                parked,
+                conn,
+                &pid,
+                ParkKind::Forward,
+                &t,
+                sid,
+                v,
+                l2_deny_reason
+                    .as_deref()
+                    .unwrap_or("device not granted shell"),
+            )
+            .await
         {
             return;
         }
@@ -403,7 +416,18 @@ async fn handle_pty_open(
     if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
         // Settle-then-evaluate: park for re-drive on proof when this deny
         // is attributable to the unproven binding; else the live verdict.
-        if park_on_deny(parked, conn, &pid, ParkKind::Pty, &t, sid, v).await {
+        if park_on_deny(
+            parked,
+            conn,
+            &pid,
+            ParkKind::Pty,
+            &t,
+            sid,
+            v,
+            cap_reason.as_deref().unwrap_or("no shell cap / untrusted"),
+        )
+        .await
+        {
             return;
         }
         let who = dev.as_deref().unwrap_or("<unverified>");
@@ -1739,22 +1763,20 @@ pub(crate) async fn recv_cmd(
             let mut expire = Vec::new();
             let mut stale = Vec::new();
             parked_opens.retain(|p| {
-                let st = conn.link(&p.pid).map(|l| {
-                    (
-                        l.identity_binding,
-                        l.identity_device_pub,
-                        l.generation,
-                    )
-                });
+                let st = conn
+                    .link(&p.pid)
+                    .map(|l| (l.identity_binding, l.identity_device_pub, l.generation));
                 match st {
                     // Release ONLY on the same link generation proving the
                     // same device key: a proof on a later link, or a
                     // re-keyed peer, denies instead (condition 2). The
                     // re-driven handler re-gathers everything fresh, so a
                     // revoke during the hold denies there.
-                    Some((crate::capability::BindingStrength::Proven, Some(pub_acting), link_gen))
-                        if pub_acting == p.device_pub && link_gen == p.generation =>
-                    {
+                    Some((
+                        crate::capability::BindingStrength::Proven,
+                        Some(pub_acting),
+                        link_gen,
+                    )) if pub_acting == p.device_pub && link_gen == p.generation => {
                         fire.push(p.clone());
                         false
                     }
