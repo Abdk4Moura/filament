@@ -250,6 +250,26 @@ mod tests {
                                         e, p,
                                         "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
                                     );
+                                    // Blanket axis: the forward caller computes its legacy
+                                    // fold through l2_open_allowed (blanket mode), not
+                                    // the shell fold -- mirror that composition here so
+                                    // the pin tests the real path, not an unreachable
+                                    // forced-legacy input. Denied must deny even
+                                    // blanketed -- N4 pins the l2_open_allowed rule.
+                                    let f_blanket = forward_gate_decision(
+                                        &inputs,
+                                        crate::l2_policy::l2_open_allowed(
+                                            true,
+                                            inputs.store_allows,
+                                            inputs.denied,
+                                        ),
+                                    );
+                                    if denied {
+                                        assert!(
+                                            f_blanket.is_err(),
+                                            "denied device opens nothing even blanketed: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                        );
+                                    }
                                     assert_eq!(
                                         f, e,
                                         "forward vs exec disagree on shared inputs: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} denied={denied} auth={authoritative}"

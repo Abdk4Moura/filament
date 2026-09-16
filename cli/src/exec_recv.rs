@@ -148,8 +148,7 @@ fn pathext_candidates(program: &str, exts: &str) -> Vec<String> {
 /// shell lookup, so argv exactness is unaffected.
 #[cfg(windows)]
 fn resolve_bare_in(dir: &std::path::Path, program: &str) -> Option<PathBuf> {
-    let exts =
-        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     for name in pathext_candidates(program, &exts) {
         let candidate = dir.join(&name);
         if is_executable(&candidate) {
@@ -254,7 +253,12 @@ pub(crate) async fn authorize_exec(
     pid: &str,
     shell_policy: &crate::ShellPolicy,
 ) -> Result<String, String> {
-    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy, crate::capability::CAP_SHELL);
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
+        conn,
+        pid,
+        shell_policy,
+        crate::capability::CAP_SHELL,
+    );
     crate::shell_gate::exec_gate_decision(&inputs)
         .map(|()| dev.unwrap_or_else(|| pid.to_string()))
         .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
@@ -590,7 +594,8 @@ pub(crate) async fn handle_exec_open(
         let (idev, _, _, _, _, _) = az.parts();
         idev.copied()
     };
-    let covered = crate::identity_state::ceiling_covers_action(idev.as_ref(), crate::capability::CAP_SHELL);
+    let covered =
+        crate::identity_state::ceiling_covers_action(idev.as_ref(), crate::capability::CAP_SHELL);
     let (_, has_grant_now) = crate::capability::cap_fleet_inputs(
         &crate::settings::config_dir(),
         "self",

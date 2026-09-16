@@ -3195,11 +3195,17 @@ pub(crate) async fn recv_cmd(
                                         // an INDEX ENTRY, not an authorization, and the
                                         // empty ceiling it carries matches the link's.
                                         if proven_name.is_none() {
-                                            // Transplant refusal: a claimed name matching
-                                            // an EXISTING record is never indexed under.
-                                            // The store pin below would refuse the write
-                                            // anyway; this refuses before attempting it
-                                            // and never binds the link to the name.
+                                            // Transplant refusal: compare the SANITIZED
+                                            // name -- the store keys on the sanitized
+                                            // form, so "laptop " or control-char variants
+                                            // must match "laptop" here, not slip past to
+                                            // land on it in the write below.
+                                            let shown = crate::sanitize_device_name(&shown);
+                                            // A claimed name matching an EXISTING record
+                                            // is never indexed under. The store pin
+                                            // below would refuse the write anyway; this
+                                            // refuses before attempting it and never
+                                            // binds the link to the name.
                                             let name_taken = std::fs::read_to_string(
                                                 crate::devices_store::devices_path(),
                                             )
@@ -3933,10 +3939,20 @@ pub(crate) async fn recv_cmd(
                             &shell_policy,
                             crate::capability::CAP_SHELL,
                         );
+                        // Ports arrive as u64; a value that does not fit u16 is
+                        // not addressable, so deny rather than truncate it into
+                        // a different (possibly exposed) port.
                         let reach_port = v["rport"]
                             .as_u64()
                             .or_else(|| v["port"].as_u64())
-                            .unwrap_or(0) as u16;
+                            .and_then(|p| u16::try_from(p).ok());
+                        let (reach_port, port_ok) = match reach_port {
+                            Some(p) => (p, true),
+                            None => {
+                                l2_deny_reason = Some("port out of range".to_string());
+                                (0, false)
+                            }
+                        };
                         gate_inputs.ceiling_covers = reach_port != 0
                             && crate::expose::load().iter().any(|b| b.port == reach_port);
                         let legacy_ok = {
@@ -3944,18 +3960,26 @@ pub(crate) async fn recv_cmd(
                                 || std::env::var("FILAMENT_L2")
                                     .map(|x| x == "1")
                                     .unwrap_or(false);
-                            let peer_has_shell = conn
+                            let (peer_has_shell, peer_denied) = conn
                                 .link(&pid)
                                 .and_then(|l| l.verified_name.as_deref())
-                                .map(|n| device_allows(n, "shell"))
-                                .unwrap_or(false);
-                            l2_open_allowed(blanket, peer_has_shell)
+                                .map(|n| {
+                                    (
+                                        device_allows(n, "shell"),
+                                        device_capability_denied(n, "shell"),
+                                    )
+                                })
+                                .unwrap_or((false, false));
+                            l2_open_allowed(blanket, peer_has_shell, peer_denied)
                         };
                         let d = crate::shell_gate::forward_gate_decision(&gate_inputs, legacy_ok);
                         if let Err(Some(r)) = &d {
                             l2_deny_reason = Some(r.clone());
                         }
-                        d.is_ok()
+                        // port_ok is ANDed last: an out-of-range port denies
+                        // even for a granted peer (there is nothing valid to
+                        // open), while keeping the recorded reason specific.
+                        d.is_ok() && port_ok
                     };
                     if !authorized {
                         // wire_sid (not a wrapping cast) so the l2-close we echo
@@ -3974,10 +3998,13 @@ pub(crate) async fn recv_cmd(
                         // device (or "*"). Loopback ignores this (always allowed).
                         let allow_nonloopback = {
                             let host = v["host"].as_str().unwrap_or("127.0.0.1");
+                            // Same truncation rule as the gate above: an
+                            // out-of-range port matches no allowlist entry.
                             let port = v["rport"]
                                 .as_u64()
                                 .or_else(|| v["port"].as_u64())
-                                .unwrap_or(0) as u16;
+                                .and_then(|p| u16::try_from(p).ok())
+                                .unwrap_or(0);
                             let name = conn
                                 .link(&pid)
                                 .and_then(|l| l.verified_name.clone())

@@ -444,6 +444,25 @@ pub(crate) async fn handle_auth_key_enroll_response(
                     }
                 }
             }
+            // Re-anchor ONLY an identity we already know under this exact
+            // name (this same key re-enrolling, e.g. the lapsed revival
+            // above reusing its name). A new key under a taken name takes
+            // a free-or-suffixed name and never overwrites another
+            // identity's record -- the invitation authorizes enrollment,
+            // not name-squatting.
+            let mut candidate = crate::sanitize_device_name(&requested_name);
+            let mut allow_reanchor =
+                prior.as_ref().and_then(|r| r["name"].as_str()) == Some(candidate.as_str());
+            if !allow_reanchor {
+                let base = candidate.clone();
+                let hex = hex::encode(device_pub);
+                let mut n = 2u32;
+                while crate::devices_store::name_pinned_by_other(&candidate, &hex) && n < 1000 {
+                    candidate = format!("{base}-{n}");
+                    n += 1;
+                }
+            }
+            let requested_name = candidate;
             let secret = fresh_secret();
             let now = identity::now_secs();
             let _certificate_ttl = ak.expires.saturating_sub(now);
@@ -463,8 +482,6 @@ pub(crate) async fn handle_auth_key_enroll_response(
             // Invitation::to_auth_key does that conversion once, so nothing here
             // has to reassemble it.
             let stored_name = if persistent {
-                // allow_reanchor: the owner minted this enrollment (invitation
-                // flow), which is the owner decision permitting this name.
                 match devices_upsert_atomic(
                     &requested_name,
                     Some(&secret),
@@ -473,7 +490,7 @@ pub(crate) async fn handle_auth_key_enroll_response(
                     Some(identity::IntroScope::Device.to_byte()),
                     None,
                     Some((&ak.caps, ak.expires, ak.max_offline, ak.max_offline)),
-                    true,
+                    allow_reanchor,
                 ) {
                     Ok(name) => name,
                     Err(error) => {

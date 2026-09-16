@@ -738,8 +738,29 @@ fn upsert_refuses_cert_reanchor_under_existing_name() {
     });
     let before = serde_json::to_string(&vec![victim]).unwrap();
     std::fs::write(dir.join("devices.json"), &before).unwrap();
-    // Attacker's cert: same name, different device key.
+    // Attacker's cert: same name, different device key -- plus the
+    // sanitization-bypass spellings (trailing space, control char) that
+    // must land on the same record after sanitizing, not slip past it.
     let impostor = cert_for(0x11, 0xb2, 9_999_999_999);
+    for alias in ["laptop", "laptop ", "laptop\u{7}"] {
+        let res = crate::devices_store::devices_upsert_atomic(
+            alias,
+            None,
+            Some(&impostor),
+            None,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            res.is_err(),
+            "re-anchoring write via '{alias}' must be refused"
+        );
+        let after = std::fs::read_to_string(dir.join("devices.json")).unwrap();
+        assert_eq!(after, before, "victim record must be byte-identical");
+    }
+    // The owner-decision opt-out still works (re-enrollment path).
     let res = crate::devices_store::devices_upsert_atomic(
         "laptop",
         None,
@@ -748,11 +769,9 @@ fn upsert_refuses_cert_reanchor_under_existing_name() {
         None,
         None,
         None,
-        false,
+        true,
     );
-    assert!(res.is_err(), "re-anchoring write must be refused");
-    let after = std::fs::read_to_string(dir.join("devices.json")).unwrap();
-    assert_eq!(after, before, "victim record must be byte-identical");
+    assert!(res.is_ok(), "owner-decided re-anchor must succeed");
 }
 
 /// The scope a vouch stores is Device, not User, and the difference is not

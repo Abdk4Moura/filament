@@ -20,8 +20,10 @@ use std::path::PathBuf;
 /// `grant`ed shell, the OPENING peer must itself hold that grant: otherwise a
 /// grant for ONE device would let EVERY trusted device open loopback tunnels.
 /// `trusted` is still required upstream; this is the additional per-device gate.
-pub(crate) fn l2_open_allowed(blanket: bool, peer_has_shell: bool) -> bool {
-    blanket || peer_has_shell
+/// An explicit deny outranks both blanket mode and the peer's own grant:
+/// a shell-denied device opens no tunnels, period (#244 class).
+pub(crate) fn l2_open_allowed(blanket: bool, peer_has_shell: bool, denied: bool) -> bool {
+    !denied && (blanket || peer_has_shell)
 }
 
 /// Opt-in non-loopback forward allowlist: `{config_dir}/l2-allow.json`. Absent or
@@ -79,14 +81,19 @@ mod tests {
     fn l2_open_gate_scopes_grant_mode() {
         // Blanket mode (--shell / --shell-only / FILAMENT_L2): any trusted peer
         // may open, regardless of its own per-device grant (unchanged behavior).
-        assert!(l2_open_allowed(true, false));
-        assert!(l2_open_allowed(true, true));
+        assert!(l2_open_allowed(true, false, false));
+        assert!(l2_open_allowed(true, true, false));
         // Grant-only mode (L2 on solely because SOME device has a shell grant):
         // the opening peer must itself hold the grant.
-        assert!(l2_open_allowed(false, true), "granted device may open");
+        assert!(l2_open_allowed(false, true, false), "granted device may open");
         assert!(
-            !l2_open_allowed(false, false),
+            !l2_open_allowed(false, false, false),
             "ungranted device denied in grant mode"
+        );
+        // Explicit deny outranks everything, including blanket mode.
+        assert!(
+            !l2_open_allowed(true, true, true),
+            "denied device opens nothing, even blanketed and granted"
         );
     }
 
