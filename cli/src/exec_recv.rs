@@ -547,21 +547,23 @@ pub(crate) async fn handle_exec_open(
     if !l2::is_l2_sid(sid) {
         return;
     }
-    // Settle-then-evaluate: hold unproven opens for re-drive on proof.
-    if crate::recv_cmd::park_unproven_open(
-        parked,
-        conn,
-        pid,
-        crate::recv_cmd::ParkKind::Exec,
-        &t,
-        sid,
-        v,
-    )
-    .await
-    {
-        return;
-    }
     if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
+        // Settle-then-evaluate: the verdict above may rest on stale
+        // (unproven) identity. Park for re-drive on proof when the deny
+        // is attributable to it; otherwise the live verdict stands.
+        if crate::recv_cmd::park_on_deny(
+            parked,
+            conn,
+            pid,
+            crate::recv_cmd::ParkKind::Exec,
+            &t,
+            sid,
+            v,
+        )
+        .await
+        {
+            return;
+        }
         crate::ui::say(&format!("l2: exec refused: {reason}"));
         // Enqueue under the verified petname (like pty-open's `who`), never
         // the raw pid: the queue is keyed by name, and "<unverified>" is a
