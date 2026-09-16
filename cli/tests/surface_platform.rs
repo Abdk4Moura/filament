@@ -64,7 +64,8 @@ fn budget() -> BTreeMap<&'static str, usize> {
         // mount_proto read 48 against a 47 budget on 2026-09-13 with no code
         // change behind it; set to the measured count rather than paid down.
         ("mount_proto.rs", 48),
-        ("l2.rs", 39),
+        // 39 -> 40 for the warm-pty verdict enum sharing its fn's gate.
+        ("l2.rs", 40),
         // Should approach zero as the armed set stops needing IPC at all.
         ("ctl.rs", 6),
         ("tun/mod.rs", 6),
