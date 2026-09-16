@@ -165,6 +165,15 @@ async fn deny_unsettled(
         .await;
 }
 
+/// Every inbound control frame, one line, at debug level. A frame that never
+/// arrived and a frame that arrived and was ignored are indistinguishable from
+/// the outside; this is the line that tells them apart, and its absence is what
+/// made "the peer ignores our challenge" take hours to disprove.
+fn log_ctl_rx<'a>(pid: &str, ty: Option<&'a str>) -> Option<&'a str> {
+    crate::ui::debug(&format!("ctl rx {} <- {pid}", ty.unwrap_or("?")));
+    ty
+}
+
 /// Settle-then-evaluate, called with an ALREADY-DENIED verdict: decide
 /// first, park only when the deny is attributable to the unproven binding.
 /// Allows proceed untouched (this fn never runs for them), so legacy
@@ -3903,7 +3912,7 @@ pub(crate) async fn recv_cmd(
                     }
                 }
             }
-            Ev::Control(pid, v) => match v["type"].as_str() {
+            Ev::Control(pid, v) => match log_ctl_rx(&pid, v["type"].as_str()) {
                 // L3 (serve_tun): the peer announced its overlay IP. Route that IP
                 // to this link and start pumping its datagrams into our TUN. Only
                 // when we run an overlay ourselves; ignored otherwise.
