@@ -57,10 +57,15 @@ fi
 
 say "A2: reach <sibling> is a known name"
 reach_out=$(timeout 40 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach charlie 2>&1)
-if echo "$reach_out" | grep -q "no device named"; then
-  bad "gateA2: reach charlie still says 'no device named' (out: $reach_out)"
+rc_reach=$?
+# Positive proof of recognition (a pong, or the roster-only mesh narration),
+# not mere absence of one error string: timeouts and crashes used to pass
+# this gate for the wrong reason (any output without 'no device named').
+echo "## (reach) rc=$rc_reach"
+if [ "$rc_reach" = "0" ] && { echo "$reach_out" | grep -q "pong" || echo "$reach_out" | grep -q "in your mesh"; }; then
+  ok "gateA2: reach charlie recognized the sibling (rc=0, positive proof)"
 else
-  ok "gateA2: reach charlie does not call the sibling unknown"
+  bad "gateA2: reach charlie did not recognizably succeed (rc=$rc_reach out: $reach_out)"
 fi
 
 say "B: revoked device still refused even though the roster lists it"
@@ -87,10 +92,15 @@ say "B2: after a roster refresh, the sibling no longer lists the revoked device,
 # epoch bump) and push to charlie.
 sleep 8
 charlie_after=$(env FILAMENT_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" devices 2>&1)
-if echo "$charlie_after" | grep -q "bravo"; then
-  bad "gateB2: charlie still lists revoked bravo after the refresh (out: $charlie_after)"
+# Assert on the MESH section (the pushed roster) ONLY: cert-revoke removes
+# bravo from what the owner re-issues, never from charlie's LOCAL pairing
+# (FLEET section -- only `forget` removes that). Grepping the whole output
+# made this gate fail forever: the local record correctly persists.
+mesh_block=$(echo "$charlie_after" | sed -n '/MESH/,/^$/p')
+if echo "$mesh_block" | grep -q "bravo"; then
+  bad "gateB2: pushed roster still lists revoked bravo after the refresh (mesh: $mesh_block)"
 else
-  ok "gateB2: charlie no longer lists revoked bravo after the roster refresh"
+  ok "gateB2: pushed roster no longer lists revoked bravo after the refresh"
 fi
 # And the acceptor still refuses bravo if presented again (both halves).
 again=$(env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1)
