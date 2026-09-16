@@ -231,40 +231,48 @@ pub(crate) fn handle_identity_expose(
     v: &Value,
     identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) -> bool {
+    // Every drop below used to be silent, which made an unprovable link
+    // indistinguishable from a link nobody challenged: the whole identity
+    // path looked idle while a peer's proof was being discarded. Debug
+    // level, so it costs nothing unless asked for.
+    let fail = |why: &str| {
+        crate::ui::debug(&format!("identity-expose dropped for {pid}: {why}"));
+        false
+    };
     let nonce_hex = v["nonce"].as_str().unwrap_or_default();
     let Ok(nonce_bytes) = hex::decode(nonce_hex) else {
-        return false;
+        return fail("malformed nonce");
     };
     if nonce_bytes.len() != 32 {
-        return false;
+        return fail("nonce wrong length");
     }
     let mut nonce_arr = [0u8; 32];
     nonce_arr.copy_from_slice(&nonce_bytes);
     // Check held nonce matches (single-use)
     let Some((held_nonce, _ts, _held_recv_dpub)) = identity_nonces.get(pid) else {
-        return false;
+        return fail("no challenge is held for this link (proof arrived on a different link?)");
     };
     if held_nonce != &nonce_arr {
-        return false;
+        return fail("nonce does not match the one held for this link");
     }
     // Verify cert and possession sig
     let Some(cert_json) = v.get("cert") else {
-        return false;
+        return fail("no certificate in the frame");
     };
     let Some(cert) = identity::DeviceCert::from_json(cert_json) else {
-        return false;
+        return fail("unparseable certificate");
     };
     if cert.verify(identity::now_secs()).is_err() {
-        return false;
+        return fail("certificate expired or malformed");
     }
     let Some(sig_hex) = v.get("possession_sig").and_then(|x| x.as_str()) else {
-        return false;
+        return fail("no possession signature");
     };
     let Ok(sig_bytes) = hex::decode(sig_hex) else {
-        return false;
+        return fail("possession signature is not hex");
     };
     if sig_bytes.len() != 64 {
-        return false;
+        return fail("possession signature wrong length");
     }
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&sig_bytes);
@@ -273,7 +281,7 @@ pub(crate) fn handle_identity_expose(
     let caps_d = crate::identity::caps_digest("transfer");
     let chash = crate::identity::cert_hash(&cert);
     let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() else {
-        return false;
+        return fail("this device has no overlay key");
     };
     let sender_dpub = cert.device_pub;
     let receiver_dpub = own_dpub;
@@ -287,7 +295,7 @@ pub(crate) fn handle_identity_expose(
         &receiver_dpub,
     );
     if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_err() {
-        return false;
+        return fail("possession signature does not verify");
     }
     // Anti-reflection, narrowed to device_pub (#41). A REFLECTION is my own message
     // bounced back to me, which necessarily carries MY OWN device cert, so
@@ -300,7 +308,7 @@ pub(crate) fn handle_identity_expose(
     // payload. On this 0x02 path the possession_msg also binds receiver_dpub non-zero,
     // so message binding is a second barrier here; on the 0x01 PAKE path it is not.
     if cert.device_pub == own_dpub {
-        return false;
+        return fail("reflection: the certificate is this device's own");
     }
     // Store as provisional, then promote on link
     let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
@@ -394,9 +402,11 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
     let (Ok(nonce_bytes), Ok(recv_dpub_bytes)) =
         (hex::decode(nonce_hex), hex::decode(recv_dpub_hex))
     else {
+        crate::ui::debug("identity challenge ignored: malformed nonce/receiver fields");
         return;
     };
     if nonce_bytes.len() != 32 || recv_dpub_bytes.len() != 32 {
+        crate::ui::debug("identity challenge ignored: nonce/receiver wrong length");
         return;
     }
     let mut nonce_arr = [0u8; 32];
@@ -407,10 +417,12 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
     // as the challenger (a self-challenge).
     if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
         if recv_dpub_arr == own_dpub {
+            crate::ui::debug("identity challenge ignored: it names my own device key");
             return;
         }
     }
     let Some(local_cert) = local_device_cert() else {
+        crate::ui::debug("identity challenge NOT answered: this device holds no certificate");
         return;
     };
     let scope = crate::identity::IntroScope::User.to_byte();
@@ -437,6 +449,9 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
             "possession_sig": hex::encode(sig)
         });
         let _ = t.send_control(&payload).await;
+        crate::ui::debug("identity challenge answered (identity-expose sent)");
+    } else {
+        crate::ui::debug("identity challenge NOT answered: possession signing failed");
     }
 }
 
