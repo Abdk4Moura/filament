@@ -1393,6 +1393,10 @@ pub(crate) async fn recv_cmd(
     // flight (settle-then-evaluate): re-driven on proof, denied at the
     // settle bound. Bounded (2 per link, 32 per daemon) at park time.
     let mut parked_opens: Vec<ParkedOpen> = Vec::new();
+    // Sweep counter for the settle retry cadence: while an open is parked,
+    // every third sweep (about 300ms at the parked tick) re-issues the
+    // possession challenge even when a hold is nominally live.
+    let mut settle_ticks: u32 = 0;
     // Warm-pty session -> (pid, sid), so a `pty-resize` op relays to the right stream.
     let warm_ptys: WarmPtys = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
     // Warm ssh-bootstrap reply sockets awaiting the peer's ack (see PendingBootstraps).
@@ -1907,24 +1911,34 @@ pub(crate) async fn recv_cmd(
             // challenge and the park, and a proof nobody solicited never
             // arrives. Re-issue while it waits; the issuer dedupes on a LIVE
             // hold, so this cannot clobber an in-flight nonce.
+            settle_ticks = settle_ticks.wrapping_add(1);
+            let retry_due = settle_ticks % 3 == 0;
             for p in &parked_opens {
                 let Some(t) = conn.transport_of(&p.pid) else {
                     continue;
                 };
-                // "Already challenged" means live AND on THIS transport --
-                // the same rule the issuer applies. Checking liveness alone
-                // made the issuer's transport check unreachable from here,
-                // so a hold recorded for a replaced link suppressed the
-                // re-challenge that would have let the park terminate in a
-                // proof instead of a timeout.
-                let held = st
+                // A live hold for THIS transport normally means "already
+                // challenged, do not clobber the nonce". Two exceptions,
+                // both needed for a park to terminate in a proof:
+                //   - the hold belongs to a REPLACED transport (the peer's
+                //     answer can never arrive on the link we have now), and
+                //   - the retry cadence fires: a challenge whose answer was
+                //     lost in flight -- observed live, the peer logs
+                //     "identity challenge answered" while the owner's frame
+                //     dispatch never sees it -- must be retried on the SAME
+                //     link, or the open waits out its whole window on a
+                //     proof that no longer exists anywhere. Each retry puts
+                //     a fresh nonce in the map and the peer answers the
+                //     latest one, so a match is guaranteed once a frame
+                //     survives.
+                let held_same_link = st
                     .pending_proven
                     .lock()
                     .unwrap()
                     .get(&p.pid)
                     .map(|(held_t, deadline)| now < *deadline && Arc::ptr_eq(held_t, &t))
                     .unwrap_or(false);
-                if held {
+                if held_same_link && !retry_due {
                     continue;
                 }
                 issue_proven_challenge_and_hold(
