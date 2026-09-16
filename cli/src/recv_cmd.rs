@@ -4106,11 +4106,13 @@ pub(crate) async fn recv_cmd(
                                             .unwrap_or(false);
                                             if name_taken {
                                                 // A REFUSAL, not chatter: a peer tried to
-                                                // take over another device's identity. Visible
-                                                // at the default level (like the other
-                                                // refusals the gates assert on), not debug.
-                                                ui::say(&format!(
-                                                    "l2: fleet peer claiming existing name '{shown}' not indexed: this is not the device paired under that name"
+                                                // take over another device's identity. Emitted
+                                                // at Critical so `-q` cannot hide it, with a
+                                                // STABLE TOKEN first so gates and log
+                                                // pipelines match on structure rather than on
+                                                // prose that a later edit may reword.
+                                                crate::ui::critical(&format!(
+                                                    "l2: refuse reason=name-taken claimed='{shown}' existing='{shown}' (this is not the device paired under that name)"
                                                 ));
                                             } else if let Some(cert) =
                                                 identity::DeviceCert::from_json(&v["cert"])
