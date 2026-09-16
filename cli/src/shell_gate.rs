@@ -14,7 +14,7 @@
 //! (the exact regression that motivated this module) turns red instead of
 //! shipping silently.
 
-use crate::capability::{BindingStrength, CAP_SHELL, CapOutcome, GateDecision};
+use crate::capability::{BindingStrength, CapOutcome, GateDecision};
 use crate::conn::Conn;
 
 /// Gathered gate inputs: link-derived + store-derived + policy, pre-decision.
@@ -175,7 +175,7 @@ pub(crate) fn ssh_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::CapOutcome;
+    use crate::capability::{CAP_SHELL, CapOutcome};
 
     /// Cross-path equivalence: exec's decision == pty-open's for every cell
     /// of trusted x has_grant x cert_revoked x delegated-ceiling x

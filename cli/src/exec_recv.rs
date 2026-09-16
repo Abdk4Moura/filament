@@ -536,6 +536,7 @@ pub(crate) async fn handle_exec_open(
     mux: Arc<l2::Mux>,
     v: &Value,
     shell_policy: &crate::ShellPolicy,
+    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     let Some(req) = parse_exec_open(v) else {
         return;
@@ -544,6 +545,20 @@ pub(crate) async fn handle_exec_open(
         return;
     };
     if !l2::is_l2_sid(sid) {
+        return;
+    }
+    // Settle-then-evaluate: hold unproven opens for re-drive on proof.
+    if crate::recv_cmd::park_unproven_open(
+        parked,
+        conn,
+        pid,
+        crate::recv_cmd::ParkKind::Exec,
+        &t,
+        sid,
+        v,
+    )
+    .await
+    {
         return;
     }
     if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {

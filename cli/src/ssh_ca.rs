@@ -493,6 +493,7 @@ pub(crate) async fn handle_ssh_sign(
     t: std::sync::Arc<dyn crate::net::Transport>,
     v: &serde_json::Value,
     shell_policy: &crate::ShellPolicy,
+    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     // Refusals are GENERIC on the wire: every deny looks identical out
     // there, so a refused peer cannot oracle which check failed. The detail
@@ -529,6 +530,20 @@ pub(crate) async fn handle_ssh_sign(
         let _ = t
             .send_control(&serde_json::json!({ "type": "l2-close", "sid": sid, "err": "malformed ssh-sign-request" }))
             .await;
+        return;
+    }
+    // Settle-then-evaluate: hold unproven opens for re-drive on proof.
+    if crate::recv_cmd::park_unproven_open(
+        parked,
+        conn,
+        pid,
+        crate::recv_cmd::ParkKind::SshSign,
+        &t,
+        sid,
+        v,
+    )
+    .await
+    {
         return;
     }
     // Gate first (same function, same inputs as pty/exec): no grant, no cert.

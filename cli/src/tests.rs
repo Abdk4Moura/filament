@@ -3123,7 +3123,6 @@ fn revoked_device_survives_cert_renewal() {
         .unwrap()
     };
     let cert_a = mk_cert(0xa1);
-    let cert_b = mk_cert(0xa2);
     let p = dir.join("devices.json");
     std::fs::write(
         &p,
