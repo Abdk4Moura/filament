@@ -105,6 +105,46 @@ pub(crate) fn park_budget_ok(per_link: usize, total: usize) -> bool {
     per_link < 2 && total < 32
 }
 
+/// What the settle sweep does with one parked open, as a PURE decision over
+/// the live link state -- so every arm (fire, and the three ways a hold goes
+/// stale) is unit-testable without a Conn or a clock.
+pub(crate) enum SweepArm {
+    /// Still waiting, deadline not reached.
+    Keep,
+    /// Same link generation, same device key, now Proven: re-drive.
+    Fire,
+    /// A different device key on the link: the peer re-keyed.
+    IdentityChanged,
+    /// Same key, newer link generation: the transport was swapped.
+    Replaced,
+    /// No link at all.
+    Dropped,
+    /// The settle bound passed.
+    Expired,
+}
+
+pub(crate) fn sweep_arm(
+    device_pub: [u8; 32],
+    generation: u32,
+    live: Option<(crate::capability::BindingStrength, Option<[u8; 32]>, u32)>,
+    now: Instant,
+    deadline: Instant,
+) -> SweepArm {
+    use crate::capability::BindingStrength;
+    match live {
+        Some((BindingStrength::Proven, Some(pub_), link_gen))
+            if pub_ == device_pub && link_gen == generation =>
+        {
+            SweepArm::Fire
+        }
+        Some((_, Some(pub_), _)) if pub_ != device_pub => SweepArm::IdentityChanged,
+        Some((_, _, link_gen)) if link_gen != generation => SweepArm::Replaced,
+        None => SweepArm::Dropped,
+        _ if now >= deadline => SweepArm::Expired,
+        _ => SweepArm::Keep,
+    }
+}
+
 /// The settle timeout reason, shared by the expiry deny and the client.
 pub(crate) fn settle_timeout_reason(ms: u64) -> String {
     format!("identity not proven within {ms} ms; retry")
@@ -154,14 +194,24 @@ pub(crate) async fn park_on_deny(
         None => (false, None, 0, None),
     };
     // Settled, revoked, or explicitly denied: the live verdict stands,
-    // whatever it was. Only an unproven, known, revocable identity parks.
+    // whatever it was, and the caller emits it (with its enqueue tell).
+    // Only an unproven, known, revocable identity parks.
     if binding_proven {
         return false;
     }
+    // No resolved key: there is nothing for a hold to bind to, so the LIVE
+    // verdict stands -- the caller sends its own reason and raises the
+    // access request. Answering here would replace a real denial ("no shell
+    // grant") with a retry hint and suppress the requestable tell.
     let Some(device_pub) = device_pub else {
-        deny_unsettled(t, sid, kind, "identity not proven; retry").await;
-        return true;
+        return false;
     };
+    // "Known key" means it resolves to a device record: an unresolved key
+    // cannot become Proven against a record, so it must not occupy hold
+    // budget (a stream of unknown-key opens would otherwise fill the queue).
+    if crate::device_view::devices_find_by_device_pub(&device_pub).is_none() {
+        return false;
+    }
     if crate::identity_state::cert_revoked_for(Some(&device_pub)) {
         return false;
     }
@@ -221,6 +271,22 @@ async fn handle_forward_open(
     // mode any trusted peer may open; in grant-only mode the opening
     // peer must hold the shell grant itself.
     let mut l2_deny_reason: Option<String> = None;
+    // Ports arrive as u64; a value that does not fit u16 is not
+    // addressable, so deny rather than truncate it into a different
+    // (possibly exposed) port. Parsed BEFORE the gate (and before any
+    // park): an out-of-range port is not an identity question, so it must
+    // keep its own immediate verdict.
+    let parsed_port = v["rport"]
+        .as_u64()
+        .or_else(|| v["port"].as_u64())
+        .and_then(|p| u16::try_from(p).ok());
+    let (reach_port, port_ok) = match parsed_port {
+        Some(p) => (p, true),
+        None => {
+            l2_deny_reason = Some("port out of range".to_string());
+            (0, false)
+        }
+    };
     let authorized = v["type"].as_str() != Some("l2-open") || {
         // Fourth shell-gated path, through the shared gather
         // and verdict core like pty/exec/ssh-sign. Two path-
@@ -237,20 +303,6 @@ async fn handle_forward_open(
             &shell_policy,
             crate::capability::CAP_SHELL,
         );
-        // Ports arrive as u64; a value that does not fit u16 is
-        // not addressable, so deny rather than truncate it into
-        // a different (possibly exposed) port.
-        let reach_port = v["rport"]
-            .as_u64()
-            .or_else(|| v["port"].as_u64())
-            .and_then(|p| u16::try_from(p).ok());
-        let (reach_port, port_ok) = match reach_port {
-            Some(p) => (p, true),
-            None => {
-                l2_deny_reason = Some("port out of range".to_string());
-                (0, false)
-            }
-        };
         gate_inputs.ceiling_covers =
             reach_port != 0 && crate::expose::load().iter().any(|b| b.port == reach_port);
         let legacy_ok = {
@@ -286,7 +338,8 @@ async fn handle_forward_open(
         // Settle-then-evaluate: the verdict above may rest on stale
         // (unproven) identity. Park for re-drive on proof when the deny
         // is attributable to it; otherwise the live verdict stands.
-        if l2::is_l2_sid(sid)
+        if port_ok
+            && l2::is_l2_sid(sid)
             && park_on_deny(
                 parked,
                 conn,
@@ -1741,11 +1794,19 @@ pub(crate) async fn recv_cmd(
                 None
             }
             res = tokio::time::timeout(
-                Duration::from_secs(2),
+                // While opens are parked the loop ticks fast, so a proof
+                // dispatched this iteration is acted on promptly instead of
+                // up to a full 2s later (a settled release must not miss its
+                // own bound). Idle cost is unchanged when nothing is parked.
+                if parked_opens.is_empty() {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(100)
+                },
                 next_ev(&mut rx, &conn, !st.pending.is_empty()),
             ) => match res {
                 Ok(res) => res?,
-                Err(_) => None, // 2s tick, run the fallback quiet-check below
+                Err(_) => None, // tick: run the settle sweep + quiet-check below
             },
         };
 
@@ -1763,75 +1824,79 @@ pub(crate) async fn recv_cmd(
             let mut expire = Vec::new();
             let mut stale = Vec::new();
             parked_opens.retain(|p| {
-                let st = conn
+                let live = conn
                     .link(&p.pid)
                     .map(|l| (l.identity_binding, l.identity_device_pub, l.generation));
-                match st {
-                    // Release ONLY on the same link generation proving the
-                    // same device key: a proof on a later link, or a
-                    // re-keyed peer, denies instead (condition 2). The
-                    // re-driven handler re-gathers everything fresh, so a
-                    // revoke during the hold denies there.
-                    Some((
-                        crate::capability::BindingStrength::Proven,
-                        Some(pub_acting),
-                        link_gen,
-                    )) if pub_acting == p.device_pub && link_gen == p.generation => {
+                match sweep_arm(p.device_pub, p.generation, live, now, p.deadline) {
+                    // The re-driven handler re-gathers everything fresh, so
+                    // a revoke during the hold denies there.
+                    SweepArm::Fire => {
                         fire.push(p.clone());
                         false
                     }
-                    // Same link, different key: the peer re-keyed under us.
-                    Some((_, Some(pub_acting), _)) if pub_acting != p.device_pub => {
+                    SweepArm::IdentityChanged => {
                         stale.push((p.clone(), "peer identity changed during hold"));
                         false
                     }
-                    // Same key but a newer link generation: the transport was
-                    // swapped (reconnect/repair) under the hold. The parked
-                    // open belongs to the dead transport; deny at once rather
-                    // than serving it there or lingering to expiry.
-                    Some((_, _, link_gen)) if link_gen != p.generation => {
+                    // The parked open belongs to the dead transport; deny
+                    // rather than serving it there or lingering to expiry.
+                    SweepArm::Replaced => {
                         stale.push((p.clone(), "link replaced during hold"));
                         false
                     }
-                    None => {
+                    SweepArm::Dropped => {
                         stale.push((p.clone(), "link dropped during hold"));
                         false
                     }
-                    _ if now >= p.deadline => {
+                    SweepArm::Expired => {
                         expire.push(p.clone());
                         false
                     }
-                    _ => true,
+                    SweepArm::Keep => true,
                 }
             });
-            // Transports are ALWAYS derived fresh: a parked transport may
-            // belong to a dead link (reconnect swaps it). If the link is
-            // gone there is nobody to answer, so drop silently.
+            // A close may only ride the SAME link generation the open was
+            // parked on. sids are per-Mux and start at 0, so after a
+            // reconnect the parked sid can name an unrelated live stream on
+            // the new link -- sending there would kill someone else's
+            // stream. When the generation moved, the denial is local-only
+            // (the peer's own stream died with its old link anyway).
+            let can_answer =
+                |p: &ParkedOpen| conn.link(&p.pid).map(|l| l.generation) == Some(p.generation);
             for p in expire {
                 crate::ui::say(&format!(
                     "l2: {:?} open timed out settling ({}ms); denying",
                     p.kind, p.settle_ms,
                 ));
-                if let Some(t) = conn.transport_of(&p.pid) {
-                    let _ = t
-                        .send_control(&serde_json::json!({
-                            "type": "l2-close",
-                            "sid": p.sid,
-                            "err": settle_timeout_reason(p.settle_ms),
-                        }))
-                        .await;
+                if can_answer(&p) {
+                    if let Some(t) = conn.transport_of(&p.pid) {
+                        let _ = t
+                            .send_control(&serde_json::json!({
+                                "type": "l2-close",
+                                "sid": p.sid,
+                                "err": settle_timeout_reason(p.settle_ms),
+                            }))
+                            .await;
+                    }
+                } else {
+                    crate::ui::say(&format!(
+                        "l2: {:?} open expired on a replaced link; not answering",
+                        p.kind
+                    ));
                 }
             }
             for (p, reason) in stale {
                 crate::ui::say(&format!("l2: {:?} open dropped: {reason}", p.kind));
-                if let Some(t) = conn.transport_of(&p.pid) {
-                    let _ = t
-                        .send_control(&serde_json::json!({
-                            "type": "l2-close",
-                            "sid": p.sid,
-                            "err": reason,
-                        }))
-                        .await;
+                if can_answer(&p) {
+                    if let Some(t) = conn.transport_of(&p.pid) {
+                        let _ = t
+                            .send_control(&serde_json::json!({
+                                "type": "l2-close",
+                                "sid": p.sid,
+                                "err": reason,
+                            }))
+                            .await;
+                    }
                 }
             }
             for p in fire {
@@ -6998,6 +7063,62 @@ mod settle_tests {
         // Per-daemon cap (32): the 33rd concurrent open denies.
         assert!(!park_budget_ok(0, 32));
         assert!(!park_budget_ok(1, 32));
+    }
+
+    /// Every sweep arm: the release condition, and each way a hold goes
+    /// stale. Pure, so these are exhaustive and clock-free. The record is
+    /// what stops a later edit from widening "fire" (e.g. dropping the
+    /// generation check) without noticing.
+    #[test]
+    fn sweep_arms_cover_fire_and_each_stale_way() {
+        use crate::capability::BindingStrength as B;
+        let now = Instant::now();
+        let past = now + Duration::from_secs(3);
+        let deadline = now + Duration::from_secs(2);
+        let key_a = [0x11u8; 32];
+        let key_b = [0x22u8; 32];
+        // Same link generation, same key, Proven -> release.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Proven, Some(key_a), 7)), now, deadline),
+            SweepArm::Fire
+        ));
+        // Not proven yet, deadline ahead -> keep waiting.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Inferred, Some(key_a), 7)), now, deadline),
+            SweepArm::Keep
+        ));
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::None, None, 7)), now, deadline),
+            SweepArm::Keep
+        ));
+        // Deadline passed -> expire (denied at the bound).
+        assert!(matches!(
+            sweep_arm(
+                key_a,
+                7,
+                Some((B::Inferred, Some(key_a), 7)),
+                past,
+                deadline
+            ),
+            SweepArm::Expired
+        ));
+        // A different key on the link -> the peer re-keyed.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Proven, Some(key_b), 7)), now, deadline),
+            SweepArm::IdentityChanged
+        ));
+        // Same key, NEWER generation -> replaced. This is the case a
+        // pid+key-only hold got wrong: it would have fired into a transport
+        // that never carried the challenge, or closed a stranger's sid.
+        assert!(matches!(
+            sweep_arm(key_a, 7, Some((B::Proven, Some(key_a), 8)), now, deadline),
+            SweepArm::Replaced
+        ));
+        // No link -> dropped.
+        assert!(matches!(
+            sweep_arm(key_a, 7, None, now, deadline),
+            SweepArm::Dropped
+        ));
     }
 
     #[test]
