@@ -197,6 +197,10 @@ static LD_NO_HEADER: AtomicU64 = AtomicU64::new(0);
 /// is NOT something the flip changes. Exposed in cap-status for delegated-
 /// enforcement review.
 static CEILING_DENIED: AtomicU64 = AtomicU64::new(0);
+/// Allows granted by fleet auto-trust WITHOUT an explicit grant (the
+/// enrolment-ceiling population the flip newly permits). Informational:
+/// name the population for reviewers, never gate the flip on it.
+static CEILING_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static PA_CEILING_DENIED: OnceLock<ActionCounters> = OnceLock::new();
 
 type ActionCounters = Mutex<HashMap<String, AtomicU64>>;
@@ -290,6 +294,7 @@ pub fn cap_shadow_counts() -> ShadowCounts {
         ld_denied: LD_DENIED.load(Ordering::Relaxed),
         ld_no_header: LD_NO_HEADER.load(Ordering::Relaxed),
         ceiling_denied: CEILING_DENIED.load(Ordering::Relaxed),
+        ceiling_admitted: CEILING_ADMITTED.load(Ordering::Relaxed),
     }
 }
 
@@ -435,6 +440,12 @@ pub fn cap_gate_effective(
     scoped_in_bounds: bool,
     has_explicit_grant: bool,
     cert_revoked: bool,
+    // An explicit owner-recorded deny for this action. Short-circuits
+    // EVERYTHING including fleet auto-trust: a deny is a decision, and a
+    // decision outranks auto-trust (#244 class -- fleet_allow used to
+    // bypass legacy, where denied lived, so a denied-but-covered device
+    // was allowed). Callers with no deny list for their path pass false.
+    denied: bool,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
 
@@ -548,7 +559,15 @@ pub fn cap_gate_effective(
             false,
         );
     }
-    let base_outcome = if same_owner {
+    // An explicit deny outranks EVERYTHING on this branch, including the
+    // fleet auto-trust recomputation below: without this, a covered-but-
+    // denied device would be re-authorized by fleet_ok two lines down,
+    // which is the #244 hole in a new form (the fleet_allow short-circuit
+    // alone cannot close it, because base_outcome feeds the authoritative
+    // decision independently).
+    let base_outcome = if denied {
+        CapOutcome::Denied("explicitly denied by owner (deniedCaps)".into())
+    } else if same_owner {
         if fleet_ok || has_explicit_grant {
             CapOutcome::Authorized
         } else {
@@ -571,11 +590,15 @@ pub fn cap_gate_effective(
     // just works regardless of the flag. It still respects cert expiry (the
     // standard expiry composer is a no-op in shadow, so re-check it here) and,
     // via fleet_auto_trust, the Proven binding.
-    let fleet_allow = fleet_ok
+    let fleet_allow = !denied
+        && fleet_ok
         && matches!(
             cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
             CapOutcome::Authorized
         );
+    if fleet_allow && !has_explicit_grant {
+        CEILING_ADMITTED.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Counters: recorded in BOTH modes so a flip does not blind us.
     // Per-action bucketing runs in parallel so the flip decision can cite
@@ -1045,6 +1068,7 @@ mod tests {
             false,
             false,
             true,
+            false,
         );
         assert!(
             !resolved_revoked.allowed(),
@@ -1063,6 +1087,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1093,6 +1118,7 @@ mod tests {
             true,
             false,
             false,
+            false,
         );
         assert!(
             matches!(decision, GateDecision::Allow),
@@ -1119,6 +1145,7 @@ mod tests {
             true,
             false,
             true,
+            false,
         );
         assert!(
             matches!(decision, GateDecision::Deny { .. }),
@@ -1161,6 +1188,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             );
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
@@ -1178,6 +1206,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         // Legacy-denied, cap authorizes → ld_authorized (widening)
         cap_gate_effective(
@@ -1191,6 +1220,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1279,6 +1309,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
@@ -1301,6 +1332,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1329,6 +1361,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1351,6 +1384,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1379,6 +1413,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1404,6 +1439,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1426,6 +1462,7 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
             false,
             false,
             false,
@@ -1865,6 +1902,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
         );
         assert!(
             d.allowed(),
@@ -1892,6 +1930,7 @@ mod tests {
             /*scoped_in_bounds*/ false,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1918,6 +1957,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1949,6 +1989,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ true,
             /*cert_revoked*/ true,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1982,6 +2023,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ true,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2013,6 +2055,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ true,
             /*cert_revoked*/ true,
+            false,
         );
         if prior.is_empty() {
             unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") };
@@ -2046,6 +2089,7 @@ mod tests {
             /*scoped_in_bounds*/ false,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
         );
         assert!(!d.allowed(), "same-owner Proven out-of-scope must DENY");
     }
@@ -2071,6 +2115,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2098,6 +2143,7 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2123,6 +2169,7 @@ mod tests {
             true,
             false,
             true,
+            false,
         );
         assert!(
             !d.allowed(),

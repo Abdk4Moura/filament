@@ -19,22 +19,22 @@ use crate::l3;
 #[cfg(l3)]
 use crate::{
     AdoptSource, Ceremony, Conn, DaemonMounts, Ev, IncomingFile, MAX_ATTEMPTS, MAX_VERIFY_FAILS,
-    PROVEN_CHALLENGE_DEADLINE, PakeInbound, PartMeta, Presence, RecvState, Rung,
-    ShellPolicy, TtyGuard, WarmPtys, any_shell_grant, apply_reconfigure, cancelled, channel_of,
-    clear_provisional_identity, codeentry, command_arg, config_get,
-    consent_token, ctl, daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
+    PROVEN_CHALLENGE_DEADLINE, PakeInbound, PartMeta, Presence, RecvState, Rung, ShellPolicy,
+    TtyGuard, WarmPtys, any_shell_grant, apply_reconfigure, cancelled, channel_of,
+    clear_provisional_identity, codeentry, command_arg, config_get, consent_token, ctl,
+    daemon_alive, device_allows, device_capability_denied, device_cert_revoked,
     device_name_for_pub, device_set_cap, devices_load, devices_path, devices_remove, devices_store,
     devices_sweep_lapsed, devices_touch, devices_upsert_atomic, direct, direct_ok_for,
     display_name, enqueue_if_requestable, ensure_self_genesis_header, exec_recv, expire_requests,
     expose, finalize_incoming, fleet, fleet_identity_pending, fleet_route_ok, fleet_shaped_link,
     flush_inflight, fresh_secret, handle_auth_key_enroll_response, handle_cert_renew_ack,
-    handle_identity_expose, handle_warm_req, human, identity,
-    in_binding, interactive_allowed, interactive_requested, is_self_uid,
-    issue_proven_challenge_and_hold, issue_signed_bounded_grant, l2, l2_open_allowed,
-    l2_target_allowed, link_nonce, load_provisional_identity, load_requests, local_device_cert,
-    mark_bounded_cap_source, mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal,
-    merge_owner_cap_ops, mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding,
-    overlay, owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz, platform,
+    handle_identity_expose, handle_warm_req, human, identity, in_binding, interactive_allowed,
+    interactive_requested, is_self_uid, issue_proven_challenge_and_hold,
+    issue_signed_bounded_grant, l2, l2_open_allowed, l2_target_allowed, link_nonce,
+    load_provisional_identity, load_requests, local_device_cert, mark_bounded_cap_source,
+    mark_lapsed_now, maybe_hint_local_wedge, maybe_request_cert_renewal, merge_owner_cap_ops,
+    mk_uid, mount, mount_proto, net, next_ev, offer_question, out_binding, overlay,
+    owner_pub_for_resources, owner_signed_cap_ops, pair_v2_caps, peer_authz, platform,
     principal_ceiling_for, prompt_line, proof_for, protocol, pwrite_at, quiet_exit_window,
     record_range, regex_lite_code, relay_banner, resolve_peer_identity,
     respond_to_auth_key_enroll_request, respond_to_cert_renew_request,
@@ -47,9 +47,9 @@ use crate::{
 // daemon_ctl.rs. Call sites stay byte-identical to the monolith.
 #[cfg(unix)]
 use crate::{
-    PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm,
-    handle_mount, handle_mount_health, handle_unmount, handle_warm_bootstrap,
-    reap_warm_bootstraps, warm_link_for,
+    PendingBootstraps, complete_warm_bootstrap, handle_list_mounts, handle_list_warm, handle_mount,
+    handle_mount_health, handle_unmount, handle_warm_bootstrap, reap_warm_bootstraps,
+    warm_link_for,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -1070,6 +1070,7 @@ pub(crate) async fn recv_cmd(
                                     "ld_denied": counts.ld_denied,
                                     "ld_no_header": counts.ld_no_header,
                                     "ceiling_denied": counts.ceiling_denied,
+                                    "ceiling_admitted": counts.ceiling_admitted,
                                 },
                                 "by_action": action_counts,
                                 "flip_ready": counts.flip_ready(),
@@ -3194,9 +3195,34 @@ pub(crate) async fn recv_cmd(
                                         // an INDEX ENTRY, not an authorization, and the
                                         // empty ceiling it carries matches the link's.
                                         if proven_name.is_none() {
-                                            if let Some(cert) =
+                                            // Transplant refusal: a claimed name matching
+                                            // an EXISTING record is never indexed under.
+                                            // The store pin below would refuse the write
+                                            // anyway; this refuses before attempting it
+                                            // and never binds the link to the name.
+                                            let name_taken = std::fs::read_to_string(
+                                                crate::devices_store::devices_path(),
+                                            )
+                                            .ok()
+                                            .and_then(|raw| {
+                                                serde_json::from_str::<Value>(&raw).ok()
+                                            })
+                                            .and_then(|v| v.as_array().cloned())
+                                            .map(|arr| {
+                                                arr.iter().any(|d| {
+                                                    d["name"].as_str() == Some(shown.as_str())
+                                                })
+                                            })
+                                            .unwrap_or(false);
+                                            if name_taken {
+                                                ui::debug(&format!(
+                                                    "fleet peer claiming existing name '{shown}' not indexed: this is not the device paired under that name"
+                                                ));
+                                            } else if let Some(cert) =
                                                 identity::DeviceCert::from_json(&v["cert"])
                                             {
+                                                // Strict: a peer-asserted name may never
+                                                // take over a pinned identity (F1).
                                                 match devices_upsert_atomic(
                                                     &shown,
                                                     None,
@@ -3205,6 +3231,7 @@ pub(crate) async fn recv_cmd(
                                                     Some(identity::IntroScope::Device.to_byte()),
                                                     None,
                                                     None,
+                                                    false,
                                                 ) {
                                                     Ok(stored) => {
                                                         // Bind the link to the record we
@@ -3891,6 +3918,27 @@ pub(crate) async fn recv_cmd(
                     // peer must hold the shell grant itself.
                     let mut l2_deny_reason: Option<String> = None;
                     let authorized = v["type"].as_str() != Some("l2-open") || {
+                        // Fourth shell-gated path, through the shared gather
+                        // and verdict core like pty/exec/ssh-sign. Two path-
+                        // specific pieces stay HERE, not in the gate: the
+                        // legacy fold (blanket L2 mode has no shell-gate
+                        // equivalent -- dropping it would newly deny default
+                        // setups in shadow) and the bound (expose.json, not
+                        // the enrolment ceiling). A forward --stdio to an
+                        // exposed sshd is shell-equivalent in reach (any byte
+                        // stream, incl. an ssh session).
+                        let (_dev, mut gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
+                            &mut conn,
+                            &pid,
+                            &shell_policy,
+                            crate::capability::CAP_SHELL,
+                        );
+                        let reach_port = v["rport"]
+                            .as_u64()
+                            .or_else(|| v["port"].as_u64())
+                            .unwrap_or(0) as u16;
+                        gate_inputs.ceiling_covers = reach_port != 0
+                            && crate::expose::load().iter().any(|b| b.port == reach_port);
                         let legacy_ok = {
                             let blanket = shell_policy.enables_l2()
                                 || std::env::var("FILAMENT_L2")
@@ -3903,56 +3951,11 @@ pub(crate) async fn recv_cmd(
                                 .unwrap_or(false);
                             l2_open_allowed(blanket, peer_has_shell)
                         };
-                        let az = peer_authz(&mut conn, &pid);
-                        let (idev, iusr, binding, expires, cert_revoked, ak_caps) = az.parts();
-                        let outcome = crate::capability::cap_authorize(
-                            &crate::settings::config_dir(),
-                            "self",
-                            crate::capability::CAP_SHELL,
-                            idev,
-                            iusr,
-                            ak_caps,
-                        );
-                        // Fleet scope for `reach`: a same-owner Proven device may
-                        // open an l2 forward WITHOUT a grant ONLY to a port the
-                        // owner has explicitly exposed (`expose.json`). A forward to
-                        // any other port is reach-all (deliberate) and needs a grant.
-                        let reach_port = v["rport"]
-                            .as_u64()
-                            .or_else(|| v["port"].as_u64())
-                            .unwrap_or(0) as u16;
-                        let scoped_in_bounds = reach_port != 0
-                            && crate::expose::load().iter().any(|b| b.port == reach_port);
-                        let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
-                            &crate::settings::config_dir(),
-                            "self",
-                            crate::capability::CAP_SHELL,
-                            idev,
-                            iusr,
-                            ak_caps,
-                        );
-                        let d = crate::capability::cap_gate_effective(
-                            legacy_ok,
-                            &outcome,
-                            crate::capability::CAP_SHELL,
-                            "self",
-                            idev,
-                            iusr,
-                            binding,
-                            expires,
-                            ak_caps,
-                            own_user.as_ref(),
-                            scoped_in_bounds,
-                            has_grant,
-                            cert_revoked,
-                        );
-                        if let crate::capability::GateDecision::Deny {
-                            cap_reason: Some(r),
-                        } = &d
-                        {
+                        let d = crate::shell_gate::forward_gate_decision(&gate_inputs, legacy_ok);
+                        if let Err(Some(r)) = &d {
                             l2_deny_reason = Some(r.clone());
                         }
-                        d.allowed()
+                        d.is_ok()
                     };
                     if !authorized {
                         // wire_sid (not a wrapping cast) so the l2-close we echo
@@ -4192,6 +4195,12 @@ pub(crate) async fn recv_cmd(
                             // Deliberate tier: `shell` is never a scoped default, so a
                             // same-owner device gets it ONLY via an explicit grant
                             // (has_grant), never fleet auto-trust (scoped_in_bounds=false).
+                            // The explicit deny travels too: denied short-circuits
+                            // fleet auto-trust, matching the legacy fold above.
+                            let denied = dev
+                                .as_deref()
+                                .map(|n| device_capability_denied(n, "shell"))
+                                .unwrap_or(false);
                             crate::capability::cap_gate_effective(
                                 legacy_ok,
                                 &outcome,
@@ -4206,6 +4215,7 @@ pub(crate) async fn recv_cmd(
                                 false,
                                 has_grant,
                                 cert_revoked,
+                                denied,
                             )
                         }
                     };
@@ -4346,8 +4356,12 @@ pub(crate) async fn recv_cmd(
                     // One shared shell gate (same function, same inputs as
                     // exec-open): gather, then the pty entry point. The tells
                     // below stay local; only the verdict is shared.
-                    let (dev, gate_inputs) =
-                        crate::shell_gate::gather_shell_gate_inputs(&mut conn, &pid, &shell_policy, crate::capability::CAP_SHELL);
+                    let (dev, gate_inputs) = crate::shell_gate::gather_shell_gate_inputs(
+                        &mut conn,
+                        &pid,
+                        &shell_policy,
+                        crate::capability::CAP_SHELL,
+                    );
                     if let Err(cap_reason) = crate::shell_gate::pty_gate_decision(&gate_inputs) {
                         let who = dev.as_deref().unwrap_or("<unverified>");
                         ui::say(&format!(
@@ -4360,7 +4374,8 @@ pub(crate) async fn recv_cmd(
                         // produced and then thrown away before it crossed the wire,
                         // so the initiator read an empty success instead of the
                         // refusal. The fallback stays coarse on purpose.
-                        let reason = cap_reason.unwrap_or_else(|| "shell capability not granted".to_string());
+                        let reason = cap_reason
+                            .unwrap_or_else(|| "shell capability not granted".to_string());
                         let _ = t
                             .send_control(&json!({ "type": "l2-close", "sid": sid, "err": reason }))
                             .await;
@@ -4503,8 +4518,7 @@ pub(crate) async fn recv_cmd(
                     let spawn_idev = conn.link(&pid).and_then(|l| l.identity_device_pub);
                     // Ceiling-admitted (covered, grantless) sessions must die
                     // when the ceiling narrows; grant-admitted ones ignore it.
-                    let admitted_via_ceiling =
-                        gate_inputs.ceiling_covers && !gate_inputs.has_grant;
+                    let admitted_via_ceiling = gate_inputs.ceiling_covers && !gate_inputs.has_grant;
                     match l2::spawn_pty_session(
                         pty_sessions.clone(),
                         session_id.clone(),
@@ -4648,6 +4662,8 @@ pub(crate) async fn recv_cmd(
                             && binding == crate::capability::BindingStrength::Proven
                             && mount_scoped_default
                             && !has_grant;
+                        // No deny list is consulted on the mount path today;
+                        // false preserves that exactly.
                         let d = crate::capability::cap_gate_effective(
                             trusted,
                             &outcome,
@@ -4662,6 +4678,7 @@ pub(crate) async fn recv_cmd(
                             mount_scoped_default,
                             has_grant,
                             cert_revoked,
+                            false,
                         );
                         (d, read_only)
                     };
@@ -5475,6 +5492,8 @@ pub(crate) async fn recv_cmd(
                             iusr,
                             ak_caps,
                         );
+                        // No deny list is consulted on the transfer path today;
+                        // false preserves that exactly.
                         let d = crate::capability::cap_gate_effective(
                             legacy_ok,
                             &outcome,
@@ -5489,6 +5508,7 @@ pub(crate) async fn recv_cmd(
                             scoped_in_bounds,
                             has_grant,
                             cert_revoked,
+                            false,
                         );
                         let reason =
                             if let crate::capability::GateDecision::Deny { cap_reason } = &d {

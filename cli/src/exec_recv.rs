@@ -498,7 +498,11 @@ pub(crate) async fn serve_exec(
                         authz.idev.as_ref(),
                         crate::capability::CAP_SHELL,
                     );
-                if cert_gone || grant_gone || ceiling_gone {
+                // A lapsed deadline (cert expiry, absolute stop, offline
+                // budget) ends it too; unresolvable identity is no opinion.
+                let lapsed =
+                    matches!(crate::identity_state::peer_liveness_alive(authz.idev.as_ref()), Some(false));
+                if cert_gone || grant_gone || ceiling_gone || lapsed {
                     crate::ui::critical("exec: peer access revoked, closing live session");
                     let _ = child.kill().await;
                     let _ = t

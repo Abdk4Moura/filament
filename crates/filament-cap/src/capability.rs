@@ -1382,6 +1382,11 @@ pub struct ShadowCounts {
     pub ld_no_header: u64,
     /// Auth-key ceiling denials (both modes, outside flip criterion).
     pub ceiling_denied: u64,
+    /// Allows granted by fleet auto-trust WITHOUT an explicit grant
+    /// (enrolment-ceiling admission). Informational only: it names the
+    /// population the flip newly permits, so reviewers can enumerate it.
+    /// Never part of flip_ready (widening is reviewed, not gated).
+    pub ceiling_admitted: u64,
 }
 
 impl ShadowCounts {
@@ -2885,13 +2890,13 @@ mod tests {
     /// counters would have.
     #[test]
     fn shadow_flip_criterion() {
-        let ready = ShadowCounts { la_authorized: 5, la_denied: 0, la_no_header: 0, ld_authorized: 2, ld_denied: 3, ld_no_header: 0, ceiling_denied: 0 };
+        let ready = ShadowCounts { la_authorized: 5, la_denied: 0, la_no_header: 0, ld_authorized: 2, ld_denied: 3, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
         assert!(ready.flip_ready(), "clean legacy-allowed sample, all provisioned, must be flip-ready");
-        let empty = ShadowCounts { la_authorized: 0, la_denied: 0, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0 };
+        let empty = ShadowCounts { la_authorized: 0, la_denied: 0, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
         assert!(!empty.flip_ready(), "no sample yet: a bare zero total must NOT pass");
-        let disagree = ShadowCounts { la_authorized: 10, la_denied: 1, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0 };
+        let disagree = ShadowCounts { la_authorized: 10, la_denied: 1, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
         assert!(!disagree.flip_ready(), "a real header disagreement must block the flip");
-        let unprov = ShadowCounts { la_authorized: 10, la_denied: 0, la_no_header: 4, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0 };
+        let unprov = ShadowCounts { la_authorized: 10, la_denied: 0, la_no_header: 4, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
         assert!(!unprov.flip_ready(), "an unprovisioned resource must block the flip (absent != clean)");
         assert!(disagree.summary().contains("flip_ready=false"));
     }

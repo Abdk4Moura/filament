@@ -538,6 +538,9 @@ pub(crate) async fn pair_cmd(
                             // row holding only one of them is either unreachable or
                             // "uncertified, trusted in full".
                             if let Some((cert, caps)) = issued_cert.as_ref() {
+                                // allow_reanchor: the local user accepted this
+                                // pairing ceremony, which is the owner decision
+                                // that permits re-anchoring (e.g. reinstall).
                                 if let Err(e) = devices_upsert_atomic(
                                     &n,
                                     Some(&sec),
@@ -546,6 +549,7 @@ pub(crate) async fn pair_cmd(
                                     Some(identity::IntroScope::Device.to_byte()),
                                     None,
                                     None,
+                                    true,
                                 ) {
                                     ui::debug(&format!(
                                         "enrol: could not record the certificate: {e}"
@@ -558,6 +562,7 @@ pub(crate) async fn pair_cmd(
                             // If process crashes between them, cap_authorize sees new-secret + old-cert (or no cert)
                             // yielding wrong userPub. Fix: devices_upsert_atomic writes both fields together.
                             let pcert = peer_identity_cert.as_ref().unwrap();
+                            // allow_reanchor: same accepted ceremony as above.
                             devices_upsert_atomic(
                                 &n,
                                 Some(&sec),
@@ -566,6 +571,7 @@ pub(crate) async fn pair_cmd(
                                 Some(scope),
                                 None,
                                 None,
+                                true,
                             )
                             .context("atomic store secret+cert")?;
                             // Also store provisional for overlay check: on overlay failure, REMOVE the durable anchor

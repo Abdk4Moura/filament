@@ -176,6 +176,14 @@ pub(crate) fn upsert_peer_record(
 /// `upsert_peer_record` (both fields in ONE record), persist via write-tmp-then-rename
 /// (SecretFile::write already atomic on POSIX). A concurrent reader sees either the full
 /// old peer or the full new peer, never a torn state.
+/// `allow_reanchor` is the owner-agency escape hatch, and it is deliberately
+/// a caller-visible boolean rather than inferred: re-anchoring a record to
+/// a new device key is legitimate ONLY as a direct consequence of an
+/// owner/user decision made outside this function (accepting an enrollment
+/// or pairing ceremony, joining as the owner). The network-driven fleet
+/// indexing path must always pass false -- a peer-asserted name may never
+/// take over a pinned identity, which is the transplant the pin exists to
+/// stop. Default to false unless the call site names the owner decision.
 pub(crate) fn devices_upsert_atomic(
     name: &str,
     secret: Option<&str>,
@@ -184,6 +192,7 @@ pub(crate) fn devices_upsert_atomic(
     scope: Option<u8>,
     user_key_hex: Option<&str>,
     delegated: Option<(&[String], u64, u64, u64)>,
+    allow_reanchor: bool,
 ) -> Result<String> {
     let clean = sanitize_device_name(name);
     let name = clean.as_str();
@@ -192,6 +201,25 @@ pub(crate) fn devices_upsert_atomic(
         std::fs::create_dir_all(dir).context("create config dir")?;
     }
     with_devices_mut(|arr| {
+        // Identity pinning: records are keyed by identity, names are
+        // presentation. A cert write whose device key differs from the
+        // record's pinned one is a takeover (e.g. a fleet sibling naming
+        // itself after a ceilinged device), so it is refused HERE, in the
+        // writer, in the SAME lock cycle as the write -- never delegated
+        // to callers and with no TOCTOU window between check and write.
+        // Records with no pinned cert yet (secret-only pairs) accept.
+        if let Some(c) = cert {
+            if let Some(existing) = arr.iter().find(|d| d["name"].as_str() == Some(name)) {
+                if let Some(pinned) = existing["deviceCert"]["devicePub"].as_str() {
+                    let incoming = hex::encode(c.device_pub);
+                    if pinned != incoming.as_str() && !allow_reanchor {
+                        anyhow::bail!(
+                            "refusing to re-anchor record '{name}': pinned device key {pinned} != presented key {incoming}"
+                        );
+                    }
+                }
+            }
+        }
         let final_name = upsert_peer_record(
             arr,
             name,
