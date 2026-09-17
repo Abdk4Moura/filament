@@ -263,6 +263,26 @@ async fn handle_forward_open(
     l2_enabled: bool,
     parked: &mut Vec<ParkedOpen>,
 ) {
+    // The live arm denies an l2-open when serving is off BEFORE the handler is
+    // reached, so this reads as redundant -- but a PARKED open is re-driven
+    // straight into this function, bypassing that guard. Applying it here keeps
+    // "re-drive re-gathers every input" true for the L2 switch too (a policy
+    // reload that turns L2 off cannot be outrun by an open that parked while it
+    // was on), and the denial is byte-identical to the live arm's so the peer
+    // gets one reason for one cause.
+    if !l2_enabled {
+        if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
+            let _ = t
+                .send_control(&json!({
+                    "type": "l2-close",
+                    "sid": sid,
+                    "err": crate::capability::TUNNEL_OFF_REASON,
+                }))
+                .await;
+        }
+        return;
+    }
+
     // TODO(diag acceptor): emit a diag::Attempt with role
     // "acceptor" for this l2-open->l2-open-ack round trip. Deferred
     // because the acceptor has no per-connect span here: this fires
