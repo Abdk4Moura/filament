@@ -46,6 +46,14 @@ Owner: whoever writes the flip commit. Cite the evidence in that commit.
       device's name; enumerate the population before the flip so the number is
       explained rather than surprising. Its verdict text is
       `CAP-SHADOW cap-narrows-legacy` at Info, never CRITICAL.
+- [ ] `la_narrowed` reviewed (informational, not a gate, and NOT part of
+      `flip_ready`): opens legacy allowed and the layer refuses because the
+      subject is not covered by any ceiling or grant. This is the flip CLOSING
+      a legacy hole (pairing alone used to suffice) -- intended. A NONZERO
+      value is expected on any fleet where a peer has ever tried to claim
+      another device's name; enumerate the population before the flip so the
+      number is explained rather than surprising. Its verdict text is
+      `CAP-SHADOW cap-narrows-legacy` at Info, never CRITICAL.
 - [ ] `ceiling_admitted` reviewed (informational, not a gate): opens allowed
       by fleet auto-trust WITHOUT an explicit grant (enrolment-ceiling
       admission). Widening is reviewed, not gated -- cite the count alongside
@@ -70,6 +78,22 @@ entirely (legacy decides), which is why it went unnoticed.
 Consequence for the flip: in shadow this is invisible; under authoritative it
 locks out every fleet device that is mid-reconnect after an owner restart. Do NOT
 flip until #312 is fixed and AUTH-A is green first-try.
+
+## FLIP BLOCKER: fleet devices cannot re-prove after an owner restart
+
+Measured by `cli/tests/fleet-cert-gates.sh` gate AUTH-A (currently KNOWN-RED,
+filed as issue #312): after the owner daemon restarts, the possession
+challenge does not reach the peer on the link that is carrying its traffic, so
+a covered shell-class open is refused under authoritative mode until the peer
+reconnects cleanly. The defect is in the LINK, not in the authz layer: a
+primary transport can go writable-but-deaf because its reader exits silently
+on a QUIC `FinishedEarly` without marking the link dead
+(`crates/filament-transport/src/direct.rs:1410` and `:1436`). Shadow mode
+masks it completely (legacy decides), which is why it went unnoticed.
+
+Consequence: invisible in shadow; under authoritative it locks out every
+fleet device that is mid-reconnect after an owner restart. Do NOT flip until
+issue #312 is fixed and AUTH-A is green first-try.
 
 ## Mandatory review citation (not a boolean)
 
