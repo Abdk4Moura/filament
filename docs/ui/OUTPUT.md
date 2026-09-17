@@ -161,6 +161,25 @@ are unaffected (#208).
 Say what a pause is for. If the program is waiting on the user rather than on
 the network, the prompt should say so.
 
+## One shape per repeated result
+
+A verb that prints a result more than once prints the SAME line every time, from
+one formatter. `reach` renders every probe through `ping::probe_line`:
+
+```
+pong via relay(198.51.100.4:3478) 41 ms
+pong via 203.0.113.7:41641 (direct-quic) 9 ms
+```
+
+`reach` prints it once, `reach --until-direct` once a second until the link is
+direct. One formatter means one unit test for the shape, and it means a reader
+who has seen the line once can read the loop.
+
+Under `--json` the same probe is one envelope per line on stdout,
+`{"ok","verb":"reach","data":{route,direct,rtt_ms,addr}}` — per verb, not a
+global wrapper, and the exit code is what a script branches on (0 direct,
+5 still on a relay at the timeout).
+
 ## Enforcing this
 
 `cli/tests/surface_output.rs` holds a per-file budget of bare print macros and
