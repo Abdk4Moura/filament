@@ -29,8 +29,8 @@
 //! with WG access can reach SSH and exposed ports regardless of capability
 //! grants. This is the stated boundary — the WG PSK IS the authorization
 //! for SSH and exposed-port reach on the overlay.
-use anyhow::{anyhow, bail, Result};
-use ring::signature::{Ed25519KeyPair, UnparsedPublicKey, ED25519};
+use anyhow::{Result, anyhow, bail};
+use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use serde_json::Value;
 
 /// The only capability names understood by the enforcement layer.
@@ -118,12 +118,17 @@ pub fn parse_grant_spec(spec: &str, owner_pub: &[u8; 32]) -> Result<GrantSpec> {
 pub fn canonical_capability(name: &str) -> Result<String> {
     let normalized = name.trim().to_ascii_lowercase();
     if matches!(normalized.as_str(), "send" | "inbox") {
-        bail!("capability '{normalized}' is not currently grantable; use 'transfer', which covers both directions")
+        bail!(
+            "capability '{normalized}' is not currently grantable; use 'transfer', which covers both directions"
+        )
     }
     if CANONICAL_CAPABILITIES.contains(&normalized.as_str()) {
         Ok(normalized)
     } else {
-        bail!("unknown capability '{name}' (valid: {})", CANONICAL_CAPABILITIES.join(", "))
+        bail!(
+            "unknown capability '{name}' (valid: {})",
+            CANONICAL_CAPABILITIES.join(", ")
+        )
     }
 }
 
@@ -208,9 +213,13 @@ fn route_resource_nonce(normalized_cidr: &str) -> [u8; 32] {
 ///
 /// Family-crossing never matches: a v4 ceiling cannot authorise a v6 prefix.
 pub fn cidr_within_any(candidate: &str, allowed: &[String]) -> bool {
-    let Some((c_net, c_len)) = parse_cidr(candidate) else { return false };
+    let Some((c_net, c_len)) = parse_cidr(candidate) else {
+        return false;
+    };
     allowed.iter().any(|a| {
-        let Some((a_net, a_len)) = parse_cidr(a) else { return false };
+        let Some((a_net, a_len)) = parse_cidr(a) else {
+            return false;
+        };
         // The candidate must be at least as SPECIFIC as the allowance, and sit
         // inside it. `c_len >= a_len` is what refuses widening.
         c_len >= a_len && same_family(&c_net, &a_net) && masked_eq(&c_net, &a_net, a_len)
@@ -222,7 +231,9 @@ fn parse_cidr(s: &str) -> Option<(std::net::IpAddr, u8)> {
     let net: std::net::IpAddr = net.trim().parse().ok()?;
     let len: u8 = len.trim().parse().ok()?;
     let max = if net.is_ipv4() { 32 } else { 128 };
-    if len > max { return None; }
+    if len > max {
+        return None;
+    }
     Some((net, len))
 }
 
@@ -270,7 +281,11 @@ pub fn normalize_cidr(cidr: &str) -> Result<String> {
                 anyhow::bail!("'{t}': /{len} is not valid for IPv4 (max 32)");
             }
             let bits = u32::from(a);
-            let masked = if len == 0 { 0 } else { bits & (u32::MAX << (32 - len)) };
+            let masked = if len == 0 {
+                0
+            } else {
+                bits & (u32::MAX << (32 - len))
+            };
             Ok(format!("{}/{len}", Ipv4Addr::from(masked)))
         }
         IpAddr::V6(a) => {
@@ -278,7 +293,11 @@ pub fn normalize_cidr(cidr: &str) -> Result<String> {
                 anyhow::bail!("'{t}': /{len} is not valid for IPv6 (max 128)");
             }
             let bits = u128::from(a);
-            let masked = if len == 0 { 0 } else { bits & (u128::MAX << (128 - len)) };
+            let masked = if len == 0 {
+                0
+            } else {
+                bits & (u128::MAX << (128 - len))
+            };
             Ok(format!("{}/{len}", Ipv6Addr::from(masked)))
         }
     }
@@ -294,7 +313,10 @@ pub fn normalize_cidr(cidr: &str) -> Result<String> {
 /// grantor is not the resource owner.
 pub fn route_resource_id(owner_pub: &[u8; 32], cidr: &str) -> Result<String> {
     let normalized = normalize_cidr(cidr)?;
-    Ok(make_resource_id(owner_pub, &route_resource_nonce(&normalized)))
+    Ok(make_resource_id(
+        owner_pub,
+        &route_resource_nonce(&normalized),
+    ))
 }
 
 /// Self-certifying resource id: hex(SHA-256(owner_pub || nonce)).
@@ -467,19 +489,31 @@ impl CapOp {
         let op = CapOpKind::from_byte(op_byte)?;
         let grantor = {
             let b = hex::decode(v["grantor"].as_str()?).ok()?;
-            if b.len() != 32 { return None; }
-            let mut a = [0u8; 32]; a.copy_from_slice(&b); a
+            if b.len() != 32 {
+                return None;
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
         };
         let target = {
             let b = hex::decode(v["target"].as_str()?).ok()?;
-            if b.len() != 32 { return None; }
-            let mut a = [0u8; 32]; a.copy_from_slice(&b); a
+            if b.len() != 32 {
+                return None;
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
         };
         let target_kind = v["targetKind"].as_u64()? as u8;
         let sig = {
             let b = hex::decode(v["sig"].as_str()?).ok()?;
-            if b.len() != 64 { return None; }
-            let mut a = [0u8; 64]; a.copy_from_slice(&b); a
+            if b.len() != 64 {
+                return None;
+            }
+            let mut a = [0u8; 64];
+            a.copy_from_slice(&b);
+            a
         };
         let perms: Vec<String> = v["permissions"]
             .as_array()?
@@ -608,7 +642,13 @@ pub fn evaluate(
     let eval_time = std::cmp::max(now, ratchet.unwrap());
 
     if scan_grants_authorizes(
-        store, header, principal_device_pub, principal_user_pub, resource, action, eval_time,
+        store,
+        header,
+        principal_device_pub,
+        principal_user_pub,
+        resource,
+        action,
+        eval_time,
     ) {
         Decision::Authorized
     } else {
@@ -654,10 +694,19 @@ fn scan_grants_authorizes(
             0x02 => continue, // reserved (Group) — 0x03 (Tag) is the active kind
             0x03 => {
                 let t = hex::decode(entry["target"].as_str().unwrap_or("")).unwrap_or_default();
-                if t.len() != 32 { false }
-                else {
-                    let mut hash = [0u8; 32]; hash.copy_from_slice(&t);
-                    resolve_tag_match(store, &header.owner_pub, hash, principal_user_pub, principal_device_pub, eval_time)
+                if t.len() != 32 {
+                    false
+                } else {
+                    let mut hash = [0u8; 32];
+                    hash.copy_from_slice(&t);
+                    resolve_tag_match(
+                        store,
+                        &header.owner_pub,
+                        hash,
+                        principal_user_pub,
+                        principal_device_pub,
+                        eval_time,
+                    )
                 }
             }
             _ => continue,
@@ -737,7 +786,13 @@ pub fn evaluate_grants_only(
     }
     let eval_time = std::cmp::max(now, ratchet.unwrap());
     if scan_grants_authorizes(
-        store, header, principal_device_pub, principal_user_pub, resource, action, eval_time,
+        store,
+        header,
+        principal_device_pub,
+        principal_user_pub,
+        resource,
+        action,
+        eval_time,
     ) {
         Decision::Authorized
     } else {
@@ -802,8 +857,8 @@ pub fn fleet_auto_trust(
 
 #[derive(Debug, Clone)]
 pub struct TagBindingObj {
-    pub tag_ref: [u8; 32],  // SHA-256(owner_pub || tag_id)
-    pub subject_kind: u8,   // 0x00=user, 0x01=device
+    pub tag_ref: [u8; 32], // SHA-256(owner_pub || tag_id)
+    pub subject_kind: u8,  // 0x00=user, 0x01=device
     pub subject: [u8; 32],
     pub owner_pub: [u8; 32],
     pub version: u64,
@@ -844,23 +899,54 @@ impl TagBindingObj {
 
 /// Find tag bindings for (owner_pub, tag_hash) that are not expired and sig-valid.
 fn find_tag_bindings(store: &[Value], owner: &[u8; 32], tag_hash: [u8; 32]) -> Vec<TagBindingObj> {
-    store.iter().filter_map(|e| {
-        if e.get("type").and_then(|v| v.as_str()) != Some("cap_tag_binding") { return None; }
-        let b = TagBindingObj {
-            tag_ref: { let b = hex::decode(e["tag_ref"].as_str()?).ok()?; let mut a = [0u8;32]; a.copy_from_slice(&b); a },
-            subject_kind: e["subject_kind"].as_u64()? as u8,
-            subject: { let b = hex::decode(e["subject"].as_str()?).ok()?; let mut a = [0u8;32]; a.copy_from_slice(&b); a },
-            owner_pub: { let b = hex::decode(e["owner_pub"].as_str()?).ok()?; let mut a = [0u8;32]; a.copy_from_slice(&b); a },
-            version: e["version"].as_u64()?,
-            issued_at: e["issued_at"].as_u64()?,
-            expires: e["expires"].as_u64()?,
-            sig: { let b = hex::decode(e["sig"].as_str()?).ok()?; let mut a = [0u8;64]; a.copy_from_slice(&b); a },
-        };
-        if b.tag_ref != tag_hash { return None; }
-        if b.owner_pub != *owner { return None; }
-        if b.verify().is_err() { return None; }
-        Some(b)
-    }).collect()
+    store
+        .iter()
+        .filter_map(|e| {
+            if e.get("type").and_then(|v| v.as_str()) != Some("cap_tag_binding") {
+                return None;
+            }
+            let b = TagBindingObj {
+                tag_ref: {
+                    let b = hex::decode(e["tag_ref"].as_str()?).ok()?;
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                },
+                subject_kind: e["subject_kind"].as_u64()? as u8,
+                subject: {
+                    let b = hex::decode(e["subject"].as_str()?).ok()?;
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                },
+                owner_pub: {
+                    let b = hex::decode(e["owner_pub"].as_str()?).ok()?;
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&b);
+                    a
+                },
+                version: e["version"].as_u64()?,
+                issued_at: e["issued_at"].as_u64()?,
+                expires: e["expires"].as_u64()?,
+                sig: {
+                    let b = hex::decode(e["sig"].as_str()?).ok()?;
+                    let mut a = [0u8; 64];
+                    a.copy_from_slice(&b);
+                    a
+                },
+            };
+            if b.tag_ref != tag_hash {
+                return None;
+            }
+            if b.owner_pub != *owner {
+                return None;
+            }
+            if b.verify().is_err() {
+                return None;
+            }
+            Some(b)
+        })
+        .collect()
 }
 
 /// Apply a tag binding with monotonic version check (anti-rollback).
@@ -870,15 +956,28 @@ pub fn apply_tag_binding(store: &mut Vec<Value>, binding: &TagBindingObj) -> Res
     let tag_hex = hex::encode(binding.tag_ref);
 
     for entry in store.iter_mut() {
-        if entry.get("type").and_then(|v| v.as_str()) != Some("cap_tag_binding") { continue; }
-        if entry["owner_pub"].as_str() != Some(&owner_hex) { continue; }
-        if entry["tag_ref"].as_str() != Some(&tag_hex) { continue; }
-        if entry["subject_kind"].as_u64() != Some(binding.subject_kind as u64) { continue; }
-        if entry["subject"].as_str() != Some(hex::encode(binding.subject).as_str()) { continue; }
+        if entry.get("type").and_then(|v| v.as_str()) != Some("cap_tag_binding") {
+            continue;
+        }
+        if entry["owner_pub"].as_str() != Some(&owner_hex) {
+            continue;
+        }
+        if entry["tag_ref"].as_str() != Some(&tag_hex) {
+            continue;
+        }
+        if entry["subject_kind"].as_u64() != Some(binding.subject_kind as u64) {
+            continue;
+        }
+        if entry["subject"].as_str() != Some(hex::encode(binding.subject).as_str()) {
+            continue;
+        }
         let existing_ver = entry["version"].as_u64().unwrap_or(0);
         if existing_ver >= binding.version {
-            bail!("tag binding version rollback: existing {} >= new {}",
-                existing_ver, binding.version);
+            bail!(
+                "tag binding version rollback: existing {} >= new {}",
+                existing_ver,
+                binding.version
+            );
         }
         *entry = binding.to_json();
         return Ok(());
@@ -1084,32 +1183,48 @@ impl CapHeader {
     pub fn from_json(v: &Value) -> Option<Self> {
         let owner_pub = {
             let b = hex::decode(v["owner_pub"].as_str()?).ok()?;
-            if b.len() != 32 { return None; }
-            let mut a = [0u8; 32]; a.copy_from_slice(&b); a
+            if b.len() != 32 {
+                return None;
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
         };
         let nonce = {
             let b = hex::decode(v["nonce"].as_str()?).ok()?;
-            if b.len() != 32 { return None; }
-            let mut a = [0u8; 32]; a.copy_from_slice(&b); a
+            if b.len() != 32 {
+                return None;
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
         };
         let prev_owner_pub = v["prev_owner_pub"].as_str().and_then(|s| {
             let b = hex::decode(s).ok()?;
-            if b.len() != 32 { return None; }
+            if b.len() != 32 {
+                return None;
+            }
             let mut a = [0u8; 32];
             a.copy_from_slice(&b);
             Some(a)
         });
         let prev_header_hash = v["prev_header_hash"].as_str().and_then(|s| {
             let b = hex::decode(s).ok()?;
-            if b.len() != 32 { return None; }
+            if b.len() != 32 {
+                return None;
+            }
             let mut a = [0u8; 32];
             a.copy_from_slice(&b);
             Some(a)
         });
         let sig = {
             let b = hex::decode(v["sig"].as_str()?).ok()?;
-            if b.len() != 64 { return None; }
-            let mut a = [0u8; 64]; a.copy_from_slice(&b); a
+            if b.len() != 64 {
+                return None;
+            }
+            let mut a = [0u8; 64];
+            a.copy_from_slice(&b);
+            a
         };
         let floors: Vec<CapFloor> = v["floors"]
             .as_array()?
@@ -1118,7 +1233,9 @@ impl CapHeader {
                 let tk = f["targetKind"].as_u64()? as u8;
                 let t = {
                     let b = hex::decode(f["target"].as_str()?).ok()?;
-                    if b.len() != 32 { return None; }
+                    if b.len() != 32 {
+                        return None;
+                    }
                     let mut a = [0u8; 32];
                     a.copy_from_slice(&b);
                     a
@@ -1230,7 +1347,9 @@ impl GateDecision {
     /// (authoritative), else `legacy`.
     pub fn deny_reason<'a>(&'a self, legacy: &'a str) -> &'a str {
         match self {
-            GateDecision::Deny { cap_reason: Some(r) } => r,
+            GateDecision::Deny {
+                cap_reason: Some(r),
+            } => r,
             _ => legacy,
         }
     }
@@ -1248,7 +1367,9 @@ pub enum BindingStrength {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrincipalKind {
     OwnerDevice,
-    Delegated { caps: Vec<String> },
+    Delegated {
+        caps: Vec<String>,
+    },
     /// A same-owner FLEET device: identity proven by an owner-signed certificate
     /// bound to the link, but NOT this machine's owner principal.
     ///
@@ -1348,9 +1469,11 @@ pub fn cap_trust_floor(
 pub fn transfer_gate_decision(gate: &GateDecision, authoritative: bool) -> Option<String> {
     match gate {
         GateDecision::Allow => None,
-        GateDecision::Deny { cap_reason } if authoritative => {
-            Some(cap_reason.clone().unwrap_or_else(|| "capability denied".into()))
-        }
+        GateDecision::Deny { cap_reason } if authoritative => Some(
+            cap_reason
+                .clone()
+                .unwrap_or_else(|| "capability denied".into()),
+        ),
         _ => None, // shadow, or legacy-only deny without cap reason
     }
 }
@@ -1365,6 +1488,11 @@ pub struct ActionCounts {
     pub action: String,
     pub la_authorized: u64,
     pub la_denied: u64,
+    /// Legacy ALLOWED, cap denied, and the subject is not covered by any
+    /// ceiling or grant: the flip NARROWING a legacy hole (e.g. a peer that is
+    /// secret-paired but has no capability path). Deliberately NOT breakage, so
+    /// it is bucketed apart from `la_denied`.
+    pub la_narrowed: u64,
     pub la_no_header: u64,
     pub ld_authorized: u64,
     pub ld_denied: u64,
@@ -1376,6 +1504,12 @@ pub struct ActionCounts {
 pub struct ShadowCounts {
     pub la_authorized: u64,
     pub la_denied: u64,
+    /// Cap-denies-what-legacy-allowed for a subject the capability layer does
+    /// not cover (no ceiling, no grant). This is the flip CLOSING a legacy
+    /// hole, not a regression: a breakage-accurate signal must not count it.
+    /// Excluded from `flip_ready` by construction, and reported separately so
+    /// the population stays enumerable.
+    pub la_narrowed: u64,
     pub la_no_header: u64,
     pub ld_authorized: u64,
     pub ld_denied: u64,
@@ -1404,6 +1538,10 @@ impl ShadowCounts {
     /// which opens will be newly permitted and why. A number written down gets looked
     /// at; a number labeled "informational" does not.
     ///
+    /// `la_narrowed` is deliberately NOT read here either: it records opens the
+    /// flip REFUSES (a legacy-allowed subject with no capability path), which is
+    /// the flip doing its job. Counting it would make a stricter flip look broken.
+    ///
     /// Caveat: `la_no_header == 0` proves every resource EXERCISED during the window
     /// was provisioned, not that every resource is. Today all gates pass "self" (one
     /// resource) so the claim is tight; when resources multiply this silently becomes
@@ -1415,10 +1553,11 @@ impl ShadowCounts {
     /// One-line operator summary of both populations plus flip-readiness.
     pub fn summary(&self) -> String {
         format!(
-            "legacy-allowed ok={} deny={} no-header={} | WIDENING(newly-allowed-on-flip)={} legacy-denied[deny={} no-header={}] | flip_ready={}",
+            "legacy-allowed ok={} deny={} no-header={} | NARROWED(cap-denies-an-uncovered-legacy-allow)={} | WIDENING(newly-allowed-on-flip)={} legacy-denied[deny={} no-header={}] | flip_ready={}",
             self.la_authorized,
             self.la_denied,
             self.la_no_header,
+            self.la_narrowed,
             self.ld_authorized,
             self.ld_denied,
             self.ld_no_header,
@@ -1501,8 +1640,26 @@ pub fn check_self_lockout(
     }
     for (label, dev_pub, user_pub) in principals {
         for action in admin_actions {
-            let before = evaluate(store, header, dev_pub, user_pub, &header.resource, action, now, None);
-            let after = evaluate(&after_store, header, dev_pub, user_pub, &header.resource, action, now, None);
+            let before = evaluate(
+                store,
+                header,
+                dev_pub,
+                user_pub,
+                &header.resource,
+                action,
+                now,
+                None,
+            );
+            let after = evaluate(
+                &after_store,
+                header,
+                dev_pub,
+                user_pub,
+                &header.resource,
+                action,
+                now,
+                None,
+            );
             if matches!(before, Decision::Authorized) && matches!(after, Decision::Denied(_)) {
                 warnings.push(format!(
                     "self-lockout WARNING: {} would lose '{}' on resource '{}'",
@@ -1519,10 +1676,10 @@ pub fn check_self_lockout(
 // ---------------------------------------------------------------------------
 
 fn find_header_idx(store: &[Value], resource: &str) -> Option<usize> {
-    store
-        .iter()
-        .position(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                      && e["resource"].as_str() == Some(resource))
+    store.iter().position(|e| {
+        e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+            && e["resource"].as_str() == Some(resource)
+    })
 }
 
 /// Apply a resource header.  Genesis must be self-certifying (resource id =
@@ -1571,7 +1728,11 @@ pub fn apply_header(store: &mut Vec<Value>, new_header: &CapHeader) -> Result<()
     }
 
     // Check chain is not frozen
-    if store[existing_idx.unwrap()].get("frozen").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if store[existing_idx.unwrap()]
+        .get("frozen")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         bail!(
             "succession frozen for resource '{}' (fork detected)",
             new_header.resource
@@ -1596,7 +1757,10 @@ pub fn apply_cap_op(
     op.verify(&header.owner_pub, now)?;
 
     if find_header_idx(store, &header.resource).is_none() {
-        bail!("cannot apply cap op: no header for resource '{}' in store", &header.resource);
+        bail!(
+            "cannot apply cap op: no header for resource '{}' in store",
+            &header.resource
+        );
     }
 
     let floor = header.floor_for(op.target_kind, &op.target);
@@ -1676,7 +1840,10 @@ mod tests {
         let g = parse_grant_spec("shell", &owner).unwrap();
         assert_eq!((g.action.as_str(), g.resource.as_str()), ("shell", "self"));
         let g = parse_grant_spec(" Transfer ", &owner).unwrap();
-        assert_eq!((g.action.as_str(), g.resource.as_str()), ("transfer", "self"));
+        assert_eq!(
+            (g.action.as_str(), g.resource.as_str()),
+            ("transfer", "self")
+        );
 
         // A route carries its prefix, and the resource is the owner-bound id.
         let g = parse_grant_spec("route:10.0.0.0/24", &owner).unwrap();
@@ -1695,9 +1862,18 @@ mod tests {
         // grant that matches nothing; a non-route with one would store a resource
         // enforcement never asks about. Either way the grant silently authorizes
         // nothing, which is worse than an error because it looks like it worked.
-        assert!(parse_grant_spec("route", &owner).is_err(), "route needs a prefix");
-        assert!(parse_grant_spec("route:", &owner).is_err(), "empty prefix is not a prefix");
-        assert!(parse_grant_spec("shell:10.0.0.0/24", &owner).is_err(), "shell takes no resource");
+        assert!(
+            parse_grant_spec("route", &owner).is_err(),
+            "route needs a prefix"
+        );
+        assert!(
+            parse_grant_spec("route:", &owner).is_err(),
+            "empty prefix is not a prefix"
+        );
+        assert!(
+            parse_grant_spec("shell:10.0.0.0/24", &owner).is_err(),
+            "shell takes no resource"
+        );
 
         // And a malformed prefix is refused rather than hashed into a resource
         // that can never match.
@@ -1761,7 +1937,11 @@ mod tests {
         assert_ne!(a, e, "resource must be owner-bound");
 
         // And it never collides with the self resource.
-        assert_ne!(a, self_resource_id(&owner), "route id must not collide with self id");
+        assert_ne!(
+            a,
+            self_resource_id(&owner),
+            "route id must not collide with self id"
+        );
     }
 
     #[test]
@@ -1797,7 +1977,10 @@ mod tests {
         for capability in CANONICAL_CAPABILITIES {
             // This checks grantable vocabulary against declared classification, not enforcement.
             // The CLI behavioral authorization test covers the latter for shell.
-            assert!(is_enforced_capability(capability), "canonical capability '{capability}' is not classified");
+            assert!(
+                is_enforced_capability(capability),
+                "canonical capability '{capability}' is not classified"
+            );
         }
     }
 
@@ -1930,13 +2113,21 @@ mod tests {
         let nonce = [0x01; 32];
         let header = make_genesis_header(&owner, &nonce, &[]);
         let v1 = hlc_next(0, now_ms());
-        let grant = make_grant(&owner, target, &header.resource, &["ssh", "shell"], v1, 86400);
+        let grant = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh", "shell"],
+            v1,
+            86400,
+        );
 
         grant.verify(&pk, now_secs()).unwrap();
 
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
-        let grants: Vec<_> = store.iter()
+        let grants: Vec<_> = store
+            .iter()
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_grant"))
             .collect();
         assert_eq!(grants.len(), 1);
@@ -2064,10 +2255,20 @@ mod tests {
         let header = make_genesis_header(&owner, &nonce, &[]);
 
         let seed = now_ms();
-        let v5 = hlc_next(hlc_next(hlc_next(hlc_next(hlc_next(0, seed), seed), seed), seed), seed);
+        let v5 = hlc_next(
+            hlc_next(hlc_next(hlc_next(hlc_next(0, seed), seed), seed), seed),
+            seed,
+        );
         let v3 = hlc_next(hlc_next(hlc_next(0, seed), seed), seed);
 
-        let grant_v5 = make_grant(&owner, target, &header.resource, &["ssh", "shell"], v5, 86400);
+        let grant_v5 = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh", "shell"],
+            v5,
+            86400,
+        );
         let grant_v3 = make_grant(&owner, target, &header.resource, &["ssh"], v3, 86400);
 
         let mut store = init_store(&header);
@@ -2092,7 +2293,8 @@ mod tests {
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
         apply_cap_op(&mut store, &header, &revoke, now_secs()).unwrap();
-        let grants: Vec<_> = store.iter()
+        let grants: Vec<_> = store
+            .iter()
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_grant"))
             .collect();
         assert_eq!(grants.len(), 0, "revoke must remove grant");
@@ -2114,7 +2316,8 @@ mod tests {
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
         apply_cap_op(&mut store, &header, &empty_grant, now_secs()).unwrap();
-        let grants: Vec<_> = store.iter()
+        let grants: Vec<_> = store
+            .iter()
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_grant"))
             .collect();
         assert_eq!(grants.len(), 0);
@@ -2134,7 +2337,14 @@ mod tests {
         let v4 = hlc_next(v3, seed);
         let v5 = hlc_next(v4, seed);
 
-        let grant_v5 = make_grant(&owner, target, &header.resource, &["ssh", "shell"], v5, 86400);
+        let grant_v5 = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh", "shell"],
+            v5,
+            86400,
+        );
         let grant_v3 = make_grant(&owner, target, &header.resource, &["ssh"], v3, 86400);
 
         let mut store = init_store(&header);
@@ -2144,7 +2354,10 @@ mod tests {
         assert!(grant_v3.verify(&pk, now_secs()).is_ok());
 
         let res = apply_cap_op(&mut store, &header, &grant_v3, now_secs());
-        assert!(res.is_err(), "rollback v5->v3 must be REFUSED; if green, guard is broken");
+        assert!(
+            res.is_err(),
+            "rollback v5->v3 must be REFUSED; if green, guard is broken"
+        );
     }
 
     // -- Floor --------------------------------------------------------------
@@ -2195,8 +2408,10 @@ mod tests {
         // Any genesis with owner_pub=mallory will produce a different resource id.
         let mallory_pk = owner_pub(&mallory);
         let mallory_id = make_resource_id(&mallory_pk, &nonce);
-        assert_ne!(mallory_id, alice_genesis.resource,
-            "different owner must produce different resource id");
+        assert_ne!(
+            mallory_id, alice_genesis.resource,
+            "different owner must produce different resource id"
+        );
 
         // Mallory cannot produce a genesis for Alice's resource id because
         // sha256(mallory_pub||nonce) != sha256(alice_pub||nonce)
@@ -2214,8 +2429,10 @@ mod tests {
             sig: [0u8; 64],
         };
         bogus.sig = sign_cap_header(&bogus, &mallory);
-        assert!(bogus.verify_genesis().is_err(),
-            "genesis with mismatched owner_pub+nonce must be rejected");
+        assert!(
+            bogus.verify_genesis().is_err(),
+            "genesis with mismatched owner_pub+nonce must be rejected"
+        );
     }
 
     // -- Succession hash-chained ---------------------------------------------
@@ -2269,7 +2486,10 @@ mod tests {
         };
         bogus.sig = sign_cap_header(&bogus, &mallory);
         let res = apply_header(&mut store, &bogus);
-        assert!(res.is_err(), "succession not signed by prev owner must be rejected");
+        assert!(
+            res.is_err(),
+            "succession not signed by prev owner must be rejected"
+        );
     }
 
     #[test]
@@ -2314,7 +2534,10 @@ mod tests {
         };
         gap.sig = sign_cap_header(&gap, &bob);
         let res = apply_header(&mut store, &gap);
-        assert!(res.is_err(), "chain gap: prev_header_hash must match stored predecessor");
+        assert!(
+            res.is_err(),
+            "chain gap: prev_header_hash must match stored predecessor"
+        );
     }
 
     // -- Equal-epoch fork ---------------------------------------------------
@@ -2369,12 +2592,20 @@ mod tests {
         assert!(res.is_err(), "equal-epoch fork must be rejected");
 
         // Chain must be frozen now
-        let stored = store.iter()
-            .find(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
-                     && e["resource"].as_str() == Some(genesis.resource.as_str()))
+        let stored = store
+            .iter()
+            .find(|e| {
+                e.get("type").and_then(|v| v.as_str()) == Some("cap_header")
+                    && e["resource"].as_str() == Some(genesis.resource.as_str())
+            })
             .unwrap();
-        assert!(stored.get("frozen").and_then(|v| v.as_bool()).unwrap_or(false),
-            "chain must be frozen after fork detection");
+        assert!(
+            stored
+                .get("frozen")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "chain must be frozen after fork detection"
+        );
 
         // Any succession after freeze is rejected
         let succ2 = make_succession_header(&alice, &fork_a, &bob, 2, &nonce, &[]);
@@ -2429,21 +2660,56 @@ mod tests {
         let target = CapTarget::Device([0x11; 32]);
         let seed = now_ms();
 
-        let op1 = make_grant(&owner, target, &header.resource, &["ssh"], hlc_next(0, seed), 86400);
-        let op2 = make_grant(&owner, target, &header.resource, &["ssh"], hlc_next(hlc_next(0, seed), seed), 86400);
+        let op1 = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh"],
+            hlc_next(0, seed),
+            86400,
+        );
+        let op2 = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh"],
+            hlc_next(hlc_next(0, seed), seed),
+            86400,
+        );
         assert_ne!(op1.canonical_for_signing(), op2.canonical_for_signing());
 
-        let op3 = make_grant(&owner, target, &header.resource, &["ssh", "shell"], hlc_next(0, seed), 86400);
+        let op3 = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh", "shell"],
+            hlc_next(0, seed),
+            86400,
+        );
         assert_ne!(op1.canonical_for_signing(), op3.canonical_for_signing());
 
         let target2 = CapTarget::Device([0x22; 32]);
-        let op4 = make_grant(&owner, target2, &header.resource, &["ssh"], hlc_next(0, seed), 86400);
+        let op4 = make_grant(
+            &owner,
+            target2,
+            &header.resource,
+            &["ssh"],
+            hlc_next(0, seed),
+            86400,
+        );
         assert_ne!(op1.canonical_for_signing(), op4.canonical_for_signing());
 
         let op5 = make_grant(&owner, target, "admin", &["ssh"], hlc_next(0, seed), 86400);
         assert_ne!(op1.canonical_for_signing(), op5.canonical_for_signing());
 
-        let op_user = make_grant(&owner, CapTarget::User([0x11; 32]), &header.resource, &["ssh"], hlc_next(0, seed), 86400);
+        let op_user = make_grant(
+            &owner,
+            CapTarget::User([0x11; 32]),
+            &header.resource,
+            &["ssh"],
+            hlc_next(0, seed),
+            86400,
+        );
         assert_ne!(op1.canonical_for_signing(), op_user.canonical_for_signing());
     }
 
@@ -2456,7 +2722,14 @@ mod tests {
         let header = make_genesis_header(&owner, &nonce, &[]);
         let target = CapTarget::Device([0x42; 32]);
         let v = hlc_next(0, now_ms());
-        let grant = make_grant(&owner, target, &header.resource, &["send", "receive"], v, 86400);
+        let grant = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["send", "receive"],
+            v,
+            86400,
+        );
 
         let j = grant.to_json();
         let grant2 = CapOp::from_json(&j).unwrap();
@@ -2514,7 +2787,8 @@ mod tests {
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant_shell, now_secs()).unwrap();
         apply_cap_op(&mut store, &header, &grant_transfer, now_secs()).unwrap();
-        let grant_count = store.iter()
+        let grant_count = store
+            .iter()
             .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("cap_grant"))
             .count();
         assert_eq!(grant_count, 2); // shell + transfer
@@ -2542,9 +2816,18 @@ mod tests {
         let device_pub = [0xff; 32];
         let user_pub = owner_pub(&alice);
 
-        let d = evaluate(&store, &header, &device_pub, &user_pub, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &device_pub,
+            &user_pub,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Authorized => {},
+            Decision::Authorized => {}
             Decision::Denied(reason) => panic!("owner must be authorized, got: {}", reason),
         }
     }
@@ -2557,16 +2840,34 @@ mod tests {
         let header = make_genesis_header(&owner, &nonce, &[]);
 
         let v1 = hlc_next(0, now_ms());
-        let grant = make_grant(&owner, target, &header.resource, &["ssh", "shell"], v1, 86400);
+        let grant = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh", "shell"],
+            v1,
+            86400,
+        );
 
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         let principal_user = [0xaa; 32]; // different user, not the owner
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("granted action must be authorized, got: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => {
+                panic!("granted action must be authorized, got: {}", reason)
+            }
         }
     }
 
@@ -2584,9 +2885,18 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "admin", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "admin",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Denied(_) => {},
+            Decision::Denied(_) => {}
             Decision::Authorized => panic!("ungranted action must be denied"),
         }
     }
@@ -2623,10 +2933,21 @@ mod tests {
 
         let principal_user = [0xaa; 32];
         // fresh grant covers "ssh", expired grant is not there — test evaluates against stored grants
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("non-expired grant must be authorized, got: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => {
+                panic!("non-expired grant must be authorized, got: {}", reason)
+            }
         }
 
         // Now test with an expired grant
@@ -2637,9 +2958,22 @@ mod tests {
         expired_store.push(expired_entry);
 
         // evaluate should see the grant but consider it expired
-        let d2 = evaluate(&expired_store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
+        let d2 = evaluate(
+            &expired_store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d2 {
-            Decision::Denied(reason) => assert!(reason.contains("not authorized"), "expired-only store must be denied: {}", reason),
+            Decision::Denied(reason) => assert!(
+                reason.contains("not authorized"),
+                "expired-only store must be denied: {}",
+                reason
+            ),
             Decision::Authorized => panic!("expired grant must be denied"),
         }
     }
@@ -2683,10 +3017,22 @@ mod tests {
 
         // A principal with device=0xcc and user=0xaa matches BOTH grants.
         // The expired Device grant must NOT shadow the valid User grant.
-        let d = evaluate(&store, &header, &[0xcc; 32], &user_pub, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &user_pub,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("valid User grant must authorize despite expired Device grant: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => panic!(
+                "valid User grant must authorize despite expired Device grant: {}",
+                reason
+            ),
         }
     }
 
@@ -2705,9 +3051,18 @@ mod tests {
 
         let principal_user = [0xaa; 32];
         // Wrong device pubkey
-        let d = evaluate(&store, &header, &[0xdd; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xdd; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Denied(_) => {},
+            Decision::Denied(_) => {}
             Decision::Authorized => panic!("wrong target device must be denied"),
         }
     }
@@ -2728,16 +3083,37 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         // Any device pubkey works when target_kind=User and principal_user_pub matches
-        let d = evaluate(&store, &header, &[0x11; 32], &principal_user_pub, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0x11; 32],
+            &principal_user_pub,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("User grant must authorize device chaining to that user, got: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => panic!(
+                "User grant must authorize device chaining to that user, got: {}",
+                reason
+            ),
         }
 
         // Wrong user_pub must be denied even with correct device
-        let d2 = evaluate(&store, &header, &[0x11; 32], &[0xbb; 32], &header.resource, "ssh", now_secs(), None);
+        let d2 = evaluate(
+            &store,
+            &header,
+            &[0x11; 32],
+            &[0xbb; 32],
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d2 {
-            Decision::Denied(_) => {},
+            Decision::Denied(_) => {}
             Decision::Authorized => panic!("wrong user must be denied"),
         }
     }
@@ -2764,18 +3140,43 @@ mod tests {
         store.push(grant_json);
 
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Denied(reason) => assert!(reason.contains("ratchet"), "must fail on uninitialized ratchet: {}", reason),
+            Decision::Denied(reason) => assert!(
+                reason.contains("ratchet"),
+                "must fail on uninitialized ratchet: {}",
+                reason
+            ),
             Decision::Authorized => panic!("uninitialized ratchet must deny grants"),
         }
 
         // But owner is still authorized even with uninitialized ratchet
         let owner_pubkey = owner_pub(&owner);
-        let d2 = evaluate(&store, &header, &[0x00; 32], &owner_pubkey, &header.resource, "ssh", now_secs(), None);
+        let d2 = evaluate(
+            &store,
+            &header,
+            &[0x00; 32],
+            &owner_pubkey,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d2 {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("owner must be authorized even without ratchet, got: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => panic!(
+                "owner must be authorized even without ratchet, got: {}",
+                reason
+            ),
         }
     }
 
@@ -2809,13 +3210,25 @@ mod tests {
         // Now test with `now` set behind the ratchet (clock went backwards)
         let clock_back_now = future_issued.saturating_sub(50);
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", clock_back_now, None);
+        let d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            clock_back_now,
+            None,
+        );
         // eval_time = max(clock_back_now, ratchet) = ratchet (future_issued)
         // grant.expires = future_issued + 86400
         // eval_time (future_issued) < grant.expires (future_issued + 86400) -> authorized
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("clock set back must still authorize via ratchet, got: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => panic!(
+                "clock set back must still authorize via ratchet, got: {}",
+                reason
+            ),
         }
     }
 
@@ -2864,10 +3277,21 @@ mod tests {
         // Bob's ratchet is at future_issued. Alice's ratchet should be her own.
         // evaluate Alice's grant: ratchet_for(Alice's owner) != future_issued
         let principal_user = [0xaa; 32];
-        let d = evaluate(&store, &header_a, &[0xcc; 32], &principal_user, &header_a.resource, "ssh", now_secs(), None);
+        let d = evaluate(
+            &store,
+            &header_a,
+            &[0xcc; 32],
+            &principal_user,
+            &header_a.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
         match d {
-            Decision::Authorized => {},
-            Decision::Denied(reason) => panic!("Bob's ratchet must not expire Alice's grant: {}", reason),
+            Decision::Authorized => {}
+            Decision::Denied(reason) => {
+                panic!("Bob's ratchet must not expire Alice's grant: {}", reason)
+            }
         }
     }
 
@@ -2890,14 +3314,66 @@ mod tests {
     /// counters would have.
     #[test]
     fn shadow_flip_criterion() {
-        let ready = ShadowCounts { la_authorized: 5, la_denied: 0, la_no_header: 0, ld_authorized: 2, ld_denied: 3, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
-        assert!(ready.flip_ready(), "clean legacy-allowed sample, all provisioned, must be flip-ready");
-        let empty = ShadowCounts { la_authorized: 0, la_denied: 0, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
-        assert!(!empty.flip_ready(), "no sample yet: a bare zero total must NOT pass");
-        let disagree = ShadowCounts { la_authorized: 10, la_denied: 1, la_no_header: 0, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
-        assert!(!disagree.flip_ready(), "a real header disagreement must block the flip");
-        let unprov = ShadowCounts { la_authorized: 10, la_denied: 0, la_no_header: 4, ld_authorized: 0, ld_denied: 0, ld_no_header: 0, ceiling_denied: 0, ceiling_admitted: 0 };
-        assert!(!unprov.flip_ready(), "an unprovisioned resource must block the flip (absent != clean)");
+        let ready = ShadowCounts {
+            la_authorized: 5,
+            la_narrowed: 0,
+            la_denied: 0,
+            la_no_header: 0,
+            ld_authorized: 2,
+            ld_denied: 3,
+            ld_no_header: 0,
+            ceiling_denied: 0,
+            ceiling_admitted: 0,
+        };
+        assert!(
+            ready.flip_ready(),
+            "clean legacy-allowed sample, all provisioned, must be flip-ready"
+        );
+        let empty = ShadowCounts {
+            la_authorized: 0,
+            la_narrowed: 0,
+            la_denied: 0,
+            la_no_header: 0,
+            ld_authorized: 0,
+            ld_denied: 0,
+            ld_no_header: 0,
+            ceiling_denied: 0,
+            ceiling_admitted: 0,
+        };
+        assert!(
+            !empty.flip_ready(),
+            "no sample yet: a bare zero total must NOT pass"
+        );
+        let disagree = ShadowCounts {
+            la_authorized: 10,
+            la_narrowed: 0,
+            la_denied: 1,
+            la_no_header: 0,
+            ld_authorized: 0,
+            ld_denied: 0,
+            ld_no_header: 0,
+            ceiling_denied: 0,
+            ceiling_admitted: 0,
+        };
+        assert!(
+            !disagree.flip_ready(),
+            "a real header disagreement must block the flip"
+        );
+        let unprov = ShadowCounts {
+            la_authorized: 10,
+            la_narrowed: 0,
+            la_denied: 0,
+            la_no_header: 4,
+            ld_authorized: 0,
+            ld_denied: 0,
+            ld_no_header: 0,
+            ceiling_denied: 0,
+            ceiling_admitted: 0,
+        };
+        assert!(
+            !unprov.flip_ready(),
+            "an unprovisioned resource must block the flip (absent != clean)"
+        );
         assert!(disagree.summary().contains("flip_ready=false"));
     }
 
@@ -2931,15 +3407,35 @@ mod tests {
         store.push(grant_json);
 
         // Before update_ratchet: evaluate must deny ("ratchet uninitialized")
-        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs(), None) {
+        match evaluate(
+            &store,
+            &header,
+            &target.target_bytes(),
+            &principal_pub,
+            &header.resource,
+            "shell",
+            now_secs(),
+            None,
+        ) {
             Decision::Denied(reason) => assert!(reason.contains("ratchet uninitialized")),
             Decision::Authorized => panic!("evaluate must refuse before ratchet is initialized"),
         }
         // After update_ratchet: evaluate must authorize
         update_ratchet(&mut store, &pk, grant.issued_at).unwrap();
-        match evaluate(&store, &header, &target.target_bytes(), &principal_pub, &header.resource, "shell", now_secs(), None) {
+        match evaluate(
+            &store,
+            &header,
+            &target.target_bytes(),
+            &principal_pub,
+            &header.resource,
+            "shell",
+            now_secs(),
+            None,
+        ) {
             Decision::Authorized => {}
-            Decision::Denied(reason) => panic!("evaluate must authorize after ratchet init, got: {reason}"),
+            Decision::Denied(reason) => {
+                panic!("evaluate must authorize after ratchet init, got: {reason}")
+            }
         }
     }
 
@@ -2963,8 +3459,11 @@ mod tests {
         let name_hash = h.finalize();
         let mut name_hash_arr = [0u8; 32];
         name_hash_arr.copy_from_slice(&name_hash);
-        assert_ne!(&name_hash_arr[..], &principal_pub[..],
-            "SHA-256(device_name) must not equal the user_pub");
+        assert_ne!(
+            &name_hash_arr[..],
+            &principal_pub[..],
+            "SHA-256(device_name) must not equal the user_pub"
+        );
 
         // The correct approach: target = principal_pub (the real user key)
         let target = CapTarget::User(principal_pub);
@@ -2974,14 +3473,34 @@ mod tests {
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
         // evaluate() with the principal's user_pub must authorize
-        match evaluate(&store, &header, &principal_pub, &principal_pub, &header.resource, "shell", now_secs(), None) {
+        match evaluate(
+            &store,
+            &header,
+            &principal_pub,
+            &principal_pub,
+            &header.resource,
+            "shell",
+            now_secs(),
+            None,
+        ) {
             Decision::Authorized => {}
-            Decision::Denied(reason) => panic!("grant targeting real user_pub must authorize, got: {reason}"),
+            Decision::Denied(reason) => {
+                panic!("grant targeting real user_pub must authorize, got: {reason}")
+            }
         }
         // evaluate() with a WRONG user_pub must deny
         let wrong_pub = [0xbb; 32];
         assert_ne!(&wrong_pub[..], &principal_pub[..]);
-        match evaluate(&store, &header, &wrong_pub, &wrong_pub, &header.resource, "shell", now_secs(), None) {
+        match evaluate(
+            &store,
+            &header,
+            &wrong_pub,
+            &wrong_pub,
+            &header.resource,
+            "shell",
+            now_secs(),
+            None,
+        ) {
             Decision::Authorized => panic!("wrong user_pub must NOT authorize"),
             Decision::Denied(_) => {}
         }
@@ -3008,27 +3527,43 @@ mod tests {
         let revoke = make_revoke(&owner, target, &header.resource, v2, 86400);
         let revoke2 = revoke.clone();
 
-        let queries = vec![
-            AuthQuery {
-                principal_device_pub: [0xcc; 32],
-                principal_user_pub: principal_user,
-                action: "ssh".to_string(),
-            },
-        ];
+        let queries = vec![AuthQuery {
+            principal_device_pub: [0xcc; 32],
+            principal_user_pub: principal_user,
+            action: "ssh".to_string(),
+        }];
 
         let preview_results = preview(&store, &header, &[revoke2], &queries, now_secs());
-        assert!(!preview_results[0].authorized, "preview of revoke must show Denied");
+        assert!(
+            !preview_results[0].authorized,
+            "preview of revoke must show Denied"
+        );
 
         // Apply revoke for real and evaluate — must match preview
         apply_cap_op(&mut store, &header, &revoke, now_secs()).unwrap();
-        let real_d = evaluate(&store, &header, &[0xcc; 32], &principal_user, &header.resource, "ssh", now_secs(), None);
-        assert!(matches!(real_d, Decision::Denied(_)), "real enforcement must match preview");
+        let real_d = evaluate(
+            &store,
+            &header,
+            &[0xcc; 32],
+            &principal_user,
+            &header.resource,
+            "ssh",
+            now_secs(),
+            None,
+        );
+        assert!(
+            matches!(real_d, Decision::Denied(_)),
+            "real enforcement must match preview"
+        );
 
         // No-op preview: should show Authorized (preview doesn't mutate store)
         let mut store2 = init_store(&header);
         apply_cap_op(&mut store2, &header, &grant, now_secs()).unwrap();
         let preview_current = preview(&store2, &header, &[], &queries, now_secs());
-        assert!(preview_current[0].authorized, "preview of no-op must show Authorized for existing grant");
+        assert!(
+            preview_current[0].authorized,
+            "preview of no-op must show Authorized for existing grant"
+        );
     }
 
     #[test]
@@ -3040,24 +3575,35 @@ mod tests {
 
         let v1 = hlc_next(0, now_ms());
         let v2 = hlc_next(v1, now_ms());
-        let grant = make_grant(&owner, target, &header.resource, &["admin", "ssh"], v1, 86400);
+        let grant = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["admin", "ssh"],
+            v1,
+            86400,
+        );
         let narrow = make_grant(&owner, target, &header.resource, &["ssh"], v2, 86400);
 
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
 
-        let principals = vec![(
-            "bob".to_string(),
-            [0xcc; 32],
-            [0xaa; 32],
-        )];
+        let principals = vec![("bob".to_string(), [0xcc; 32], [0xaa; 32])];
 
         // Narrowing from ["admin","ssh"] to ["ssh"] loses "admin"
         let warnings = check_self_lockout(
-            &store, &header, &narrow, &principals, &["admin", "ssh", "shell"], now_secs(),
+            &store,
+            &header,
+            &narrow,
+            &principals,
+            &["admin", "ssh", "shell"],
+            now_secs(),
         );
         assert!(!warnings.is_empty(), "must warn when admin action is lost");
-        assert!(warnings[0].contains("admin"), "warning must mention the lost action");
+        assert!(
+            warnings[0].contains("admin"),
+            "warning must mention the lost action"
+        );
     }
 
     #[test]
@@ -3070,7 +3616,14 @@ mod tests {
         let v1 = hlc_next(0, now_ms());
         let v2 = hlc_next(v1, now_ms());
         let grant = make_grant(&owner, target, &header.resource, &["ssh"], v1, 86400);
-        let expand = make_grant(&owner, target, &header.resource, &["ssh", "admin"], v2, 86400);
+        let expand = make_grant(
+            &owner,
+            target,
+            &header.resource,
+            &["ssh", "admin"],
+            v2,
+            86400,
+        );
 
         let mut store = init_store(&header);
         apply_cap_op(&mut store, &header, &grant, now_secs()).unwrap();
@@ -3079,7 +3632,12 @@ mod tests {
 
         // Expanding grants must NOT warn (no loss)
         let warnings = check_self_lockout(
-            &store, &header, &expand, &principals, &["admin"], now_secs(),
+            &store,
+            &header,
+            &expand,
+            &principals,
+            &["admin"],
+            now_secs(),
         );
         assert!(warnings.is_empty(), "must not warn when gaining access");
     }
@@ -3094,8 +3652,11 @@ mod tests {
         };
         // Under authoritative: hard-decline with the real reason
         let r_auth = transfer_gate_decision(&deny, true);
-        assert_eq!(r_auth, Some("not authorized".into()),
-            "authoritative: must return Some(reason) to hard-decline");
+        assert_eq!(
+            r_auth,
+            Some("not authorized".into()),
+            "authoritative: must return Some(reason) to hard-decline"
+        );
 
         // Under shadow: fall through to legacy consent (None)
         let r_shadow = transfer_gate_decision(&deny, false);
@@ -3104,8 +3665,11 @@ mod tests {
         // Deny with no reason string (structurally fail-closed)
         let deny_noreason = GateDecision::Deny { cap_reason: None };
         let r_noreason = transfer_gate_decision(&deny_noreason, true);
-        assert_eq!(r_noreason, Some("capability denied".into()),
-            "authoritative Deny without cap_reason must still hard-decline (fail-closed)");
+        assert_eq!(
+            r_noreason,
+            Some("capability denied".into()),
+            "authoritative Deny without cap_reason must still hard-decline (fail-closed)"
+        );
 
         // Allow always returns None
         assert!(transfer_gate_decision(&GateDecision::Allow, true).is_none());
@@ -3120,17 +3684,35 @@ mod tests {
         let unprov = CapOutcome::Unprovisioned;
 
         // Authorized + Proven + authoritative → passes through
-        assert_eq!(cap_authorize_proven(&auth, BindingStrength::Proven, true), CapOutcome::Authorized);
+        assert_eq!(
+            cap_authorize_proven(&auth, BindingStrength::Proven, true),
+            CapOutcome::Authorized
+        );
         // Authorized + Inferred + authoritative → downgraded
-        assert!(matches!(cap_authorize_proven(&auth, BindingStrength::Inferred, true), CapOutcome::Denied(_)));
+        assert!(matches!(
+            cap_authorize_proven(&auth, BindingStrength::Inferred, true),
+            CapOutcome::Denied(_)
+        ));
         // Authorized + None + authoritative → downgraded
-        assert!(matches!(cap_authorize_proven(&auth, BindingStrength::None, true), CapOutcome::Denied(_)));
+        assert!(matches!(
+            cap_authorize_proven(&auth, BindingStrength::None, true),
+            CapOutcome::Denied(_)
+        ));
         // Authorized + Inferred + shadow → passes through (no downgrade)
-        assert_eq!(cap_authorize_proven(&auth, BindingStrength::Inferred, false), CapOutcome::Authorized);
+        assert_eq!(
+            cap_authorize_proven(&auth, BindingStrength::Inferred, false),
+            CapOutcome::Authorized
+        );
         // Denied + Inferred + authoritative → stays Denied (no laundering)
-        assert_eq!(cap_authorize_proven(&deny, BindingStrength::Inferred, true), deny);
+        assert_eq!(
+            cap_authorize_proven(&deny, BindingStrength::Inferred, true),
+            deny
+        );
         // Unprovisioned + Inferred + authoritative → stays Unprovisioned
-        assert_eq!(cap_authorize_proven(&unprov, BindingStrength::Inferred, true), unprov);
+        assert_eq!(
+            cap_authorize_proven(&unprov, BindingStrength::Inferred, true),
+            unprov
+        );
     }
 
     #[test]
@@ -3142,13 +3724,25 @@ mod tests {
         let past = now_secs().saturating_sub(86400);
 
         // Authorized + valid cert + authoritative → passes
-        assert_eq!(cap_authorize_expired(&auth, Some(future), true), CapOutcome::Authorized);
+        assert_eq!(
+            cap_authorize_expired(&auth, Some(future), true),
+            CapOutcome::Authorized
+        );
         // Authorized + expired cert + authoritative → downgraded
-        assert!(matches!(cap_authorize_expired(&auth, Some(past), true), CapOutcome::Denied(_)));
+        assert!(matches!(
+            cap_authorize_expired(&auth, Some(past), true),
+            CapOutcome::Denied(_)
+        ));
         // Authorized + None expiry + authoritative → downgraded (fail-closed)
-        assert!(matches!(cap_authorize_expired(&auth, None, true), CapOutcome::Denied(_)));
+        assert!(matches!(
+            cap_authorize_expired(&auth, None, true),
+            CapOutcome::Denied(_)
+        ));
         // Authorized + expired + shadow → passes through
-        assert_eq!(cap_authorize_expired(&auth, Some(past), false), CapOutcome::Authorized);
+        assert_eq!(
+            cap_authorize_expired(&auth, Some(past), false),
+            CapOutcome::Authorized
+        );
         // Denied + expired + authoritative → stays Denied
         assert_eq!(cap_authorize_expired(&deny, Some(past), true), deny);
     }
@@ -3161,7 +3755,10 @@ mod tests {
 
         // Proven + valid → passes
         let r = cap_authorize_proven(&auth, BindingStrength::Proven, true);
-        assert_eq!(cap_authorize_expired(&r, Some(future), true), CapOutcome::Authorized);
+        assert_eq!(
+            cap_authorize_expired(&r, Some(future), true),
+            CapOutcome::Authorized
+        );
 
         // Inferred + valid → denied (proven gate wins)
         let r2 = cap_authorize_proven(&auth, BindingStrength::Inferred, true);
@@ -3169,7 +3766,10 @@ mod tests {
 
         // Proven + expired → denied (expiry gate wins)
         let r3 = cap_authorize_proven(&auth, BindingStrength::Proven, true);
-        assert!(matches!(cap_authorize_expired(&r3, Some(past), true), CapOutcome::Denied(_)));
+        assert!(matches!(
+            cap_authorize_expired(&r3, Some(past), true),
+            CapOutcome::Denied(_)
+        ));
     }
 
     #[test]
@@ -3179,13 +3779,25 @@ mod tests {
         let inferred = BindingStrength::Inferred;
 
         // Authoritative + untrusted + Inferred + Authorized → Denied
-        assert!(matches!(cap_trust_floor(&auth, false, inferred, true), CapOutcome::Denied(_)));
+        assert!(matches!(
+            cap_trust_floor(&auth, false, inferred, true),
+            CapOutcome::Denied(_)
+        ));
         // Authoritative + trusted + Inferred + Authorized → passes through
-        assert_eq!(cap_trust_floor(&auth, true, inferred, true), CapOutcome::Authorized);
+        assert_eq!(
+            cap_trust_floor(&auth, true, inferred, true),
+            CapOutcome::Authorized
+        );
         // Shadow + untrusted + Inferred + Authorized → passes through
-        assert_eq!(cap_trust_floor(&auth, false, inferred, false), CapOutcome::Authorized);
+        assert_eq!(
+            cap_trust_floor(&auth, false, inferred, false),
+            CapOutcome::Authorized
+        );
         // Proven binding alone passes the floor even without link.trusted
-        assert_eq!(cap_trust_floor(&auth, false, BindingStrength::Proven, true), CapOutcome::Authorized);
+        assert_eq!(
+            cap_trust_floor(&auth, false, BindingStrength::Proven, true),
+            CapOutcome::Authorized
+        );
         // Denied + untrusted + authoritative → stays Denied
         assert_eq!(cap_trust_floor(&deny, false, inferred, true), deny);
     }
@@ -3214,15 +3826,35 @@ mod tests {
         // same-owner Proven + in-scope → auto-trust
         assert!(fleet_auto_trust(true, BindingStrength::Proven, true, true));
         // same-owner Proven + OUT of scope → no auto-trust (deliberate/out-of-bounds)
-        assert!(!fleet_auto_trust(true, BindingStrength::Proven, false, true));
+        assert!(!fleet_auto_trust(
+            true,
+            BindingStrength::Proven,
+            false,
+            true
+        ));
         // same-owner INFERRED + in-scope → NOTHING (the Proven gate)
-        assert!(!fleet_auto_trust(true, BindingStrength::Inferred, true, true));
+        assert!(!fleet_auto_trust(
+            true,
+            BindingStrength::Inferred,
+            true,
+            true
+        ));
         // same-owner None + in-scope → NOTHING
         assert!(!fleet_auto_trust(true, BindingStrength::None, true, true));
         // DIFFERENT owner + Proven + in-scope → deny-by-default (not my fleet)
-        assert!(!fleet_auto_trust(false, BindingStrength::Proven, true, true));
+        assert!(!fleet_auto_trust(
+            false,
+            BindingStrength::Proven,
+            true,
+            true
+        ));
         // A local revocation must disable automatic fleet trust independently.
-        assert!(!fleet_auto_trust(true, BindingStrength::Proven, true, false));
+        assert!(!fleet_auto_trust(
+            true,
+            BindingStrength::Proven,
+            true,
+            false
+        ));
     }
 
     /// `evaluate_grants_only` must NOT apply the owner shortcut: a peer that
@@ -3243,29 +3875,56 @@ mod tests {
 
         // Baseline: evaluate() applies the owner shortcut → same-owner authorized
         // for a deliberate action even with no grant.
-        assert!(matches!(
-            evaluate(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
-            Decision::Authorized
-        ), "evaluate owner shortcut authorizes same-owner");
+        assert!(
+            matches!(
+                evaluate(
+                    &store, &header, &dev, &owner_pk, &resource, "shell", now, None
+                ),
+                Decision::Authorized
+            ),
+            "evaluate owner shortcut authorizes same-owner"
+        );
 
         // evaluate_grants_only: same-owner, no grant → DENIED (shortcut skipped).
-        assert!(matches!(
-            evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
-            Decision::Denied(_)
-        ), "grants-only must not apply the owner shortcut");
+        assert!(
+            matches!(
+                evaluate_grants_only(
+                    &store, &header, &dev, &owner_pk, &resource, "shell", now, None
+                ),
+                Decision::Denied(_)
+            ),
+            "grants-only must not apply the owner shortcut"
+        );
 
         // With an explicit device grant for transfer, grants-only authorizes
         // transfer for that device but still NOT shell.
-        let grant = make_grant(&owner, CapTarget::Device(dev), &resource, &["transfer"], hlc_next(0, now_ms()), 86_400);
+        let grant = make_grant(
+            &owner,
+            CapTarget::Device(dev),
+            &resource,
+            &["transfer"],
+            hlc_next(0, now_ms()),
+            86_400,
+        );
         apply_cap_op(&mut store, &header, &grant, now).unwrap();
-        assert!(matches!(
-            evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "transfer", now, None),
-            Decision::Authorized
-        ), "explicit device grant authorizes transfer under grants-only");
-        assert!(matches!(
-            evaluate_grants_only(&store, &header, &dev, &owner_pk, &resource, "shell", now, None),
-            Decision::Denied(_)
-        ), "no shell grant → grants-only denies shell for same-owner device");
+        assert!(
+            matches!(
+                evaluate_grants_only(
+                    &store, &header, &dev, &owner_pk, &resource, "transfer", now, None
+                ),
+                Decision::Authorized
+            ),
+            "explicit device grant authorizes transfer under grants-only"
+        );
+        assert!(
+            matches!(
+                evaluate_grants_only(
+                    &store, &header, &dev, &owner_pk, &resource, "shell", now, None
+                ),
+                Decision::Denied(_)
+            ),
+            "no shell grant → grants-only denies shell for same-owner device"
+        );
     }
 }
 
@@ -3273,12 +3932,17 @@ mod tests {
 mod route_scope_tests {
     use super::cidr_within_any;
 
-    fn allow(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+    fn allow(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
 
     #[test]
     fn a_narrower_prefix_is_inside_a_wider_allowance() {
         assert!(cidr_within_any("10.66.0.0/24", &allow(&["10.0.0.0/8"])));
-        assert!(cidr_within_any("10.0.0.0/8", &allow(&["10.0.0.0/8"])), "exact match");
+        assert!(
+            cidr_within_any("10.0.0.0/8", &allow(&["10.0.0.0/8"])),
+            "exact match"
+        );
     }
 
     /// The hole this scoping exists to close: a member must not be able to widen
@@ -3294,7 +3958,10 @@ mod route_scope_tests {
     #[test]
     fn a_default_route_needs_a_default_route_allowance() {
         assert!(cidr_within_any("0.0.0.0/0", &allow(&["0.0.0.0/0"])));
-        assert!(cidr_within_any("10.66.0.0/24", &allow(&["0.0.0.0/0"])), "0/0 allows anything v4");
+        assert!(
+            cidr_within_any("10.66.0.0/24", &allow(&["0.0.0.0/0"])),
+            "0/0 allows anything v4"
+        );
     }
 
     #[test]

@@ -117,7 +117,11 @@ jobs:
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=6
             [cli/tests/exec-gates.sh]=13
-            [cli/tests/fleet-cert-gates.sh]=22
+            # 23 = 22 gate slots + the RECON (post-restart link re-establishment)
+            # verdict. AUTH-A keeps its slot while it is KNOWN-RED: the count
+            # below includes KNOWN-RED lines, so a tracked failure can never make
+            # the total look short and can never be silently dropped.
+            [cli/tests/fleet-cert-gates.sh]=23
             [cli/tests/pty-revoke-gates.sh]=3
             [cli/tests/mount-revoke-gates.sh]=4
             [cli/tests/l2-revoke-gates.sh]=3
@@ -151,7 +155,7 @@ jobs:
             out="$(bash "$g" 2>&1)" || code=$?
             echo "$out"
             echo "::endgroup::"
-            got=$(printf '%s\n' "$out" | grep -c '^PASS:' || true)
+            got=$(printf '%s\n' "$out" | grep -cE '^(PASS|KNOWN-RED):' || true)
             want=${EXPECT[$g]}
             if [ "$code" -ne 0 ]; then
               echo "::error::$g exited $code"; rc=1

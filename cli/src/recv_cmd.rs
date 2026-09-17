@@ -1688,6 +1688,7 @@ pub(crate) async fn recv_cmd(
                                 "counts": {
                                     "la_authorized": counts.la_authorized,
                                     "la_denied": counts.la_denied,
+                                    "la_narrowed": counts.la_narrowed,
                                     "la_no_header": counts.la_no_header,
                                     "ld_authorized": counts.ld_authorized,
                                     "ld_denied": counts.ld_denied,

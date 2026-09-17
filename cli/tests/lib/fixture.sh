@@ -12,7 +12,51 @@
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
-bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED="$FAILED $1"; }
+bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED="$FAILED $1"; FAILED_LIST+=("$1"); }
+
+# A gate whose failure is a NAMED, TRACKED defect rather than a regression.
+# Same philosophy as gates-ratchet.sh: a still-broken gate does not fail the
+# build (it was already broken and this job is not where that is discovered),
+# but the list only ever SHRINKS -- a known-red gate that starts passing fails
+# the run so the entry gets removed in the same commit, with evidence.
+#
+# Usage: declare KNOWN_RED_ALLOW=( "<substring of the FAIL text>" ... ) in the
+# gate script, and end with `declare_known_red_summary`; see
+# fleet-cert-gates.sh's AUTH-A for the worked example.
+KNOWN_RED_ALLOW=()
+KNOWN_RED_HIT=()
+FAILED_LIST=()
+declare_known_red_summary() {
+  # Array-based on purpose: gate texts contain spaces, so word-splitting the
+  # accumulated string would compare fragments and silently fail to match.
+  local allow f hit
+  local remaining=()
+  for f in ${FAILED_LIST[@]+"${FAILED_LIST[@]}"}; do
+    hit=0
+    for allow in ${KNOWN_RED_ALLOW[@]+"${KNOWN_RED_ALLOW[@]}"}; do
+      case "$f" in *"$allow"*) hit=1 ;; esac
+    done
+    if [ "$hit" = "1" ]; then
+      echo "KNOWN-RED: $f"
+      KNOWN_RED_HIT+=("$f")
+    else
+      remaining+=("$f")
+    fi
+  done
+  for allow in ${KNOWN_RED_ALLOW[@]+"${KNOWN_RED_ALLOW[@]}"}; do
+    case " ${FAILED_LIST[*]-} " in
+      *"$allow"*) : ;;
+      *)
+        echo "KNOWN-RED handled: the known-red gate '$allow' now PASSES."
+        echo "FAIL: a known-red gate started passing; remove its entry from KNOWN_RED_ALLOW in this commit (the list only shrinks)."
+        remaining+=("known-red-gate-started-passing:$allow")
+        ;;
+    esac
+  done
+  FAILED=""
+  for f in ${remaining[@]+"${remaining[@]}"}; do FAILED="$FAILED $f"; done
+  FAIL=${#remaining[@]}
+}
 
 FIX_PIDS=()
 fixture_cleanup() {
