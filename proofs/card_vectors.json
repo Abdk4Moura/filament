@@ -1,0 +1,119 @@
+{
+  "contract": "CONTRACT.md, section 'Bootstrap card (fc1)'",
+  "format": "filament bootstrap card (fc1) test vectors",
+  "generator": "proofs/card_vectors.py",
+  "keys": {
+    "device_a": {
+      "addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+      "pub_hex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+    },
+    "device_b": {
+      "addr": "fdf1:1af7:c30d:786f:25af:1630:b78c:e2e1",
+      "pub_hex": "da29e95b02e00ffa15645775fb1d2ba222a1943395eea06b94e2c057b7be69d0",
+      "seed_hex": "65666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081828384"
+    }
+  },
+  "now": 1760000000,
+  "psk_hex": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+  "signature_backend": "ed25519",
+  "signature_backend_note": "real Ed25519; these vectors are usable as crypto fixtures",
+  "vectors": [
+    {
+      "card": "fc1pmF2AWNzaWdYQLEEdPQYBV1Qx_yT9J99N_qVvkZAC9XgKqURodgiuFcrFRmfQ-p3lf9ULZyQvgBXttbVhK5byBpyVFuddYAnTAZlcmVsYXmiZGFkZHJ1cmVsYXkuZXhhbXBsZS5uZXQ6NDQzaW1lY2hhbmlzbWV0dXJuc2dleHBpcmVzGmkPBQBpZW5kcG9pbnRzgqNiaXBsMTk4LjUxLjEwMC43ZHBvcnQZoqllcHJvdG9kcXVpY6NiaXBrMjAwMTpkYjg6OjdkcG9ydBmiqWVwcm90b2RxdWljamRldmljZV9wdWJYIHm1Vi6P5lT5QHixEuipi6eQH4U65pW-1-DjkQutBJZk",
+      "expect": "accept",
+      "name": "valid_public",
+      "note": "what `addr --card` prints and what DNS publishes; no psk",
+      "reason": null,
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "public"
+      }
+    },
+    {
+      "card": "fc1pmF2AWNwc2tYIKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgY3NpZ1hATJwDLxpetOkDZafmJsQgY2uJYEOdhl2MTCkZf-kw3WnSFA92vNSWyWYcvil86OmFHie65GBG9ki8GHznRC-nBWdleHBpcmVzGmjnhhBpZW5kcG9pbnRzgaNiaXBsMTk4LjUxLjEwMC43ZHBvcnQZoqllcHJvdG9kcXVpY2pkZXZpY2VfcHViWCB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA",
+      "expect": "accept",
+      "name": "valid_private",
+      "note": "the invitation / pair-QR form; psk present, private channel",
+      "reason": null,
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "private"
+      }
+    },
+    {
+      "card": "fc1pWF2AWNzaWdYQHOgjRAajxkNwtqwN-WDiYcDCuvFt8sBCrjq9bXLBI7QmU3Hd-M4u4mvHjSdS8mwZ-bxs8IgCx21qcOz56PRkQ1nZXhwaXJlcxpo6MmAaWVuZHBvaW50c4KjYmlwbDE5OC41MS4xMDAuN2Rwb3J0GQTSZXByb3RvZHF1aWOjYmlwazIwMDE6ZGI4Ojo3ZHBvcnQZoqllcHJvdG9kcXVpY2pkZXZpY2VfcHViWCB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA",
+      "expect": "refuse",
+      "name": "tampered_field",
+      "note": "port edited after signing; every other check still passes",
+      "reason": "bad_signature",
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "public"
+      }
+    },
+    {
+      "card": "fc1pWF2AWNzaWdYQI1zTmq6BPZ72j0ErV4nvfED3tfbfrlFGX13JnaSktFz_bYPDCiVFFOLK7csLzbt3jnTcOQGyrPLWPEMK_yD1gRnZXhwaXJlcxpo53f_aWVuZHBvaW50c4KjYmlwbDE5OC41MS4xMDAuN2Rwb3J0GQTSZXByb3RvZHF1aWOjYmlwazIwMDE6ZGI4Ojo3ZHBvcnQZoqllcHJvdG9kcXVpY2pkZXZpY2VfcHViWCB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA",
+      "expect": "refuse",
+      "name": "expired",
+      "note": "one second past; expiry is checked against the `now` parameter",
+      "reason": "expired",
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "public"
+      }
+    },
+    {
+      "card": "fc1pWF2AWNzaWdYQOblkgrFeRq85IFKlYupFsIynGue_a9TI0sg8LV_SAgVr9eBFv3UvmsFJ9BEB8dFVUYXqnCZ8XbicKYtzEBW7AlnZXhwaXJlcxpo6MmAaWVuZHBvaW50c4KjYmlwbDE5OC41MS4xMDAuN2Rwb3J0GQTSZXByb3RvZHF1aWOjYmlwazIwMDE6ZGI4Ojo3ZHBvcnQZoqllcHJvdG9kcXVpY2pkZXZpY2VfcHViWCB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA",
+      "expect": "refuse",
+      "name": "wrong_derivation",
+      "note": "a perfectly valid card for A, offered as the record for B",
+      "reason": "addr_mismatch",
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:786f:25af:1630:b78c:e2e1",
+        "now": 1760000000,
+        "source": "public"
+      }
+    },
+    {
+      "card": "fc1pWF2AmNzaWdYQOblkgrFeRq85IFKlYupFsIynGue_a9TI0sg8LV_SAgVr9eBFv3UvmsFJ9BEB8dFVUYXqnCZ8XbicKYtzEBW7AlnZXhwaXJlcxpo6MmAaWVuZHBvaW50c4KjYmlwbDE5OC41MS4xMDAuN2Rwb3J0GQTSZXByb3RvZHF1aWOjYmlwazIwMDE6ZGI4Ojo3ZHBvcnQZoqllcHJvdG9kcXVpY2pkZXZpY2VfcHViWCB5tVYuj-ZU-UB4sRLoqYunkB-FOuaVvtfg45ELrQSWZA",
+      "expect": "refuse",
+      "name": "unknown_version",
+      "note": "v=2; refused before the signature, no best-effort parse",
+      "reason": "unknown_version",
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "public"
+      }
+    },
+    {
+      "card": "fc1pmF2AWNwc2tYIKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgY3NpZ1hAbjFeBfVRJdZGtEuc_q0bL7HOVODHfuXo81DVf-7kiv3RDmFapWkrxjbrwWIoPflbgG7wu1wHF-Od2hKouJFwCGdleHBpcmVzGmjoyYBpZW5kcG9pbnRzgqNiaXBsMTk4LjUxLjEwMC43ZHBvcnQZBNJlcHJvdG9kcXVpY6NiaXBrMjAwMTpkYjg6OjdkcG9ydBmiqWVwcm90b2RxdWljamRldmljZV9wdWJYIHm1Vi6P5lT5QHixEuipi6eQH4U65pW-1-DjkQutBJZk",
+      "expect": "refuse",
+      "name": "psk_in_public",
+      "note": "structurally valid private card retrieved from a public channel",
+      "reason": "psk_in_public_card",
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "public"
+      }
+    },
+    {
+      "card": "fc1pWF2AWNzaWdYQGwKhMP-FrQNRO2Ue0S8YiOpWkecNKg3DM3DLz3iZw2LLkZPYy7ZtqM7usQuJO6gXxzHTW6PXFI10ekiWMtkewxnZXhwaXJlcxpo6MmAaWVuZHBvaW50c4WjYmlwbDE5OC41MS4xMDAuMWRwb3J0GaKpZXByb3RvZHF1aWOjYmlwbDE5OC41MS4xMDAuMmRwb3J0GaKpZXByb3RvZHF1aWOjYmlwbDE5OC41MS4xMDAuM2Rwb3J0GaKpZXByb3RvZHF1aWOjYmlwbDE5OC41MS4xMDAuNGRwb3J0GaKpZXByb3RvZHF1aWOjYmlwbDE5OC41MS4xMDAuNWRwb3J0GaKpZXByb3RvZHF1aWNqZGV2aWNlX3B1YlggebVWLo_mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ",
+      "expect": "refuse",
+      "name": "oversized_endpoints",
+      "note": "5 endpoints; refused at parse, never truncated to 4",
+      "reason": "too_many_endpoints",
+      "verify_with": {
+        "claimed_addr": "fdf1:1af7:c30d:ae6:d172:a56b:1e26:36eb",
+        "now": 1760000000,
+        "source": "public"
+      }
+    }
+  ]
+}

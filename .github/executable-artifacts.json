@@ -453,6 +453,17 @@
       ]
     },
     {
+      "path": "proofs/card_vectors.py",
+      "disposition": "required",
+      "entrypoint": "python3 proofs/card_vectors.py --check",
+      "matrix": [
+        {
+          "platform": "portable",
+          "topology": "unit"
+        }
+      ]
+    },
+    {
       "path": "proofs/establishment_model.py",
       "disposition": "required",
       "entrypoint": "python3 proofs/establishment_model.py",
