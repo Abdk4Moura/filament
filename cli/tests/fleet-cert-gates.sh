@@ -469,8 +469,14 @@ echo "## (shadow covered exec) rc=$rcSH out='$OUTSH' criticals_delta=$CRITS (tot
 # above are exactly that population (legacy would admit a secret-paired peer;
 # the capability layer refuses it). Asserting both halves turns the class from
 # prose into a measured verdict.
-NARROWED=$(grep -c "cap-narrows-legacy" "$WORK/up.log" || true)
-echo "## (shadow classes) new_criticals=$CRITS cap-narrows-legacy=$NARROWED"
+# The LINE is deduped per (action, subject) -- three impostor opens from the same
+# key print once -- so the population is read from the counter the line carries,
+# which increments per OPEN. Counting lines would undercount and call a working
+# instrument miscounting.
+NARROWED=$(grep -o "la_narrowed=[0-9]*" "$WORK/up.log" | sed 's/.*=//' | sort -n | tail -1)
+NARROWED=${NARROWED:-0}
+NARROWED_LINES=$(grep -c "cap-narrows-legacy" "$WORK/up.log" || true)
+echo "## (shadow classes) new_criticals=$CRITS cap-narrows-legacy_counter=$NARROWED (lines=$NARROWED_LINES)"
 if [ "$rcSH" = "0" ] && [ "$OUTSH" = "FLEET-SHADOW-OK" ] && [ "$CRITS" = "0" ] && [ "$NARROWED" -ge 3 ]; then
   ok "gateD-sh: covered exec clean in shadow (zero NEW CRITICAL) and the narrowing class is reachable ($NARROWED impostor refusals classified)"
 elif [ "$rcSH" = "0" ] && [ "$OUTSH" = "FLEET-SHADOW-OK" ] && [ "$CRITS" = "0" ]; then

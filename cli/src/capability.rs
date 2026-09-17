@@ -781,7 +781,12 @@ pub fn cap_gate_effective(
                         hex::encode(device_pub.copied().unwrap_or([0u8; 32]))
                     ),
                     &format!(
-                        "CAP-SHADOW cap-narrows-legacy: legacy ALLOWED '{action}' on '{resource}' for a subject with no ceiling coverage and no explicit grant; the flip REFUSES it (intended: this is a legacy hole closing, counted in la_narrowed). Not breakage."
+                        // The running COUNT is on the line because the line itself
+                        // is deduped per (action, subject): three opens from the same
+                        // impostor key print once, so only the counter can show that
+                        // the population is real and how big it is. Gates assert it.
+                        "CAP-SHADOW cap-narrows-legacy: legacy ALLOWED '{action}' on '{resource}' for a subject with no ceiling coverage and no explicit grant; the flip REFUSES it (intended: this is a legacy hole closing). Not breakage. [la_narrowed={}]",
+                        cap_shadow_counts().la_narrowed,
                     ),
                     true, // informational: debug-level only
                 );
