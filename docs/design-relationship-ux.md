@@ -471,7 +471,7 @@ A$ filament pass jane \
   a pass for jane, good for 7 days, on at most 3 of her devices.
 
     what          where                  which way   how long
-    forward       ws:8080                out         7d
+    forward       ws:8080                in          7d
     receive       nas:~/share            in          7d
 
   jane gets nothing else. she cannot pass any of it on.
@@ -485,7 +485,7 @@ A$ filament pass jane \
 ```
 J$ filament join ./jane.pass
   alex offers you a pass:
-    forward  ws:8080       out    7d
+    forward  ws:8080       in     7d
     receive  nas:~/share   in     7d
   this is 1 of 3 devices alex allowed. accept? [y/N] y
   accepted. `filament guests` on alex's side now shows this device.
@@ -509,11 +509,14 @@ Three properties the transcripts are chosen to show:
 - **A device budget, not a device list.** The pass names a person key and a
   count. Each device that claims it consumes one slot, and the slots are visible
   on the grantor's side, which is where the cost lands.
-- **`out` grants the counterpart nothing.** `forward:ws:8080 out` means jane may
-  reach my `ws:8080`. It confers no ability for me to reach hers. Direction is a
-  bit on the grant, not a relationship property, and the default is `in` for
-  receive-shaped verbs and `out` for reach-shaped ones — stated per row rather
-  than inferred.
+- **Both rows say `in`, and that is the point.** `in` is the only direction that
+  authorizes the subject: jane may reach my `ws:8080` and write into my
+  `nas:~/share`. An `out` row would say *I* may reach something of jane's, and
+  it would grant jane nothing — it is a statement of my side only, and it does
+  not work until jane separately grants me the matching `in`. The reverse never
+  exists unless it is separately granted
+  (`docs/design-identity-access-ux.md`, §5). Direction is a bit on the grant,
+  not a property of the relationship.
 
 `pass` needs resource-scoped grants, which do not exist yet:
 `parse_grant_spec` accepts a `:`-suffixed resource only for `route`, and every
