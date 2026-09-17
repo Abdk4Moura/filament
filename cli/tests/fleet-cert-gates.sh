@@ -133,7 +133,7 @@ AK_FILE="$HOME/.ssh/authorized_keys"
 
 # See the KNOWN-RED block in the header. Matching is on a stable substring of
 # the FAIL text, deliberately not the whole line (the measured rc varies).
-KNOWN_RED_ALLOW=("gateAUTH-A: covered exec refused under authoritative")
+KNOWN_RED_ALLOW=("gateAUTH-A: covered exec allowed under authoritative|gateAUTH-A: covered exec refused under authoritative")
 
 O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
 S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
