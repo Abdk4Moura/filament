@@ -1491,6 +1491,25 @@ fn spawn_reader(
             frames += 1;
             match kind {
                 KIND_CONTROL => {
+                    // #312 P4: A CONTROL FRAME IS EVIDENCE THE LINK IS ALIVE, so
+                    // it advances `last_activity` exactly as a data frame does.
+                    // AUDIT of what reads idle_ms() -- three sites, and NONE of
+                    // them means "carried DATA":
+                    //   * conn.rs `link_flowing()` against
+                    //     FILAMENT_ADOPT_ACTIVE_MS, with the comment "can't
+                    //     masquerade as idle and let a spurious supersede
+                    //     through";
+                    //   * conn.rs `stall_observation()` into
+                    //     `resilience::LiveObs { idle_ms }`, i.e. stall repair;
+                    //   * recv_cmd.rs's stall-repair flush, which drops a stream
+                    //     whose transport looks stalled.
+                    // A control-only link (roster, policy, ping, challenge) that
+                    // reads as stalled is what produced the supersede churn
+                    // measured in the AUTH-A logs. And the safety argument for
+                    // moving liveness rather than throughput: `stall_observation`
+                    // reports `flowed` SEPARATELY from `idle_ms`, so this leaves
+                    // data-flow accounting untouched.
+                    last_activity.store(now_ms(), Ordering::Relaxed);
                     match serde_json::from_slice::<Value>(&body) {
                         Ok(v) => {
                             let _ = tx.send(crate::net::Ev::Control(peer_id.clone(), v));
@@ -2152,6 +2171,67 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         f()
+    }
+
+    /// #312 P4: a CONTROL frame must advance liveness exactly as a data frame
+    /// does, or a control-only link's `idle_ms()` climbs forever and the three
+    /// readers above read it as stalled. The frame is sent AFTER the link has
+    /// gone measurably quiet, so the assertion cannot be satisfied by the
+    /// transport's creation time.
+    #[tokio::test]
+    async fn control_frame_advances_liveness_on_a_quiet_link() {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ((conn_d, send_d, recv_d), (conn_a, send_a, recv_a)) =
+                connected_pair().await;
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let (peer_tx, _peer_rx) = tokio::sync::mpsc::unbounded_channel();
+            let link = make_transport(
+                "peer".to_string(),
+                conn_d,
+                send_d,
+                recv_d,
+                tx,
+                true,
+                None,
+                true,
+            );
+            let peer = make_transport(
+                "peer".to_string(),
+                conn_a,
+                send_a,
+                recv_a,
+                peer_tx,
+                false,
+                None,
+                true,
+            );
+            // Quiet first: idle_ms() must be unambiguously above the bound we
+            // assert below, or the test would pass on the creation timestamp.
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let quiet = link.idle_ms();
+            assert!(
+                quiet >= 400,
+                "the link should look idle before the frame arrives, saw {quiet}ms"
+            );
+            peer.send_control(&serde_json::json!({"type": "ping"}))
+                .await
+                .expect("send a control frame");
+            // The EVENT is the proof it arrived; only then is the liveness
+            // assertion meaningful.
+            let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a control frame should arrive within 5s");
+            assert!(
+                matches!(got, Some(crate::net::Ev::Control(_, _))),
+                "the delivered event should be Ev::Control, got {got:?}"
+            );
+            assert!(
+                link.idle_ms() < 200,
+                "a control frame must reset liveness (idle_ms was {quiet}ms before it)"
+            );
+        })
+        .await
+        .expect("P4 liveness test did not finish within 20s (a stall must FAIL here)");
     }
 
     /// #312 T2: a PRIMARY link whose peer ends its send half must report DEAD
