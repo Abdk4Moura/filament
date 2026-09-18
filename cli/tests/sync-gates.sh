@@ -5,6 +5,17 @@
 #
 #   FILAMENT_BIN=/path/to/filament ./sync-gates.sh
 #
+# TWO PAIRING STYLES, and the gate says which arm uses which:
+#   * A to H are SECRET-PAIRED: each side hand-writes the other's name and a
+#     shared secret into devices.json. That link resolves NO device identity, so
+#     no capability or ceiling check can bind to it. It is the right fixture for
+#     everything about paths, deltas, resumes and refusals of the wrong target.
+#   * I is ENROLLED: an owner mints an invitation for a named device with an
+#     explicit ceiling (`add --for <name> --allow <caps>`), the device joins, and
+#     the capability check has an identity to bind to. This is the only style in
+#     which "a peer that cannot send/receive cannot sync" can be EXPRESSED at all;
+#     asserted on a secret-paired link it would pass for the wrong reason.
+#
 # Gates:
 #   A  FIRST SYNC -- every file lands (`sent`), the symlink is `skipped: symlink`,
 #      bytes moved == the tree's size, landed bytes identical.
@@ -18,6 +29,13 @@
 #   G  DELETE -- `--delete` removes the one file B has that A no longer does.
 #   H  RESUME -- with a landed file gone and another truncated on B, a re-run
 #      moves only the missing chunk and the missing file.
+#   I  CAPABILITY (enrolled pairing) -- a device whose ceiling has NO transfer is
+#      refused with exit 4 and a named reason, and a device whose ceiling HAS
+#      transfer syncs on the same fixture. The positive half is what separates
+#      "refuses the right thing" from "refuses everything".
+#   J  CORRUPTION -- a landed file overwritten with SAME-SIZE different bytes is
+#      re-sent (`updated`, whole file), never accepted as up to date. Same size on
+#      purpose: a size-only or mtime-only comparison would call it `same`.
 
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -158,6 +176,89 @@ if [ "$rcH" = 0 ] && [ "$(jstates "$WORK/H.jsonl")" = "$(printf 'updated\tbig\t%
   ok "gateH: resume moves only the missing chunk and the missing file"
 else cat "$WORK/H.err"; jstates "$WORK/H.jsonl"; bad "gateH: resume moved the wrong set (rc=$rcH)"; fi
 
+
+# ===================================================================== GATE I ==
+# Criterion (a): a peer that cannot send/receive cannot sync, and one that CAN
+# still does. THIS IS THE ONLY ARM IN THIS GATE THAT USES THE ENROLLED PAIRING
+# STYLE, and it has to be: the capability check is keyed on IDENTITY, while the
+# boxA/boxB pair above is secret-paired and therefore resolves no identity at all
+# (the same reason fleet-cert-gates.sh exists). Asserting a capability refusal on
+# a secret-paired link would pass for the wrong reason, which is the disease, not
+# the cure.
+#
+# The enrol commands are inlined rather than calling enroll_delegate, because
+# that helper reads `$DA` as the owner directory and this arm's owner is a fresh
+# one; the COMMANDS are the same ones the helper issues.
+say I
+DO="$WORK/owner"
+init_owner "$DO"
+env FILAMENT_CONFIG_DIR="$DO" FILAMENT_NAME=alpha "$BIN" --server "$SERVER" up --dir "$WORK/owner-drop" >"$WORK/up-owner.log" 2>&1 &
+FIX_PIDS+=($!)
+sleep 3
+for d in nosend cansend; do
+  case "$d" in
+    nosend) ALLOW="shell" ;;      # NO transfer in the ceiling
+    cansend) ALLOW="transfer" ;;  # transfer IS in the ceiling
+  esac
+  DDC="$WORK/$d"
+  mkdir -p "$DDC"
+  env FILAMENT_CONFIG_DIR="$DO" "$BIN" --server "$SERVER" add --for "$d" --allow "$ALLOW" \
+    --out "$WORK/$d-inv.txt" --yes >/dev/null 2>&1
+  env FILAMENT_CONFIG_DIR="$DDC" "$BIN" --server "$SERVER" join \
+    --invite-file "$WORK/$d-inv.txt" --name "$d" --no-interactive >"$WORK/$d-join.log" 2>&1
+done
+sleep 2
+mkdir -p "$WORK/itree"; head -c 100 /dev/urandom > "$WORK/itree/f"
+
+# NEGATIVE: no transfer in the ceiling -> refused, exit 4, with a reason.
+env FILAMENT_CONFIG_DIR="$WORK/nosend" FILAMENT_NAME=nosend timeout 120 "$BIN" \
+  --server "$SERVER" sync "$WORK/itree" alpha:inbox >"$WORK/I-neg.out" 2>&1; rcI=$?
+# The refusal is asserted in TWO places, because they say different things:
+#   * the OWNER'S LOG carries the decision, and it names the ceiling: "this
+#     capability is outside the device's invitation ceiling";
+#   * the CLIENT is told "identity not proven within 2000 ms; retry", because the
+#     open is parked for identity proof and the settle window expires first. That
+#     surfaced reason is a FINDING about the message (it names the settle timeout
+#     rather than the capability, and its "retry" invites a loop for a capability
+#     that will never be granted) and is reported rather than asserted here.
+if [ "$rcI" = 4 ] && grep -qi "outside the device's invitation ceiling" "$WORK/up-owner.log"; then
+  ok "gateI: a peer without transfer in its ceiling is refused (exit 4, owner names the ceiling)"
+else
+  cat "$WORK/I-neg.out"; tail -20 "$WORK/up-owner.log"
+  bad "gateI: peer without transfer not refused (rc=$rcI)"
+fi
+
+# POSITIVE half, so a gate that refuses EVERYTHING is distinguishable from one
+# that refuses only the wrong thing.
+env FILAMENT_CONFIG_DIR="$WORK/cansend" FILAMENT_NAME=cansend timeout 120 "$BIN" \
+  --server "$SERVER" sync "$WORK/itree" alpha:inbox >"$WORK/I-pos.out" 2>&1; rcI2=$?
+if [ "$rcI2" = 0 ] && [ -f "$WORK/owner-drop/inbox/f" ]; then
+  ok "gateI: a peer WITH transfer in its ceiling syncs (exit 0, file landed)"
+else
+  cat "$WORK/I-pos.out"; tail -20 "$WORK/up-owner.log"; ls -la "$WORK/owner-drop" 2>/dev/null
+  bad "gateI: covered peer did not sync (rc=$rcI2)"
+fi
+
+# ===================================================================== GATE J ==
+# Criterion (c): the delta path verifies content hashes on arrival, so a partial
+# or corrupted block is never accepted as up to date. The corruption is SAME SIZE
+# on purpose: a size-only or mtime-only comparison would call this file "same" and
+# skip it, so the arm is discriminating only in this shape.
+say J
+BIGSZ=$(stat -c%s "$TREE/big")
+python3 -c "import sys; sys.stdout.buffer.write(bytes((i*7+3) % 251 for i in range($BIGSZ)))" > "$DROP/inbox/big"
+if cmp -s "$TREE/big" "$DROP/inbox/big"; then
+  bad "gateJ: the corruption did not take, so this arm would have tested nothing"
+else
+  "${SYNC[@]}" --json sync "$TREE" boxB:inbox >"$WORK/J.jsonl" 2>"$WORK/J.err"; rcJ=$?
+  echo "## rc=$rcJ"; cat "$WORK/J.jsonl"
+  if [ "$rcJ" = 0 ] && jstates "$WORK/J.jsonl" | grep -q "$(printf 'updated\tbig\t%s' "$BIGSZ")" && same_bytes big; then
+    ok "gateJ: a same-size corrupted block is re-sent ($BIGSZ bytes, state updated), never accepted as up to date"
+  else
+    cat "$WORK/J.err"; jstates "$WORK/J.jsonl"
+    bad "gateJ: a corrupted same-size block was treated as up to date (rc=$rcJ)"
+  fi
+fi
 echo
 echo "== sync gates: PASS=$PASS FAIL=$FAIL${FAILED:+ (failed:$FAILED)} =="
 [ "$FAIL" = 0 ]
