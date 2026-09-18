@@ -24,7 +24,7 @@ use crate::{
     with_devices_mut,
 };
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -154,7 +154,11 @@ async fn send_identity_challenge(
             });
             // MUST await: send_control is async; dropping the future would leave
             // the challenge unsent (the peer never learns it must prove Proven).
-            let _ = t.send_control(&challenge).await;
+            if let Err(e) = t.send_control(&challenge).await {
+                crate::ui::say(&format!(
+                    "l2: identity challenge to {pid} could NOT be sent ({e})"
+                ));
+            }
         }
     }
 }
@@ -189,9 +193,18 @@ pub(crate) async fn issue_proven_challenge_and_hold(
     // before the await — never hold a std Mutex across .await).
     {
         let mut pend = pending_proven.lock().unwrap();
-        if let Some((_, deadline)) = pend.get(pid) {
-            if Instant::now() < *deadline {
-                return; // challenge already in flight; do not clobber its nonce
+        // A hold counts as live only when it is BOTH unexpired AND bound to
+        // the link we would send on now. A hold recorded for a transport
+        // that has since been replaced (reconnect/repair re-adopts the pid
+        // with a new transport) is unusable: the peer's answer would arrive
+        // on the new link while the nonce it used was issued for the old
+        // one, so the proof could never land and the link would never reach
+        // Proven. Treat that exactly like an expired hold -- re-challenge --
+        // which is what makes a parked open's wait terminate in a proof
+        // instead of a timeout.
+        if let Some((held_t, deadline)) = pend.get(pid) {
+            if Instant::now() < *deadline && Arc::ptr_eq(held_t, t) {
+                return; // challenge already in flight on THIS link; do not clobber its nonce
             }
         }
         pend.insert(
@@ -200,6 +213,67 @@ pub(crate) async fn issue_proven_challenge_and_hold(
         );
     }
     send_identity_challenge(conn, pid, identity_nonces).await;
+}
+
+/// Re-send the challenge already held for this link, SAME nonce: idempotent
+/// for the peer, and the reason it exists is a measurement -- installing a
+/// fresh nonce on every retry races the peer's reply whenever the reply's
+/// RTT exceeds the retry cadence (200-400ms on relay paths), which drops
+/// every answer and trades a deterministic timeout for a probabilistic one.
+/// A fresh nonce is minted only when the held one has expired or belongs to
+/// a different transport (see the settle caller).
+pub(crate) async fn resend_identity_challenge(
+    conn: &crate::Conn,
+    pid: &str,
+    identity_nonces: &std::collections::HashMap<String, ([u8; 32], Instant, [u8; 32])>,
+) -> bool {
+    let Some((nonce, _issued, recv_dpub)) = identity_nonces.get(pid) else {
+        return false;
+    };
+    let Some(t) = conn.transport_of(pid) else {
+        return false;
+    };
+    let challenge = serde_json::json!({
+        "type": "identity-nonce-challenge",
+        "nonce": hex::encode(nonce),
+        "receiver_device_pub": hex::encode(recv_dpub)
+    });
+    if let Err(e) = t.send_control(&challenge).await {
+        // A challenge we could not write is indistinguishable, from the
+        // challenger's side, from a peer that ignores us. Name it.
+        crate::ui::say(&format!(
+            "l2: identity challenge to {pid} could NOT be sent ({e}); the peer cannot prove until this link carries frames"
+        ));
+        return false;
+    }
+    true
+}
+
+/// A dropped proof is a SECURITY verdict and must never be invisible -- but
+/// it is also peer-triggerable, so it is deduped per (link, reason) with a
+/// cap: the operator sees the first one (at default level, like the other
+/// refusals), and a peer replaying bad exposes cannot flood the log.
+fn drop_once(pid: &str, why: &str) {
+    const DROP_ONCE_CAP: usize = 512;
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if let Ok(mut g) = seen.lock() {
+        let key = format!("{pid}|{why}");
+        if g.contains(&key) || g.len() >= DROP_ONCE_CAP {
+            return;
+        }
+        g.insert(key);
+    }
+    crate::ui::say(&format!(
+        "l2: identity-expose dropped for {pid}: {why} (not repeated for this link)"
+    ));
+}
+
+/// Whether a recorded challenge hold has served its whole deadline. Pure so
+/// the expiry rule is testable without a Conn or a sleeping test.
+pub(crate) fn hold_expired(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
 }
 
 /// #161: how long the possession challenge stays LIVE. Must be raised in
@@ -222,40 +296,49 @@ pub(crate) fn handle_identity_expose(
     v: &Value,
     identity_nonces: &mut HashMap<String, ([u8; 32], Instant, [u8; 32])>,
 ) -> bool {
+    // Every drop below used to be silent, which made an unprovable link
+    // indistinguishable from a link nobody challenged: the whole identity
+    // path looked idle while a peer's proof was being discarded. Debug
+    // level, so it costs nothing unless asked for.
+    let fail = |why: &'static str| {
+        drop_once(pid, why);
+        crate::ui::debug(&format!("identity-expose dropped for {pid}: {why}"));
+        false
+    };
     let nonce_hex = v["nonce"].as_str().unwrap_or_default();
     let Ok(nonce_bytes) = hex::decode(nonce_hex) else {
-        return false;
+        return fail("malformed nonce");
     };
     if nonce_bytes.len() != 32 {
-        return false;
+        return fail("nonce wrong length");
     }
     let mut nonce_arr = [0u8; 32];
     nonce_arr.copy_from_slice(&nonce_bytes);
     // Check held nonce matches (single-use)
     let Some((held_nonce, _ts, _held_recv_dpub)) = identity_nonces.get(pid) else {
-        return false;
+        return fail("no challenge is held for this link (proof arrived on a different link?)");
     };
     if held_nonce != &nonce_arr {
-        return false;
+        return fail("nonce does not match the one held for this link");
     }
     // Verify cert and possession sig
     let Some(cert_json) = v.get("cert") else {
-        return false;
+        return fail("no certificate in the frame");
     };
     let Some(cert) = identity::DeviceCert::from_json(cert_json) else {
-        return false;
+        return fail("unparseable certificate");
     };
     if cert.verify(identity::now_secs()).is_err() {
-        return false;
+        return fail("certificate expired or malformed");
     }
     let Some(sig_hex) = v.get("possession_sig").and_then(|x| x.as_str()) else {
-        return false;
+        return fail("no possession signature");
     };
     let Ok(sig_bytes) = hex::decode(sig_hex) else {
-        return false;
+        return fail("possession signature is not hex");
     };
     if sig_bytes.len() != 64 {
-        return false;
+        return fail("possession signature wrong length");
     }
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&sig_bytes);
@@ -264,7 +347,7 @@ pub(crate) fn handle_identity_expose(
     let caps_d = crate::identity::caps_digest("transfer");
     let chash = crate::identity::cert_hash(&cert);
     let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() else {
-        return false;
+        return fail("this device has no overlay key");
     };
     let sender_dpub = cert.device_pub;
     let receiver_dpub = own_dpub;
@@ -278,7 +361,7 @@ pub(crate) fn handle_identity_expose(
         &receiver_dpub,
     );
     if crate::identity::verify_possession_sig(&cert.device_pub, &msg, &sig_arr).is_err() {
-        return false;
+        return fail("possession signature does not verify");
     }
     // Anti-reflection, narrowed to device_pub (#41). A REFLECTION is my own message
     // bounced back to me, which necessarily carries MY OWN device cert, so
@@ -291,7 +374,7 @@ pub(crate) fn handle_identity_expose(
     // payload. On this 0x02 path the possession_msg also binds receiver_dpub non-zero,
     // so message binding is a second barrier here; on the 0x01 PAKE path it is not.
     if cert.device_pub == own_dpub {
-        return false;
+        return fail("reflection: the certificate is this device's own");
     }
     // Store as provisional, then promote on link
     let _ = store_provisional_identity(&format!("peer-{}", pid), &cert);
@@ -379,15 +462,29 @@ pub(crate) fn handle_identity_expose(
 /// Shared by recv_cmd (the `up`/receiver loop) AND send_cmd (the one-shot
 /// sender session) so a sender can prove possession and be authorized under an
 /// authoritative cap gate. Reflection-guarded and echoes the challenger nonce.
+///
+/// WHICH KEY IS WHICH, because the names invite the opposite reading.
+/// `receiver_device_pub` is the CHALLENGER's key, not ours: the challenger mints
+/// it from its own overlay key (recv_cmd.rs, the pair-intro branch: "Receiver
+/// device_pub is our own overlay key") and verifies the reply against
+/// `receiver_dpub = own_dpub`. So there is deliberately NO "refuse unless the
+/// receiver is us" rule here -- that rule, applied to a real challenge, would
+/// refuse every peer in the fleet. possession_msg always carries OUR cert's
+/// device_pub as sender, so this path can only ever sign as itself; the
+/// challenger's key is the intended binding. The only refusal on the receiver
+/// side is the REFLECTION guard below, and inverting it would be a PROTOCOL
+/// change, not a hardening.
 pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Value) {
     let nonce_hex = v["nonce"].as_str().unwrap_or_default();
     let recv_dpub_hex = v["receiver_device_pub"].as_str().unwrap_or_default();
     let (Ok(nonce_bytes), Ok(recv_dpub_bytes)) =
         (hex::decode(nonce_hex), hex::decode(recv_dpub_hex))
     else {
+        crate::ui::debug("identity challenge ignored: malformed nonce/receiver fields");
         return;
     };
     if nonce_bytes.len() != 32 || recv_dpub_bytes.len() != 32 {
+        crate::ui::debug("identity challenge ignored: nonce/receiver wrong length");
         return;
     }
     let mut nonce_arr = [0u8; 32];
@@ -398,12 +495,43 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
     // as the challenger (a self-challenge).
     if let Ok(own_dpub) = crate::overlay::overlay_pubkey_bytes() {
         if recv_dpub_arr == own_dpub {
+            crate::ui::debug("identity challenge ignored: it names my own device key");
             return;
         }
     }
     let Some(local_cert) = local_device_cert() else {
+        // LOUD, not debug: this refusal is why the peer will see no proof at
+        // all, and a silent one is exactly how a link that cannot prove itself
+        // reads as a link that was refused. Same class as the capsule's other
+        // refusals, which are visible at the default level.
+        crate::ui::say(
+            "identity challenge NOT answered: this device holds no certificate for its own key",
+        );
         return;
     };
+    // Self-binding, made explicit rather than inherited: the certificate we are
+    // about to sign with must BE this device's own key. `local_device_cert()`
+    // already filters on that (it returns the cert only when
+    // `cert.device_pub == overlay_pub` and the cert verifies), so this is
+    // belt-and-braces against a future change to that accessor -- and it is the
+    // invariant a reader is looking for when they ask "can this path sign as
+    // somebody else?". It cannot: the signature is made with the overlay key
+    // and carries this cert's device_pub as sender.
+    match crate::overlay::overlay_pubkey_bytes() {
+        Ok(own_pub) if local_cert.device_pub == own_pub => {}
+        Ok(_) => {
+            crate::ui::say(
+                "identity challenge NOT answered: the local certificate is not this device's key (refusing to sign as another identity)",
+            );
+            return;
+        }
+        Err(e) => {
+            crate::ui::say(&format!(
+                "identity challenge NOT answered: this device's key is unreadable ({e}); nothing can be signed"
+            ));
+            return;
+        }
+    }
     let scope = crate::identity::IntroScope::User.to_byte();
     let caps_d = crate::identity::caps_digest("transfer");
     let chash = crate::identity::cert_hash(&local_cert);
@@ -427,7 +555,14 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
             "cert": local_cert.to_json(),
             "possession_sig": hex::encode(sig)
         });
-        let _ = t.send_control(&payload).await;
+        match t.send_control(&payload).await {
+            Ok(()) => crate::ui::debug("identity challenge answered (identity-expose sent)"),
+            Err(e) => crate::ui::say(&format!(
+                "l2: identity-expose could NOT be sent ({e}); the challenger will see no proof"
+            )),
+        }
+    } else {
+        crate::ui::debug("identity challenge NOT answered: possession signing failed");
     }
 }
 

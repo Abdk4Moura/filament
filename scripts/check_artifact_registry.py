@@ -50,6 +50,7 @@ UNWIRED_REQUIRED = {
 
 RETIRED_TOMBSTONES = {
     "cli/tests/holepunch-gates.sh",
+    "cli/tests/livelock-nat-gates.sh",
     "cli/tests/nat-cone-gate.sh",
     "cli/tests/reliability_test.sh",
     "cli/tests/stun-server.py",

@@ -19,13 +19,13 @@ use crate::local_device_cert;
 use crate::sweep_lapsed;
 use crate::ui;
 use crate::warm_device_names;
-use anyhow::{Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) fn devices_store(name: &str, secret: &str) -> Result<()> {
     // Delegate to atomic upsert: secret only, preserve cert
-    devices_upsert_atomic(name, Some(secret), None, None, None, None, None)?;
+    devices_upsert_atomic(name, Some(secret), None, None, None, None, None, false)?;
     Ok(())
 }
 
@@ -36,7 +36,16 @@ pub(crate) fn devices_store(name: &str, secret: &str) -> Result<()> {
 /// working byte-for-byte, no regression.
 pub(crate) fn devices_store_v2(name: &str, secret: &str, caps: &[String]) -> Result<()> {
     // Delegate to atomic upsert: secret + caps together, preserve cert
-    devices_upsert_atomic(name, Some(secret), None, Some(caps), None, None, None)?;
+    devices_upsert_atomic(
+        name,
+        Some(secret),
+        None,
+        Some(caps),
+        None,
+        None,
+        None,
+        false,
+    )?;
     Ok(())
 }
 

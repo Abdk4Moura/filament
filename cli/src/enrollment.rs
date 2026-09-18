@@ -42,9 +42,10 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
     let assigned_name = v["name"]
         .as_str()
         .ok_or_else(|| anyhow!("join acknowledgement omitted the device name"))?;
-    let owner_name = v["owner_name"]
-        .as_str()
-        .ok_or_else(|| anyhow!("join acknowledgement omitted the owner name"))?;
+    // The owner name comes from the SIGNED invitation, never from the
+    // acknowledgement frame: a network peer must not choose whose fleet
+    // we think we joined.
+    let owner_name = inv.owner_name.as_str();
     let secret = v["secret"]
         .as_str()
         .ok_or_else(|| anyhow!("join acknowledgement omitted the reconnect secret"))?;
@@ -101,6 +102,17 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         )?,
     )?;
     let transfer_caps = vec!["transfer".to_string()];
+    // The invitation names the fleet, but it must not re-key a DIFFERENT
+    // fleet already recorded under this name (stale join, or a hostile
+    // invitation): refuse instead of silently replacing the owner's
+    // identity. Same key re-joining passes through below.
+    if crate::devices_store::name_pinned_by_other(owner_name, &hex::encode(owner_cert.device_pub)) {
+        anyhow::bail!(
+            "already have a different fleet owner recorded as '{owner_name}': forget it first, then join"
+        );
+    }
+    // allow_reanchor: joining under an owner-signed invitation is the owner
+    // decision that permits recording under this name.
     devices_upsert_atomic(
         owner_name,
         Some(secret),
@@ -109,6 +121,7 @@ fn persist_join_ack(v: &Value, inv: &crate::ephemeral::Invitation) -> Result<Str
         Some(identity::IntroScope::Device.to_byte()),
         None,
         None,
+        true,
     )?;
     // Fleet auto-mesh: keep the rendezvous secret the owner sent. Its ABSENCE is
     // not a failure, it just means no auto-mesh (an older owner, or a join that

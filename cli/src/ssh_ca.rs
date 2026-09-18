@@ -493,6 +493,7 @@ pub(crate) async fn handle_ssh_sign(
     t: std::sync::Arc<dyn crate::net::Transport>,
     v: &serde_json::Value,
     shell_policy: &crate::ShellPolicy,
+    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     // Refusals are GENERIC on the wire: every deny looks identical out
     // there, so a refused peer cannot oracle which check failed. The detail
@@ -532,8 +533,29 @@ pub(crate) async fn handle_ssh_sign(
         return;
     }
     // Gate first (same function, same inputs as pty/exec): no grant, no cert.
-    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy, crate::capability::CAP_SHELL);
     if let Err(cap_reason) = crate::shell_gate::ssh_gate_decision(&inputs) {
+        // Settle-then-evaluate: the verdict above may rest on stale
+        // (unproven) identity. Park for re-drive on proof when the deny
+        // is attributable to it; otherwise the live verdict stands.
+        // Note: unlike exec/pty/forward, a parked sign request that must
+        // deny now goes through the generic settle refusal (with the
+        // retryable reason) rather than the generic ssh-sign refusal, so
+        // the initiator can distinguish "retry" from "refused".
+        if crate::recv_cmd::park_on_deny(
+            parked,
+            conn,
+            pid,
+            crate::recv_cmd::ParkKind::SshSign,
+            &t,
+            sid,
+            v,
+            cap_reason.as_deref().unwrap_or("shell capability not granted"),
+        )
+        .await
+        {
+            return;
+        }
         refuse(
             &t,
             sid,

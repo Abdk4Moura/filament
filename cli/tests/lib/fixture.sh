@@ -11,8 +11,68 @@
 # --- assertion bookkeeping ---
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
-ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
-bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED="$FAILED $1"; }
+ok()  { echo "PASS: $1"; PASS=$((PASS+1)); PASSED_LIST+=("$1"); }
+bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); FAILED="$FAILED $1"; FAILED_LIST+=("$1"); }
+
+# A gate whose failure is a NAMED, TRACKED defect rather than a regression.
+# Same philosophy as gates-ratchet.sh: a still-broken gate does not fail the
+# build (it was already broken and this job is not where that is discovered),
+# but the list only ever SHRINKS -- a known-red gate that starts passing fails
+# the run so the entry gets removed in the same commit, with evidence.
+#
+# Usage: declare KNOWN_RED_ALLOW=( "<substring of the FAIL text>" ... ) in the
+# gate script, and end with `declare_known_red_summary`; see
+# fleet-cert-gates.sh's AUTH-A for the worked example.
+# Entries are "<pass-text>|<fail-text>" pairs, following gates-ratchet.sh: a
+# gate almost never announces failure under the name it announces success, so a
+# single substring cannot tell "it passed" from "it never ran".
+KNOWN_RED_ALLOW=()
+KNOWN_RED_HIT=()
+FAILED_LIST=()
+PASSED_LIST=()
+declare_known_red_summary() {
+  # Array-based on purpose: gate texts contain spaces, so word-splitting the
+  # accumulated string would compare fragments and silently fail to match.
+  local entry f hit pass_txt fail_txt
+  local remaining=()
+  for f in ${FAILED_LIST[@]+"${FAILED_LIST[@]}"}; do
+    hit=0
+    for entry in ${KNOWN_RED_ALLOW[@]+"${KNOWN_RED_ALLOW[@]}"}; do
+      fail_txt="${entry#*|}"
+      case "$f" in *"$fail_txt"*) hit=1 ;; esac
+    done
+    if [ "$hit" = "1" ]; then
+      echo "KNOWN-RED: $f"
+      KNOWN_RED_HIT+=("$f")
+    else
+      remaining+=("$f")
+    fi
+  done
+  # The ratchet: the list only ever SHRINKS, and only with evidence.
+  for entry in ${KNOWN_RED_ALLOW[@]+"${KNOWN_RED_ALLOW[@]}"}; do
+    pass_txt="${entry%%|*}"
+    fail_txt="${entry#*|}"
+    case " ${PASSED_LIST[*]-} " in
+      *"$pass_txt"*)
+        echo "KNOWN-RED handled: the known-red gate '$pass_txt' now PASSES."
+        echo "FAIL: a known-red gate started passing; remove its entry from KNOWN_RED_ALLOW in this commit (the list only shrinks)."
+        remaining+=("known-red-gate-started-passing:$pass_txt")
+        ;;
+      *)
+        case " ${FAILED_LIST[*]-} " in
+          *"$fail_txt"*) : ;;  # reported above as KNOWN-RED
+          *)
+            echo "FAIL: the known-red gate '$fail_txt' neither passed nor failed -- it did not run."
+            remaining+=("known-red-gate-did-not-run:$fail_txt")
+            ;;
+        esac
+        ;;
+    esac
+  done
+  FAILED=""
+  for f in ${remaining[@]+"${remaining[@]}"}; do FAILED="$FAILED $f"; done
+  FAIL=${#remaining[@]}
+}
 
 FIX_PIDS=()
 fixture_cleanup() {
