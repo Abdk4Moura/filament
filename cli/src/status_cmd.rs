@@ -57,13 +57,28 @@ pub(crate) fn tour_cmd() -> Result<()> {
         )),
     }
     let n = devices_load().len();
-    // U1: the first screen mints the identity instead of warning about it.
-    let identity = crate::identity_flow::ensure_user_key(false)?;
+    let identity = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
     ui::say(&format!("  {n} device{}", if n == 1 { "" } else { "s" }));
-    ui::say(&format!(
-        "  identity {}",
-        ui::paint_when(color, ui::Tone::Bold, &identity.fingerprint())
-    ));
+    // U1: this screen READS the identity, it does not mint one. Bare `filament`
+    // is the command people run to see what filament is, and it must not write
+    // a private key as a side effect of being looked at, nor fail on the two
+    // devices that cannot mint (joined, opt-out set). What U1 changes here is
+    // the verdict: a missing identity stopped being a warning, because `init`
+    // stopped being a precondition and the next verb creates the key itself.
+    match identity {
+        Some(key) => ui::say(&format!(
+            "  identity {}",
+            ui::paint_when(color, ui::Tone::Bold, &key.fingerprint())
+        )),
+        None if local_device_cert().is_some() => ui::say(&format!(
+            "  identity {}",
+            ui::paint_when(color, ui::Tone::Dim, "joined device (owner holds the key)")
+        )),
+        None => ui::say(&format!(
+            "  identity {}",
+            ui::paint_when(color, ui::Tone::Dim, "created when you first use one")
+        )),
+    }
     ui::say("");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  do this:"));
     let act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));

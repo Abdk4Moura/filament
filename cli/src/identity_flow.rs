@@ -180,12 +180,33 @@ pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
 /// with the old "run `filament init` first" instead of minting one.
 pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "FILAMENT_NO_IMPLICIT_INIT";
 
+/// Whether the opt-out above is set (any value except empty and `0`).
+///
+/// The INSPECT surfaces read this instead of calling the accessor and letting
+/// it fail. `filament id` and the bare tour screen answered pre-U1 without an
+/// identity and exited 0; if the opt-out turned either into an error, U1 would
+/// have taken a working read-only answer away from exactly the scripts that
+/// asked for the old behaviour, which is the opposite of what an opt-out is
+/// for.
+pub(crate) fn implicit_init_disabled() -> bool {
+    std::env::var_os(NO_IMPLICIT_INIT_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 /// The identity, minted on first use (U1). A keypair is not a ceremony: the
-/// seven "no identity. Run `filament init` first" bails route through here and
-/// proceed instead. Prints one past-tense line the ONE time the key is
+/// bails that read "no identity. Run `filament init` first" route through here
+/// and proceed instead. Prints one past-tense line the ONE time the key is
 /// created, to stderr via `ui::say`, and nothing under `--json` (the envelope
 /// that could carry it as a data field is audit ticket 1; until then a prose
 /// line on a `--json` run is the defect `docs/agent-output-audit.md` names).
+///
+/// WHERE IT IS CALLED, and the rule behind the list: a verb mints only when it
+/// needs the key to do the job it was asked to do. `add --for` and both `grant`
+/// paths sign with it; `id` is the verb whose entire subject is the identity.
+/// The bare tour screen (`status_cmd::tour_cmd`) does NOT call this and must
+/// not: it is an inspect screen that renders whatever state it finds, so
+/// minting there would make `filament` with no arguments write a private key
+/// as a side effect of being looked at, and would make the screen FAIL on the
+/// two devices that cannot mint (a joined one, and one with the opt-out set).
 ///
 /// What it deliberately does NOT do, because those ARE ceremonies and
 /// `filament init` still owns them: name the device, choose the inbox, write
@@ -224,7 +245,7 @@ pub(crate) fn ensure_user_key_inner() -> Result<(identity::UserKey, bool)> {
              Run the command on the owner's machine."
         );
     }
-    if std::env::var_os(NO_IMPLICIT_INIT_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
+    if implicit_init_disabled() {
         bail!("no identity. Run `filament init` first");
     }
     let dir = settings::config_dir();
