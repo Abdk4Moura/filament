@@ -797,6 +797,11 @@ pub fn client_config() -> Result<quinn::ClientConfig> {
 /// (simultaneous-open over one socket). Returns the endpoint and its port.
 /// Uses socket2 for large SO_RCVBUF/SO_SNDBUF to reduce UDP packet loss at
 /// high throughput (the default ~208KB kernel buffer overflows at ~1.2 Gbps).
+///
+/// TESTS THAT REACH FOR THIS MUST BOUND EVERY AWAIT -- see the note at the top of
+/// the test module below. An unbounded await in a test does not fail, it HANGS,
+/// and a hang has no verdict at all: no failing test name, no count, just a job
+/// that times out and reads as infrastructure.
 pub fn bind_endpoint() -> Result<(Endpoint, u16)> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
@@ -2033,6 +2038,19 @@ pub async fn race_connect_labeled(
 
 #[cfg(test)]
 mod tests {
+    //! EVERY AWAIT IN A TEST THAT TOUCHES A REAL SOCKET OR ENDPOINT IS BOUNDED.
+    //!
+    //! A bound on the part you thought of is still an unbounded await somewhere
+    //! else. The first version of the T2 pair bounded its handshake and then hung
+    //! in the test BODY, and the job's whole 25-minute budget went twice: the
+    //! only thing that named the cause was the cleanup line
+    //! (`Terminate orphan process: ... (filament_transport-...)`) while the test
+    //! binary printed 20 tests `ok` and named neither of the new ones.
+    //!
+    //! A test that HANGS is worse than a test that fails: it names nothing and
+    //! reports as infrastructure, so nobody looks at the test. Hence the general
+    //! rule rather than "the setup is bounded": every await here sits inside a
+    //! `tokio::time::timeout` whose panic sentence says what did not complete.
     use super::*;
 
     #[test]
