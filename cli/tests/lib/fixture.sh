@@ -108,12 +108,39 @@ start_acceptor() {
 
 # $1 = device name, $2... = extra `add` flags (e.g. `--allow shell`). Enroll a
 # delegated device from the owner config, then have it join from a fresh dir.
+# A setup step that never returns used to hang the whole gate until the job's own timeout,
+# which reports as a CANCELLED job with no failing test named. Both of these calls talk to
+# the server, so both are bounded through `fs_bounded`, whose whole purpose is to tell a
+# refusal from a hang. A wedge is a failure with a name, not a slow pass.
 enroll_delegate() {
   local name="$1"; shift
   local ddir="$WORK/$name"; mkdir -p "$ddir"
-  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes >/dev/null 2>&1
-  env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive >"$WORK/$name-join.log" 2>&1
+  local out state
+  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes)
+  state=$(fs_state)
+  case "$state" in
+    ok) ;;
+    err)  fixture_die "setup: 'add --for $name' failed (fs_state=$state): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
+    *)    fixture_die "setup: 'add --for $name' WEDGED after 45s (fs_state=$state). A hang is a failure, not a slow pass; see lib/fixture.sh fs_bounded." ;;
+  esac
+  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive)
+  state=$(fs_state)
+  case "$state" in
+    ok) ;;
+    err)  fixture_die "setup: 'join --name $name' failed (fs_state=$state): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
+    *)    fixture_die "setup: 'join --name $name' WEDGED after 45s (fs_state=$state). A hang is a failure, not a slow pass; see lib/fixture.sh fs_bounded." ;;
+  esac
+  printf '%s\n' "$out" > "$WORK/$name-join.log"
   sleep 2
+}
+
+# Report a setup failure that makes the rest of the gate meaningless, name it, count it and
+# stop. Called from inside the fixture rather than from the gate's tail, because a wedged
+# setup never reaches the tail.
+fixture_die() {
+  bad "$1"
+  declare_known_red_summary
+  exit 1
 }
 
 # Run `$@` with a HARD bound that can distinguish a refusal from a hang.
@@ -133,13 +160,37 @@ fs_bounded() {  # $1 = seconds, rest = command
   ( "$@" >"$out" 2>&1; echo $? >"$done" ) &
   for _ in $(seq 1 $((secs * 2))); do [ -f "$done" ] && break; sleep 0.5; done
   if [ -f "$done" ]; then
+    cat "$done" > "$WORK/fs.rc"
     [ "$(cat "$done")" = "0" ] && echo ok >"$WORK/fs.state" || echo err >"$WORK/fs.state"
   else
+    : > "$WORK/fs.rc"
     echo wedged >"$WORK/fs.state"
   fi
   cat "$out" 2>/dev/null
 }
 fs_state() { cat "$WORK/fs.state" 2>/dev/null; }
+# The child's exit code, empty when it wedged. Bounded callers still need it: the gates assert
+# on refusals (`exit $rc`), so a bound that discarded the code would quietly weaken them.
+fs_rc() { cat "$WORK/fs.rc" 2>/dev/null; }
+
+# A CLI call with a BOUND that aborts the gate by name when it wedges. Echoes the command's
+# output (which the gates already capture and assert on) and returns the child's exit code so
+# `rc=$?` keeps meaning what it meant. This is the shape every CLI call in a gate should use:
+# a gate that hangs cannot report anything, and "the output stopped" is satisfied by a hang
+# exactly as well as by a refusal, which is what fs_bounded's own comment says.
+# DOES NOT CAPTURE, and that is the whole point: `out=$(fs_bounded ...)` cannot return when the
+# command it bounded left a descendant holding the capture pipe, which is what the CLI does here,
+# so the bound fired and the gate stayed wedged anyway. The output is read from $WORK/fs.out with
+# fs_out after the call, which no pipe can hold open.
+fs_cli() {  # $1 = seconds, rest = command
+  local secs="$1"; shift
+  fs_bounded "$secs" "$@" >/dev/null 2>&1
+  if [ "$(fs_state)" = "wedged" ]; then
+    fixture_die "CLI WEDGED after ${secs}s with no result: $* -- a hang is a failure, not a slow pass"
+  fi
+  return "$(fs_rc)"
+}
+fs_out() { cat "$WORK/fs.out" 2>/dev/null; }
 
 # --- certified fleet pair (two daemons, real enrolment) ----------------------
 #
