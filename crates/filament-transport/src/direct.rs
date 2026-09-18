@@ -2088,16 +2088,39 @@ mod tests {
         (quinn::Connection, SendStream, RecvStream),
         (quinn::Connection, SendStream, RecvStream),
     ) {
-        let (dial_ep, _) = bind_endpoint().expect("dialer endpoint");
-        let (acc_ep, acc_port) = bind_endpoint().expect("acceptor endpoint");
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], acc_port));
-        let dialing = dial_ep.connect(addr, "filament-direct").expect("connect");
-        let incoming = acc_ep.accept().await.expect("accept").await.expect("handshake");
-        let conn = dialing.await.expect("dial handshake");
-        let tkey = transport_key("t2-secret");
-        let (send_d, recv_d) = authenticate(&conn, &tkey, true).await.expect("dialer auth");
-        let (send_a, recv_a) = authenticate(&incoming, &tkey, false).await.expect("acceptor auth");
-        ((conn, send_d, recv_d), (incoming, send_a, recv_a))
+        // BOTH ENDS MUST BE DRIVEN CONCURRENTLY, and the whole thing is BOUNDED.
+        //
+        // The first version awaited the accept before the dial, so the dialer's
+        // handshake was a future nobody polled and the accept never arrived; and
+        // the two `authenticate` calls were sequential, which deadlocks the same
+        // way if the exchange is mutual. A test that HANGS is worse than one that
+        // fails: it prints no test name and consumes the job's whole timeout, so
+        // CI reports "timed out" rather than "this test". That is exactly how
+        // this was found -- the linux job died at 25m with `filament_transport-...`
+        // as its orphaned process and neither T2 test named anywhere in the log.
+        let exchange = async {
+            let (dial_ep, _) = bind_endpoint().expect("dialer endpoint");
+            let (acc_ep, acc_port) = bind_endpoint().expect("acceptor endpoint");
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], acc_port));
+            let dialing = dial_ep.connect(addr, "filament-direct").expect("connect");
+            let tkey = transport_key("t2-secret");
+            let (conn, incoming) = tokio::join!(
+                async { dialing.await.expect("dial handshake") },
+                async { acc_ep.accept().await.expect("accept").await.expect("handshake") },
+            );
+            let (dial_auth, acc_auth) = tokio::join!(
+                authenticate(&conn, &tkey, true),
+                authenticate(&incoming, &tkey, false),
+            );
+            let (send_d, recv_d) = dial_auth.expect("dialer auth");
+            let (send_a, recv_a) = acc_auth.expect("acceptor auth");
+            ((conn, send_d, recv_d), (incoming, send_a, recv_a))
+        };
+        // A STALL MUST FAIL LOUDLY: a bounded wait turns a deadlock into a named
+        // assertion failure instead of a job-wide timeout.
+        tokio::time::timeout(std::time::Duration::from_secs(20), exchange)
+            .await
+            .expect("connected_pair: the QUIC handshake/authenticate exchange did not                      complete within 20s (it must FAIL here, never hang the job)")
     }
 
     /// Poll a predicate for a bounded time, so a test states HOW LONG it is
