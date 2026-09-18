@@ -366,3 +366,31 @@ enrolled device could ever be on a channel, so `S1` was vacuous and passed on a
 model that could not express the attack. A check that cannot fail is not
 evidence. If you extend this model, mutate it and confirm it bites before
 trusting a green run.
+
+## Companion: the bootstrap card reference codec
+
+`card_vectors.py` is not a model checker; it is the other kind of evidence.
+The bootstrap card (`fc1`, specified in [`CONTRACT.md`](../CONTRACT.md)) is a
+signed structure, so its correctness lives in BYTES: "deterministic CBOR,
+sorted keys, shortest ints" is the wire, not a style note, and a spec precise
+enough to read is not automatically precise enough to implement twice. This
+file implements the card a second time in pure Python (a minimal deterministic
+CBOR encoder, the `fdf1` overlay derivation, and the contract's six-step verify
+order) and emits `card_vectors.json` so the Rust implementation has fixtures to
+agree with rather than a paragraph to interpret. Run it:
+
+```
+python3 card_vectors.py           # self-check, then write card_vectors.json
+python3 card_vectors.py --check   # self-check and fail on drift (the CI gate)
+```
+
+The vectors are two accepted cards (public and private) and one per refusal in
+the contract: tampered field, expired, wrong derivation, unknown version, psk
+in a public card, oversized endpoint list. Each refusal vector asserts the
+SPECIFIC reason, which is what makes them worth having: a refusal that starts
+happening for a different reason than the contract gives has drifted even
+though the test still says "refused". Ed25519 comes from `cryptography` when it
+is installed; without it the script falls back to a loudly marked placeholder
+backend and stamps `signature_backend` in the JSON, so structure vectors stay
+usable and nobody mistakes a placeholder for a crypto fixture. Runtime is under
+a tenth of a second.
