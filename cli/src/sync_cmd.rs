@@ -722,6 +722,31 @@ async fn serve_sync(
 /// the root: every existing ancestor first, then the parent once it exists.
 /// Nothing is written before both hold.
 fn bound_parent(root: &Path, parent: &Path) -> Result<()> {
+    // REFUSE BEFORE CREATING. Every component of `parent` below `root` is checked for
+    // symlinks before anything is created, because the checks below can only report what
+    // they find: `create_dir_all` follows a symlinked parent, so a refusal issued after it
+    // leaves the directory already landed outside the root. A post-hoc refusal is a hole
+    // with a message attached, which is what this arm found on Windows and what it would
+    // have found on Unix had the fixture asserted on the symlink's target itself.
+    //
+    // The predicate is `symlink_metadata` and `is_symlink`, deliberately NOT canonicalize:
+    // Windows returns verbatim `\\?\` paths from canonicalize, so a within-root decision
+    // built on it can miss on one platform while passing on another. `root` itself is not
+    // walked, so a root reached through a symlink stays legitimate.
+    if let Ok(rel) = parent.strip_prefix(root) {
+        let mut walked = root.to_path_buf();
+        for c in rel.components() {
+            walked.push(c.as_os_str());
+            match std::fs::symlink_metadata(&walked) {
+                Ok(md) if md.file_type().is_symlink() => {
+                    bail!("path escapes the remote dir: {walked:?} is a symlink")
+                }
+                Ok(_) => {}
+                // Does not exist yet, so nothing below it can be a symlink either.
+                Err(_) => break,
+            }
+        }
+    }
     let mut probe = parent.to_path_buf();
     while !probe.exists() {
         probe = match probe.parent() {
@@ -928,6 +953,16 @@ mod tests {
                 "and so must a path under it"
             );
             assert!(!out.join("x").exists(), "nothing was created outside the root");
+            // The symlink's TARGET is the thing the refusal has to protect, and asserting
+            // only on `x` let a create-then-refuse ordering pass on Unix: `create_dir_all`
+            // on the symlink itself makes the target directory, which is already a write
+            // outside the root even though no file below it was written. This assertion is
+            // what makes the ordering observable on every platform rather than on Windows
+            // alone, and it is the assertion the fix's bite check goes red against.
+            assert!(
+                !out.exists(),
+                "nothing at all was created outside the root, not even the symlink's target"
+            );
         } else {
             crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
         }
