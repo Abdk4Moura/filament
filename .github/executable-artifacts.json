@@ -224,8 +224,8 @@
     {
       "path": "cli/tests/mount-gates.sh",
       "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "chief-ux",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/318",
+      "owner": "pi-director",
       "expires": "2026-10-18"
     },
     {
