@@ -33,6 +33,7 @@ Legend: `done` merged to main · `in PR` open pull request · `building` branch 
 | U4 | `serve exec/forward/mount` | worker | not started | needs U2 |
 | U5 | `remember`, `--remember` repair | pi | not started | hotfix for the false "mutually remembered" message requested |
 | U6 | tier becomes the base | worker | not started | |
+| U6 (view) | `devices --caps [<device>]`: per-capability rows, source, `valid_until`, EFFECTIVE from the gate, `--json`, exit 3 | worker | in PR | #325; tier derivation unchanged (`tier_for`), expired cert shown as a caveat |
 | U7 | `forget` at top level | helper | not started | |
 | U8 | resource-scoped caps + lattice | pi | contract done, code not started | CONTRACT "Relationship frames" (#313) |
 | U9 | direction bit | pi | contract done, code not started | CONTRACT "Relationship frames" (#313) |
