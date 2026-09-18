@@ -5,6 +5,12 @@
 # DegradedNet tiers) and exits non-zero if ANY reachable state is invalid, stuck,
 # deadlocked, or cannot self-heal to CONNECTED. See proofs/README.md.
 #
+# proofs/capability_ledger_model.py model-checks the capability ledger defined in
+# CONTRACT.md ("Capability ledger (append-only signed ops)", laws L1-L13). It is
+# run twice: once for the laws, once with --self-test, which breaks one law at a
+# time and requires the model to catch each. A green model that cannot go red is
+# not evidence.
+#
 # The discipline this enforces: a protocol change must keep the proof green. If
 # you change the establishment FSM (crates/filament-transport/src/{net,direct}.rs,
 # cli/src/main.rs, frontend/src/lib/*.js,
@@ -42,3 +48,7 @@ jobs:
         run: python3 proofs/fleet_automesh_model.py
       - name: Model-check stall ladder (calibration and recovery boundary)
         run: python3 proofs/stall_ladder_model.py
+      - name: Model-check capability ledger (CONTRACT.md laws L1-L13)
+        run: python3 proofs/capability_ledger_model.py
+      - name: Capability-ledger model catches a broken law (mutation self-test)
+        run: python3 proofs/capability_ledger_model.py --self-test
