@@ -14,13 +14,13 @@
 //! `device_cert_for` skips expiry by design (#266). This view shows the row the
 //! way `devices` files it and adds the "cert expired" caveat beside it rather
 //! than masking the tier.
-use crate::capability::{self, BindingStrength, GateDecision, CAP_SHELL};
+use crate::capability::{self, BindingStrength, CAP_SHELL, GateDecision};
 use crate::device_caps::{device_allows, device_capability_denied};
 use crate::device_view::{same_owner_key, tier_for};
 use crate::devices_store::devices_path;
 use crate::fleet_ui::devices::DeviceTier;
 use crate::identity;
-use crate::shell_gate::{pty_gate_decision, ShellGateInputs};
+use crate::shell_gate::{ShellGateInputs, pty_gate_decision};
 use crate::ui;
 use crate::{
     PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, cert_revoked_for,
@@ -55,7 +55,11 @@ pub(crate) struct DevicePerms {
 
 fn strings(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|c| c.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
