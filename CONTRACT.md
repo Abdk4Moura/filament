@@ -1040,3 +1040,153 @@ implement them behaves exactly as before, only slower.
   "while the session is open" to "until cert expiry" against a
   same-user attacker on A. The bound is `ssh.cert_ttl`, and the cache
   lifecycle plus B-side teardown above exist to hold it.
+
+## Capability ceilings (who may write them)
+
+The persisted per-device ceiling (the record field `principal_ceiling_for`
+reads) is owner-signed policy, and only three paths may write it -- all of
+them local consequences of owner-signed artifacts, never network input:
+
+- `join` writes the ceiling from the invitation, and only after the
+  invitation's owner signature verifies;
+- `certify --scope` (planned; not yet built) will write it as an
+  owner-signed CapOp through the grant path on the owner side -- until
+  then, only renewal_lifecycle's post-verify ceiling write does;
+- renewal writes the CERTIFICATE only, never the ceiling.
+
+In particular: `identity-cert-delivery` and cert renewal persist the cert
+and must not touch the ceiling field (pinned by test); no UNSIGNED frame
+carries a ceiling, a grant, or a role -- `fleet-policy` push carries
+owner-signed ops verified against the held owner key, and every other
+frame's receiver resolves everything from its local stores. The shell/exec gate reads the ceiling fresh at
+gate time and on every revoke tick (never cached at link open), keyed by
+the peer's verified device identity, and checks the requested action
+against it (`ceiling_covers_action`). Anything outside the ceiling needs
+an explicit grant exactly as before.
+
+## Shadow accounting classes
+
+Shadow mode decides on the legacy fold and records what the flip WOULD do, so
+the classes must be separated or a stricter flip reads as a broken one. Four,
+each with its own counter and its own verdict text:
+
+- **BREAKAGE** -- legacy ALLOWED, the capability layer DENIES, and the subject
+  IS covered (ceiling or explicit grant). Counted `la_denied`, logged
+  `CAP-SHADOW CRITICAL`, and it is the only class that blocks the flip. A
+  CRITICAL means "a covered, legitimate population would lose access".
+- **cap-narrows-legacy** -- legacy ALLOWED, the capability layer DENIES, and the
+  subject is NOT covered by anything (no ceiling, no grant). Counted
+  `la_narrowed` (never `la_denied`), logged at Info. This is the flip CLOSING a
+  legacy hole where mere pairing sufficed -- e.g. a peer that hellos as a
+  ceilinged device's name -- so it is intended, and it must not pollute the
+  breakage signal. Deliberately excluded from `flip_ready`.
+- **pending-proof** -- legacy ALLOWED, the layer DENIES, and the only obstacle is
+  that the link's possession proof has not settled. Logged at Info. The flip
+  admits the open once the link is Proven, so a transient reconnect is not
+  breakage; the settle path above exists to wait exactly that transient out.
+- **WIDENING** -- legacy DENIED, the layer AUTHORIZES: opens the flip will newly
+  permit. Counted `ld_authorized`, never gated (a hard zero would forbid the
+  point of the migration), but it MUST be enumerated in the flip commit.
+
+`ceiling_admitted` is informational alongside them: opens admitted by the
+enrolment ceiling without an explicit grant, i.e. the population the flip newly
+permits. Reviewed, not gated.
+
+## Shadow accounting classes
+
+Shadow mode decides on the legacy fold and records what the flip WOULD do, so
+the classes must be separated or a stricter flip reads as a broken one. Four,
+each with its own counter and its own verdict text:
+
+- **BREAKAGE** -- legacy ALLOWED, the capability layer DENIES, and the subject
+  IS covered (ceiling or explicit grant). Counted `la_denied`, logged
+  `CAP-SHADOW CRITICAL`, and it is the only class that blocks the flip. A
+  CRITICAL means "a covered, legitimate population would lose access".
+- **cap-narrows-legacy** -- legacy ALLOWED, the capability layer DENIES, and
+  the subject is NOT covered by anything (no ceiling, no grant). Counted
+  `la_narrowed` (never `la_denied`), logged at Info. This is the flip CLOSING
+  a legacy hole where mere pairing sufficed -- e.g. a peer that hellos as a
+  ceilinged device's name -- so it is intended, and it must not pollute the
+  breakage signal. Deliberately excluded from `flip_ready`.
+- **pending-proof** -- legacy ALLOWED, the layer DENIES, and the only obstacle
+  is that the link's possession proof has not settled. Logged at Info. The flip
+  admits the open once the link is Proven, so a transient reconnect is not
+  breakage; the settle path above exists to wait exactly that transient out.
+- **WIDENING** -- legacy DENIED, the layer AUTHORIZES: opens the flip will
+  newly permit. Counted `ld_authorized`, never gated (a hard zero would forbid
+  the point of the migration), but it MUST be enumerated in the flip commit.
+
+`ceiling_admitted` is informational alongside them: opens admitted by the
+enrolment ceiling without an explicit grant, i.e. the population the flip
+newly permits. Reviewed, not gated.
+
+## Settle-then-evaluate for shell-class opens
+
+DECIDE FIRST, park second. Every shell-class open runs the live gate before
+anything else; the settle layer only ever sees an open the gate ALREADY
+denied. An allow is never parked, so every existing allow -- including a
+secret-paired, shell-granted peer with no resolved certificate, which the
+capability layer admits in shadow mode -- behaves exactly as it did before
+this feature existed. What parks is a DENY that may have been caused by an
+unproven binding: the open is held up to `gate.settle_ms` (registry,
+default 2000, hard max 5000) and re-decided on the settled state.
+
+Parking is conditioned, not automatic. A denied open parks only when ALL of:
+the binding is not Proven; the link carries a resolved device key that
+maps to a local device record (an unknown key cannot become Proven and must
+not occupy budget); the device is not certificate-revoked; the peer is not
+explicitly denied; and budget remains. Otherwise the live verdict stands
+and the caller emits it (with its usual access-request tell). A denied open
+with no resolved key at all also keeps its live verdict -- there is nothing
+for a hold to bind to.
+
+- A parked open carries (pid, device key, link GENERATION, kind, frame,
+  sid, settle deadline). Release requires the SAME generation proven for
+  the SAME device key. The generation check is load-bearing: a reconnect or
+  repair swaps the transport under an existing link (and its sids restart
+  per mux), so a hold keyed by pid+key alone could fire into a transport
+  that never carried the challenge, or answer a parked sid that now belongs
+  to an unrelated stream.
+- Three stale outcomes, each denied with its own reason: the peer re-keyed
+  (device key changed), the link was replaced (newer generation, even for
+  the same key), or the link dropped. A close is sent only when the live
+  generation still matches the parked one; otherwise the denial is local
+  only, because the peer's stream died with its old link and the parked sid
+  may now name somebody else's stream.
+- Bounds: at most 2 parked opens per link, 32 per daemon; excess denies
+  immediately with "identity settling, retry".
+- Timeout denies with "identity not proven within N ms; retry" (never
+  silently, never as success). One log line per outcome (parked with the
+  gate's own reason, proven-in-N-ms re-drive, timed-out, replaced, dropped,
+  bound-hit). While anything is parked the loop ticks at 100ms instead of
+  2s, so a proof dispatched this iteration is acted on promptly rather than
+  up to two seconds late.
+- Applies to exec-open, pty-open, ssh-sign-request and l2-open (forward).
+  Forward parses and validates its port range BEFORE the gate, so an
+  out-of-range port keeps its own immediate denial instead of parking.
+- AUTO-TRUST CLASSES, DISTINCT ON PURPOSE: `scoped_in_bounds` is the
+  SCOPE DEFAULT class (a transfer into the drop dir, a forward to an exposed
+  port) and has always auto-authorized a same-owner Proven device in BOTH
+  modes. The enrolment CEILING is a separate input and authorizes a
+  deliberate-tier action (shell/exec/pty/ssh-sign) only in authoritative
+  mode. It still counts as *would-allow* in shadow accounting, because the
+  flip PERMITS those opens rather than breaking them: classifying them as
+  denials produced a false BREAKAGE alarm on a population the flip is meant
+  to admit. Shadow decisions are unchanged by construction -- shadow always
+  decides on the legacy fold. The ceiling class needs no LINK trust: it is
+  owner-signed policy plus a Proven possession proof (and the identity may
+  never be revoked), so a fleet sibling admitted without the legacy
+  `trusted` flag is exactly the case it exists for.
+- KNOWN DEVIATION, deliberate: for ssh-sign the settle denials use their
+  own retryable reasons rather than the intentionally-generic "ssh-sign
+  refused". The generic wording exists so a denied peer cannot oracle which
+  check failed; the settle reasons reveal only that the link was not
+  identity-proven, which the peer already knows about itself, and they are
+  what lets a client retry cheaply on the warm link instead of re-running
+  the full ceremony.
+- Re-drive calls the SAME handler the live path uses, which re-gathers
+  every input fresh (identity, denied, ceiling, certificate revocation,
+  liveness), so a revoke that lands during the hold denies at re-drive.
+- FUTURE WORK, not built: the cleaner shape is client-side (the client
+  waits for a "proven" acknowledgement before sending the open), which
+  would remove the server-side hold entirely.

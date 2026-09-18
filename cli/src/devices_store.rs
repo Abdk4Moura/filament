@@ -176,6 +176,35 @@ pub(crate) fn upsert_peer_record(
 /// `upsert_peer_record` (both fields in ONE record), persist via write-tmp-then-rename
 /// (SecretFile::write already atomic on POSIX). A concurrent reader sees either the full
 /// old peer or the full new peer, never a torn state.
+/// `allow_reanchor` is the owner-agency escape hatch, and it is deliberately
+/// a caller-visible boolean rather than inferred: re-anchoring a record to
+/// a new device key is legitimate ONLY as a direct consequence of an
+/// owner/user decision made outside this function (accepting an enrollment
+/// or pairing ceremony, joining as the owner). The network-driven fleet
+/// indexing path must always pass false -- a peer-asserted name may never
+/// take over a pinned identity, which is the transplant the pin exists to
+/// stop. Default to false unless the call site names the owner decision.
+/// Whether `name` is pinned to a DIFFERENT device identity than `device_pub_hex`:
+/// an exact-name record exists whose deviceCert.devicePub differs. Used by
+/// enrollment to suffix to a fresh name instead of taking over (or refusing
+/// outright) -- the check and the write are separate calls, so a concurrent
+/// writer racing between them can only cause a refused enrollment, never a
+/// takeover: the pin inside the write still refuses.
+pub(crate) fn name_pinned_by_other(name: &str, device_pub_hex: &str) -> bool {
+    let Ok(raw) = std::fs::read_to_string(devices_path()) else {
+        return false;
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        return false;
+    };
+    arr.iter().any(|d| {
+        d["name"].as_str() == Some(name)
+            && d["deviceCert"]["devicePub"]
+                .as_str()
+                .is_some_and(|p| p != device_pub_hex)
+    })
+}
+
 pub(crate) fn devices_upsert_atomic(
     name: &str,
     secret: Option<&str>,
@@ -184,6 +213,7 @@ pub(crate) fn devices_upsert_atomic(
     scope: Option<u8>,
     user_key_hex: Option<&str>,
     delegated: Option<(&[String], u64, u64, u64)>,
+    allow_reanchor: bool,
 ) -> Result<String> {
     let clean = sanitize_device_name(name);
     let name = clean.as_str();
@@ -192,6 +222,29 @@ pub(crate) fn devices_upsert_atomic(
         std::fs::create_dir_all(dir).context("create config dir")?;
     }
     with_devices_mut(|arr| {
+        // Identity pinning: records are keyed by identity, names are
+        // presentation. A cert write under an existing name is refused
+        // unless the incoming key matches the record's pinned one, or the
+        // caller holds the owner-decision opt-out: a fleet sibling naming
+        // itself after a ceilinged device is a takeover, and a record with
+        // NO pinned cert yet is not a free slot either (secret-only and
+        // vouched records would re-key silently -- userKey, deviceCert and
+        // scope overwritten, caps cleared). Refused HERE, in the writer,
+        // in the SAME lock cycle as the write -- never delegated to callers
+        // and with no TOCTOU window between check and write.
+        if let Some(c) = cert {
+            if let Some(existing) = arr.iter().find(|d| d["name"].as_str() == Some(name)) {
+                let incoming = hex::encode(c.device_pub);
+                let pinned_matches = existing["deviceCert"]["devicePub"]
+                    .as_str()
+                    .is_some_and(|pinned| pinned == incoming.as_str());
+                if !pinned_matches && !allow_reanchor {
+                    anyhow::bail!(
+                        "refusing to re-anchor record '{name}': presented key {incoming} is not the pinned identity"
+                    );
+                }
+            }
+        }
         let final_name = upsert_peer_record(
             arr,
             name,

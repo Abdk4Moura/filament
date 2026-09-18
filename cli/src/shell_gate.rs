@@ -14,7 +14,7 @@
 //! (the exact regression that motivated this module) turns red instead of
 //! shipping silently.
 
-use crate::capability::{BindingStrength, CapOutcome, GateDecision, CAP_SHELL};
+use crate::capability::{BindingStrength, CapOutcome, GateDecision};
 use crate::conn::Conn;
 
 /// Gathered gate inputs: link-derived + store-derived + policy, pre-decision.
@@ -33,6 +33,20 @@ pub(crate) struct ShellGateInputs {
     pub own_user: Option<[u8; 32]>,
     pub has_grant: bool,
     pub cert_revoked: bool,
+    /// The gated action, threaded from gather through decide so no shell
+    /// literal can drift between callers. All current callers pass CAP_SHELL.
+    pub action: String,
+    /// Whether the peer's persisted, owner-signed enrolment ceiling covers
+    /// the gated action. Gathered fresh (never cached) via
+    /// `ceiling_covers_action`, keyed by verified device identity. Feeds the
+    /// engine's `ceiling_authorizes`, which decides only under authoritative
+    /// mode (shadow must decide exactly as it did before this feature).
+    pub ceiling_covers: bool,
+    /// The SCOPE-DEFAULT class for this open (transfer into the drop dir,
+    /// forward to an exposed port). Distinct from the ceiling: this class has
+    /// always auto-authorized same-owner Proven devices in BOTH modes.
+    /// False for the shell-class paths, which are deliberate-tier.
+    pub scoped_default: bool,
 }
 
 /// Gather from live state. Both call sites use this; nothing gate-relevant
@@ -41,14 +55,15 @@ pub(crate) fn gather_shell_gate_inputs(
     conn: &mut Conn,
     pid: &str,
     shell_policy: &crate::ShellPolicy,
+    action: &str,
 ) -> (Option<String>, ShellGateInputs) {
     let trusted = conn.link(pid).map(|l| l.trusted).unwrap_or(false);
     let dev = conn.link(pid).and_then(|l| l.verified_name.clone());
     let (denied, policy_allows, store_allows) = match dev.as_deref() {
         Some(n) => (
-            crate::device_capability_denied(n, "shell"),
+            crate::device_capability_denied(n, action),
             shell_policy.auto_allows(n),
-            crate::device_allows(n, "shell"),
+            crate::device_allows(n, action),
         ),
         None => (false, false, false),
     };
@@ -57,15 +72,16 @@ pub(crate) fn gather_shell_gate_inputs(
     let outcome = crate::capability::cap_authorize(
         &crate::settings::config_dir(),
         "self",
-        CAP_SHELL,
+        action,
         idev,
         iusr,
         ak_caps,
     );
+    let ceiling_covers = crate::identity_state::ceiling_covers_action(idev, action);
     let (own_user, has_grant) = crate::capability::cap_fleet_inputs(
         &crate::settings::config_dir(),
         "self",
-        CAP_SHELL,
+        action,
         idev,
         iusr,
         ak_caps,
@@ -84,6 +100,9 @@ pub(crate) fn gather_shell_gate_inputs(
         own_user,
         has_grant,
         cert_revoked,
+        ceiling_covers,
+        scoped_default: false,
+        action: action.to_string(),
     };
     (dev, inputs)
 }
@@ -93,12 +112,26 @@ pub(crate) fn gather_shell_gate_inputs(
 /// when it names one; each call site applies its own fallback wording for
 /// the reason-less case (pty and exec historically differ there, preserved).
 fn decide(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
-    let legacy_ok =
-        inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows);
+    decide_with_legacy(
+        inputs,
+        inputs.trusted && !inputs.denied && (inputs.policy_allows || inputs.store_allows),
+    )
+}
+
+/// Verdict core with a caller-supplied legacy fold. exec/pty/ssh-sign use
+/// the shell fold above; the forward path passes its own blanket fold
+/// (blanket L2 mode admits trusted peers with no shell policy behind it,
+/// which the shell fold cannot express -- dropping it would newly deny
+/// default setups in shadow). Same engine, same inputs otherwise.
+fn decide_with_legacy(inputs: &ShellGateInputs, legacy_ok: bool) -> Result<(), Option<String>> {
+    // Two auto-trust classes travel separately: `scoped_default` (mode
+    // independent, pre-existing) and `ceiling_covers` (authoritative-only
+    // for the decision; counted as would-allow in shadow so the ceiling
+    // population is not mistaken for breakage).
     let granted = crate::capability::cap_gate_effective(
         legacy_ok,
         &inputs.outcome,
-        CAP_SHELL,
+        &inputs.action,
         "self",
         inputs.idev.as_ref(),
         inputs.iusr.as_ref(),
@@ -106,9 +139,11 @@ fn decide(inputs: &ShellGateInputs) -> Result<(), Option<String>> {
         inputs.expires,
         inputs.ak_caps.as_deref(),
         inputs.own_user.as_ref(),
-        false,
+        inputs.scoped_default,
         inputs.has_grant,
         inputs.cert_revoked,
+        inputs.denied,
+        inputs.ceiling_covers,
     );
     match granted {
         GateDecision::Allow => Ok(()),
@@ -126,6 +161,17 @@ pub(crate) fn pty_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<S
     decide(inputs)
 }
 
+/// Forward-open's entry point: same shared core, but the caller supplies
+/// the legacy fold (see above) and overrides `ceiling_covers` with its
+/// expose.json bound before calling. A forward --stdio to an exposed sshd
+/// is shell-equivalent in reach.
+pub(crate) fn forward_gate_decision(
+    inputs: &ShellGateInputs,
+    legacy_ok: bool,
+) -> Result<(), Option<String>> {
+    decide_with_legacy(inputs, legacy_ok)
+}
+
 /// SSH-sign's entry point: the certificate signer asks the same gate before
 /// signing (a cert is B's statement about A, so the shell grant gates it
 /// like any shell-class open). Delegates to the shared core (no local logic).
@@ -136,11 +182,12 @@ pub(crate) fn ssh_gate_decision(inputs: &ShellGateInputs) -> Result<(), Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::CapOutcome;
+    use crate::capability::{CAP_SHELL, CapOutcome};
 
     /// Cross-path equivalence: exec's decision == pty-open's for every cell
     /// of trusted x has_grant x cert_revoked x delegated-ceiling x
-    /// authoritative(on/off), calling all three entry points. Fabricated inputs
+    /// ceiling-covers x denied x authoritative(on/off), calling all three
+    /// entry points. Fabricated inputs
     /// mirror production gathering (store_allows tracks the grant, outcome
     /// tracks it the way cap_authorize's grant dependence does, legacy folds
     /// trust with store fixed grant-leaning); authoritative toggles via env
@@ -157,70 +204,206 @@ mod tests {
                 );
             }
             for trusted in [false, true] {
-                for has_grant in [false, true] {
-                    for cert_revoked in [false, true] {
-                        for ceiling_allows in [false, true] {
-                            let outcome = if has_grant {
-                                CapOutcome::Authorized
-                            } else {
-                                CapOutcome::Denied("test: no grant".into())
-                            };
-                            let ak_caps = if ceiling_allows {
-                                None
-                            } else {
-                                Some(vec!["transfer".to_string()])
-                            };
-                            let inputs = ShellGateInputs {
-                                trusted,
-                                denied: false,
-                                policy_allows: false,
-                                store_allows: has_grant,
-                                outcome,
-                                idev: Some([0x42u8; 32]),
-                                iusr: Some([0x11u8; 32]),
-                                binding: BindingStrength::Proven,
-                                // Fixed far-future expiry (not an axis): None
-                                // fail-closes under authoritative, which would
-                                // deny every allow-cell for a reason outside
-                                // the matrix.
-                                expires: Some(9_999_999_999u64),
-                                ak_caps,
-                                own_user: None,
-                                has_grant,
-                                cert_revoked,
-                            };
-                            let e = exec_gate_decision(&inputs);
-                            let p = pty_gate_decision(&inputs);
-                            let s = ssh_gate_decision(&inputs);
-                            assert_eq!(
-                                e, p,
-                                "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
-                            );
-                            assert_eq!(
-                                e, s,
-                                "exec vs ssh-sign disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
-                            );
-                            // Oracle pins (not just equality): absolutes deny in
-                            // every cell, and the two canonical allows hold in
-                            // every cell. A core regression either way fails
-                            // here even if both wrappers still agree.
-                            if cert_revoked {
-                                assert!(
-                                    e.is_err(),
-                                    "revoked cert must deny: trusted={trusted} grant={has_grant} ceiling={ceiling_allows} auth={authoritative}"
-                                );
-                            }
-                            if !ceiling_allows {
-                                assert!(
-                                    e.is_err(),
-                                    "narrow ceiling must deny: trusted={trusted} grant={has_grant} revoked={cert_revoked} auth={authoritative}"
-                                );
-                            }
-                            if trusted && has_grant && !cert_revoked && ceiling_allows {
-                                assert!(
-                                    e.is_ok(),
-                                    "trusted+granted must allow: ceiling={ceiling_allows} auth={authoritative}"
-                                );
+                // Binding is a DIMENSION, not a constant: the regression this
+                // pins was a secret-paired peer (binding None/Inferred, no
+                // resolved cert) being denied by a settle path that held
+                // binding fixed at Proven.
+                for binding in [
+                    BindingStrength::Proven,
+                    BindingStrength::Inferred,
+                    BindingStrength::None,
+                ] {
+                    // Scope-default class (transfer into the drop dir, forward to
+                    // an exposed port): pre-existing fleet auto-trust, which is
+                    // mode-INDEPENDENT for this class, unlike the ceiling.
+                    for scoped_default in [false, true] {
+                        for has_grant in [false, true] {
+                            for cert_revoked in [false, true] {
+                                for ceiling_allows in [false, true] {
+                                    for ceiling_covers in [false, true] {
+                                        for denied in [false, true] {
+                                            let outcome = if has_grant {
+                                                CapOutcome::Authorized
+                                            } else {
+                                                CapOutcome::Denied("test: no grant".into())
+                                            };
+                                            let ak_caps = if ceiling_allows {
+                                                None
+                                            } else {
+                                                Some(vec!["transfer".to_string()])
+                                            };
+                                            let inputs = ShellGateInputs {
+                                                trusted,
+                                                denied,
+                                                policy_allows: false,
+                                                store_allows: has_grant,
+                                                outcome,
+                                                idev: Some([0x42u8; 32]),
+                                                iusr: Some([0x11u8; 32]),
+                                                binding,
+                                                // Fixed far-future expiry (not an axis): None
+                                                // fail-closes under authoritative, which would
+                                                // deny every allow-cell for a reason outside
+                                                // the matrix.
+                                                expires: Some(9_999_999_999u64),
+                                                ak_caps,
+                                                // Same user key as iusr: these cells model the
+                                                // same-owner fleet population the ceiling branch
+                                                // exists for (without it same_owner is false
+                                                // and no covered cell could ever allow).
+                                                own_user: Some([0x11u8; 32]),
+                                                has_grant,
+                                                cert_revoked,
+                                                ceiling_covers,
+                                                scoped_default,
+                                                action: CAP_SHELL.to_string(),
+                                            };
+                                            let e = exec_gate_decision(&inputs);
+                                            let p = pty_gate_decision(&inputs);
+                                            let s = ssh_gate_decision(&inputs);
+                                            let f = forward_gate_decision(
+                                                &inputs,
+                                                inputs.trusted
+                                                    && !inputs.denied
+                                                    && (inputs.policy_allows
+                                                        || inputs.store_allows),
+                                            );
+                                            assert_eq!(
+                                                e, p,
+                                                "exec vs pty disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                            );
+                                            // Blanket axis: the forward caller computes its legacy
+                                            // fold through l2_open_allowed (blanket mode), not
+                                            // the shell fold -- mirror that composition here so
+                                            // the pin tests the real path, not an unreachable
+                                            // forced-legacy input. Denied must deny even
+                                            // blanketed -- N4 pins the l2_open_allowed rule.
+                                            let f_blanket = forward_gate_decision(
+                                                &inputs,
+                                                crate::l2_policy::l2_open_allowed(
+                                                    true,
+                                                    inputs.store_allows,
+                                                    inputs.denied,
+                                                ),
+                                            );
+                                            if denied {
+                                                assert!(
+                                                    f_blanket.is_err(),
+                                                    "denied device opens nothing even blanketed: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                                );
+                                            }
+                                            assert_eq!(
+                                                f, e,
+                                                "forward vs exec disagree on shared inputs: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} denied={denied} auth={authoritative}"
+                                            );
+                                            assert_eq!(
+                                                e, s,
+                                                "exec vs ssh-sign disagree: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                            );
+                                            // Oracle pins (not just equality): absolutes deny in
+                                            // every cell, and the two canonical allows hold in
+                                            // every cell. A core regression either way fails
+                                            // here even if both wrappers still agree.
+                                            if cert_revoked {
+                                                assert!(
+                                                    e.is_err(),
+                                                    "revoked cert must deny: trusted={trusted} grant={has_grant} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                                );
+                                            }
+                                            if !ceiling_allows {
+                                                assert!(
+                                                    e.is_err(),
+                                                    "narrow ceiling must deny: trusted={trusted} grant={has_grant} revoked={cert_revoked} covers={ceiling_covers} auth={authoritative}"
+                                                );
+                                            }
+                                            // An allow is pinned only where the mode
+                                            // and binding can produce one: shadow always
+                                            // follows legacy; authoritative additionally
+                                            // requires Proven (cap_authorize_proven).
+                                            let binding_can_allow = !authoritative
+                                                || binding == BindingStrength::Proven;
+                                            if trusted
+                                                && has_grant
+                                                && !cert_revoked
+                                                && ceiling_allows
+                                                && !denied
+                                                && binding_can_allow
+                                            {
+                                                assert!(
+                                                    e.is_ok(),
+                                                    "trusted+granted must allow: ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                                );
+                                            }
+                                            // Shadow follows the legacy fold EXACTLY where the
+                                            // unconditional auth-key ceiling check passes (in this
+                                            // matrix policy=false and store=grant, so legacy is
+                                            // trusted && !denied && grant): the ceiling
+                                            // substitution is authoritative-only, so those shadow
+                                            // cells are a literal golden table of pre-change
+                                            // behavior. ak-narrow cells deny in both modes via
+                                            // the unconditional ceiling check, independent of
+                                            // legacy -- that predates this change.
+                                            // (cert-revoked cells excluded: the legacy fold has
+                                            // no revocation term, but the gate denies revoked
+                                            // absolutely in both modes -- that predates this
+                                            // change.)
+                                            // Widened: shadow takes the legacy fold PLUS the
+                                            // scope-default fleet class, which has always
+                                            // auto-authorized a same-owner Proven device in
+                                            // BOTH modes. The ceiling is deliberately absent
+                                            // here -- it decides only under authoritative.
+                                            if !authoritative && ceiling_allows && !cert_revoked {
+                                                let legacy_fold = trusted && !denied && has_grant;
+                                                let fleet_default = !denied
+                                                    && binding == BindingStrength::Proven
+                                                    && scoped_default;
+                                                assert_eq!(
+                                                    e.is_ok(),
+                                                    legacy_fold || fleet_default,
+                                                    "shadow must follow the legacy fold exactly: trusted={trusted} grant={has_grant} denied={denied}"
+                                                );
+                                            }
+                                            // An explicit deny short-circuits everything including
+                                            // fleet auto-trust (#244 class): denied denies in
+                                            // every cell, both modes, all paths.
+                                            if denied {
+                                                assert!(
+                                                    e.is_err(),
+                                                    "explicit deny must deny: trusted={trusted} grant={has_grant} revoked={cert_revoked} ceiling={ceiling_allows} covers={ceiling_covers} auth={authoritative}"
+                                                );
+                                            }
+                                            // covers=false is the pre-change behavior (scoped_in_bounds
+                                            // was hardcoded false): authoritative deliberate-tier cells
+                                            // without a grant must still deny, pinning the flip
+                                            // blocker exactly where it was.
+                                            if !ceiling_covers
+                                                && !scoped_default
+                                                && authoritative
+                                                && !has_grant
+                                            {
+                                                assert!(
+                                                    e.is_err(),
+                                                    "uncovered deliberate action must deny under authoritative: trusted={trusted} revoked={cert_revoked} ceiling={ceiling_allows} auth={authoritative}"
+                                                );
+                                            }
+                                            // covers=true opens exactly one new door: authoritative,
+                                            // trusted, Proven, unrevoked, grantless, covered,
+                                            // UNDENIED (an explicit deny outranks coverage).
+                                            if (ceiling_covers || scoped_default)
+                                                && authoritative
+                                                && !cert_revoked
+                                                && ceiling_allows
+                                                && !denied
+                                                && binding == BindingStrength::Proven
+                                            {
+                                                assert!(
+                                                    e.is_ok(),
+                                                    "covered enrolment ceiling must allow under authoritative: ceiling={ceiling_allows} auth={authoritative}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
