@@ -853,7 +853,7 @@ mod tests {
         // platform branching outside it has a budget of 0 (docs/architecture/PLATFORM.md).
         let linked = crate::platform::symlink(Path::new("/etc/passwd"), &d.join("link")).is_ok();
         if !linked {
-            eprintln!("note: this platform would not create a symlink; the symlink arm is skipped");
+            crate::ui::say("note: this platform would not create a symlink; the symlink arm is skipped");
         }
         let (local, skipped) = walk_manifest(&d).unwrap();
         assert_eq!(local.iter().map(|e| e.p.as_str()).collect::<Vec<_>>(), ["big", "sub/small"]);
@@ -898,7 +898,7 @@ mod tests {
         if crate::platform::symlink(Path::new("/tmp"), &d.join("esc")).is_ok() {
             assert!(resolve_root(&d, "esc/x", true).is_err(), "symlink escape must be refused");
         } else {
-            eprintln!("note: this platform would not create a symlink; the escape arm is skipped");
+            crate::ui::say("note: this platform would not create a symlink; the escape arm is skipped");
         }
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -929,7 +929,7 @@ mod tests {
             );
             assert!(!out.join("x").exists(), "nothing was created outside the root");
         } else {
-            eprintln!("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
+            crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);
