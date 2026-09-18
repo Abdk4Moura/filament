@@ -437,6 +437,12 @@ pub(crate) async fn serve_exec(
                     }
                 }
                 if let Err(e) = t.send_control(&close).await {
+                    // The close is the only other way the initiator learns the session finished,
+                    // so when it cannot be delivered the streams have to END on the wire instead.
+                    // An EMPTY payload is the mux's pipe-end sentinel (`on_frame` maps it to
+                    // None), which is the same mechanism stdin EOF uses, and the initiator's
+                    // closed-pipe arm reads it as a terminal end without an exit status rather
+                    // than waiting forever for a frame that will never be actioned.
                     // A close that never arrives leaves the initiator in a select with nothing
                     // left to select: this file already documents that hazard class a few lines
                     // above, for a different early break ("hanging the initiator"). The old
@@ -446,6 +452,9 @@ pub(crate) async fn serve_exec(
                     crate::ui::say(&format!(
                         "filament: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
                     ));
+                }
+                    let _ = t.send_frame(sid, 0, &[]).await;
+                    let _ = t.send_frame(err_sid, 0, &[]).await;
                 }
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;

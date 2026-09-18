@@ -41,14 +41,16 @@ say "A: a spoke sees the mesh"
 for name in bravo charlie; do
   local_cfg="$DB"; [ "$name" = "charlie" ] && local_cfg="$DC"
   other="charlie"; [ "$name" = "bravo" ] || other="bravo"
-  out=$(env FILAMENT_CONFIG_DIR="$local_cfg" "$BIN" --server "$SERVER" devices 2>&1)
+  fs_cli 45 env FILAMENT_CONFIG_DIR="$local_cfg" "$BIN" --server "$SERVER" devices 2>&1
+  out=$(fs_out)
   echo "$out" | grep -q "MESH" && echo "$out" | grep -q "$other" \
     && ok "gateA: $name lists sibling $other under MESH" \
     || bad "gateA: $name did not list $other under MESH"
 done
 
 # The owner must stop reading as EXTERNAL on a spoke.
-bravo_out=$(env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices 2>&1)
+fs_cli 45 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" devices 2>&1
+bravo_out=$(fs_out)
 if echo "$bravo_out" | grep -q "FLEET" && echo "$bravo_out" | grep -q "alpha"; then
   ok "gateA-owner: bravo files the owner under FLEET, not EXTERNAL"
 else
@@ -70,16 +72,18 @@ fi
 
 say "B: revoked device still refused even though the roster lists it"
 # bravo can shell the owner BEFORE the revoke (positive control, owner-equivalent shell).
-pre=$(env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo PRE-OK' 2>&1)
+fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo PRE-OK' 2>&1
+pre=$(fs_out)
 echo "$pre" | grep -q "PRE-OK" \
   && ok "gateB-pre: bravo shells the owner before revoke" \
   || bad "gateB-pre: bravo could not shell before revoke (out: $pre)"
 # Revoke bravo's certificate on the owner.
-env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
+fs_cli 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo --certificate --yes >/dev/null 2>&1
 # Immediately: the acceptor refuses bravo on the tombstone. charlie's stored
 # roster still lists bravo (the refresh has not re-pushed yet), so this is the
 # sharp form of the invariant: roster presence is evidence of nothing.
-post=$(env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo POST-OK' 2>&1)
+fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo POST-OK' 2>&1
+post=$(fs_out)
 rc=$?
 if [ "$rc" -ne 0 ]; then
   ok "gateB: revoked bravo is refused (exit $rc), roster presence did not resurrect it"
@@ -91,7 +95,8 @@ say "B2: after a roster refresh, the sibling no longer lists the revoked device,
 # Let the owner's 5s roster tick re-mint (bravo now filtered out of the snapshot,
 # epoch bump) and push to charlie.
 sleep 8
-charlie_after=$(env FILAMENT_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" devices 2>&1)
+fs_cli 45 env FILAMENT_CONFIG_DIR="$DC" "$BIN" --server "$SERVER" devices 2>&1
+charlie_after=$(fs_out)
 # Assert on the MESH section (the pushed roster) ONLY: cert-revoke removes
 # bravo from what the owner re-issues, never from charlie's LOCAL pairing
 # (FLEET section -- only `forget` removes that). Grepping the whole output
@@ -103,7 +108,8 @@ else
   ok "gateB2: pushed roster no longer lists revoked bravo after the refresh"
 fi
 # And the acceptor still refuses bravo if presented again (both halves).
-again=$(env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1)
+fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1
+again=$(fs_out)
 rc2=$?
 if [ "$rc2" -ne 0 ]; then
   ok "gateB2: revoked bravo is still refused after the refresh (exit $rc2)"
