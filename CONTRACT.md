@@ -567,12 +567,15 @@ pause, and no subject counter-signature in the engine today.
 Op      { id, author: key, subject: key, capability: (action, resource),
           interval: [not_before, not_after),   // half-open, UTC seconds
           kind: Grant | Deny | Ceiling | Pass | Pause | Accept,
+          min_binding: Proven | Inferred,       // author-signed, like kind
           version: u64,                        // per author, monotone
           sig }
 Facts   { now, subject: key, binding: None|Inferred|Proven,
           cert: Option<{ device_pub, user_pub, expires, revoked }>,
           held_author_key: Option<key>, ops: verified ops }
 Request { action, resource }                   // DAEMON-derived, never peer-supplied
+// Facts.subject is DAEMON-derived too: the daemon resolves it from the verified
+// link identity, never from a frame field, so a peer cannot name its own subject.
 Verdict { decision: Allow | Deny(reason), valid_until: Option<u64>,
           because: [op id] }
 ```
@@ -592,14 +595,11 @@ Two calls with equal arguments return equal verdicts, byte for byte. A
 non-conformant however correct its answer.
 
 **L2 -- Keys are identity, names are presentation.** The library never sees a
-display name, a petname, or a device label. Every `author` and `subject` is a
-key. Renaming a device changes no verdict; re-pairing one (a new key) changes
-every verdict about it. `Facts.binding`, `Facts.cert` and
-`Facts.held_author_key` are carried for the CLI's view layer and for
-boundary-side ingest, and `decide` does **not** read them: the verdict is a
-function of `now`, `ops` and `request` alone. Widening that -- making the
-verdict depend on the cert or the binding -- is a contract change, not an
-implementation detail.
+name: every op, fact and request is keyed by public key, and display names move
+no verdict. Facts the DECISION does read -- `binding`, `cert` and
+`held_author_key` -- are read by name here on purpose (L15-L17 depend on them),
+so this law says what it means: a name is never an input, and the facts that are
+inputs are listed rather than implied.
 
 **L3 -- Time is first-class.** Every op carries a half-open interval
 `[not_before, not_after)`; an op is live at `t` iff `not_before <= t <

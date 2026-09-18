@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Exhaustive model check for the capability ledger (CONTRACT.md laws L1-L13,
-plus L14-L18 from the review rulings, which the contract text does not yet
-carry -- see `source_guard`).
+"""Exhaustive model check for the capability ledger (CONTRACT.md laws L1-L18).
+L14-L18 arrived as review rulings and the contract now declares them; the guard
+maps every declared law to a check key in this file, so text and model cannot
+drift apart in either direction. See `source_guard`.
 
 Same discipline as establishment_model.py and fleet_automesh_model.py:
 enumerate the ENTIRE op space of a bounded universe, then assert every law over
@@ -12,9 +13,15 @@ WHAT IS MODELLED
 ----------------
 An append-only log of signed ops and the pure verdict function over it.
 
-  Op      (id, author, subject, action, resource, nb, na, kind, version, ref)
+  Op      (id, author, subject, action, resource, nb, na, kind, version, ref,
+           min_binding)
           interval is half-open [nb, na); `ref` is the referenced op id on an
-          Accept and None elsewhere.
+          Accept and None elsewhere; `min_binding` is the strength of identity
+          binding the op REQUIRES for an allow it supports -- "proven" by
+          default, "inferred" only on a Grant (the pair-secret legacy
+          population), which is what gives the migration switch a home (L16).
+          It is part of the op, so the author's signature covers it exactly as it
+          covers kind and interval.
   kinds   grant | deny | ceiling | pass | pause | accept
           `certify` is NOT here: per review ruling 2 it is an identity-lifecycle
           event, not a ledger op, and its result reaches the evaluator as
@@ -205,18 +212,43 @@ def binding_satisfies(binding, need):
     return binding_rank(binding) >= binding_rank(need)
 
 
-def pass_is_attenuative(ops, p, now):
+def op_is_supported(ops, o, now):
+    """L13 for one op: does a live Accept by its SUBJECT reference it?"""
+    return any(a[KIND] == "accept" and a[REF] == o[ID] and a[AUTHOR] == o[SUBJECT]
+               and a[SUBJECT] == o[SUBJECT] and a[NB] <= now < a[NA]
+               for a in effective(ops))
+
+
+def pass_is_attenuative(ops, p, now, held=None):
     """L14: may `p`'s author pass what `p` passes?
 
-    Only if that author HOLDS something covering `p`'s pattern: an op live at
-    `now`, about the AUTHOR as subject, whose pattern is no narrower than `p`'s.
+    Only if that author HOLDS something covering `p`'s pattern -- and "holds"
+    means an op that is itself EFFECTIVE and not the author's own unaccepted
+    self-grant. The first cut credited any live op whose subject was the author,
+    which made the property self-certifiable: a key could write two ops about
+    itself (a grant with no Accept) and then pass the capability onward. So a
+    candidate must be
+
+      (a) authored by ANOTHER key -- or by the held trust root, whose own policy
+          is the root and therefore does not need a second signature; and
+      (b) itself effective: a widening op must carry its referenced Accept, a
+          ceiling stands alone.
+
+    With no trust root supplied (`held=None`, the op-algebra callers) a
+    self-authored candidate is not credited. That can only make a pass INERT,
+    never allow one, so the omission fails closed.
     """
     for x in effective(ops):
         if x[SUBJECT] != p[AUTHOR] or x[KIND] not in GRANT_SPECIES + ("ceiling",):
             continue
+        if (x[AUTHOR] == p[AUTHOR] and x[AUTHOR] != held
+                and MUTATION != "self-certifying-pass"):
+            continue
         if not x[NB] <= now < x[NA]:
             continue
-        if pattern_contains(x[ACTION], x[RESOURCE], p[ACTION], p[RESOURCE]):
+        if not pattern_contains(x[ACTION], x[RESOURCE], p[ACTION], p[RESOURCE]):
+            continue
+        if x[KIND] == "ceiling" or op_is_supported(ops, x, now):
             return True
     return False
 
@@ -242,14 +274,33 @@ def delegated_ok(ops, o, held, now):
 
 
 def trust_filter(ops, held, now):
-    """L17: the op set the evaluator may see, given the held author key."""
+    """L17: the op set the evaluator may see, given the held author key.
+
+    ACCEPTS ARE EXEMPT, and that exemption is the point of the law rather than a
+    hole in it. L17 governs AUTHORITY: ops that assert what a key may do. An
+    Accept asserts nothing -- L13 defines it as the countersignature of the
+    referenced op's SUBJECT, and it is checked there ("signed by that op's
+    subject"). Filtering Accepts by authorship is how the deployed
+    owner->device shape came out with ZERO allows: the owner grants the device,
+    the DEVICE accepts its own grant, and the owner's trust root then discarded
+    the device's countersignature, so only self-grants could ever allow. The
+    alternative reading -- make the held ceiling be about the SUBJECT -- was
+    rejected because it changes what L17 is about (a held key tolerates
+    AUTHORITIES, not countersignatures) and would let the trust root's ceiling
+    decide whether a peer may accept what it was granted.
+    """
     if held is None:
         return tuple(ops)
     if MUTATION == "held-key-ignored":
         return tuple(ops)
+    if MUTATION == "trust-filter-drops-accepts":
+        # The blocker, reintroduced on purpose: the tier-non-vacuity check must
+        # catch it, because the laws themselves did not.
+        return tuple(o for o in ops if delegated_ok(ops, o, held, now))
     return tuple(o for o in ops
-                 if (MUTATION != "held-key-drops-own-policy" or o[AUTHOR] != held)
-                 and delegated_ok(ops, o, held, now))
+                 if o[KIND] == "accept"
+                 or ((MUTATION != "held-key-drops-own-policy" or o[AUTHOR] != held)
+                     and delegated_ok(ops, o, held, now)))
 
 
 def effective(ops):
@@ -457,10 +508,14 @@ def decide(facts, request):
     # ran it when the requirement was Proven, so an `inferred`-minimum op
     # allowed on an absent binding.
     if decision == ALLOW:
-        need = "proven"
-        for o in chosen:
-            if o[KIND] in WIDENING and o[MINB] == "inferred":
-                need = "inferred"
+        # The requirement is the STRONGEST any supporting op asks for: an allow
+        # must satisfy EVERY op in its cause, so one Proven-demanding Grant
+        # outranks any number of Inferred ones. (The first cut started at
+        # "proven" and DOWNGRADED on any inferred op -- the minimum, which is the
+        # opposite of what its own comment claimed and would let a single weaker
+        # op relax the whole cause.)
+        needs = [o[MINB] for o in chosen if o[KIND] in WIDENING]
+        need = "proven" if (not needs or "proven" in needs) else "inferred"
         granted = binding
         if MUTATION == "inferred-ok-for-proven-op" and binding == "Inferred":
             granted = "Proven"
@@ -669,7 +724,93 @@ REQUIRED_NONEMPTY = ("L12 pause-distinct", "L13 accept-well-formed",
                      "L18 compaction-preserves-because",
                      "L1 fact-cert-is-load-bearing",
                      "L1 fact-binding-is-load-bearing",
-                     "L1 fact-held_author_key-is-load-bearing")
+                     "L1 fact-held_author_key-is-load-bearing",
+                     # Review round 2: the shapes that SHIP, per tier, plus the
+                     # deployed direction in particular. The L17 blocker passed
+                     # 2.88M cells while the deployed shape allowed nothing.
+                     "L0 tier-non-vacuity",
+                     "L17 deployed-shape-allows",
+                     "L17 deployed-shape-survives-no-root",
+                     "L17 untrusted-author-is-not-effective",
+                     "L14 self-grant-cannot-back-a-pass")
+
+
+# ------------------------------------------------- per-tier non-vacuity
+# "2.88M cells, 0 violations" says NOTHING about a law whose only reachable
+# allows are degenerate -- and that is not hypothetical: the first L17 dropped
+# the subject's own Accept, so the DEPLOYED owner->device shape produced 544
+# denies and ZERO allows, every law checked passed, and the number looked
+# healthy. A cell count is not evidence that a law constrains the configurations
+# that actually ship, so every tier now DECLARES the verdict shapes it must
+# reach and the run fails when one is missing. This is the coverage-matrix
+# lesson one level up: assert reachability of the shapes you ship, per tier,
+# rather than trusting a global total.
+#
+# Shape key: (decision, reason, held_is_subject) -- `held_is_subject` is False
+# exactly when a trust root other than the granted subject is in play, which is
+# the deployed direction (owner holds a key, device is the subject).
+TIER_SHAPES = {}
+TIER_SHAPE_LAW = "L0 tier-non-vacuity"
+# What each tier must be able to REACH. A tier absent from this map is reported
+# as unasserted, so adding a tier without declaring its shapes is itself a
+# failure rather than a silent hole.
+REQUIRED_TIER_SHAPES = {
+    "L3..L13 over N=2": {("Allow", None, None), ("Deny", R_NOGRANT, None)},
+    "L3..L13 over N=3": {("Allow", None, None), ("Deny", R_CEILING, None),
+                         ("Deny", R_PAUSED, None)},
+    "L4 versioning": {("Allow", None, None)},
+    "L10 pairwise + tombstone": {("Allow", None, None), ("Deny", R_DENIED, None)},
+    "L11 order / replay": {("Allow", None, None)},
+    "L2 subject scoping": {("Allow", None, None)},
+    "L14 pass attenuation": {("Allow", None, None)},
+    "L15 certificate": {("Allow", None, None), ("Deny", R_REVOKED, None),
+                        ("Deny", R_EXPIRED, None)},
+    "L16 binding": {("Allow", None, None), ("Deny", R_UNPROVEN, None)},
+    # The headline: with a held author key that is NOT the subject (the deployed
+    # owner->device direction), an ALLOW must be reachable. This is the shape
+    # that was 0 before the L17 fix.
+    "L17 held author key": {("Allow", None, False), ("Deny", R_NOGRANT, False)},
+    "L18 compaction": {("Allow", None, None), ("Deny", R_NOGRANT, None)},
+    "L1/L2 facts relevance": {("Allow", None, None)},
+    "L6 ingest": set(),
+    "DEPLOYED owner->device": {("Allow", None, False)},
+}
+
+
+RUN_TIERS = set()
+# The tier whose cells are being checked, so the shared per-cell checker can
+# attribute a shape without being told on every call.
+CURRENT_TIER = None
+
+
+def register_tier(label):
+    """A tier announces itself, so `check_tier_shapes` knows what ran."""
+    RUN_TIERS.add(label)
+
+
+def note_shape(tier, decision, reason, held, subject):
+    """Record that `tier` reached this verdict shape."""
+    key = (decision, reason, None if held is None else held == subject)
+    TIER_SHAPES.setdefault(tier, set()).add(key)
+
+
+def check_tier_shapes(tally):
+    """Fail the run for any tier that could not reach a shape it must reach.
+
+    Only tiers that RAN are checked, because a plan (the self-test's QUICK) runs
+    a subset; a tier that ran and declared nothing is itself a failure.
+    """
+    for tier in sorted(RUN_TIERS):
+        required = REQUIRED_TIER_SHAPES.get(tier)
+        if required is None:
+            tally.check(TIER_SHAPE_LAW, False)
+            print(f"  !! tier {tier!r} ran without declaring required shapes")
+            continue
+        seen = TIER_SHAPES.get(tier, set())
+        missing = sorted(str(m) for m in required - seen)
+        tally.check(TIER_SHAPE_LAW, not missing)
+        if missing:
+            print(f"  !! tier {tier!r} never reached: {', '.join(missing)}")
 
 
 class Tally:
@@ -697,10 +838,12 @@ def pool(keys, subjects, patterns, intervals, kinds, slots, minbs=("proven",)):
     out = []
     for author, subject, pattern, (nb, na), kind, minb in itertools.product(
             keys, subjects, patterns, intervals, kinds, minbs):
-        # L16 construction invariant: only a GRANT species may ask for less
-        # than Proven. Pair-secret Grants are the legacy population, so their
-        # weaker requirement lives on the op, not in the evaluator.
-        if minb == "inferred" and kind not in GRANT_SPECIES:
+        # L16 construction invariant: an op may ask for less than Proven ONLY
+        # if it is a plain GRANT. Ruling 3 names pair-secret GRANTS as the legacy
+        # population whose weaker requirement has a home; a Pass is not that, and
+        # allowing it made the L16 check tautological (the check would test
+        # membership of the very set that admitted the weaker value).
+        if minb == "inferred" and kind != "grant":
             continue
         out.append((author, subject, pattern, nb, na, kind, None, minb))
     for author, subject, (nb, na), ref in itertools.product(
@@ -739,6 +882,8 @@ def check_cell(tally, ops, subject, now, request, clock):
     """Every law that is a property of one (log, subject, now, request) cell."""
     decision, reason = decide_core(ops, subject, now, request)
     VERDICTS_SEEN.add((decision, reason))
+    if CURRENT_TIER:
+        note_shape(CURRENT_TIER, decision, reason, None, subject)
     live = [o for o in effective(ops)
             if o[SUBJECT] == subject and o[NB] <= now < o[NA]]
     hits = [o for o in live if covers(o[ACTION], o[RESOURCE], *request)]
@@ -861,7 +1006,9 @@ def check_cell(tally, ops, subject, now, request, clock):
 # ----------------------------------------------------------------------- tiers
 def tier_cells(tally, label, keys, subjects, patterns, intervals, kinds, slots,
                clock, requests, decided):
-    global CELL
+    global CELL, CURRENT_TIER
+    register_tier(label)
+    CURRENT_TIER = label
     tpool = pool(keys, subjects, patterns, intervals, kinds, slots)
     logs = 0
     for ops in ledgers(tpool, slots):
@@ -871,6 +1018,7 @@ def tier_cells(tally, label, keys, subjects, patterns, intervals, kinds, slots,
                 for now in clock:
                     CELL = (ops, subject, now, request)
                     check_cell(tally, ops, subject, now, request, clock)
+    CURRENT_TIER = None
     print(f"  {label:<28} logs={logs:<8d} pool={len(tpool):<4d} N={slots} "
           f"times={len(clock)} reqs={len(requests)}")
 
@@ -879,6 +1027,7 @@ def tier_version(tally, keys, subjects, patterns, intervals, kinds, clock,
                  requests):
     """L4: newest version per author wins; older versions are ignored."""
     global CELL
+    register_tier("L4 versioning")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     olds = [o for o in singles(tpool, 0) if o[KIND] != "accept"]
     pairs = 0
@@ -887,23 +1036,37 @@ def tier_version(tally, keys, subjects, patterns, intervals, kinds, clock,
             if new[AUTHOR] != old[AUTHOR]:
                 continue  # ingest refuses an id whose author changes
             newer = with_fields(new, version=2)
+            # A supporting Accept, so this tier reaches the ALLOWING shape as
+            # well: a version law tested only on denials proves nothing about the
+            # shape that ships. The Accept references the revision's id and is
+            # signed by its subject, which is exactly L13.
+            acc = mk(9, new[SUBJECT], new[SUBJECT], ACC, new[NB], new[NA],
+                     "accept", ref=new[ID])
             pairs += 1
             for subject in subjects:
                 for request in requests:
                     for now in clock:
-                        CELL = ((old, newer), subject, now, request)
+                        CELL = ((old, newer, acc), subject, now, request)
+                        note_shape("L4 versioning",
+                                   *decide_core((newer, acc), subject, now,
+                                                request), None, subject)
                         tally.check("L4 newest-version-wins",
-                                    decide_core((old, newer), subject, now, request)
-                                    == decide_core((newer,), subject, now, request))
+                                    decide_core((old, newer, acc), subject, now,
+                                                request)
+                                    == decide_core((newer, acc), subject, now,
+                                                   request))
                         tally.check("L4 stale-version-inert",
-                                    decide_core((newer, old), subject, now, request)
-                                    == decide_core((newer,), subject, now, request))
+                                    decide_core((newer, old, acc), subject, now,
+                                                request)
+                                    == decide_core((newer, acc), subject, now,
+                                                   request))
     print(f"  {'L4 versioning':<28} pairs={pairs:<7d}  pool={len(olds)}")
 
 
 def tier_pairs(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
     """L10: no widening by combination, with L5's single exception named."""
     global CELL
+    register_tier("L10 pairwise + tombstone")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     left_ops = list(singles(tpool, 0))
     right_ops = list(singles(tpool, 1))
@@ -918,6 +1081,9 @@ def tier_pairs(tally, keys, subjects, patterns, intervals, kinds, clock, request
                         la = decide_core((left,), subject, now, request)[0]
                         lb = decide_core((right,), subject, now, request)[0]
                         both = decide_core((left, right), subject, now, request)[0]
+                        note_shape("L10 pairwise + tombstone",
+                                   *decide_core((left, right), subject, now,
+                                                request), None, subject)
                         if la == DENY and lb == DENY and both == ALLOW:
                             widen = [o for o in (left, right) if o[KIND] in WIDENING]
                             acc = [o for o in (left, right) if o[KIND] == "accept"]
@@ -972,6 +1138,7 @@ def tier_order(tally, keys, subjects, patterns, intervals, kinds, slots, clock,
                requests):
     """L11: arrival order and replay change nothing."""
     global CELL
+    register_tier("L11 order / replay")
     tpool = pool(keys, subjects, patterns, intervals, kinds, slots)
     logs = 0
     for ops in ledgers(tpool, slots):
@@ -981,6 +1148,7 @@ def tier_order(tally, keys, subjects, patterns, intervals, kinds, slots, clock,
                 for now in clock:
                     CELL = (ops, subject, now, request)
                     base = decide_core(ops, subject, now, request)
+                    note_shape("L11 order / replay", *base, None, subject)
                     base_ids, _ = because(ops, subject, now, request)
                     for perm in itertools.permutations(ops):
                         tally.check("L11 order-independent",
@@ -997,6 +1165,7 @@ def tier_order(tally, keys, subjects, patterns, intervals, kinds, slots, clock,
 def tier_scope(tally, keys, patterns, intervals, kinds, clock, requests):
     """L2: ops about one subject never move another subject's verdict."""
     global CELL
+    register_tier("L2 subject scoping")
     tpool = pool(keys, keys, patterns, intervals, kinds, 2)
     logs = 0
     for ops in ledgers(tpool, 2):
@@ -1006,6 +1175,9 @@ def tier_scope(tally, keys, patterns, intervals, kinds, clock, requests):
             for request in requests:
                 for now in clock:
                     CELL = (ops, subject, now, request)
+                    note_shape("L2 subject scoping",
+                               *decide_core(ops, subject, now, request), None,
+                               subject)
                     tally.check("L2 subject-scoped",
                                 decide_core(ops, subject, now, request)
                                 == decide_core(mine, subject, now, request))
@@ -1015,6 +1187,7 @@ def tier_scope(tally, keys, patterns, intervals, kinds, clock, requests):
 def tier_ingest(tally, keys, patterns, clock, requests):
     """L6: sig and version checks at the boundary, not in the evaluator."""
     global CELL
+    register_tier("L6 ingest")
     k, j = keys
     base = [mk(0, j, k, SHELL, 1, 9, "grant", 1),
             mk(1, k, k, ACC, 1, 9, "accept", 2, ref=0)]
@@ -1067,6 +1240,7 @@ CERT_VARIANTS = (CERT_NONE, CERT_VALID, CERT_EXPIRED, CERT_REVOKED)
 def tier_cert(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
     """L15: a revoked or expired certificate denies, absolutely, by reason."""
     global CELL
+    register_tier("L15 certificate")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     logs = 0
     for ops in ledgers(tpool, 2):
@@ -1082,6 +1256,8 @@ def tier_cert(tally, keys, subjects, patterns, intervals, kinds, clock, requests
                                  "display_name": "laptop"}
                         got = decide(facts, request)
                         VERDICTS_SEEN.add((got[0], got[1]))
+                        note_shape("L15 certificate", got[0], got[1], None,
+                                   subject)
                         revoked = cert is not None and cert["revoked"]
                         expired = (cert is not None and not cert["revoked"]
                                    and cert["expires"] <= now)
@@ -1130,6 +1306,7 @@ def tier_pass(tally, keys, subjects, patterns, intervals, kinds, clock, requests
     ever sees inert passes would pass with the attenuation test deleted.
     """
     global CELL
+    register_tier("L14 pass attenuation")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     logs, attenuative, inert = 0, 0, 0
     for ops in ledgers(tpool, 2):
@@ -1139,6 +1316,8 @@ def tier_pass(tally, keys, subjects, patterns, intervals, kinds, clock, requests
                 for now in clock:
                     CELL = (ops, subject, now, request)
                     decision, reason = decide_core(ops, subject, now, request)
+                    note_shape("L14 pass attenuation", decision, reason, None,
+                               subject)
                     for o in effective(ops):
                         if o[KIND] != "pass":
                             continue
@@ -1165,6 +1344,35 @@ def tier_pass(tally, keys, subjects, patterns, intervals, kinds, clock, requests
                                        for x in because(ops, subject, now,
                                                         request)[1]
                                        if x[KIND] == "pass"))
+    # A pass backed ONLY by the author's own UNACCEPTED self-grant is not backed
+    # at all: that is self-certification, and it must leave the pass inert (the
+    # verdict without it), not merely unaccepted-by-someone-else. This is the
+    # regression the first cut shipped -- `pass_is_attenuative` credited any live
+    # op whose subject was the author.
+    # The shape has to be FULLY self-certified to test anything: the author's own
+    # grant AND the Accept that supports it, both signed by the author. With only
+    # the unaccepted self-grant the "itself effective" clause already rejects it,
+    # so a check built on that shape passes with the authorship clause deleted --
+    # which is exactly what the first version of this check did.
+    self_grant = mk(0, keys[0], keys[0], SHELL, 1, 3, "grant")
+    self_accept = mk(1, keys[0], keys[0], ACC, 1, 3, "accept", ref=0)
+    self_pass = mk(2, keys[0], keys[0], SHELL, 1, 3, "pass")
+    for now in clock:
+        CELL = ("self-certification", now)
+        tally.check(
+            "L14 self-grant-cannot-back-a-pass",
+            not pass_is_attenuative((self_grant, self_accept, self_pass),
+                                    self_pass, now))
+    for subject in subjects:
+        for request in requests:
+            for now in clock:
+                CELL = ("self-certification", subject, now, request)
+                with_pass = decide_core((self_grant, self_accept, self_pass),
+                                        subject, now, request)
+                without = decide_core((self_grant, self_accept), subject, now,
+                                      request)
+                tally.check("L14 self-grant-cannot-back-a-pass",
+                            with_pass == without)
     CELL = ("non-vacuity", "pass")
     # A tier that never produced BOTH an attenuative pass and an inert one did
     # not test L14; it tested that the file runs.
@@ -1180,6 +1388,7 @@ BINDINGS = (None, "Inferred", "Proven")
 def tier_binding(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
     """L16: every allow needs binding >= the cause's own minimum."""
     global CELL
+    register_tier("L16 binding")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2,
                  minbs=("proven", "inferred"))
     logs = 0
@@ -1196,28 +1405,36 @@ def tier_binding(tally, keys, subjects, patterns, intervals, kinds, clock, reque
                                  "display_name": "laptop"}
                         got = decide(facts, request)
                         VERDICTS_SEEN.add((got[0], got[1]))
+                        note_shape("L16 binding", got[0], got[1], None, subject)
                         if got[0] == ALLOW:
-                            need = "proven"
-                            for o in because(ops, subject, now, request)[1]:
-                                if o[KIND] in WIDENING and o[MINB] == "inferred":
-                                    need = "inferred"
+                            _needs = [o[MINB]
+                                      for o in because(ops, subject, now,
+                                                       request)[1]
+                                      if o[KIND] in WIDENING]
+                            need = "proven" if (not _needs or "proven" in _needs) \
+                                else "inferred"
                             tally.check("L16 allow-requires-binding",
                                         binding_satisfies(binding, need))
                             # Ruling 3: Inferred is allowed ONLY for pair-secret
-                            # Grants. A pass may never demand less than Proven.
+                            # Grants, so a Pass can never demand less than Proven.
+                            # Checked against the KIND, not membership of the set
+                            # that admitted the weaker value -- otherwise the law
+                            # tests itself.
                             tally.check("L16 inferred-only-on-grants",
                                         need != "inferred" or all(
-                                            o[KIND] in GRANT_SPECIES
+                                            o[KIND] == "grant"
                                             for o in because(ops, subject, now,
                                                              request)[1]
                                             if o[KIND] == "pass"))
                         elif got[1] == R_UNPROVEN:
                             RELEVANT["binding"] += 1
                             tally.check("L16 unproven-is-a-deny", got[0] == DENY)
-    # Construction invariant: `inferred` never lands on a non-grant-species op
-    # (ruling 3: the weaker requirement belongs to pair-secret Grants only).
+    # Construction invariant: `inferred` never lands on anything but a GRANT
+    # (ruling 3: the weaker requirement belongs to pair-secret Grants only). A
+    # GRANT_SPECIES test here would be satisfied by a Pass, which is the
+    # tautology this replaced.
     tally.check("L16 inferred-only-on-grants",
-                all(o[MINB] != "inferred" or o[KIND] in GRANT_SPECIES
+                all(o[MINB] != "inferred" or o[KIND] == "grant"
                     for ops in ledgers(tpool, 2) for o in ops))
     print(f"  {'L16 binding':<28} logs={logs:<8d} pool={len(tpool):<4d} "
           f"bindings={len(BINDINGS)}")
@@ -1226,6 +1443,7 @@ def tier_binding(tally, keys, subjects, patterns, intervals, kinds, clock, reque
 def tier_held(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
     """L17: a held author key is the trust root; others act inside its ceiling."""
     global CELL
+    register_tier("L17 held author key")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     logs = 0
     for ops in ledgers(tpool, 2):
@@ -1245,6 +1463,8 @@ def tier_held(tally, keys, subjects, patterns, intervals, kinds, clock, requests
                                  "display_name": "laptop"}
                         got = decide(facts, request)
                         VERDICTS_SEEN.add((got[0], got[1]))
+                        note_shape("L17 held author key", got[0], got[1], held,
+                                   subject)
                         if got != base:
                             RELEVANT["held_author_key"] += 1
                         # Own policy is the trust root: an op authored BY the
@@ -1256,10 +1476,17 @@ def tier_held(tally, keys, subjects, patterns, intervals, kinds, clock, requests
                             set(mine) <= set(trust_filter(ops, held, now)))
                         # A delegated op survives only inside a ceiling its
                         # author was granted BY the held key.
+                        # Accepts are exempt from the trust filter by design
+                        # (L13 governs them), so the invariant is about the
+                        # AUTHORITY-bearing ops: every non-Accept op by another
+                        # author survives only inside a ceiling the held key
+                        # granted it.
                         tally.check(
                             "L17 delegated-ops-need-ceiling",
-                            all(delegated_ok(ops, o, held, now) or o not in
-                                trust_filter(ops, held, now) for o in rest))
+                            all(o[KIND] == "accept"
+                                or delegated_ok(ops, o, held, now)
+                                or o not in trust_filter(ops, held, now)
+                                for o in rest))
     print(f"  {'L17 held author key':<28} logs={logs:<8d} pool={len(tpool):<4d}")
 
 
@@ -1303,6 +1530,7 @@ def _no_verdict_changes(candidate, original):
 def tier_compact(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
     """L18 (ruling 8): compaction never changes a verdict or a `because`."""
     global CELL
+    register_tier("L18 compaction")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     logs = 0
     for ops in ledgers(tpool, 2):
@@ -1312,6 +1540,9 @@ def tier_compact(tally, keys, subjects, patterns, intervals, kinds, clock, reque
             for request in requests:
                 for now in clock:
                     CELL = (ops, subject, now, request)
+                    note_shape("L18 compaction",
+                               *decide_core(small, subject, now, request), None,
+                               subject)
                     tally.check(
                         "L18 compaction-preserves-verdict",
                         decide_core(small, subject, now, request)
@@ -1360,10 +1591,73 @@ def tier_compact(tally, keys, subjects, patterns, intervals, kinds, clock, reque
 RELEVANT = {"cert": 0, "binding": 0, "held_author_key": 0}
 
 
+DEPLOYED_ALLOWS = 0
+
+
+def tier_deployed(tally, keys, subjects, patterns, intervals, kinds, clock,
+                  requests):
+    """The configuration that SHIPS: an owner grants a device, the device
+    accepts, and the OWNER's key is the trust root (`held != subject`).
+
+    This tier exists because its absence hid the L17 blocker. Every law passed
+    over 2.88M cells while this shape allowed NOTHING, so the assertion here is
+    the plain one: with a held author key that is not the subject, an allow must
+    be REACHABLE, and the count is reported rather than assumed.
+    """
+    global CELL, DEPLOYED_ALLOWS
+    owner, device = KEYS[1], KEYS[0]
+    grant = mk(0, owner, device, ("shell", "*"), 1, 4, "grant")
+    accept = mk(1, device, device, ACC, 1, 4, "accept", ref=0)
+    ops = (grant, accept)
+    for request in requests:
+        for now in clock:
+            if not grant[NB] <= now < grant[NA]:
+                continue
+            CELL = ("deployed", request, now)
+            facts = {"now": now, "subject": device, "ops": ops,
+                     "binding": "Proven", "cert": None,
+                     "held_author_key": owner, "display_name": "laptop"}
+            got = decide(facts, request)
+            note_shape("DEPLOYED owner->device", got[0], got[1], owner, device)
+            if got[0] == ALLOW:
+                DEPLOYED_ALLOWS += 1
+            # The shape's own law: an owner-granted, device-accepted shell is an
+            # ALLOW while the owner is the trust root. Checked for the requests
+            # the grant covers, and deliberately not for the ones it does not.
+            if covers(grant[ACTION], grant[RESOURCE], *request):
+                tally.check("L17 deployed-shape-allows", got == (ALLOW, None,
+                                                                 got[2], got[3]))
+            else:
+                tally.check("L17 deployed-shape-does-not-overreach",
+                            got[0] == DENY)
+    # The same configuration must ALSO deny when the trust root is absent, or the
+    # allow above would prove nothing about L17 (it could be reaching an allow
+    # with no filter at all).
+    CELL = ("deployed", "no-trust-root")
+    no_root = decide({"now": 2, "subject": device, "ops": ops,
+                      "binding": "Proven", "cert": None,
+                      "held_author_key": None, "display_name": "laptop"},
+                     ("shell", "dev:a"))
+    tally.check("L17 deployed-shape-survives-no-root", no_root[0] == ALLOW)
+    # And a device grant the OWNER never issued (another author, no ceiling) must
+    # NOT allow: the trust filter is doing work, not waving everything through.
+    rogue = mk(0, device, device, ("shell", "*"), 1, 4, "grant")
+    rogue_accept = mk(1, device, device, ACC, 1, 4, "accept", ref=0)
+    CELL = ("deployed", "rogue")
+    rogue_v = decide({"now": 2, "subject": device, "ops": (rogue, rogue_accept),
+                      "binding": "Proven", "cert": None,
+                      "held_author_key": owner, "display_name": "laptop"},
+                     ("shell", "dev:a"))
+    tally.check("L17 untrusted-author-is-not-effective", rogue_v[0] == DENY)
+    print(f"  {'DEPLOYED owner->device':<28} allows with held != subject = "
+          f"{DEPLOYED_ALLOWS}")
+
+
 def tier_relevance(tally, keys, subjects, patterns, intervals, kinds, clock,
                    requests):
     """L1/L2 + ruling 3: which Facts fields are load-bearing, and which are not."""
     global CELL
+    register_tier("L1/L2 facts relevance")
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     logs = 0
     for ops in ledgers(tpool, 2):
@@ -1378,6 +1672,8 @@ def tier_relevance(tally, keys, subjects, patterns, intervals, kinds, clock,
                                  "binding": "Proven", "cert": None,
                                  "held_author_key": None, "display_name": name}
                         got = decide(facts, request)
+                        note_shape("L1/L2 facts relevance", got[0], got[1], None,
+                                   subject)
                         if base is None:
                             base = got
                             tally.check("L1 deterministic",
@@ -1394,7 +1690,7 @@ def tier_relevance(tally, keys, subjects, patterns, intervals, kinds, clock,
 
 
 # ---------------------------------------------------------------------- runner
-KINDS_ALL = ("grant", "deny", "ceiling", "pause", "certify", "pass")
+KINDS_ALL = ("grant", "deny", "ceiling", "pause", "pass")
 KINDS_CORE = ("grant", "deny", "ceiling", "pause")
 KINDS_MIN = ("grant", "deny", "pause")
 
@@ -1439,6 +1735,11 @@ FULL = {
     "compact": dict(patterns=PATTERNS[:2], intervals=((1, 3), (2, 4)),
                     kinds=("grant", "deny", "ceiling"), clock=tuple(range(5)),
                     requests=REQUESTS[:1]),
+    # The shape that ships, so the tier-non-vacuity gate can see it in every
+    # plan: the deployed owner->device direction must produce an ALLOW.
+    "deployed": dict(patterns=PATTERNS, intervals=((1, 3),),
+                     kinds=("grant",), clock=tuple(range(4)),
+                     requests=REQUESTS),
 }
 
 QUICK = {
@@ -1478,6 +1779,9 @@ QUICK = {
     "compact": dict(patterns=PATTERNS[:1], intervals=((1, 3),),
                     kinds=("grant", "deny"), clock=tuple(range(4)),
                     requests=REQUESTS[:1]),
+    "deployed": dict(patterns=PATTERNS[:1], intervals=((1, 3),),
+                     kinds=("grant",), clock=tuple(range(4)),
+                     requests=REQUESTS[:1]),
 }
 
 
@@ -1525,6 +1829,14 @@ def run_all(tally, plan):
         print("\nTier FACTS -- L1/L2: which Facts fields are load-bearing, and")
         print("  which (display_name only) must stay inert (ruling 3).")
         tier_relevance(tally, KEYS, KEYS[:1], **plan["facts"])
+    if plan.get("deployed"):
+        print("\nTier DEPLOYED -- the configuration that SHIPS: owner grants a")
+        print("  device, the device accepts, the OWNER is the trust root. Its")
+        print("  absence is what hid the L17 blocker (544 denies, 0 allows).")
+        tier_deployed(tally, KEYS, KEYS[:1], **plan["deployed"])
+    # The lesson, enforced: a tier that cannot reach a shape it must reach has
+    # proved nothing, however many cells it checked.
+    check_tier_shapes(tally)
 
 
 MUTATIONS = (
@@ -1551,6 +1863,11 @@ MUTATIONS = (
     ("binding-ignored", "L16 allow-requires-binding"),
     ("inferred-ok-for-proven-op", "L16 allow-requires-binding"),
     ("held-key-ignored", "L17 delegated-ops-need-ceiling"),
+    # Review round 2, the blocker itself: the trust filter discarding a
+    # subject's own Accept. The LAWS did not catch it, so the non-vacuity gate
+    # must -- that is the whole point of adding it.
+    ("trust-filter-drops-accepts", "L17 deployed-shape-allows"),
+    ("self-certifying-pass", "L14 self-grant-cannot-back-a-pass"),
     ("held-key-drops-own-policy", "L17 own-policy-is-trust-root"),
     ("compaction-drops-live", "L18 compaction-preserves-verdict"),
     # The `because` arm is guarded rather than mutated, and that is a finding

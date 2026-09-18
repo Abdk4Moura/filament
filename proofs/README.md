@@ -270,11 +270,12 @@ deny, trusted-plus-granted must allow) and CONTRACT.md's "expiry IS the
 revocation mechanism" -- and prints the new primitives as new rather than
 claiming to have reproduced them.
 
-Thirteen laws, each a numbered clause in CONTRACT.md and a named check here:
+Eighteen laws, each a numbered clause in CONTRACT.md and a named check here.
+L14-L18 arrived as review rulings and the contract now declares them:
 
 | Law | What it pins |
 |---|---|
-| L1 / L2 | purity, and that `binding`, `cert`, `held_author_key` and display names move no verdict |
+| L1 / L2 | purity, and that display names -- and ONLY display names -- move no verdict |
 | L3 / L9 | every op has an interval; `valid_until` is returned, and the verdict cannot change before it |
 | L4 | deny absolute, ceiling only narrows, newest version per author wins |
 | L5 | widening needs a Grant AND a subject-signed Accept; narrowing needs one signature |
@@ -283,15 +284,34 @@ Thirteen laws, each a numbered clause in CONTRACT.md and a named check here:
 | L8 | capabilities are opaque `(action, resource)` pairs plus `covers()` |
 | L10 | no widening by combination; a deny is a tombstone only its author lifts |
 | L11 | arrival order and replay change nothing |
-| L12 / L13 | pause is author-only and reads `paused`, not `denied`; accept names one live grant |
+| L12 / L13 | pause is author-only, pattern-scoped, and reads `paused`, not `denied`; accept names one live grant |
+| L14 | `Pass` is a Grant species and attenuation-only: a pass its author cannot back is INERT, and "backed" excludes the author's own self-certified grant |
+| L15 | a revoked or expired certificate denies absolutely, with `revoked` and `expired` as DISTINCT reasons |
+| L16 | every allow needs `binding` at least as strong as the STRONGEST `min_binding` in its cause; `inferred` is a plain-Grant property only |
+| L17 | the held author key is the trust root: its own ops are effective, a delegated op is effective only inside a ceiling it granted, and ACCEPTS are exempt because L13 governs them |
+| L18 | compaction preserves every verdict AND every `because`; a Deny tombstone and a shorter-interval revision both agree with the deletion they replace |
 
 Two properties of the run matter as much as the green:
 
-**Vacuity is a failure, not a footnote.** The run asserts that every verdict
-shape -- `Allow`, `denied`, `paused`, `above-ceiling`, `unaccepted`,
-`no-grant` -- was actually produced, and that the checks guarding the rarest of
-them ran at least once. The first version of this model never reached `paused`
-or `above-ceiling` at all: at N=2 a grant and its accept fill the log, leaving
+**Vacuity is a failure, not a footnote, and now PER TIER.** The run asserts that
+every verdict shape -- `Allow`, `denied`, `paused`, `above-ceiling`,
+`unaccepted`, `no-grant`, `revoked`, `expired`, `unproven` -- was actually
+produced, that the checks guarding the rarest of them ran at least once, AND
+that each tier reaches the verdict shapes it must reach: a tier that ran and
+could only produce denials fails the run, and so does a tier that ran without
+declaring what it must reach.
+
+That last check exists because a global total hid a real defect. The first L17
+filtered the ACCEPT out of the trust model, so an owner-granted device could
+never allow: the DEPLOYED owner->device shape produced 544 denies and ZERO
+allows, every law still passed, and the run reported 2.88 million cells and no
+violations. Cell counts are not evidence that a law constrains the
+configurations that SHIP, so the deployed shape is its own tier now, its allow
+count is printed (`allows with held != subject`), and reintroducing the bug is a
+mutation -- `trust-filter-drops-accepts` -- that the per-tier gate must catch.
+
+The same gate also catches the older, milder hole: the first version of this
+model never reached `paused` or `above-ceiling` at all: at N=2 a grant and its accept fill the log, leaving
 no slot for a ceiling or a pause, so both checks passed without being tested.
 That is the `S1`-under-tier-0 failure from the fleet model in a new costume,
 and the N=3 tier exists because of it.
@@ -307,10 +327,11 @@ narrows" (it narrows by nothing), so the mutation had to be a ceiling that
 actually grants. A mutation that does not violate the law it targets proves
 nothing about the check.
 
-The model states its reading of three under-constrained points rather than
-resolving them quietly: `Certify` carries no authority, `Pass` is widening
-under L5's rules with its delegation rule left open, and a `Pause` is scoped
-by its own capability pattern. It also records that L10's plain-English form
+The model states its reading of the under-constrained points rather than
+resolving them quietly: `Certify` is not a ledger op at all (it is an
+identity-lifecycle event whose result reaches the evaluator as Facts.cert, law
+L15), `Pass` is a Grant species whose attenuation rule is L14, and a `Pause` is
+scoped by its own capability pattern. It also records that L10's plain-English form
 is contradicted by L5 -- a Grant and an Accept each deny alone and allow
 together -- and checks the restricted form, requiring that pair to be the
 ONLY widening combination in the whole universe.
