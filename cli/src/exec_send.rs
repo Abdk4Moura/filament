@@ -212,7 +212,9 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                     // Without an answer here the link can never become Proven,
                     // the open parks and expires, and every retry mints a fresh
                     // equally silent link. Same shared helper send_cmd uses, so
-                    // there is one possession-signing path, not two.
+                    // there is one possession-signing path, not two; its doc
+                    // comment states which key is which, and why the path can
+                    // only ever sign as itself.
                     if v.get("type").and_then(|t| t.as_str()) == Some("identity-nonce-challenge") {
                         respond_to_identity_challenge(&t, &v).await;
                     }
@@ -310,7 +312,8 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                 Some(crate::net::Ev::Control(_pid, v)) => {
                     // #309: the owner re-challenges while an open is parked (and
                     // after any re-adopt), so the same answer is owed here, in
-                    // the long-lived pump, not only during the ack wait.
+                    // the long-lived pump, not only during the ack wait. Same
+                    // shared helper: one possession-signing path, not two.
                     if v.get("type").and_then(|t| t.as_str())
                         == Some("identity-nonce-challenge")
                     {

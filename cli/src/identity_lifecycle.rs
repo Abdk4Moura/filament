@@ -24,7 +24,7 @@ use crate::{
     with_devices_mut,
 };
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -462,6 +462,18 @@ pub(crate) fn handle_identity_expose(
 /// Shared by recv_cmd (the `up`/receiver loop) AND send_cmd (the one-shot
 /// sender session) so a sender can prove possession and be authorized under an
 /// authoritative cap gate. Reflection-guarded and echoes the challenger nonce.
+///
+/// WHICH KEY IS WHICH, because the names invite the opposite reading.
+/// `receiver_device_pub` is the CHALLENGER's key, not ours: the challenger mints
+/// it from its own overlay key (recv_cmd.rs, the pair-intro branch: "Receiver
+/// device_pub is our own overlay key") and verifies the reply against
+/// `receiver_dpub = own_dpub`. So there is deliberately NO "refuse unless the
+/// receiver is us" rule here -- that rule, applied to a real challenge, would
+/// refuse every peer in the fleet. possession_msg always carries OUR cert's
+/// device_pub as sender, so this path can only ever sign as itself; the
+/// challenger's key is the intended binding. The only refusal on the receiver
+/// side is the REFLECTION guard below, and inverting it would be a PROTOCOL
+/// change, not a hardening.
 pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Value) {
     let nonce_hex = v["nonce"].as_str().unwrap_or_default();
     let recv_dpub_hex = v["receiver_device_pub"].as_str().unwrap_or_default();
@@ -488,9 +500,38 @@ pub(crate) async fn respond_to_identity_challenge(t: &Arc<dyn Transport>, v: &Va
         }
     }
     let Some(local_cert) = local_device_cert() else {
-        crate::ui::debug("identity challenge NOT answered: this device holds no certificate");
+        // LOUD, not debug: this refusal is why the peer will see no proof at
+        // all, and a silent one is exactly how a link that cannot prove itself
+        // reads as a link that was refused. Same class as the capsule's other
+        // refusals, which are visible at the default level.
+        crate::ui::say(
+            "identity challenge NOT answered: this device holds no certificate for its own key",
+        );
         return;
     };
+    // Self-binding, made explicit rather than inherited: the certificate we are
+    // about to sign with must BE this device's own key. `local_device_cert()`
+    // already filters on that (it returns the cert only when
+    // `cert.device_pub == overlay_pub` and the cert verifies), so this is
+    // belt-and-braces against a future change to that accessor -- and it is the
+    // invariant a reader is looking for when they ask "can this path sign as
+    // somebody else?". It cannot: the signature is made with the overlay key
+    // and carries this cert's device_pub as sender.
+    match crate::overlay::overlay_pubkey_bytes() {
+        Ok(own_pub) if local_cert.device_pub == own_pub => {}
+        Ok(_) => {
+            crate::ui::say(
+                "identity challenge NOT answered: the local certificate is not this device's key (refusing to sign as another identity)",
+            );
+            return;
+        }
+        Err(e) => {
+            crate::ui::say(&format!(
+                "identity challenge NOT answered: this device's key is unreadable ({e}); nothing can be signed"
+            ));
+            return;
+        }
+    }
     let scope = crate::identity::IntroScope::User.to_byte();
     let caps_d = crate::identity::caps_digest("transfer");
     let chash = crate::identity::cert_hash(&local_cert);
