@@ -20,6 +20,52 @@ enum, and the `--json` honesty gate are tickets 1-3 of
 `docs/agent-output-audit.md`. Several tickets here depend on them; none of them
 re-implement them, and where a ticket needs JSON it says so and blocks.
 
+
+## Status board (kept current; update in the same PR that moves a ticket)
+
+Legend: `done` merged to main · `in PR` open pull request · `building` branch exists, not yet a PR · `queued` assigned, not started · `blocked` waiting on a named item · `not started`.
+
+| Ticket | What | Lane | State | Where |
+|---|---|---|---|---|
+| U1 | implicit `init` | helper | not started | |
+| U2 | `serve shell` + `shell <code>` | pi | not started | |
+| U3 | `reach --until-direct` | helper | in PR | #315 (gate 3/3, waits on registry hotfix #317) |
+| U4 | `serve exec/forward/mount` | worker | not started | needs U2 |
+| U5 | `remember`, `--remember` repair | pi | not started | hotfix for the false "mutually remembered" message requested |
+| U6 | tier becomes the base | worker | not started | |
+| U7 | `forget` at top level | helper | not started | |
+| U8 | resource-scoped caps + lattice | pi | contract done, code not started | CONTRACT "Relationship frames" (#313) |
+| U9 | direction bit | pi | contract done, code not started | CONTRACT "Relationship frames" (#313) |
+| U10 | `certify <dev> --scope --expiry` | worker | contract in PR, code queued | #305 (contract); worker queue position 3 |
+| U11 | `requests accept`, OUT rows | worker | not started | |
+| U12 | `pause` / `resume` | worker | not started | |
+| U13 | ledger boundary | pi | blocked on ledger extraction | ledger contract L1-L13 merged (#311); L14-L18 in PR #319; Rust extraction not started |
+| U14 | overlay tiers from verdicts | worker | blocked on U13 | |
+| U15 | `grant --expires` fall-back | worker | blocked on U13 | |
+| U16 | `Accept` end to end | worker | blocked on U13 | |
+| U17 | `pass` and `guests` | pi | blocked on U13 | design in docs/design-relationship-ux.md |
+| U18 | tag visibility | worker | blocked on U13 | |
+| U19 | two-axis state in `--json` | helper | blocked on U13 + audit tickets 1-3 | |
+
+Adjacent work the tickets depend on or that came out of the same design:
+
+| Item | State | Where |
+|---|---|---|
+| `filament exec` | done | main (#302) |
+| SSH certificates from the shell grant | done | main (#303) |
+| Enrolment-ceiling `scoped_in_bounds` + settle-then-evaluate | in PR, 23/23 gates | #309 (draft lifts on green CI) |
+| Bootstrap card (fc1) contract + vectors | in PR | #314 (rebased 2026-09-18) |
+| Capability ledger contract L1-L13 + model | done | main (#311) |
+| Capability ledger L14-L18 + model | in PR, under review | #319 |
+| Relationship UX design + contract frames + this ticket list | done | main (#313) |
+| `filament sync` (delta transfer verb) | building | work/sync-verb2 |
+| `devices --caps` (what can this device do to me, until when) | building | work/device-caps2 |
+| Agent-grade output audit (23 tickets, envelope, exit codes) | in PR | #307 (rebased 2026-09-18) |
+| CLI fixes: shell help text, `logs -f` teardown | in PR | #308 (rebased 2026-09-18) |
+| Half-dead transport reader (#312) | queued | worker queue position 2 |
+| Registry hotfix (7 expired diagnostics) | in PR, blocks every merge | #317 |
+| Token carrier decision (Biscuit) | doc not yet committed | pi's checkout, docs/design-token-carrier.md |
+
 ---
 
 ## The first three, buildable today
