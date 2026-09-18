@@ -964,7 +964,6 @@ fn keep_endpoint_alive(ep: Endpoint, conn: &quinn::Connection) {
     tokio::spawn(async move {
         c.closed().await;
         #[cfg(debug_assertions)]
-        #[cfg(debug_assertions)]
         eprintln!("[KEEP-EP-DROP] conn_id={conn_id} ep={ep_addr:?} — connection closed, dropping endpoint");
         drop(ep);
     });
@@ -984,6 +983,17 @@ pub struct DirectTransport {
     send: Arc<Mutex<SendStream>>,
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
+    /// #312: the peer cleanly ENDED its send half (FinishedEarly). Kept separate
+    /// from `dead` because the two mean different things and only one of them is
+    /// fatal: a one-shot WORKER whose peer finished is simply done, while a
+    /// PRIMARY link that can never receive again must be re-established. Honoured
+    /// by `is_dead()` for primary links ONLY -- a blunt `dead.store(true)` on the
+    /// reader's EOF arms would tear a link down while it still owes a
+    /// delivery-ack, which is why the comment at those arms says not to.
+    rx_ended: Arc<std::sync::atomic::AtomicBool>,
+    /// True for the race-winning PRIMARY transport, false for every one-shot
+    /// WORKER transport. It decides whether `rx_ended` is fatal.
+    primary: bool,
     /// The deterministic `polite` role for this link (opposite on the two ends);
     /// selects this end's L2 sid half so the two ends never collide.
     answerer: bool,
@@ -1017,7 +1027,6 @@ pub struct DirectTransport {
 impl Drop for DirectTransport {
     fn drop(&mut self) {
         let ep_info = self.ep.as_ref().map(|e| format!("ep={:?}", e.local_addr())).unwrap_or_else(|| "ep=None".to_string());
-        #[cfg(debug_assertions)]
         #[cfg(debug_assertions)]
         eprintln!("[DROP] DirectTransport stable_id={} answerer={} {ep_info} close_reason={:?}",
             self.conn.stable_id(), self.answerer, self.conn.close_reason());
@@ -1294,7 +1303,13 @@ impl Transport for DirectTransport {
         true
     }
     fn is_dead(&self) -> bool {
+        // #312: a PRIMARY link whose peer ended its send half can never receive
+        // again, so it is dead for every purpose that matters (health checks,
+        // re-establishment) even though our write half technically still works.
+        // A WORKER is not: ending a one-shot stream is how workers finish, and
+        // its delivery-ack write half is still owed.
         self.dead.load(std::sync::atomic::Ordering::Relaxed)
+            || (self.primary && self.rx_ended.load(std::sync::atomic::Ordering::Relaxed))
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -1349,7 +1364,7 @@ impl Transport for DirectTransport {
     }
 
     fn idle_ms(&self) -> u64 {
-        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.is_dead() {
             return u64::MAX;
         }
         let _ = &self.conn; // keep the connection alive for the link's lifetime
@@ -1388,6 +1403,23 @@ impl Transport for DirectTransport {
 /// Spawn the read loop that demuxes the authenticated stream back into
 /// `Ev::Control` / `Ev::Chunk`, attributed to `peer_id` (same as the
 /// DataChannel read loop). Mirrors net.rs::wire_channel's reader.
+/// #312 P2: every reader exit is reported at a RELEASE-VISIBLE level for a
+/// primary link, so a link that goes deaf can never be silent again. The old
+/// diagnostics here were `#[cfg(debug_assertions)]` -- compiled out of exactly
+/// the release builds the gates run, which is why a one-way link cost a day of
+/// instrumentation to find. Workers stay at debug: a one-shot worker ending is
+/// routine, and saying so on every transfer would be noise.
+fn note_reader_exit(peer_id: &str, primary: bool, reason: &str, frames: u64, dead: bool) {
+    let line = format!(
+        "l2: link reader exited peer={peer_id} primary={primary} reason={reason} frames={frames} dead={dead}"
+    );
+    if primary {
+        crate::hooks::say(&line);
+    } else {
+        crate::hooks::debug(&line);
+    }
+}
+
 fn spawn_reader(
     peer_id: String,
     mut recv: RecvStream,
@@ -1395,8 +1427,11 @@ fn spawn_reader(
     last_activity: Arc<std::sync::atomic::AtomicU64>,
     dead: Arc<std::sync::atomic::AtomicBool>,
     answerer: bool,
+    rx_ended: Arc<std::sync::atomic::AtomicBool>,
+    primary: bool,
 ) {
     tokio::spawn(async move {
+        let mut frames: u64 = 0;
         let trace = cfg!(feature = "debug-logs") && std::env::var("FILAMENT_TRACE_THROUGHPUT").is_ok();
         let mut last_chunk_time = if trace { Some(std::time::Instant::now()) } else { None };
         let mut chunk_counter: u64 = 0;
@@ -1408,12 +1443,17 @@ fn spawn_reader(
                 // (e.g. after the final file chunk). Our WRITE half is still
                 // open for delivery-ack — DO NOT mark the transport as dead.
                 if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
+                    // #312: record it, but let `is_dead()` decide what it means
+                    // for THIS transport (fatal for a primary, normal for a
+                    // worker). `dead` stays false exactly as the comment above
+                    // requires.
+                    rx_ended.store(true, std::sync::atomic::Ordering::Relaxed);
+                    note_reader_exit(&peer_id, primary, "finished-early(hdr)", frames, false);
                     break;
                 }
-                #[cfg(debug_assertions)]
-                #[cfg(debug_assertions)]
                 eprintln!("[DEAD] spawn_reader: peer={} answerer={answerer} read hdr error: {e:?}", peer_id);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                note_reader_exit(&peer_id, primary, "read-error(hdr)", frames, true);
                 break;
             }
             let kind = hdr[0];
@@ -1421,10 +1461,9 @@ fn spawn_reader(
             // Guard against an absurd length (a corrupt/hostile peer); cap well
             // above MAX_DIRECT_PAYLOAD + the 4-byte sid.
             if len > MAX_DIRECT_PAYLOAD + 64 {
-                #[cfg(debug_assertions)]
-                #[cfg(debug_assertions)]
                 eprintln!("[DEAD] spawn_reader: peer={} absurd len={}", peer_id, len);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                note_reader_exit(&peer_id, primary, "absurd-length", frames, true);
                 break;
             }
             let hdr_us = t_hdr_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
@@ -1434,19 +1473,28 @@ fn spawn_reader(
                 // FinishedEarly after a header means clean end-of-stream after
                 // the sender's final frame — not a protocol error.
                 if matches!(&e, quinn::ReadExactError::FinishedEarly(_)) {
+                    rx_ended.store(true, std::sync::atomic::Ordering::Relaxed);
+                    note_reader_exit(&peer_id, primary, "finished-early(body)", frames, false);
                     break;
                 }
-                #[cfg(debug_assertions)]
-                #[cfg(debug_assertions)]
                 eprintln!("[DEAD] spawn_reader: peer={} read body error kind={} err={e:?}", peer_id, kind);
                 dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                note_reader_exit(&peer_id, primary, "read-error(body)", frames, true);
                 break;
             }
             let body_us = t_body_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            frames += 1;
             match kind {
                 KIND_CONTROL => {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-                        let _ = tx.send(crate::net::Ev::Control(peer_id.clone(), v));
+                    match serde_json::from_slice::<Value>(&body) {
+                        Ok(v) => {
+                            let _ = tx.send(crate::net::Ev::Control(peer_id.clone(), v));
+                        }
+                        // A control frame we cannot parse used to vanish here with
+                        // no trace; it is a frame the peer believes it sent.
+                        Err(e) => crate::hooks::debug(&format!(
+                            "l2: control frame dropped (unparseable) peer={peer_id} err={e} frames={frames}"
+                        )),
                     }
                 }
                 KIND_DATA => {
@@ -1494,15 +1542,28 @@ pub fn make_transport(
     tx: tokio::sync::mpsc::UnboundedSender<crate::net::Ev>,
     answerer: bool,
     ep: Option<quinn::Endpoint>,
+    primary: bool,
 ) -> Arc<dyn Transport> {
     let last_activity = Arc::new(std::sync::atomic::AtomicU64::new(now_ms()));
     let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_reader(peer_id, recv, tx, last_activity.clone(), dead.clone(), answerer);
+    let rx_ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_reader(
+        peer_id,
+        recv,
+        tx,
+        last_activity.clone(),
+        dead.clone(),
+        answerer,
+        rx_ended.clone(),
+        primary,
+    );
     Arc::new(DirectTransport {
         conn,
         send: Arc::new(Mutex::new(send)),
         last_activity,
         dead,
+        rx_ended,
+        primary,
         answerer,
         ep,
         #[cfg(feature = "test-hooks")]
@@ -1530,7 +1591,7 @@ pub fn spawn_mesh_accept(
                 match conn.accept_bi().await {
                     Ok((send, recv)) => {
                         let conn2 = conn.clone();
-                        let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None);
+                        let worker = make_transport(pid.clone(), conn2, send, recv, tx.clone(), true, None, false);
                         let _ = tx.send(crate::net::Ev::DirectWorkersReady(pid.clone(), vec![worker]));
                     }
                     Err(_) => return,
@@ -1588,7 +1649,7 @@ pub async fn dial_workers(
                 match result {
                     Some(Ok((conn, send, recv, ep))) => {
                         workers.push(make_transport(
-                            peer_id.clone(), conn, send, recv, tx.clone(), false, Some(ep),
+                            peer_id.clone(), conn, send, recv, tx.clone(), false, Some(ep), false,
                         ));
                         if workers.len() >= count { break; }
                     }
@@ -1650,7 +1711,7 @@ pub async fn accept_workers(
                 match result {
                     Some(Ok((conn, send, recv, ep))) => {
                         workers.push(make_transport(
-                            peer_id.clone(), conn, send, recv, tx.clone(), true, Some(ep),
+                            peer_id.clone(), conn, send, recv, tx.clone(), true, Some(ep), false,
                         ));
                         if workers.len() >= count { break; }
                     }
@@ -1950,7 +2011,6 @@ pub async fn race_connect_labeled(
         tokio::spawn(async move {
             conn2.closed().await;
             #[cfg(debug_assertions)]
-            #[cfg(debug_assertions)]
             eprintln!("[KEEP-EP-DROP] endpoint for primary conn_stable={} ep={:?}",
                 conn2.stable_id(), endpoint.local_addr());
             drop(endpoint);
@@ -1958,9 +2018,17 @@ pub async fn race_connect_labeled(
     }
     let conn_id = conn.stable_id();
     #[cfg(debug_assertions)]
-    #[cfg(debug_assertions)]
     eprintln!("[PRIMARY-MADE] conn_stable={conn_id} answerer={answerer}");
-    Some(make_transport(peer_id, conn, send, recv, tx, answerer, Some(ep_for_transport)))
+    Some(make_transport(
+        peer_id,
+        conn,
+        send,
+        recv,
+        tx,
+        answerer,
+        Some(ep_for_transport),
+        true,
+    ))
 }
 
 #[cfg(test)]
@@ -2011,6 +2079,98 @@ mod tests {
         assert!(ct_eq(b"abc", b"abc"));
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
+    }
+
+    /// Build one authenticated in-process connection pair over loopback and hand
+    /// back both ends' stream halves, so a test can drive the reader without a
+    /// daemon.
+    async fn connected_pair() -> (
+        (quinn::Connection, SendStream, RecvStream),
+        (quinn::Connection, SendStream, RecvStream),
+    ) {
+        let (dial_ep, _) = bind_endpoint().expect("dialer endpoint");
+        let (acc_ep, acc_port) = bind_endpoint().expect("acceptor endpoint");
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], acc_port));
+        let dialing = dial_ep.connect(addr, "filament-direct").expect("connect");
+        let incoming = acc_ep.accept().await.expect("accept").await.expect("handshake");
+        let conn = dialing.await.expect("dial handshake");
+        let tkey = transport_key("t2-secret");
+        let (send_d, recv_d) = authenticate(&conn, &tkey, true).await.expect("dialer auth");
+        let (send_a, recv_a) = authenticate(&incoming, &tkey, false).await.expect("acceptor auth");
+        ((conn, send_d, recv_d), (incoming, send_a, recv_a))
+    }
+
+    /// Poll a predicate for a bounded time, so a test states HOW LONG it is
+    /// willing to wait instead of assuming the reader has already run.
+    async fn within(mut f: impl FnMut() -> bool, ms: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        f()
+    }
+
+    /// #312 T2: a PRIMARY link whose peer ends its send half must report DEAD
+    /// within a stated bound, so the reaper re-establishes it instead of writing
+    /// into a link that can never answer. Before the fix this stayed alive for
+    /// the life of the process -- the one-way link: writes succeed (the comment
+    /// at the EOF arm is why `dead` was deliberately left false), nothing is ever
+    /// received again, and no health check notices.
+    #[tokio::test]
+    async fn primary_link_reports_dead_when_the_peer_ends_its_send_half() {
+        let ((conn_d, send_d, recv_d), (_conn_a, send_a, _recv_a)) = connected_pair().await;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let primary = make_transport(
+            "peer".to_string(),
+            conn_d,
+            send_d,
+            recv_d,
+            tx,
+            true,
+            None,
+            true, // PRIMARY: its inbound path is the link's inbound path
+        );
+        assert!(!primary.is_dead(), "a fresh link is alive");
+        // The peer cleanly ends its send half, exactly as a dropped or one-shot
+        // sender does.
+        let _ = send_a.finish();
+        assert!(
+            within(|| primary.is_dead(), 2_000).await,
+            "a primary link must report dead once the peer can no longer send to it"
+        );
+    }
+
+    /// #312 T2, the other arm: the SAME event on a one-shot WORKER stream must
+    /// NOT kill the transport. Workers end this way as a matter of course (the
+    /// final file chunk), and their write half is still owed a delivery-ack.
+    #[tokio::test]
+    async fn worker_stream_is_not_killed_by_its_peers_send_half_ending() {
+        let ((conn_d, _send_d, _recv_d), (conn_a, _send_a, _recv_a)) = connected_pair().await;
+        // A second bi stream on the same connection: how mesh reuse hands out
+        // workers. The worker reads what the ACCEPTOR writes on THIS stream.
+        let (w_send_d, w_recv_d) = conn_d.open_bi().await.expect("dialer worker stream");
+        let (w_send_a, _w_recv_a) = conn_a.accept_bi().await.expect("acceptor worker stream");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = make_transport(
+            "peer".to_string(),
+            conn_d.clone(),
+            w_send_d,
+            w_recv_d,
+            tx,
+            false,
+            None,
+            false, // WORKER: ending a one-shot stream is normal
+        );
+        let _ = w_send_a.finish();
+        // Give the reader time to see the EOF, then require it NOT to be death.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !worker.is_dead(),
+            "a worker stream ending must not be reported as link death"
+        );
     }
 
     #[test]
