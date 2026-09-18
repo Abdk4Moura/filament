@@ -888,34 +888,6 @@ each with its own counter and its own verdict text:
 enrolment ceiling without an explicit grant, i.e. the population the flip newly
 permits. Reviewed, not gated.
 
-## Shadow accounting classes
-
-Shadow mode decides on the legacy fold and records what the flip WOULD do, so
-the classes must be separated or a stricter flip reads as a broken one. Four,
-each with its own counter and its own verdict text:
-
-- **BREAKAGE** -- legacy ALLOWED, the capability layer DENIES, and the subject
-  IS covered (ceiling or explicit grant). Counted `la_denied`, logged
-  `CAP-SHADOW CRITICAL`, and it is the only class that blocks the flip. A
-  CRITICAL means "a covered, legitimate population would lose access".
-- **cap-narrows-legacy** -- legacy ALLOWED, the capability layer DENIES, and
-  the subject is NOT covered by anything (no ceiling, no grant). Counted
-  `la_narrowed` (never `la_denied`), logged at Info. This is the flip CLOSING
-  a legacy hole where mere pairing sufficed -- e.g. a peer that hellos as a
-  ceilinged device's name -- so it is intended, and it must not pollute the
-  breakage signal. Deliberately excluded from `flip_ready`.
-- **pending-proof** -- legacy ALLOWED, the layer DENIES, and the only obstacle
-  is that the link's possession proof has not settled. Logged at Info. The flip
-  admits the open once the link is Proven, so a transient reconnect is not
-  breakage; the settle path above exists to wait exactly that transient out.
-- **WIDENING** -- legacy DENIED, the layer AUTHORIZES: opens the flip will
-  newly permit. Counted `ld_authorized`, never gated (a hard zero would forbid
-  the point of the migration), but it MUST be enumerated in the flip commit.
-
-`ceiling_admitted` is informational alongside them: opens admitted by the
-enrolment ceiling without an explicit grant, i.e. the population the flip
-newly permits. Reviewed, not gated.
-
 ## Settle-then-evaluate for shell-class opens
 
 DECIDE FIRST, park second. Every shell-class open runs the live gate before
