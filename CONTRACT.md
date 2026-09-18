@@ -708,6 +708,210 @@ silently would be worse than naming them:
 
 The model checker for all thirteen laws is `proofs/capability_ledger_model.py`,
 a required gate in `.github/workflows/proof.yml`.
+## Bootstrap card (fc1)
+
+A bootstrap card is a short self-describing string that says "this key,
+reachable maybe at these addresses, until this instant", signed by the
+key it names. It is what `filament addr --card` prints, what an
+invitation carries, what a pair QR encodes, and what a DNS TXT record
+publishes. It exists so a peer can be reached when the signaling server
+is unreachable, untrusted, or unwanted. It is also the ONLY artifact in
+filament a stranger may hand you before any link exists, which is why
+every rule below is about what it is not allowed to do.
+
+- WIRE FORMAT: `fc1` followed immediately by base64url (RFC 4648 §5,
+  NO padding, no line breaks) of a CBOR map:
+
+  ```
+  { v: 1,                      ; uint, wire version
+    device_pub: bytes(32),     ; Ed25519 public key, the identity
+    endpoints: [ { ip, port, proto } ... ],   ; 0..4 entries
+    relay:  { addr, mechanism },              ; optional
+    psk:    bytes(32),                        ; optional, PRIVATE cards only
+    expires: uint,                            ; UTC seconds since epoch
+    sig:    bytes(64) }                       ; Ed25519 over the rest
+  ```
+
+  There is no other envelope: no JSON, no hex, no compression. A string
+  that does not start with `fc1` is not a card and must not be guessed
+  at.
+- CANONICAL CBOR (RFC 8949 §4.2.1 core deterministic encoding):
+  definite lengths everywhere, map keys sorted by their ENCODED bytes,
+  integers in their shortest form, no indefinite-length strings, no
+  tags, no duplicate keys, no unknown keys. Key order in the top map is
+  therefore `v`, `psk`, `sig`, `relay`, `expires`, `endpoints`,
+  `device_pub`; in an endpoint `ip`, `port`, `proto`; in a relay `addr`,
+  `mechanism`. An encoder that emits any other byte sequence for the
+  same fields is non-conformant, because the signature is over bytes.
+- SIGNATURE DOMAIN: `sig` is `Ed25519(device_privkey)` over the
+  canonical CBOR encoding of the SAME map with the `sig` key absent
+  (not present-and-zeroed). The card is self-signed: the key that
+  signs is the key the card names, so a card proves possession of
+  `device_pub` and nothing else about who holds it.
+- VERIFY ORDER, in this order, refusing at the first failure, before
+  any packet is sent anywhere:
+  1. parse: strip `fc1`, base64url-decode, CBOR-decode, and re-encode
+     canonically -- a card whose bytes are not already canonical is
+     REFUSED as malformed, never silently re-normalized;
+  2. check `v`: `1` is the only accepted value (see UNKNOWN VERSION);
+  3. check `expires > now`, where `now` is a PARAMETER in UTC seconds
+     supplied by the caller, never read from the clock inside the
+     verifier -- so the check is testable and a skewed host is a
+     caller-visible fact;
+  4. DERIVE the overlay address from `device_pub`
+     (`fdf1:1af7:c30d::/48` prefix ||
+     `SHA256(b"filament/overlay-addr/v1\0" || device_pub)[..10]`, the
+     same function the L3 overlay uses) and REFUSE on mismatch with the
+     record the card claims to be about;
+  5. verify `sig` over the canonical re-encoding from step 1;
+  6. only now may the dial path use the card, subject to DIAL GUARD.
+
+  The order is load-bearing. Signature verification is the expensive
+  step and derivation is free, so a mismatched address costs an attacker
+  nothing to have checked; and a verifier that dials before step 6 has
+  turned an unauthenticated string into a network action.
+- DERIVATION IS THE IDENTITY CHECK, not a convenience. Step 4 is what
+  stops a card from relabelling a known peer: an attacker with a valid
+  self-signed card for their OWN key can always produce a card that
+  verifies, and the only thing that stops it from being accepted as
+  peer B is that it does not derive to B's address. A verifier that
+  skips step 4 because it "already verified the signature" has verified
+  nothing about WHO.
+- TWO CLASSES, distinguished by `psk`:
+  - PUBLIC card -- no `psk`. This is what `addr --card` prints and what
+    DNS publishes. It may be copied, logged, indexed, and handed to
+    anyone; it grants nothing.
+  - PRIVATE card -- `psk` present. It lives only inside an invitation,
+    a pair QR, or a file handed to one named recipient, and it is a
+    secret for exactly as long as its `expires`. It must never be
+    printed to a shared terminal transcript, written to DNS, or logged.
+- PSK IN A PUBLIC CARD IS MALFORMED: a card that arrives over a public
+  channel (a DNS answer, a web page, a broadcast) and carries `psk` is
+  REFUSED, not stripped and not used. Refusing rather than degrading is
+  the point: a psk on a public channel is either a leaked secret or an
+  attacker's, and both deserve the same verdict. NOTE that "public
+  channel" is a property of the retrieval, not of the bytes; the caller
+  supplies it, and a caller that cannot say must pass "public".
+- AUTHENTICATES, AUTHORIZES NOTHING. The card AUTHENTICATES a peer and
+  AUTHORIZES nothing. Capability gates are unchanged: a verified card
+  gets a dial, not a grant, not a shell, not a mount, not a route. It
+  is not a bearer credential, unlike tailcat's token -- possession of a
+  card confers no ability its holder did not already have, which is why
+  a public card can be published at all.
+- HINTS NEVER IDENTITY: `endpoints` and `relay` are HINTS. They say
+  where the key MIGHT answer; they never say who answered. Whoever is
+  found at an endpoint still has to prove possession of `device_pub`
+  through the normal handshake, and a peer that proves it at an
+  endpoint the card did not list is equally acceptable. Corollary: a
+  stale, wrong, or hostile endpoint list costs connect time, never
+  trust.
+- DIAL GUARD, enforced by the dial path on every card:
+  - REFUSE loopback, link-local, and multicast endpoints outright
+    (127.0.0.0/8, ::1, 169.254.0.0/16, fe80::/10, 224.0.0.0/4, ff00::/8,
+    0.0.0.0, ::): a card must never be able to make a host dial itself
+    or its own link-local neighbours.
+  - REFUSE RFC1918 and ULA endpoints (10/8, 172.16/12, 192.168/16,
+    fc00::/7) UNLESS the card came from an already-paired device or the
+    operator passed `--allow-private`. An unpaired card that names
+    private space is asking a host to port-scan its own LAN.
+  - CAP the endpoint list at 4 entries; a card carrying more is
+    malformed, refused at parse, not truncated.
+  - CAP dial attempts at N per card per minute (N is a settings key;
+    see Deliberately unresolved).
+  - LOG the endpoint tried, one line per attempt, so an unexpected dial
+    is visible after the fact without a packet capture.
+- PSK SEMANTICS, stated exactly: the psk adds harvest-now-decrypt-later
+  resistance to the session key exchange for privately exchanged cards;
+  identity remains Ed25519; this is not a post-quantum signature. It
+  mixes into the key schedule, it does not replace or re-anchor the
+  identity check, and an attacker who later breaks Ed25519 still cannot
+  read a session that used a psk they never saw.
+- EXPIRY IS MANDATORY: `expires` is never absent and never zero. A
+  pairing card rides its invitation's expiry and must not outlive it
+  (`min(invitation.expires, card.expires)` when both are present; the
+  card may be shorter, never longer). A card published in DNS carries
+  at most 30 days and is rotated before then. A verifier refuses an
+  expired card, and refuses one whose expiry is implausibly far in the
+  future for its class rather than trusting the number.
+- UNKNOWN VERSION REFUSED: a `v` other than 1 is refused with a clear
+  "newer card, upgrade filament" error. No field-by-field best effort,
+  no ignoring unknown keys: a card the verifier does not fully
+  understand is one it cannot safely dial.
+- SHORT FORM IS A REFERENCE, NEVER A CARRIER. The speakable short form
+  is `version + 64-bit device_pub fingerprint + checksum`, 8 to 10
+  words from filament's pairing wordlists (8 bits per word, so 64 to 80
+  bits of payload). It is a RENDEZVOUS / FINGERPRINT REFERENCE: it
+  names which key to expect, it does not carry the card. The floor is
+  arithmetic, not taste -- `device_pub` (32 B) plus `sig` (64 B) alone
+  is 768 bits before any expiry, endpoint, or CBOR framing, and a
+  minimal one-endpoint card is about 169 B = 1352 bits, roughly 169
+  words at 8 bits each and still about 123 words on a 2048-word list.
+  No word code that a human will read aloud can carry a card, and any
+  proposal to shorten the card until it fits is a proposal to remove
+  the signature or the key. VERIFICATION: after the rendezvous
+  completes and a key is actually met, the met key's fingerprint MUST
+  equal the one in the short form, else REFUSE. The short form is
+  therefore an out-of-band integrity check on a card obtained some
+  other way, exactly like a pairing SAS.
+- DNS PUBLICATION: one TXT record at `_filament.<name>`, whose value is
+  `fc1:<base64url>` (the `fc1:` here is the record's own tag; the
+  card's own prefix form is `fc1` with no colon, and a publisher emits
+  exactly one of the two shapes per channel). ONE record: a name with
+  two `_filament` TXT values is ambiguous and is refused rather than
+  merged or raced. The published card is always PUBLIC class, always
+  `expires <= 30 days`, and rotation is the publisher's job -- an
+  expired record is a refusal, not a fallback.
+- DNS TRUST, honestly: DNSSEC where it is present gives the record an
+  authenticated origin, and that is the only case where the card's
+  endpoints inherit any authority. Without DNSSEC the record is
+  TOFU-pinned: the first card seen for a name pins `device_pub`, and a
+  later record that derives to a different address is refused and
+  surfaced as a conflict, not accepted as a rotation. DNS never
+  confers trust by itself; it is a faster way to learn a key you then
+  verify exactly as you would verify a key from anywhere else.
+- CLI SURFACE (shape, not implementation): `filament addr --card`
+  prints this machine's PUBLIC card; `--private` adds the psk and
+  prints the PRIVATE form with a "do not publish this" banner.
+  `filament addr --parse <card>` is fully OFFLINE: it decodes, runs
+  steps 1 to 5, and prints the field summary the dial path logs
+  (version, derived address, expiry with remaining time, endpoint list
+  with the guard verdict per endpoint, relay, class, signature
+  verdict). It never dials. `filament reach --until-direct` uses a
+  card's hints to keep trying for a direct path instead of settling for
+  the first relayed one.
+
+### Deliberately unresolved
+
+Stated so nobody implements a guess and calls it the contract:
+
+- RELAY MECHANISM ENUM: `relay.mechanism` has no fixed value set. What
+  strings are legal, and what an unknown mechanism does (refuse the
+  card, or ignore the relay hint and keep the endpoints) is undecided.
+- ENDPOINT PROTO ENUM: same for `endpoints[].proto`. Whether `quic`,
+  `udp`, `tcp`, and a future transport are the closed set, and whether
+  an unknown proto is a parse refusal or a skipped hint, is undecided.
+- ENDPOINT `ip` TYPE: text ("192.0.2.1", "2001:db8::1") versus a 4/16
+  byte bstr. The reference codec in `proofs/card_vectors.py` uses text
+  PROVISIONALLY so the vectors exist; this is not yet a decision.
+- NO DOMAIN-SEPARATION PREFIX. Every other signed filament struct tags
+  its signed bytes (`filament-auth-key-v2`, `INV_FORMAT`,
+  `filament/overlay-addr/v1\0`). The card as designed signs bare
+  canonical CBOR, so the same key signing a card and signing some other
+  bare-CBOR structure has overlapping domains. Whether to add a prefix
+  before v1 ships is open.
+- MAXIMUM ENCODED LENGTH: no cap on the base64url body is fixed, so a
+  decoder has no stated input bound. The 4-endpoint cap bounds a WELL
+  FORMED card, not a hostile string.
+- DIAL RATE N: the "N dial attempts per card per minute" bound has no
+  number and no settings key name yet.
+- UNCLAIMED CARDS: step 4 compares against "the record it claims". A
+  bare card read from a file claims nothing, so there is nothing to
+  mismatch. Whether such a card is refused, or accepted as a
+  first-contact TOFU pin, is undecided.
+- ROTATION: expiry is the only revocation mechanism (as with SSH
+  certificates above). There is no revocation list and no rotation
+  signal inside the card, so a compromised device key is reachable
+  until every published card expires.
 
 ## SSH certificates (`filament shell --ssh` via local CA)
 
