@@ -57,7 +57,10 @@ jobs:
       # that shows up in review.
       - name: Test the local crates
         run: |
-          set -e
+          # pipefail so a failing cargo test fails the STEP: without it the
+          # pipeline's status is tee's, which is always 0 -- the same
+          # exit-code-lies shape this job exists to stop.
+          set -euo pipefail
           for c in filament-signal filament-cap filament-id filament-overlay \
                    filament-fleet filament-pair filament-proto filament-transfer \
                    filament-transport authkeys-managed; do
@@ -66,7 +69,7 @@ jobs:
               cargo test --release --manifest-path "crates/$c/Cargo.toml"
               echo "::endgroup::"
             fi
-          done
+          done 2>&1 | tee /tmp/crate-tests.log
         env:
           CMAKE_C_COMPILER_LAUNCHER: sccache
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -79,14 +82,16 @@ jobs:
       # also refuses a name in the loop with no crate behind it, because the
       # loop's `[ -f ... ]` guard skips a stale name SILENTLY. A comment cannot
       # fail; this can.
-      # `always()` because a CANCELLED job never reaches a plain step: the two
-      # runs that hung on the crate tests were cancelled before this ran, so the
-      # check that exists to catch a dishonest crate list printed nothing in
-      # exactly the situation it is for. The checks that matter most are the ones
-      # that must still run when the job is already broken.
       - name: Every crate that carries tests is in the loop
-        if: always()
         run: python3 scripts/check_crate_test_loop.py
+
+      # Presence is not enough: a suite that is collected but EMPTY also exits 0
+      # (a rename, a `#[cfg(test)] mod` that stops compiling in, a filter that
+      # matches nothing). `always()` so a failure in the loop above still gets
+      # the count verdict printed instead of hiding it.
+      - name: Crate test counts have not dropped
+        if: always()
+        run: python3 scripts/check_crate_test_loop.py --verify-log /tmp/crate-tests.log
 
       - name: Show sccache stats
         if: always()
