@@ -5193,6 +5193,20 @@ pub(crate) async fn recv_cmd(
                     .await;
                     continue;
                 }
+                // Directory sync: bounds + transfer gate + serve, all in the
+                // module. Not gated on l2_enabled: it is a transfer, admitted by
+                // the same capability a file-offer from this peer would be.
+                Some("sync-open") => {
+                    let Some(t) = conn.transport_of(&pid) else {
+                        continue;
+                    };
+                    let mux = l2_muxes
+                        .entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    crate::sync_cmd::handle_sync_open(&mut conn, &pid, t, mux, &v, &dir).await;
+                    continue;
+                }
                 Some("ssh-sign-request") if !l2_enabled => {
                     if let (Some(t), Some(sid)) = (conn.transport_of(&pid), v["sid"].as_u64()) {
                         let _ = t

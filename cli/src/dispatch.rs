@@ -413,6 +413,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 | Cmd::Status { .. }
                 | Cmd::Set { .. }
                 | Cmd::Reach { .. }
+                | Cmd::Sync { .. }
                 | Cmd::Doctor { .. }
                 | Cmd::Addr { .. }
                 | Cmd::Devices { action: None, .. }
@@ -1313,6 +1314,31 @@ pub(crate) async fn async_main() -> Result<()> {
             // The remote status becomes our own exit code (backup.rs precedent).
             // Refusals and link failures bail with the reason instead.
             match crate::exec_send::exec_cmd(&server, &peer, relay, opts).await? {
+                0 => Ok(()),
+                code => std::process::exit(code),
+            }
+        }
+        Cmd::Sync {
+            local,
+            dest,
+            delete,
+            dry_run,
+        } => {
+            // `<device>:<remote-dir>`; the remote dir may be empty (the drop root).
+            let Some((peer, remote_dir)) = dest.split_once(':') else {
+                ui::problem(
+                    "sync needs a destination",
+                    "the destination is <device>:<remote-dir>",
+                    &["filament sync ./photos laptop:photos".to_string()],
+                );
+                std::process::exit(2);
+            };
+            let opts = crate::sync_cmd::SyncOpts {
+                delete,
+                dry_run,
+                json: cli.json,
+            };
+            match crate::sync_cmd::run(&server, &local, peer, remote_dir, relay, opts).await {
                 0 => Ok(()),
                 code => std::process::exit(code),
             }
