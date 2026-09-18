@@ -276,18 +276,23 @@ def delegated_ok(ops, o, held, now):
 def trust_filter(ops, held, now):
     """L17: the op set the evaluator may see, given the held author key.
 
-    ACCEPTS ARE EXEMPT, and that exemption is the point of the law rather than a
-    hole in it. L17 governs AUTHORITY: ops that assert what a key may do. An
-    Accept asserts nothing -- L13 defines it as the countersignature of the
-    referenced op's SUBJECT, and it is checked there ("signed by that op's
-    subject"). Filtering Accepts by authorship is how the deployed
-    owner->device shape came out with ZERO allows: the owner grants the device,
-    the DEVICE accepts its own grant, and the owner's trust root then discarded
-    the device's countersignature, so only self-grants could ever allow. The
-    alternative reading -- make the held ceiling be about the SUBJECT -- was
-    rejected because it changes what L17 is about (a held key tolerates
-    AUTHORITIES, not countersignatures) and would let the trust root's ceiling
-    decide whether a peer may accept what it was granted.
+    ONLY WIDENING OPS ARE FILTERED. L17 governs AUTHORITY: it decides which ops
+    may ASSERT that a key can do something. Accepts, Denies, Pauses and Ceilings
+    assert no new authority -- an Accept is the referenced op's countersignature
+    (L13), a Deny and a Pause refuse (L4, L12), and a Ceiling only narrows (L4,
+    L8) -- so none of them needs a ceiling from the held key, and L4/L12 already
+    give each of them force on its author's signature alone.
+
+    Exempting only Accepts was a FAIL-OPEN, and this is the probe that shows it:
+    an owner Grant + a device Accept + the DEVICE's own Deny gave (Deny, denied)
+    with no trust root and (Allow, None) with the owner held; the same held flip
+    turned a device's own narrowing Ceiling from (Deny, above-ceiling) into
+    (Allow, None). Setting a trust root DELETED a denial, which contradicts
+    "Deny is absolute" and "narrowing needs only the author's signature". The
+    filter can therefore only ever REMOVE a widening op, so filtering is
+    monotonically narrowing and can never turn a Deny into an Allow --
+    `L17 filter-never-turns-deny-into-allow` checks exactly that over every cell
+    of the held tier.
     """
     if held is None:
         return tuple(ops)
@@ -297,8 +302,16 @@ def trust_filter(ops, held, now):
         # The blocker, reintroduced on purpose: the tier-non-vacuity check must
         # catch it, because the laws themselves did not.
         return tuple(o for o in ops if delegated_ok(ops, o, held, now))
+    if MUTATION == "trust-filter-drops-narrowing":
+        # The fail-open, reintroduced: only Accepts are exempt, so a Deny (or a
+        # narrowing Ceiling) by another author is deleted and a denial becomes an
+        # allow. The monotonicity check must refuse this.
+        return tuple(o for o in ops
+                     if o[KIND] == "accept"
+                     or delegated_ok(ops, o, held, now))
+    NARROWING = ("accept", "deny", "pause", "ceiling")
     return tuple(o for o in ops
-                 if o[KIND] == "accept"
+                 if o[KIND] in NARROWING
                  or ((MUTATION != "held-key-drops-own-policy" or o[AUTHOR] != held)
                      and delegated_ok(ops, o, held, now)))
 
@@ -732,7 +745,9 @@ REQUIRED_NONEMPTY = ("L12 pause-distinct", "L13 accept-well-formed",
                      "L17 deployed-shape-allows",
                      "L17 deployed-shape-survives-no-root",
                      "L17 untrusted-author-is-not-effective",
-                     "L14 self-grant-cannot-back-a-pass")
+                     "L14 self-grant-cannot-back-a-pass",
+                     "L17 filter-never-turns-deny-into-allow",
+                     "L1 pass-under-a-trust-root-is-exercised")
 
 
 # ------------------------------------------------- per-tier non-vacuity
@@ -1474,19 +1489,79 @@ def tier_held(tally, keys, subjects, patterns, intervals, kinds, clock, requests
                         tally.check(
                             "L17 own-policy-is-trust-root",
                             set(mine) <= set(trust_filter(ops, held, now)))
-                        # A delegated op survives only inside a ceiling its
-                        # author was granted BY the held key.
-                        # Accepts are exempt from the trust filter by design
-                        # (L13 governs them), so the invariant is about the
-                        # AUTHORITY-bearing ops: every non-Accept op by another
-                        # author survives only inside a ceiling the held key
-                        # granted it.
+                        # FILTERING MAY ONLY REMOVE AUTHORITY, NEVER CREATE IT.
+                        # Every non-exempt op is a WIDENING op, so dropping one
+                        # can only turn an Allow into a Deny -- never the other
+                        # way. This is the check that catches a trust root which
+                        # deletes a Deny (or a Pause or a narrowing Ceiling) and
+                        # thereby flips a denial into an allow: the fail-open that
+                        # shipped when only Accepts were exempt.
+                        tally.check(
+                            "L17 filter-never-turns-deny-into-allow",
+                            not (base[0] == DENY and got[0] == ALLOW))
+                        if any(o[KIND] == "pass"
+                               for o in trust_filter(ops, held, now)):
+                            global PASS_UNDER_ROOT
+                            PASS_UNDER_ROOT += 1
+                        # A delegated WIDENING op survives only inside a ceiling
+                        # its author was granted BY the held key. Only widening
+                        # ops are filtered (L13/L4/L12 give the others force on
+                        # their author's signature alone), so the invariant is
+                        # about them.
                         tally.check(
                             "L17 delegated-ops-need-ceiling",
-                            all(o[KIND] == "accept"
+                            all(o[KIND] in ("accept", "deny", "pause", "ceiling")
                                 or delegated_ok(ops, o, held, now)
                                 or o not in trust_filter(ops, held, now)
                                 for o in rest))
+    # THE FAIL-OPEN SHAPES ARE PROBED EXPLICITLY rather than hoped for from the
+    # enumeration: each needs at least THREE ops, and an N=2 log cannot hold a
+    # Grant, its Accept AND a narrowing op by another author at once. That is why
+    # this defect survived 2.7M cells and had to be found by audit. Each case
+    # below asserts the SAME verdict with and without a trust root -- the
+    # reversal the review asked for.
+    for held_key in KEYS:
+        for other in KEYS:
+            if held_key == other:
+                continue
+            g_held = mk(0, held_key, other, SHELL, 1, 3, "grant")
+            g_peer = mk(0, other, other, SHELL, 1, 3, "grant")
+            a = mk(1, other, other, ACC, 1, 3, "accept", ref=0)
+            # The held key's OWN ceiling, which lets the peer's widening op
+            # survive the filter -- only then can dropping the PAUSE below change
+            # the verdict, which is the shape a pause fail-open needs.
+            held_ceiling = mk(2, held_key, other, SHELL, 1, 3, "ceiling")
+            cases = (
+                # (label, ops, expected verdict for both trust-root settings)
+                ("deny", (g_held, a, mk(3, other, other, SHELL, 1, 3, "deny")),
+                 (DENY, R_DENIED)),
+                ("ceiling", (g_held, a, mk(3, other, other, FWD_ONE, 1, 3,
+                                           "ceiling")),
+                 (DENY, R_CEILING)),
+                ("pause", (g_peer, a, held_ceiling,
+                           mk(3, other, other, SHELL, 1, 3, "pause")),
+                 (DENY, R_PAUSED)),
+            )
+            for label, ops, want in cases:
+                for now in clock:
+                    # INSIDE the ops' window only: outside it nothing applies and
+                    # the verdict is `no-grant`, which would fail this check for
+                    # the wrong reason (the first version of the probe did exactly
+                    # that at now=0, outside [1,3)).
+                    if not (ops[0][NB] <= now < ops[0][NA]):
+                        continue
+                    CELL = ("fail-open probe", other, now, label)
+                    facts = {"now": now, "subject": other, "ops": ops,
+                             "binding": "Proven", "cert": None,
+                             "held_author_key": held_key,
+                             "display_name": "laptop"}
+                    got = decide(facts, ("shell", "dev:a"))
+                    no_root = decide({**facts, "held_author_key": None},
+                                     ("shell", "dev:a"))
+                    tally.check("L17 filter-never-turns-deny-into-allow",
+                                no_root[:2] == want and got[:2] == want)
+                    note_shape("L17 held author key", got[0], got[1], held_key,
+                               other)
     print(f"  {'L17 held author key':<28} logs={logs:<8d} pool={len(tpool):<4d}")
 
 
@@ -1592,6 +1667,10 @@ RELEVANT = {"cert": 0, "binding": 0, "held_author_key": 0}
 
 
 DEPLOYED_ALLOWS = 0
+# Item 3 of the review: a Pass must be exercised UNDER a trust root. The held
+# tier used to exclude `pass`, so the interaction of a trust root with a pass --
+# the one widening op that is itself an attenuation -- had no coverage at all.
+PASS_UNDER_ROOT = 0
 
 
 def tier_deployed(tally, keys, subjects, patterns, intervals, kinds, clock,
@@ -1685,6 +1764,10 @@ def tier_relevance(tally, keys, subjects, patterns, intervals, kinds, clock,
     for field, count in sorted(RELEVANT.items()):
         CELL = ("relevance", field)
         tally.check(f"L1 fact-{field}-is-load-bearing", count > 0)
+    # Item 3: `pass` under a trust root must actually occur, or L17's only
+    # attenuating widening op is covered by nothing.
+    CELL = ("non-vacuity", "pass-under-root")
+    tally.check("L1 pass-under-a-trust-root-is-exercised", PASS_UNDER_ROOT > 0)
     print(f"  {'L1/L2 facts relevance':<28} logs={logs:<8d} "
           f"load-bearing={ {k: v for k, v in sorted(RELEVANT.items())} }")
 
@@ -1730,8 +1813,8 @@ FULL = {
                     kinds=("grant", "pass"), clock=tuple(range(5)),
                     requests=REQUESTS[:2]),
     "held":    dict(patterns=PATTERNS[:2], intervals=((1, 3),),
-                    kinds=("grant", "ceiling", "deny"), clock=tuple(range(4)),
-                    requests=REQUESTS[:1]),
+                    kinds=("grant", "ceiling", "deny", "pass"),
+                    clock=tuple(range(4)), requests=REQUESTS[:1]),
     "compact": dict(patterns=PATTERNS[:2], intervals=((1, 3), (2, 4)),
                     kinds=("grant", "deny", "ceiling"), clock=tuple(range(5)),
                     requests=REQUESTS[:1]),
@@ -1773,9 +1856,12 @@ QUICK = {
     "binding": dict(patterns=PATTERNS[:1], intervals=((1, 3),),
                     kinds=("grant",), clock=tuple(range(3)),
                     requests=REQUESTS[:1]),
+    # `deny` is here deliberately: the fail-open this tier now guards against
+    # needs a Deny by another author to manifest, so a plan without one cannot
+    # prove the check bites (the audit-found mutation escaped exactly that way).
     "held":    dict(patterns=PATTERNS[:1], intervals=((1, 3),),
-                    kinds=("grant", "ceiling"), clock=tuple(range(3)),
-                    requests=REQUESTS[:1]),
+                    kinds=("grant", "ceiling", "pass", "deny"),
+                    clock=tuple(range(3)), requests=REQUESTS[:1]),
     "compact": dict(patterns=PATTERNS[:1], intervals=((1, 3),),
                     kinds=("grant", "deny"), clock=tuple(range(4)),
                     requests=REQUESTS[:1]),
@@ -1867,6 +1953,10 @@ MUTATIONS = (
     # subject's own Accept. The LAWS did not catch it, so the non-vacuity gate
     # must -- that is the whole point of adding it.
     ("trust-filter-drops-accepts", "L17 deployed-shape-allows"),
+    # The fail-open the review found: exempting only Accepts so a Deny (or a
+    # narrowing Ceiling) by another author is deleted and a denial flips to an
+    # allow. The monotonicity check must refuse it.
+    ("trust-filter-drops-narrowing", "L17 filter-never-turns-deny-into-allow"),
     ("self-certifying-pass", "L14 self-grant-cannot-back-a-pass"),
     ("held-key-drops-own-policy", "L17 own-policy-is-trust-root"),
     ("compaction-drops-live", "L18 compaction-preserves-verdict"),

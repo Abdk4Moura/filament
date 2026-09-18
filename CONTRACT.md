@@ -718,11 +718,17 @@ denial reason, so a caller can tell "no proof yet" from "refused".
 
 **L17 -- The held author key is the trust root.** Ops authored by
 `Facts.held_author_key` ARE the subject's own policy and decide on their own.
-Ops by any OTHER author are effective only within a ceiling that the held key
-granted them: a delegated op can never exceed the local policy that admitted
-its author, and no chain of foreign authors can walk the boundary outward.
-The model keys this as `own-policy-is-trust-root` and
-`delegated-ops-need-ceiling`.
+WIDENING ops by any other author (a `Grant` or a `Pass`) are effective only
+within a ceiling that the held key granted them: a delegated op can never
+exceed the local policy that admitted its author, and no chain of foreign
+authors can walk the boundary outward. `Accept`, `Deny`, `Pause` and a
+narrowing `Ceiling` are exempt from that filtering: L13 defines an `Accept` as
+the countersignature of the referenced op's subject, a `Deny` and a `Pause`
+refuse (L4, L12) and a `Ceiling` only narrows (L4, L8), so none of them asserts
+new authority and each takes effect on its author's signature alone. Filtering
+is therefore never allowed to turn a `Deny` into an `Allow`. The model keys
+this as `own-policy-is-trust-root`, `delegated-ops-need-ceiling` and
+`filter-never-turns-deny-into-allow`.
 
 **L18 -- Compaction preserves verdicts.** Compaction may drop ops that cannot
 affect any verdict, and nothing else: for every request and instant, `decide`
@@ -747,7 +753,7 @@ and nothing persists a tier field) and the ledger must not regress it.
 
 ### Deliberately unresolved
 
-Two points are recorded here rather than resolved, because resolving them
+Three points are recorded here rather than resolved, because resolving them
 silently would be worse than naming them:
 
 - `Pass`'s device budget is NAMED but not pinned. L14 fixes the shape
@@ -762,9 +768,9 @@ silently would be worse than naming them:
   combining into an allow. L10 above states the restriction WITH its single
   exception named, and the model enforces the enumeration rather than the
   prose.
-- `Facts.binding` for a foreign author is not pinned: L16 says a foreign op is
-  effective only inside a ceiling the held key granted it, and that every allow
-  needs binding >= `min_binding`, but whether a FOREIGN grant may carry
+- `Facts.binding` for a foreign author is not pinned: L17 says a foreign op is
+  effective only inside a ceiling the held key granted it, and L16 says every
+  allow needs binding >= `min_binding`, but whether a FOREIGN grant may carry
   `Inferred` (a pair secret the subject's own key never proved) is left to the
   migration, because today's fleet links reach `Proven` only on direct-link
   adoption and a hard `Proven`-only rule for foreign ops would be a behaviour
