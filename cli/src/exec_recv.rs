@@ -148,8 +148,7 @@ fn pathext_candidates(program: &str, exts: &str) -> Vec<String> {
 /// shell lookup, so argv exactness is unaffected.
 #[cfg(windows)]
 fn resolve_bare_in(dir: &std::path::Path, program: &str) -> Option<PathBuf> {
-    let exts =
-        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     for name in pathext_candidates(program, &exts) {
         let candidate = dir.join(&name);
         if is_executable(&candidate) {
@@ -254,7 +253,12 @@ pub(crate) async fn authorize_exec(
     pid: &str,
     shell_policy: &crate::ShellPolicy,
 ) -> Result<String, String> {
-    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(conn, pid, shell_policy);
+    let (dev, inputs) = crate::shell_gate::gather_shell_gate_inputs(
+        conn,
+        pid,
+        shell_policy,
+        crate::capability::CAP_SHELL,
+    );
     crate::shell_gate::exec_gate_decision(&inputs)
         .map(|()| dev.unwrap_or_else(|| pid.to_string()))
         .map_err(|r| r.unwrap_or_else(|| "shell capability not granted".to_string()))
@@ -274,6 +278,10 @@ pub(crate) struct ExecSessionAuthz {
     pub(crate) dev_name: Option<String>,
     pub(crate) idev: Option<[u8; 32]>,
     pub(crate) policy_allows: bool,
+    /// True when this session was admitted via its enrolment ceiling rather
+    /// than an explicit grant: a narrowed ceiling must end it on the next
+    /// tick, exactly like a revocation.
+    pub(crate) admitted_via_ceiling: bool,
 }
 
 pub(crate) async fn serve_exec(
@@ -487,7 +495,18 @@ pub(crate) async fn serve_exec(
                     }
                     None => false,
                 };
-                if cert_gone || grant_gone {
+                // A ceiling narrowed under a ceiling-admitted session ends
+                // it (re-read fresh; grant-admitted sessions ignore this).
+                let ceiling_gone = authz.admitted_via_ceiling
+                    && !crate::identity_state::ceiling_covers_action(
+                        authz.idev.as_ref(),
+                        crate::capability::CAP_SHELL,
+                    );
+                // A lapsed deadline (cert expiry, absolute stop, offline
+                // budget) ends it too; unresolvable identity is no opinion.
+                let lapsed =
+                    matches!(crate::identity_state::peer_liveness_alive(authz.idev.as_ref()), Some(false));
+                if cert_gone || grant_gone || ceiling_gone || lapsed {
                     crate::ui::critical("exec: peer access revoked, closing live session");
                     let _ = child.kill().await;
                     let _ = t
@@ -517,6 +536,7 @@ pub(crate) async fn handle_exec_open(
     mux: Arc<l2::Mux>,
     v: &Value,
     shell_policy: &crate::ShellPolicy,
+    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     let Some(req) = parse_exec_open(v) else {
         return;
@@ -528,6 +548,23 @@ pub(crate) async fn handle_exec_open(
         return;
     }
     if let Err(reason) = authorize_exec(conn, pid, shell_policy).await {
+        // Settle-then-evaluate: the verdict above may rest on stale
+        // (unproven) identity. Park for re-drive on proof when the deny
+        // is attributable to it; otherwise the live verdict stands.
+        if crate::recv_cmd::park_on_deny(
+            parked,
+            conn,
+            pid,
+            crate::recv_cmd::ParkKind::Exec,
+            &t,
+            sid,
+            v,
+            &reason,
+        )
+        .await
+        {
+            return;
+        }
         crate::ui::say(&format!("l2: exec refused: {reason}"));
         // Enqueue under the verified petname (like pty-open's `who`), never
         // the raw pid: the queue is keyed by name, and "<unverified>" is a
@@ -575,10 +612,21 @@ pub(crate) async fn handle_exec_open(
         let (idev, _, _, _, _, _) = az.parts();
         idev.copied()
     };
+    let covered =
+        crate::identity_state::ceiling_covers_action(idev.as_ref(), crate::capability::CAP_SHELL);
+    let (_, has_grant_now) = crate::capability::cap_fleet_inputs(
+        &crate::settings::config_dir(),
+        "self",
+        crate::capability::CAP_SHELL,
+        idev.as_ref(),
+        None,
+        None,
+    );
     let authz = ExecSessionAuthz {
         dev_name,
         idev,
         policy_allows,
+        admitted_via_ceiling: covered && !has_grant_now,
     };
     tokio::spawn(serve_exec(t, mux, sid, req, stdin_rx, authz));
 }

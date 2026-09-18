@@ -16,9 +16,10 @@
 //! EOF goes out as one empty frame and then we stop reading stdin but keep
 //! draining both outputs until the close arrives.
 
+use crate::identity_lifecycle::respond_to_identity_challenge;
 use crate::l2;
-use anyhow::{Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Result};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -96,7 +97,51 @@ pub(crate) fn parse_env_pair(s: &str) -> Result<(String, String)> {
 /// Run a command on a peer and return its remote exit status. Local failures
 /// (connect, open, link death) are Err with a human message; a clean remote
 /// close -- including a remote NONZERO exit -- is Ok(status).
+/// A refusal that names itself as retryable is ACTED ON: the settle path
+/// hands us "identity not proven within N ms; retry" (or "identity
+/// settling, retry") after dropping the link that failed to prove, so a
+/// second attempt establishes a fresh link instead of parking on the same
+/// corpse. A retry hint nobody consumes is just a slower failure.
+fn settle_retryable(err: &anyhow::Error) -> bool {
+    let m = err.to_string();
+    m.contains("retry") && (m.contains("identity not proven") || m.contains("identity settling"))
+}
+
 pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOpts) -> Result<i32> {
+    // Bounded by BOTH count and wall clock. Measured: the window in which a
+    // challenge is unanswered is the peer's own reconnect churn (a daemon
+    // restart on either side), which lasts seconds to tens of seconds; three
+    // attempts at 300ms land inside it every time. A retry budget the daemon
+    // itself asked for ("identity not proven within N ms; retry") is bounded
+    // and honest; the count cap keeps a permanently unprovable peer from
+    // spinning forever.
+    const ATTEMPTS: u32 = 12;
+    let started = std::time::Instant::now();
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match exec_once(server, peer, relay, &opts).await {
+            Ok(code) => return Ok(code),
+            Err(e)
+                if attempt < ATTEMPTS
+                    && started.elapsed() < std::time::Duration::from_secs(20)
+                    && settle_retryable(&e) =>
+            {
+                if attempt <= 2 {
+                    crate::ui::say(&format!(
+                        "filament: {e} -- re-establishing the link (attempt {attempt})"
+                    ));
+                } else {
+                    crate::ui::debug(&format!("filament: {e} -- retry {attempt}"));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Result<i32> {
     let (t, mut rx, guard, _diag) = match tokio::time::timeout(
         std::time::Duration::from_secs(45),
         l2::bring_up_to_known(server, peer, relay, "exec"),
@@ -131,18 +176,17 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             "type": "exec-open",
             "sid": sid,
             "err_sid": err_sid,
-            "argv": opts.argv,
+            "argv": opts.argv.clone(),
         });
         if let Some(cwd) = &opts.cwd {
             f["cwd"] = json!(cwd.to_string_lossy());
         }
         if !opts.env.is_empty() {
-            f["env"] = json!(
-                opts.env
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-            );
+            f["env"] = json!(opts
+                .env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>());
         }
         if opts.tty {
             f["tty"] = json!(true);
@@ -163,6 +207,17 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             };
             match ev {
                 crate::net::Ev::Control(_pid, v) => {
+                    // #309: a covered-without-grant open needs a PROVEN link, and
+                    // the owner challenges the pid carrying the open -- this one.
+                    // Without an answer here the link can never become Proven,
+                    // the open parks and expires, and every retry mints a fresh
+                    // equally silent link. Same shared helper send_cmd uses, so
+                    // there is one possession-signing path, not two; its doc
+                    // comment states which key is which, and why the path can
+                    // only ever sign as itself.
+                    if v.get("type").and_then(|t| t.as_str()) == Some("identity-nonce-challenge") {
+                        respond_to_identity_challenge(&t, &v).await;
+                    }
                     if v.get("type").and_then(|t| t.as_str()) == Some("exec-open-ack")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
@@ -171,10 +226,7 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
                     if v.get("type").and_then(|t| t.as_str()) == Some("l2-close")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
-                        let reason = v
-                            .get("err")
-                            .and_then(|e| e.as_str())
-                            .unwrap_or("closed");
+                        let reason = v.get("err").and_then(|e| e.as_str()).unwrap_or("closed");
                         break Err(format!("'{peer}' refused exec: {reason}"));
                     }
                 }
@@ -258,6 +310,15 @@ pub(crate) async fn exec_cmd(server: &str, peer: &str, relay: bool, opts: ExecOp
             },
             ev = rx.recv() => match ev {
                 Some(crate::net::Ev::Control(_pid, v)) => {
+                    // #309: the owner re-challenges while an open is parked (and
+                    // after any re-adopt), so the same answer is owed here, in
+                    // the long-lived pump, not only during the ack wait. Same
+                    // shared helper: one possession-signing path, not two.
+                    if v.get("type").and_then(|t| t.as_str())
+                        == Some("identity-nonce-challenge")
+                    {
+                        respond_to_identity_challenge(&t, &v).await;
+                    }
                     if v.get("type").and_then(|t| t.as_str()) == Some("exec-close")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {

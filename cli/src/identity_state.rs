@@ -237,6 +237,19 @@ pub(crate) fn revoke_recheck_interval() -> std::time::Duration {
     std::time::Duration::from_millis(ms.clamp(250, 300_000))
 }
 
+/// How long a shell-class open waits for identity proof before denying it
+/// outright. Setting `gate.settle_ms` (default 2000, hard max 5000); 0 and
+/// garbage mean "default", never "wait forever" -- an unbounded hold would
+/// be a parked-open DoS surface, which the per-link/per-daemon count bounds
+/// below then could not mitigate.
+pub(crate) fn gate_settle_ms() -> u64 {
+    crate::settings::get_str("gate.settle_ms", None)
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2_000)
+        .clamp(250, 5_000)
+}
+
 /// Mark a stored device certificate revoked locally. The check path must
 /// consult this marker before granting fleet trust; expiry remains separate.
 pub(crate) fn set_device_cert_revoked(name: &str, revoked: bool) -> Result<()> {
@@ -325,6 +338,63 @@ pub(crate) fn principal_ceiling_for(name: &str) -> Option<Vec<String>> {
             })
             .unwrap_or_default(),
     )
+}
+
+/// Gate input: does the peer's persisted, owner-signed enrolment ceiling
+/// cover `action`? Keyed by the peer's VERIFIED device identity, never by
+/// display name (a name is a label; the key is what the certificate proved).
+/// None identity, unknown device, non-delegated record, or missing ceiling
+/// all mean "not covered" -- fail closed. Read fresh at every call:
+/// ceiling narrowing (re-enrolment, certify --scope) must take effect on
+/// the next gate evaluation, never at link-open time.
+pub(crate) fn ceiling_covers_action(idev: Option<&[u8; 32]>, action: &str) -> bool {
+    let hex = idev.map(hex::encode).unwrap_or_default();
+    let covered = std::fs::read_to_string(devices_path())
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|arr| {
+            arr.as_array()?
+                .iter()
+                .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))
+                .cloned()
+        })
+        .filter(|record| record["principalKind"].as_str() == Some("delegated"))
+        .and_then(|record| record["principalCeiling"].as_array().cloned())
+        // Case-insensitive, matching the auth-key ceiling check in
+        // cap_gate_effective: two spellings of one capability must agree.
+        .map(|items| {
+            let want = action.to_lowercase();
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .any(|item| item.to_lowercase() == want)
+        })
+        .unwrap_or(false);
+    idev.is_some() && covered
+}
+
+/// Liveness re-check for live sessions: recompose the delegated deadline
+/// (cert expiry, absolute stop, offline budget) for the peer's STORED cert
+/// and report whether it is still ahead. None means unresolvable (no
+/// identity, no record, unparsable cert) -- no opinion, never a kill;
+/// revocation has its own check. Some(false) ends the session.
+pub(crate) fn peer_liveness_alive(idev: Option<&[u8; 32]>) -> Option<bool> {
+    let idev = idev?;
+    let hex = hex::encode(idev);
+    let raw = std::fs::read_to_string(devices_path()).ok()?;
+    let arr: Vec<Value> = serde_json::from_str(&raw).ok()?;
+    let record = arr
+        .iter()
+        .find(|d| d["deviceCert"]["devicePub"].as_str() == Some(hex.as_str()))?;
+    let cert = identity::DeviceCert::from_json(&record["deviceCert"])?;
+    let now = crate::identity::now_secs();
+    if cert.verify(now).is_err() {
+        return Some(false);
+    }
+    let (_, not_after, max_offline, last_seen) = persisted_principal_for_cert(&cert);
+    let (deadline, _) =
+        effective_principal_deadline(cert.expires, not_after, last_seen, max_offline);
+    Some(deadline > now)
 }
 
 pub(crate) fn capability_list_summary(caps: &[String]) -> String {
