@@ -21,6 +21,14 @@
 # This is not a tool lying about a number; it is a tool silently substituting a different
 # artifact than the one that was modified.
 #
+#    AND THE PUSH MUST LAND BEFORE THE FETCH, because `git fetch` plus a worktree from the
+#    remote ref is a PROXY for "the tree under test", and proxies lag. A bite that fetched a
+#    base which did not yet contain the change it meant to revert refused with "the bite is
+#    not in it", which is the guard working: a bound-less script would have reverted nothing,
+#    run green, and reported a bite against a tree that never had the fix. Verify the base
+#    carries the change before reverting it, and let the guard fire rather than assuming the
+#    push landed.
+#
 # 2. AN ARM ADDED FOR A CAPABILITY CARRIES BOTH HALVES IN ONE RUN, because a gate that
 # refuses everything is indistinguishable from one that refuses the right thing. Weaken the
 # guard and the refusal half must go RED while the positive half stays GREEN. If both
