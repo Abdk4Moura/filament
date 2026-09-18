@@ -40,6 +40,15 @@ on:
   pull_request:
     paths:
       - 'cli/src/**'
+      # The gates exercise the transport and the crates behind it, so a change there has to
+      # run them. Without `crates/**` the suite did not run when #323 changed
+      # crates/filament-transport, and it next ran hours later on a docs-only merge: the
+      # regression was then attributed to the wrong commit, and the roster hang below is
+      # what that cost. The manifests are here for the same reason: a dependency bump can
+      # break a gate that no source file in this list ever mentions.
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - 'cli/tests/lib/fixture.sh'
       - 'cli/tests/cap-verbs-gates.sh'
       - 'cli/tests/devices-write-race-gates.sh'
