@@ -8,6 +8,20 @@
 # caller, because pty-open / mount-open / l2-open are all gated on `l2_enabled`
 # and a plain `up` leaves it off with a failure that is silent on both sides.
 
+# --- Preconditions and refusal ---
+# A HARNESS THAT CANNOT DISTINGUISH "the code is broken" from "the box cannot
+# hold the build" MUST REFUSE TO REPORT, with an exit code distinct from both
+# pass and fail. Assert your preconditions (free space, a warm toolchain, a free
+# port, a writable temp dir) BEFORE measuring, and when one is unmet print a
+# single line naming it instead of a result -- a result produced under a broken
+# precondition is indistinguishable from a defect and will be read as one.
+# There is no exit code that means "probably fine".
+#
+# Reference implementation: `scripts/flake-check.sh` (exit 0 = clean, 1 = a real
+# failure, 3 = refused). A full disk once made a test target report 20/20
+# failures that looked like product defects, with the only tell a single
+# `No space left on device` line nothing was watching for.
+
 # --- assertion bookkeeping ---
 PASS=0; FAIL=0; FAILED=""
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
