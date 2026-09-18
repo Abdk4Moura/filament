@@ -28,6 +28,12 @@ Phase 1 does not repair those verdicts; it keeps the Phase 2 work visible.
 
 ## Retired artifacts
 
+- `cli/tests/livelock-nat-gates.sh`: removed because the netns/coturn
+  transport lab it needs was never committed and does not exist, so the
+  script exits 2 rather than running. Its deterministic content is the
+  cargo unit test `link_dead_and_live_predicates_encode_246_without_suppressing_disconnected_recovery`,
+  and its end-to-end half only reddens under box load, which its own
+  header disclaims as a verdict. Issue #246 is closed.
 - `cli/tests/holepunch-gates.sh`: removed because its external transport lab
   was never committed and no longer exists. The finding was established in
   PR #94.

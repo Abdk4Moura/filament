@@ -10,17 +10,25 @@
     },
     {
       "path": "cli/tests/cap-verbs-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "chief-ux",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/cap-verbs-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/devices-write-race-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "chief-ux",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/devices-write-race-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/exec-gates.sh",
@@ -209,17 +217,16 @@
     },
     {
       "path": "cli/tests/livelock-nat-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/246",
-      "owner": "new-age-agent",
-      "expires": "2026-09-17"
+      "disposition": "retired",
+      "reason": "Its netns/coturn transport lab was never committed and does not exist (the script exits 2 without it), so it cannot run here or in CI. Its deterministic content lives in the cargo unit test link_dead_and_live_predicates_encode_246_without_suppressing_disconnected_recovery (cli/src/tests.rs), and its own header disclaims its end-to-end half as a verdict: it only reddens under box load. Issue #246 is closed.",
+      "reference": "https://github.com/Abdk4Moura/filament/issues/246"
     },
     {
       "path": "cli/tests/mount-gates.sh",
       "disposition": "diagnostic",
       "issue": "https://github.com/Abdk4Moura/filament/issues/249",
       "owner": "chief-ux",
-      "expires": "2026-09-17"
+      "expires": "2026-10-18"
     },
     {
       "path": "cli/tests/mount-revoke-gates.sh",
@@ -275,17 +282,25 @@
     },
     {
       "path": "cli/tests/roster-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "new-deep-wisdom",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/roster-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/shell-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "chief-ux",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/shell-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "cli/tests/shell-posture-gates.sh",
@@ -339,10 +354,14 @@
     },
     {
       "path": "cli/tests/whoami-candidate-gates.sh",
-      "disposition": "diagnostic",
-      "issue": "https://github.com/Abdk4Moura/filament/issues/249",
-      "owner": "new-age-agent",
-      "expires": "2026-09-17"
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/whoami-candidate-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
     },
     {
       "path": "deploy/assert-oom-shield.sh",

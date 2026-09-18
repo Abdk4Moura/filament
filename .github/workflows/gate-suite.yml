@@ -1,0 +1,146 @@
+# The remaining local-fixture gates: nothing in .github/workflows ran these,
+# which is the hole #249 names ("No workflow runs any cli/tests/*-gates.sh").
+#
+# WHY THEY ARE WIRED HERE RATHER THAN MARKED DIAGNOSTIC. Every script below was
+# measured green against the exact commit that wires it, and each one asserts a
+# user-visible property rather than describing one:
+#   cap-verbs-gates.sh         a delegated device's authority is its enrolment
+#                              ceiling, so grant/revoke cannot bind for it
+#   devices-write-race-gates.sh a revoke that reports success must persist
+#                              (the sidecar-lock race, #238)
+#   roster-gates.sh            a spoke can SEE the mesh from the owner-signed
+#                              roster, and roster presence never authorises
+#   shell-gates.sh             a shell refusal reaches the initiator as a
+#                              nonzero exit WITH a reason (#219/#223)
+#   whoami-candidate-gates.sh  an unchecked /api/whoami answer must not become
+#                              an advertised candidate (#237), observed on the
+#                              wire with tcpdump rather than from a log line
+#
+# mount-gates.sh is deliberately NOT here. Measured on main 2e8820d it is
+# 6 PASS / 2 FAIL -- every mutation through the mount (create/write, mkdir,
+# rename, unlink) returns EIO while reads are byte-exact and teardown is clean,
+# so it is not a privilege or read-only artifact. A gate that is red cannot be
+# required, and retiring it would delete coverage of a live feature, so its
+# registry entry stays a diagnostic.
+#
+# Counting PASS lines, not trusting an exit code: `bad` only increments a
+# counter in these scripts, so a script that dies early or skips a branch can
+# still exit zero. The EXPECT map is what makes green mean "the gates ran AND
+# passed" (#249's second half). Every EXPECT was measured against the commit
+# that wires it, not copied from a header comment.
+#
+# Linux only, deliberately: the mount arm needs FUSE, and the whoami arm needs
+# a raw-socket capture, so the point is to run them somewhere real.
+
+name: Gate Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'cli/src/**'
+      - 'cli/tests/lib/fixture.sh'
+      - 'cli/tests/cap-verbs-gates.sh'
+      - 'cli/tests/devices-write-race-gates.sh'
+      - 'cli/tests/roster-gates.sh'
+      - 'cli/tests/shell-gates.sh'
+      - 'cli/tests/whoami-candidate-gates.sh'
+      - 'backend/**'
+      - '.github/workflows/gate-suite.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: gate-suite-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gate-suite:
+    name: gate suite (ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: pip install flask==3.1.0 flask-socketio==5.5.1 flask-cors==5.0.1 eventlet==0.39.0
+
+      # The mount arm mounts a real FUSE filesystem and unmounts it in its trap.
+      - name: Install FUSE
+        run: sudo apt-get update && sudo apt-get install -y fuse3
+
+      # The whoami arm proves its claim ON THE WIRE, so it needs a capture.
+      # ubuntu-latest ships tcpdump; the capabilities are set explicitly rather
+      # than assumed, because the script exits 2 when it cannot capture.
+      - name: Allow the wire capture
+        run: |
+          command -v tcpdump || sudo apt-get install -y tcpdump
+          sudo setcap cap_net_raw,cap_net_admin+eip "$(command -v tcpdump)"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('cli/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Build filament
+        working-directory: cli
+        run: cargo build --release
+
+      - name: Run gates
+        env:
+          FILAMENT_BIN: ${{ github.workspace }}/cli/target/release/filament
+        run: |
+          set -uo pipefail
+          declare -A EXPECT=(
+            [cli/tests/cap-verbs-gates.sh]=3
+            [cli/tests/devices-write-race-gates.sh]=2
+            [cli/tests/roster-gates.sh]=8
+            [cli/tests/shell-gates.sh]=6
+            [cli/tests/whoami-candidate-gates.sh]=8
+          )
+          rc=0
+          for g in cli/tests/cap-verbs-gates.sh \
+                   cli/tests/devices-write-race-gates.sh \
+                   cli/tests/roster-gates.sh \
+                   cli/tests/shell-gates.sh \
+                   cli/tests/whoami-candidate-gates.sh; do
+            echo "::group::$g"
+            [ -x "$g" ] || { echo "MISSING or not executable: $g"; rc=1; echo "::endgroup::"; continue; }
+            # The runner invokes this step with `bash -e`, so a bare
+            # `out=$(...); code=$?` is a trap: a FAILING gate makes the
+            # assignment itself fail and errexit kills the step before the
+            # output is printed. `|| code=$?` keeps the status without errexit.
+            code=0
+            out="$(bash "$g" 2>&1)" || code=$?
+            echo "$out"
+            echo "::endgroup::"
+            got=$(printf '%s\n' "$out" | grep -c '^PASS:' || true)
+            want=${EXPECT[$g]}
+            if [ "$code" -ne 0 ]; then
+              echo "::error::$g exited $code"; rc=1
+            elif [ "$got" -ne "$want" ]; then
+              echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1
+            else
+              echo "$g: $got/$want gates passed"
+            fi
+          done
+          exit $rc
