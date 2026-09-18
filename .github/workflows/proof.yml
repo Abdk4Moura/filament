@@ -38,6 +38,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install the card codec's signing backend
+        run: python3 -m pip install --quiet "cryptography>=42"
       - name: Model-check establishment protocol (N=2, N=3; GoodNet + Degraded)
         run: python3 proofs/establishment_model.py
       - name: Model-check transport lifecycle (corpse / ack-loss / role; GoodNet + Degraded)
@@ -52,3 +54,5 @@ jobs:
         run: python3 proofs/capability_ledger_model.py
       - name: Capability-ledger model catches a broken law (mutation self-test)
         run: python3 proofs/capability_ledger_model.py --self-test
+      - name: Bootstrap card (fc1) reference codec and vectors
+        run: python3 proofs/card_vectors.py --check
