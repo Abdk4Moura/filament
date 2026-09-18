@@ -452,7 +452,6 @@ pub(crate) async fn serve_exec(
                     crate::ui::say(&format!(
                         "filament: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
                     ));
-                }
                     let _ = t.send_frame(sid, 0, &[]).await;
                     let _ = t.send_frame(err_sid, 0, &[]).await;
                 }
