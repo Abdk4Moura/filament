@@ -1367,3 +1367,31 @@ pub mod policy_route {
         }
     }
 }
+
+/// Create a symlink, for tests that need a symlinked entry in a fixture.
+///
+/// Both arms live here because platform differences belong in `platform/` (docs/architecture/PLATFORM.md):
+/// the budget for platform-conditional blocks in every file outside this directory is 0, so moving the
+/// branch here is exactly what that budget asks for. The `Result` is the point: creating a symlink on
+/// Windows needs SeCreateSymbolicLinkPrivilege (or Developer Mode), so a caller checks the capability
+/// rather than guessing it from the platform, and an error means "this host cannot exercise that arm",
+/// not "the product is broken".
+#[cfg(test)]
+pub fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        // Windows distinguishes a file target from a directory target and the caller does not always
+        // know which it means, so try both.
+        std::os::windows::fs::symlink_file(target, link)
+            .or_else(|_| std::os::windows::fs::symlink_dir(target, link))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "no symlink support on this platform"))
+    }
+}

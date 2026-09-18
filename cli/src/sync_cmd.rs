@@ -113,7 +113,9 @@ pub(crate) fn walk_manifest(root: &Path) -> Result<(Vec<Entry>, Vec<(String, Str
         for e in std::fs::read_dir(root.join(&rel))? {
             let e = e?;
             let r = rel.join(e.file_name());
-            let rs = r.to_string_lossy().into_owned();
+            // `/`-separated on every platform: this string is the path the plan carries on the
+            // wire, and `sub\\small` is not the same key as `sub/small` to the peer looking it up.
+            let rs = r.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
             let md = e.metadata()?; // does not follow symlinks
             if md.file_type().is_symlink() {
                 skipped.push((rs, "symlink".into()));
@@ -846,12 +848,18 @@ mod tests {
         let big: Vec<u8> = vec![7u8; SYNC_CHUNK as usize * 3];
         std::fs::write(d.join("big"), &big).unwrap();
         std::fs::write(d.join("sub/small"), b"hello").unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink("/etc/passwd", d.join("link")).unwrap();
+        // Symlink support is CHECKED, not assumed from the platform: creating one on Windows needs
+        // SeCreateSymbolicLinkPrivilege (or Developer Mode), and the arms live in platform/ because
+        // platform branching outside it has a budget of 0 (docs/architecture/PLATFORM.md).
+        let linked = crate::platform::symlink(Path::new("/etc/passwd"), &d.join("link")).is_ok();
+        if !linked {
+            eprintln!("note: this platform would not create a symlink; the symlink arm is skipped");
+        }
         let (local, skipped) = walk_manifest(&d).unwrap();
         assert_eq!(local.iter().map(|e| e.p.as_str()).collect::<Vec<_>>(), ["big", "sub/small"]);
-        #[cfg(unix)]
-        assert_eq!(skipped, vec![("link".to_string(), "symlink".to_string())]);
+        if linked {
+            assert_eq!(skipped, vec![("link".to_string(), "symlink".to_string())]);
+        }
 
         // Remote: identical small, big with the MIDDLE chunk changed, plus a stray.
         let r = tmp("walk-remote");
@@ -887,10 +895,10 @@ mod tests {
             assert!(resolve_root(&d, bad, true).is_err(), "{bad}");
             assert!(resolve_root(&d, bad, false).is_err(), "{bad}");
         }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/tmp", d.join("esc")).unwrap();
+        if crate::platform::symlink(Path::new("/tmp"), &d.join("esc")).is_ok() {
             assert!(resolve_root(&d, "esc/x", true).is_err(), "symlink escape must be refused");
+        } else {
+            eprintln!("note: this platform would not create a symlink; the escape arm is skipped");
         }
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -908,10 +916,8 @@ mod tests {
         // A parent that does not exist yet is created, and stays inside.
         assert!(bound_parent(&root, &root.join("fresh/deeper")).is_ok());
         assert!(root.join("fresh/deeper").is_dir());
-        #[cfg(unix)]
-        {
-            assert!(safe_relpath("sub/x").is_some(), "the string itself is clean");
-            std::os::unix::fs::symlink(&out, root.join("sub")).unwrap();
+        assert!(safe_relpath("sub/x").is_some(), "the string itself is clean");
+        if crate::platform::symlink(&out, &root.join("sub")).is_ok() {
             assert!(crate::path_within(&root, &root.join("sub/x")), "lexically inside");
             assert!(
                 bound_parent(&root, &root.join("sub")).is_err(),
@@ -922,6 +928,8 @@ mod tests {
                 "and so must a path under it"
             );
             assert!(!out.join("x").exists(), "nothing was created outside the root");
+        } else {
+            eprintln!("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
         }
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&out);
