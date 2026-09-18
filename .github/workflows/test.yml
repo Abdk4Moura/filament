@@ -59,7 +59,8 @@ jobs:
         run: |
           set -e
           for c in filament-signal filament-cap filament-id filament-overlay \
-                   filament-fleet filament-pair filament-proto filament-transfer; do
+                   filament-fleet filament-pair filament-proto filament-transfer \
+                   filament-transport authkeys-managed; do
             if [ -f "crates/$c/Cargo.toml" ]; then
               echo "::group::$c"
               cargo test --release --manifest-path "crates/$c/Cargo.toml"
@@ -71,6 +72,22 @@ jobs:
           CMAKE_CXX_COMPILER_LAUNCHER: sccache
           CC: sccache cc
           CXX: sccache c++
+      # The loop above is hand-maintained on purpose (its own comment says so),
+      # and that is how two crates fell out of it: filament-transport (23 tests,
+      # including the #312 T2 pair) and authkeys-managed (4) were absent, so 27
+      # tests were collected by nothing. This guard refuses that state -- and
+      # also refuses a name in the loop with no crate behind it, because the
+      # loop's `[ -f ... ]` guard skips a stale name SILENTLY. A comment cannot
+      # fail; this can.
+      # `always()` because a CANCELLED job never reaches a plain step: the two
+      # runs that hung on the crate tests were cancelled before this ran, so the
+      # check that exists to catch a dishonest crate list printed nothing in
+      # exactly the situation it is for. The checks that matter most are the ones
+      # that must still run when the job is already broken.
+      - name: Every crate that carries tests is in the loop
+        if: always()
+        run: python3 scripts/check_crate_test_loop.py
+
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats

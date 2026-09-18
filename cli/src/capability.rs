@@ -187,6 +187,8 @@ fn gate_live() -> bool {
 // 1000 shell opens could satisfy while mount/transfer were never tested.
 static LA_AUTHORIZED: AtomicU64 = AtomicU64::new(0);
 static LA_DENIED: AtomicU64 = AtomicU64::new(0);
+/// Legacy allowed, cap denied, subject not covered. See `cap_narrows_legacy`.
+static LA_NARROWED: AtomicU64 = AtomicU64::new(0);
 static LA_NO_HEADER: AtomicU64 = AtomicU64::new(0);
 static LD_AUTHORIZED: AtomicU64 = AtomicU64::new(0);
 static LD_DENIED: AtomicU64 = AtomicU64::new(0);
@@ -197,12 +199,17 @@ static LD_NO_HEADER: AtomicU64 = AtomicU64::new(0);
 /// is NOT something the flip changes. Exposed in cap-status for delegated-
 /// enforcement review.
 static CEILING_DENIED: AtomicU64 = AtomicU64::new(0);
+/// Allows granted by fleet auto-trust WITHOUT an explicit grant (the
+/// enrolment-ceiling population the flip newly permits). Informational:
+/// name the population for reviewers, never gate the flip on it.
+static CEILING_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static PA_CEILING_DENIED: OnceLock<ActionCounters> = OnceLock::new();
 
 type ActionCounters = Mutex<HashMap<String, AtomicU64>>;
 
 static PA_LA_AUTHORIZED: OnceLock<ActionCounters> = OnceLock::new();
 static PA_LA_DENIED: OnceLock<ActionCounters> = OnceLock::new();
+static PA_LA_NARROWED: OnceLock<ActionCounters> = OnceLock::new();
 static PA_LA_NO_HEADER: OnceLock<ActionCounters> = OnceLock::new();
 static PA_LD_AUTHORIZED: OnceLock<ActionCounters> = OnceLock::new();
 static PA_LD_DENIED: OnceLock<ActionCounters> = OnceLock::new();
@@ -228,7 +235,7 @@ fn pa_inc(map: &ActionCounters, action: &str) {
 /// Return per-action shadow counts for every action seen so far.
 pub fn cap_action_counts() -> Vec<ActionCounts> {
     let mut actions: HashMap<String, ActionCounts> = HashMap::new();
-    let maps: [(&ActionCounters, fn(&mut ActionCounts, &str, u64)); 6] = [
+    let maps: [(&ActionCounters, fn(&mut ActionCounts, &str, u64)); 7] = [
         (
             PA_LA_AUTHORIZED.get_or_init(|| Mutex::new(HashMap::new())),
             |a, _action, val| a.la_authorized += val,
@@ -236,6 +243,10 @@ pub fn cap_action_counts() -> Vec<ActionCounts> {
         (
             PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
             |a, _action, val| a.la_denied += val,
+        ),
+        (
+            PA_LA_NARROWED.get_or_init(|| Mutex::new(HashMap::new())),
+            |a, _action, val| a.la_narrowed += val,
         ),
         (
             PA_LA_NO_HEADER.get_or_init(|| Mutex::new(HashMap::new())),
@@ -262,6 +273,7 @@ pub fn cap_action_counts() -> Vec<ActionCounts> {
                     action: action.clone(),
                     la_authorized: 0,
                     la_denied: 0,
+                    la_narrowed: 0,
                     la_no_header: 0,
                     ld_authorized: 0,
                     ld_denied: 0,
@@ -285,11 +297,13 @@ pub fn cap_shadow_counts() -> ShadowCounts {
     ShadowCounts {
         la_authorized: LA_AUTHORIZED.load(Ordering::Relaxed),
         la_denied: LA_DENIED.load(Ordering::Relaxed),
+        la_narrowed: LA_NARROWED.load(Ordering::Relaxed),
         la_no_header: LA_NO_HEADER.load(Ordering::Relaxed),
         ld_authorized: LD_AUTHORIZED.load(Ordering::Relaxed),
         ld_denied: LD_DENIED.load(Ordering::Relaxed),
         ld_no_header: LD_NO_HEADER.load(Ordering::Relaxed),
         ceiling_denied: CEILING_DENIED.load(Ordering::Relaxed),
+        ceiling_admitted: CEILING_ADMITTED.load(Ordering::Relaxed),
     }
 }
 
@@ -416,6 +430,40 @@ pub fn cap_fleet_inputs(
     (Some(hdr.owner_pub), explicit)
 }
 
+/// Whether this decision belongs to the ceiling-admitted population: the
+/// opens the authoritative flip newly permits WITHOUT an explicit grant.
+/// Pure, so the accounting rule is unit-testable.
+fn ceiling_admitted_class(ceiling_ok: bool, has_explicit_grant: bool) -> bool {
+    ceiling_ok && !has_explicit_grant
+}
+
+/// Legacy allowed, cap denied, and the subject has NO capability path at all:
+/// not covered by the ceiling and holding no explicit grant. The flip refusing
+/// this open is the flip doing its job (it closes a legacy hole where mere
+/// pairing sufficed), so it is reported as `cap-narrows-legacy` at Info and
+/// bucketed as `la_narrowed` -- never as CAP-SHADOW CRITICAL. Pure so the
+/// classification is unit-testable, and deliberately independent of binding:
+/// an uncovered subject stays uncovered whether or not it is Proven.
+fn cap_narrows_legacy(ceiling_authorizes: bool, has_explicit_grant: bool) -> bool {
+    !ceiling_authorizes && !has_explicit_grant
+}
+
+/// A covered, unrevoked, same-owner fleet peer whose ONLY obstacle is that its
+/// possession proof has not settled yet. The flip admits this open once the
+/// link proves, so reporting shadow CRITICAL here would report a transient
+/// (the peer is mid-reconnect) as permanent breakage. Measured: the challenge/
+/// expose exchange stays unanswered for seconds to tens of seconds while a peer
+/// re-establishes after a restart, and the settle path exists to wait that out.
+fn ceiling_pending_proof(
+    ceiling_authorizes: bool,
+    same_owner: bool,
+    cert_revoked: bool,
+    binding_proven: bool,
+    has_explicit_grant: bool,
+) -> bool {
+    ceiling_authorizes && same_owner && !cert_revoked && !binding_proven && !has_explicit_grant
+}
+
 /// The single policy site. Reads the mode ONCE, records the shadow counters in BOTH
 /// modes (so observability survives the flip), logs, and returns the effective gate
 /// decision. `binding` and `cert_expires` are transport/policy facts composed under
@@ -435,6 +483,22 @@ pub fn cap_gate_effective(
     scoped_in_bounds: bool,
     has_explicit_grant: bool,
     cert_revoked: bool,
+    // An explicit owner-recorded deny for this action. Short-circuits
+    // EVERYTHING including fleet auto-trust: a deny is a decision, and a
+    // decision outranks auto-trust (#244 class -- fleet_allow used to
+    // bypass legacy, where denied lived, so a denied-but-covered device
+    // was allowed). Callers with no deny list for their path pass false.
+    denied: bool,
+    // Owner-signed enrolment ceiling covers this action. Distinct from
+    // `scoped_in_bounds` on purpose. `scoped_in_bounds` is the SCOPE DEFAULT
+    // class (transfer into the drop dir, a forward to an exposed port),
+    // which has always auto-authorized same-owner Proven devices in BOTH
+    // modes -- that is documented fleet behaviour. The ceiling is new and
+    // authorizes a DELIBERATE-tier action (shell/exec/pty/ssh-sign), so it
+    // decides only under authoritative mode while still being counted as
+    // would-allow in shadow: counting it as a denial was a false BREAKAGE
+    // alarm (the flip PERMITS this open, it does not break it).
+    ceiling_authorizes: bool,
 ) -> GateDecision {
     let authoritative = cap_authoritative();
 
@@ -526,6 +590,10 @@ pub fn cap_gate_effective(
     let peer_user = user_pub.copied().unwrap_or([0u8; 32]);
     let same_owner = own_user_pub.map_or(false, |o| o == &peer_user) && peer_user != [0u8; 32];
     let fleet_ok = fleet_auto_trust(same_owner, binding, scoped_in_bounds, !cert_revoked);
+    // The ceiling path mirrors the scoped default's preconditions (my key,
+    // Proven, not revoked) but is authoritative-only for the DECISION below.
+    let ceiling_ok =
+        ceiling_authorizes && same_owner && binding == BindingStrength::Proven && !cert_revoked;
     // Observability for the Proven-precondition — do NOT tighten blind. A
     // same-owner peer authorized ONLY by an explicit grant while its binding is
     // below Proven is EXACTLY the population that would lose access if
@@ -548,8 +616,16 @@ pub fn cap_gate_effective(
             false,
         );
     }
-    let base_outcome = if same_owner {
-        if fleet_ok || has_explicit_grant {
+    // An explicit deny outranks EVERYTHING on this branch, including the
+    // fleet auto-trust recomputation below: without this, a covered-but-
+    // denied device would be re-authorized by fleet_ok two lines down,
+    // which is the #244 hole in a new form (the fleet_allow short-circuit
+    // alone cannot close it, because base_outcome feeds the authoritative
+    // decision independently).
+    let base_outcome = if denied {
+        CapOutcome::Denied("explicitly denied by owner (deniedCaps)".into())
+    } else if same_owner {
+        if fleet_ok || ceiling_ok || has_explicit_grant {
             CapOutcome::Authorized
         } else {
             CapOutcome::Denied(
@@ -571,11 +647,22 @@ pub fn cap_gate_effective(
     // just works regardless of the flag. It still respects cert expiry (the
     // standard expiry composer is a no-op in shadow, so re-check it here) and,
     // via fleet_auto_trust, the Proven binding.
-    let fleet_allow = fleet_ok
+    // Which of the two auto-trust classes may OVERRIDE the legacy decision:
+    // the scoped default always could; the ceiling only under authoritative.
+    let fleet_allow = !denied
+        && (fleet_ok || (authoritative && ceiling_ok))
         && matches!(
             cap_authorize_expired(&CapOutcome::Authorized, cert_expires, true),
             CapOutcome::Authorized
         );
+    // Counted on the CEILING's own precondition, mode-independently: the
+    // population the flip newly permits is "covered by the owner-signed
+    // enrolment ceiling, with no explicit grant", and it must be visible in
+    // shadow too -- that is the number the flip review cites. (`fleet_allow`
+    // is the wrong source here: it is mode-dependent for this class.)
+    if ceiling_admitted_class(ceiling_ok, has_explicit_grant) {
+        CEILING_ADMITTED.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Counters: recorded in BOTH modes so a flip does not blind us.
     // Per-action bucketing runs in parallel so the flip decision can cite
@@ -590,11 +677,24 @@ pub fn cap_gate_effective(
             );
         }
         (true, CapOutcome::Denied(_)) => {
-            LA_DENIED.fetch_add(1, Ordering::Relaxed);
-            pa_inc(
-                PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
-                action,
-            );
+            // Two populations, two counters. A subject the capability layer does
+            // not cover at all (no ceiling, no grant) is the flip CLOSING a
+            // legacy hole; filing it under la_denied would make the strictness
+            // of the flip read as breakage and could block the flip for the
+            // wrong reason forever.
+            if cap_narrows_legacy(ceiling_authorizes, has_explicit_grant) {
+                LA_NARROWED.fetch_add(1, Ordering::Relaxed);
+                pa_inc(
+                    PA_LA_NARROWED.get_or_init(|| Mutex::new(HashMap::new())),
+                    action,
+                );
+            } else {
+                LA_DENIED.fetch_add(1, Ordering::Relaxed);
+                pa_inc(
+                    PA_LA_DENIED.get_or_init(|| Mutex::new(HashMap::new())),
+                    action,
+                );
+            }
         }
         (true, CapOutcome::Unprovisioned) => {
             LA_NO_HEADER.fetch_add(1, Ordering::Relaxed);
@@ -643,6 +743,54 @@ pub fn cap_gate_effective(
         // legacy refused that cap authorizes, which the flip will newly permit.
         // Unprovisioned is logged once per resource so a fresh node never floods.
         match (legacy_allowed, outcome) {
+            // A covered same-owner peer denied ONLY because its possession
+            // proof has not settled yet is NOT breakage: after the flip the
+            // same open is allowed once the link proves (the ceiling class is
+            // counted in CEILING_ADMITTED for exactly this population). Crying
+            // CRITICAL here reported a transient as a regression, and the
+            // settle path's whole job is to wait that transient out.
+            (true, CapOutcome::Denied(_))
+                if ceiling_pending_proof(
+                    ceiling_authorizes,
+                    same_owner,
+                    cert_revoked,
+                    binding == BindingStrength::Proven,
+                    has_explicit_grant,
+                ) =>
+            {
+                log_once(
+                    format!(
+                        "pend|{action}|{}",
+                        hex::encode(device_pub.copied().unwrap_or([0u8; 32]))
+                    ),
+                    &format!(
+                        "CAP-SHADOW PENDING-PROOF: a covered fleet open on '{action}' is denied by the capability layer only because the link is not Proven yet; the flip ALLOWS it once settled (counted in ceiling_admitted). Not a breakage."
+                    ),
+                    true, // informational: debug-level only
+                );
+            }
+            // Legacy would admit a subject the capability layer does not cover.
+            // That is the flip NARROWING a legacy hole (pairing alone sufficed),
+            // which is intended, so it must not pollute the breakage signal.
+            (true, CapOutcome::Denied(_))
+                if cap_narrows_legacy(ceiling_authorizes, has_explicit_grant) =>
+            {
+                log_once(
+                    format!(
+                        "narrow|{action}|{}",
+                        hex::encode(device_pub.copied().unwrap_or([0u8; 32]))
+                    ),
+                    &format!(
+                        // The running COUNT is on the line because the line itself
+                        // is deduped per (action, subject): three opens from the same
+                        // impostor key print once, so only the counter can show that
+                        // the population is real and how big it is. Gates assert it.
+                        "CAP-SHADOW cap-narrows-legacy: legacy ALLOWED '{action}' on '{resource}' for a subject with no ceiling coverage and no explicit grant; the flip REFUSES it (intended: this is a legacy hole closing). Not breakage. [la_narrowed={}]",
+                        cap_shadow_counts().la_narrowed,
+                    ),
+                    true, // informational: debug-level only
+                );
+            }
             (true, CapOutcome::Denied(reason)) => {
                 // #231 asks for exactly one thing to go quiet: the
                 // `[unprovisioned]` line, "which by its own text is the normal
@@ -809,6 +957,40 @@ pub fn reconcile_shell_keys(revoked: &[String], ak_content: &str, authoritative:
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn narrowed_is_only_the_uncovered_class() {
+        // The flip closing a legacy hole: uncovered, no grant.
+        assert!(cap_narrows_legacy(false, false));
+        // Every other combination must still reach the CRITICAL branch (or the
+        // pending-proof one), i.e. must NOT be excused as intended narrowing:
+        assert!(!cap_narrows_legacy(true, false)); // covered
+        assert!(!cap_narrows_legacy(false, true)); // holds a grant
+        assert!(!cap_narrows_legacy(true, true)); // covered and granted
+    }
+
+    #[test]
+    fn pending_proof_is_only_the_unsettled_covered_class() {
+        // The transient: covered, same owner, unrevoked, merely unproven.
+        assert!(ceiling_pending_proof(true, true, false, false, false));
+        // Every other combination must still reach the CRITICAL branch:
+        assert!(!ceiling_pending_proof(false, true, false, false, false)); // not covered
+        assert!(!ceiling_pending_proof(true, false, false, false, false)); // different owner
+        assert!(!ceiling_pending_proof(true, true, true, false, false)); // revoked
+        assert!(!ceiling_pending_proof(true, true, false, true, false)); // already proven
+        assert!(!ceiling_pending_proof(true, true, false, false, true)); // grant present
+    }
+
+    #[test]
+    fn ceiling_admitted_counts_the_covered_ungranted_class() {
+        // The flip-review population: covered by the owner-signed ceiling and
+        // NOT separately granted. A granted covered device belongs to the
+        // grant population, not this one.
+        assert!(super::ceiling_admitted_class(true, false));
+        assert!(!super::ceiling_admitted_class(true, true));
+        assert!(!super::ceiling_admitted_class(false, false));
+        assert!(!super::ceiling_admitted_class(false, true));
+    }
+
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -1045,6 +1227,8 @@ mod tests {
             false,
             false,
             true,
+            false,
+            false,
         );
         assert!(
             !resolved_revoked.allowed(),
@@ -1063,6 +1247,8 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -1093,6 +1279,8 @@ mod tests {
             true,
             false,
             false,
+            false,
+            false,
         );
         assert!(
             matches!(decision, GateDecision::Allow),
@@ -1119,6 +1307,8 @@ mod tests {
             true,
             false,
             true,
+            false,
+            false,
         );
         assert!(
             matches!(decision, GateDecision::Deny { .. }),
@@ -1161,6 +1351,8 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
+                false,
             );
         }
         // Legacy-allowed, cap denies (Denied) → la_denied
@@ -1178,6 +1370,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         // Legacy-denied, cap authorizes → ld_authorized (widening)
         cap_gate_effective(
@@ -1191,6 +1385,8 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -1279,6 +1475,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 1, "LA_AUTHORIZED must increment");
@@ -1288,7 +1486,9 @@ mod tests {
         assert_eq!(after[4] - before[4], 0);
         assert_eq!(after[5] - before[5], 0);
 
-        // (legacy_allowed=true, Denied) -> LA_DENIED++
+        let narrowed_before = LA_NARROWED.load(Ordering::Relaxed);
+        // (legacy_allowed=true, Denied, GRANTED) -> LA_DENIED++ (REAL breakage:
+        // a subject that holds an explicit grant was refused anyway).
         let before = snap();
         cap_gate_effective(
             true,
@@ -1302,6 +1502,8 @@ mod tests {
             None,
             None,
             false,
+            true, // has_explicit_grant: covered, so this is breakage not narrowing
+            false,
             false,
             false,
         );
@@ -1312,6 +1514,44 @@ mod tests {
         assert_eq!(after[3] - before[3], 0);
         assert_eq!(after[4] - before[4], 0);
         assert_eq!(after[5] - before[5], 0);
+
+        // (legacy_allowed=true, Denied, UNCOVERED) -> LA_NARROWED++, and
+        // crucially NOT LA_DENIED: the flip closing a legacy hole must not be
+        // able to block the flip as if it were breakage.
+        let before = snap();
+        cap_gate_effective(
+            true,
+            &CapOutcome::Denied("test".into()),
+            "mount",
+            "self",
+            None,
+            Some(&uk),
+            BindingStrength::Proven,
+            Some(u64::MAX),
+            None,
+            None,
+            false,
+            false, // no grant, no ceiling coverage: the narrowing class
+            false,
+            false,
+            false,
+        );
+        let after = snap();
+        assert_eq!(after[0] - before[0], 0);
+        assert_eq!(
+            after[1] - before[1],
+            0,
+            "LA_DENIED must NOT increment for the uncovered class"
+        );
+        assert_eq!(after[2] - before[2], 0);
+        assert_eq!(after[3] - before[3], 0);
+        assert_eq!(after[4] - before[4], 0);
+        assert_eq!(after[5] - before[5], 0);
+        assert_eq!(
+            LA_NARROWED.load(Ordering::Relaxed) - narrowed_before,
+            1,
+            "LA_NARROWED must increment for the uncovered class"
+        );
 
         // (legacy_allowed=true, Unprovisioned) -> LA_NO_HEADER++
         let before = snap();
@@ -1326,6 +1566,8 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -1354,6 +1596,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1376,6 +1620,8 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -1404,6 +1650,8 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
         );
         let after = snap();
         assert_eq!(after[0] - before[0], 0);
@@ -1426,6 +1674,8 @@ mod tests {
             Some(u64::MAX),
             None,
             None,
+            false,
+            false,
             false,
             false,
             false,
@@ -1865,6 +2115,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
+            false,
         );
         assert!(
             d.allowed(),
@@ -1892,6 +2144,8 @@ mod tests {
             /*scoped_in_bounds*/ false,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1918,6 +2172,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1949,6 +2205,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ true,
             /*cert_revoked*/ true,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -1982,6 +2240,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ true,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2013,6 +2273,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ true,
             /*cert_revoked*/ true,
+            false,
+            false,
         );
         if prior.is_empty() {
             unsafe { std::env::remove_var("FILAMENT_CAP_AUTHORITATIVE") };
@@ -2046,6 +2308,8 @@ mod tests {
             /*scoped_in_bounds*/ false,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
+            false,
         );
         assert!(!d.allowed(), "same-owner Proven out-of-scope must DENY");
     }
@@ -2071,6 +2335,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2098,6 +2364,8 @@ mod tests {
             /*scoped_in_bounds*/ true,
             /*has_explicit_grant*/ false,
             /*cert_revoked*/ false,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),
@@ -2123,6 +2391,8 @@ mod tests {
             true,
             false,
             true,
+            false,
+            false,
         );
         assert!(
             !d.allowed(),

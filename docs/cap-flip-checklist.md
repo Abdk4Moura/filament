@@ -38,9 +38,58 @@ Owner: whoever writes the flip commit. Cite the evidence in that commit.
       Caveat: this proves it for resources exercised, not all resources. Tight today
       (all gates pass "self", one resource); becomes a sampled claim when resources
       multiply, revisit then.
+- [ ] `la_narrowed` reviewed (informational, not a gate, and NOT part of
+      `flip_ready`): opens legacy allowed and the layer refuses because the
+      subject is not covered by any ceiling or grant. This is the flip CLOSING a
+      legacy hole (pairing alone used to suffice) -- intended. A NONZERO value
+      is expected on any fleet that has ever had a peer try to claim another
+      device's name; enumerate the population before the flip so the number is
+      explained rather than surprising. Its verdict text is
+      `CAP-SHADOW cap-narrows-legacy` at Info, never CRITICAL.
+- [ ] `la_narrowed` reviewed (informational, not a gate, and NOT part of
+      `flip_ready`): opens legacy allowed and the layer refuses because the
+      subject is not covered by any ceiling or grant. This is the flip CLOSING
+      a legacy hole (pairing alone used to suffice) -- intended. A NONZERO
+      value is expected on any fleet where a peer has ever tried to claim
+      another device's name; enumerate the population before the flip so the
+      number is explained rather than surprising. Its verdict text is
+      `CAP-SHADOW cap-narrows-legacy` at Info, never CRITICAL.
+- [ ] `ceiling_admitted` reviewed (informational, not a gate): opens allowed
+      by fleet auto-trust WITHOUT an explicit grant (enrolment-ceiling
+      admission). Widening is reviewed, not gated -- cite the count alongside
+      the `ld_authorized` numbers and enumerate which opens it names before
+      the flip, same as any other newly-permitted population.
 
 Read these from the running daemon via the shadow-status surface (task #16), since
 the counters are process-global and a fresh CLI invocation reads zeros.
+
+## FLIP BLOCKER: fleet devices cannot re-prove identity after an owner restart
+
+Measured on `cli/tests/fleet-cert-gates.sh` gate AUTH-A (currently KNOWN-RED,
+https://github.com/Abdk4Moura/filament/issues/312): after the owner daemon
+restarts, the possession challenge does not reach the peer on the link that is
+carrying its traffic, so a covered shell-class open is refused under
+authoritative mode until the peer reconnects cleanly. The defect is in the link,
+not in the authz layer: a primary transport can go writable-but-deaf because its
+reader exits silently on a QUIC `FinishedEarly` without marking the link dead
+(`crates/filament-transport/src/direct.rs:1410`, `:1436`). Shadow mode masks it
+entirely (legacy decides), which is why it went unnoticed.
+
+Consequence for the flip: in shadow this is invisible; under authoritative it
+locks out every fleet device that is mid-reconnect after an owner restart. Do NOT
+flip until #312 is fixed and AUTH-A is green first-try.
+
+## RESOLVED: fleet devices re-prove after an owner restart
+
+Was a flip blocker; fixed and now gated first-try by `cli/tests/fleet-cert-gates.sh`
+gate AUTH-A. The possession challenge was being answered by nobody because the
+exec open travels on the one-shot `filament exec` client's link, which had no
+identity responder -- so the link could never become Proven, the open parked and
+expired, and each retry minted a fresh equally silent link. The client now answers
+challenges through the SAME shared responder the daemon uses (one
+possession-signing path). Kept here rather than deleted because the failure mode is
+invisible in shadow (legacy decides) and would return silently if the one-shot
+responder is ever refactored away.
 
 ## Mandatory review citation (not a boolean)
 

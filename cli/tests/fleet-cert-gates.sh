@@ -42,6 +42,16 @@
 # which IS the product path for a fleet device, and `grant` is deliberately
 # never called.
 #
+# WAS KNOWN-RED, NOW GREEN: gateAUTH-A. The covered exec after an OWNER RESTART
+# was refused because the possession challenge went to the pid carrying the
+# exec-open -- the ONE-SHOT `filament exec` client's own link -- and that client
+# never answered challenges, so the link could never become Proven, the open
+# parked, expired, and every retry minted a fresh equally silent link. Fixed by
+# giving the one-shot client the same shared responder the daemon uses (one
+# possession-signing path; send_cmd.rs and exec_send.rs now differ only in which
+# loop calls it). AUTH-A now passes FIRST TRY. The half-dead-reader defect found
+# while chasing this is a real latent bug and remains its own slice (#312).
+#
 # Gates:
 #   enrolment x3  both ends resolved a certified identity (lib/fixture.sh)
 #   A   POSITIVE exec    -- the certified spoke runs a remote command, rc=0
@@ -55,6 +65,16 @@
 #   F   no ssh key was installed anywhere by A3/E (authorized_keys byte-equal)
 #   G   A/B CONTROL: `devices restore` and exec works again -- so C/D/E were
 #       the revocation and not a broken link, a dead daemon or a lost secret.
+#   I1/I2/I3 IMPOSTOR (F1 acceptance, live): a sibling daemon hellos as the
+#       ceilinged device's exact name, trailing-space name, and control-char
+#       name; each is refused, the victim record is byte-identical, and the
+#       sibling's exec is refused.
+#   D-sh SHADOW EVIDENCE for the flip checklist: a covered fleet exec in
+#       shadow mode logs zero CAP-SHADOW CRITICAL lines.
+#   AUTH-A/B/C under FILAMENT_CAP_AUTHORITATIVE=1 on a restarted owner
+#       daemon: shell within the enrolment ceiling succeeds (A); exec
+#       outside the ceiling (transfer-only enrolment) is refused with the
+#       grant reason (B); revoke --certificate refuses too (C).
 #
 # G is the gate that stops this suite passing for the wrong reason. Without it
 # "everything is refused after the revoke" is equally satisfied by a harness
@@ -103,6 +123,13 @@ SSHD_STANDIN_PORT=9124
 SSH_ENV=(env FILAMENT_NO_L3_SSH=1 FILAMENT_SSH_PORT=$SSHD_STANDIN_PORT)
 AK_FILE="$HOME/.ssh/authorized_keys"
 [ -f "$AK_FILE" ] && cp "$AK_FILE" "$WORK/ak.before" || : > "$WORK/ak.before"
+
+# See the KNOWN-RED block in the header. Matching is on a stable substring of
+# the FAIL text, deliberately not the whole line (the measured rc varies).
+# EMPTY, and it must stay empty until something is genuinely red: the ratchet
+# forces removal the moment a known-red gate starts passing, which is exactly
+# what happened to gateAUTH-A (see the header note).
+KNOWN_RED_ALLOW=()
 
 O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
 S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
@@ -307,9 +334,281 @@ else
   bad "gateG: exec did not come back after restore (rc=$rcG out='$OUTG')"
 fi
 
+# =================================================== IMPOSTOR GATES ==
+# F1 acceptance, live: a sibling daemon with a DIFFERENT device key hellos
+# as the ceilinged device's name. The owner must refuse to index it, leave
+# the victim record byte-identical, and refuse its exec. Three variants:
+# the exact name, a trailing space, and a control character -- the latter
+# two must land on the same record after sanitizing, not slip past it.
+# (The store-level variants of this live as unit tests; these prove the
+# fleet-hello path end to end. The exec refusal is asserted as the
+# end-to-end property -- the link stays unverified, so the refusal may
+# also rest on that; the log line pins the transplant mechanism and the
+# byte comparison pins the store.)
+MALLORY=mallory
+DM="$WORK/$MALLORY"
+# The impostor is a FORGOTTEN enrollee: enrolled (so it holds a valid
+# owner-signed cert and the fleet channel), then forgotten on the owner.
+# A still-enrolled impostor resolves its proven name and never reaches
+# the transplant branch -- testing with one would assert nothing. The
+# forgotten-but-certified shape is the real squat threat: valid cert,
+# no record, claimed name of the ceilinged victim.
+enroll_delegate "$MALLORY" --allow transfer
+start_spoke "$DM" "$MALLORY"
+sleep 6
+"${O_ENV[@]}" "$BIN" --server "$SERVER" devices forget "$MALLORY" >"$WORK/forget.log" 2>&1
+sleep 2
+# Stable fields only (timestamps/last_seen drift between snapshots, so a
+# whole-record comparison would fail spuriously -- gate B does the same).
+python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" >"$WORK/victim.before" <<'PY'
+import json,sys
+arr=json.load(open(sys.argv[1]))
+rec={d.get("name"):d for d in arr}
+v=rec.get(sys.argv[2]) or {}
+print(json.dumps({
+  "victim_pub":v.get("deviceCert",{}).get("devicePub"),
+  "victim_ceiling":v.get("principalCeiling"),
+  "victim_revoked":v.get("certRevoked",False),
+  "mallory_absent":sys.argv[3] not in rec,
+},sort_keys=True))
+PY
+M_ENV=(env FILAMENT_CONFIG_DIR="$DM")
+run_impostor_variant() {
+  local variant="$1" tag="$2"
+  # Per-variant refusal counting: the owner log accumulates, so record the
+  # count before and require it to GROW (a stale line must not pass this).
+  local refused_before=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
+  pkill -f "up --dir $WORK/$MALLORY-drop" 2>/dev/null || true
+  sleep 2
+  env FILAMENT_CONFIG_DIR="$DM" FILAMENT_NAME="$variant" "$BIN" --server "$SERVER" up --dir "$WORK/$MALLORY-drop" >"$WORK/up-$MALLORY-$tag.log" 2>&1 &
+  FIX_PIDS+=($!)
+  sleep 8
+  local refused=0 intact=0 execref=0 attempted=0 victim_ok=0
+  local refused_after=$(grep -c "reason=name-taken" "$WORK/up.log" || true)
+  [ "$refused_after" -gt "$refused_before" ] && refused=1
+  # NON-VACUITY, two ways. Containment means nothing unless (i) this impostor
+  # actually reached the owner (a daemon that never started satisfies "exec
+  # refused" via a plain connection failure) and (ii) the victim snapshot
+  # really held a keyed record (comparing two empty records passes).
+  grep -qE "fleet-hello|identity verified|joined the mesh" "$WORK/up-$MALLORY-$tag.log" && attempted=1
+  [ -n "$(python3 -c "import json;print(json.load(open('$WORK/victim.before')).get('victim_pub') or '')")" ] && victim_ok=1
+  python3 - "$DA/devices.json" "$SPOKE" "$MALLORY" "$WORK/victim.before" >"$WORK/victim.$tag.after" <<'PY'
+import json,sys
+arr=json.load(open(sys.argv[1]))
+rec={d.get("name"):d for d in arr}
+v=rec.get(sys.argv[2]) or {}
+now=json.dumps({
+  "victim_pub":v.get("deviceCert",{}).get("devicePub"),
+  "victim_ceiling":v.get("principalCeiling"),
+  "victim_revoked":v.get("certRevoked",False),
+  "mallory_absent":sys.argv[3] not in rec,
+},sort_keys=True)
+before=json.load(open(sys.argv[4]))
+print(now)
+# victim identity+ceiling identical AND no record re-created for mallory
+sys.exit(0 if now==json.dumps(before,sort_keys=True) else 1)
+PY
+  [ "$?" = "0" ] && intact=1
+  OUTI=$(timeout 60 "${M_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/I-$tag.err" </dev/null)
+  [ "$?" != "0" ] && ! echo "$OUTI" | grep -q "SHOULD-NOT-RUN" && execref=1
+  echo "## (impostor $tag) refused=$refused attempted=$attempted victim=$victim_ok intact=$intact execref=$execref"
+  if [ "$attempted" = "1" ] && [ "$victim_ok" = "1" ] && [ "$intact" = "1" ] && [ "$execref" = "1" ]; then
+    ok "gateI-$tag: squat as '$variant' CONTAINED (victim keyed + byte-identical, impostor reached the owner, exec refused)"
+  else
+    # Print what the gate actually knows: CI's empty `grep | tail -3` was the
+    # least informative possible failure output and cost a whole run to read.
+    echo "-- impostor log ($tag) --"; tail -5 "$WORK/up-$MALLORY-$tag.log" 2>/dev/null
+    echo "-- forget log --"; cat "$WORK/forget.log" 2>/dev/null
+    echo "-- owner log (fleet) --"; grep -i "fleet" "$WORK/up.log" | tail -5
+    bad "gateI-$tag: impostor as '$variant' NOT contained (attempted=$attempted victim=$victim_ok intact=$intact execref=$execref refused=$refused)"
+  fi
+  # The refusal line is its OWN verdict: a log-environment difference must
+  # never fake a containment pass or mask a containment failure.
+  if [ "$refused" = "1" ]; then
+    ok "gateI-$tag: transplant refusal emitted (reason=name-taken seen)"
+  else
+    bad "gateI-$tag: transplant refusal line absent (containment=$([ "$attempted$victim_ok$intact$execref" = "1111" ] && echo held || echo broken); no refusal emitted for this attempt)"
+  fi
+}
+say "I1: exact-name squat refused"
+run_impostor_variant "$SPOKE" exact
+say "I2: trailing-space squat refused"
+run_impostor_variant "$SPOKE " space
+say "I3: control-char squat refused"
+run_impostor_variant "$SPOKE$(printf '\007')" ctrl
+
+# ================================================== AUTHORITATIVE MODE ==
+# The same questions under FILAMENT_CAP_AUTHORITATIVE=1 on the owner
+# daemon. The daemon reads the flag at startup, so the owner acceptor is
+# restarted with it (same config dir, fresh log); the spokes are untouched.
+# Gate D-sh runs FIRST, while the daemons are still in shadow mode.
+
+# ================================================================== GATE D-sh =
+# Shadow-mode evidence for the flip checklist: a covered fleet exec must not
+# log CAP-SHADOW CRITICAL (a header denying what legacy allowed). The owner
+# log accumulates the whole run above, so any covered open that disagreed
+# would already be recorded.
+# The delta is what matters. A global count conflates THIS exec with every
+# earlier section -- including the impostor gates, whose refusals are recorded
+# as shadow disagreements ON PURPOSE (legacy would let a secret-paired peer in;
+# the capability layer refuses it, which is the flip narrowing a legacy hole,
+# not breakage). Counting globally made this gate fail on other gates' events.
+say "D-sh: shadow run of the covered exec adds zero CRITICAL denials"
+CRITS_BEFORE=$(grep -c "CAP-SHADOW CRITICAL" "$WORK/up.log" || true)
+OUTSH=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo FLEET-SHADOW-OK 2>"$WORK/SH.err" </dev/null)
+rcSH=$?
+CRITS_ALL=$(grep -c "CAP-SHADOW CRITICAL" "$WORK/up.log" || true)
+CRITS=$((CRITS_ALL - CRITS_BEFORE))
+echo "## (shadow covered exec) rc=$rcSH out='$OUTSH' criticals_delta=$CRITS (total $CRITS_ALL, pre-existing $CRITS_BEFORE)"
+# The narrowing class must be REACHABLE, or "zero criticals" could be satisfied
+# by an instrument that never classifies anything: the three impostor refusals
+# above are exactly that population (legacy would admit a secret-paired peer;
+# the capability layer refuses it). Asserting both halves turns the class from
+# prose into a measured verdict.
+# The LINE is deduped per (action, subject) -- three impostor opens from the same
+# key print once -- so the population is read from the counter the line carries,
+# which increments per OPEN. Counting lines would undercount and call a working
+# instrument miscounting.
+NARROWED=$(grep -o "la_narrowed=[0-9]*" "$WORK/up.log" | sed 's/.*=//' | sort -n | tail -1)
+NARROWED=${NARROWED:-0}
+NARROWED_LINES=$(grep -c "cap-narrows-legacy" "$WORK/up.log" || true)
+echo "## (shadow classes) new_criticals=$CRITS cap-narrows-legacy_counter=$NARROWED (lines=$NARROWED_LINES)"
+# REACHABILITY OF THE NARROWING CLASS IS NOT ASSERTED HERE, deliberately.
+# Measured on ONE unchanged binary, twice: the class fired once in the first run
+# and zero times in the second. The impostor's exec is usually refused by ITS OWN
+# daemon ("shell capability not granted") before the open ever reaches the
+# owner's capability gate, and only sometimes does the owner see it as a
+# legacy-allowed, uncovered open. Asserting ">= 3 impostor refusals classified"
+# here would therefore be a FLAKY assertion, and a gate that fails for timing is
+# worse than no gate -- it teaches people to ignore red.
+#
+# Reachability is instead proven DETERMINISTICALLY by the unit tests, which CI
+# runs in the same job family: cap_narrows_legacy's four-case truth table and the
+# bucketing assertion that LA_NARROWED (and NOT LA_DENIED) increments for the
+# uncovered class. What this gate must prove about the flip is the BREAKAGE
+# signal, and that is what it asserts: zero NEW CRITICALs from its own open. The
+# observed counter is printed as evidence either way.
+if [ "$rcSH" = "0" ] && [ "$OUTSH" = "FLEET-SHADOW-OK" ] && [ "$CRITS" = "0" ]; then
+  ok "gateD-sh: covered exec clean in shadow, zero NEW CRITICAL lines from its own open (la_denied evidence; narrowing class observed $NARROWED time(s), reachability pinned by unit tests)"
+else
+  echo "-- new criticals --"; grep "CAP-SHADOW CRITICAL" "$WORK/up.log" | tail -3
+  echo "-- pre-existing (earlier sections, incl. intended impostor refusals) --"; grep "CAP-SHADOW CRITICAL" "$WORK/up.log" | head -3
+  bad "gateD-sh: shadow covered exec unclean (rc=$rcSH out='$OUTSH' new_criticals=$CRITS of $CRITS_ALL total)"
+fi
+
+say "restarting the owner acceptor under FILAMENT_CAP_AUTHORITATIVE=1"
+pkill -f "up --dir $WORK/Adrop" 2>/dev/null || true
+sleep 2
+env FILAMENT_CONFIG_DIR="$DA" FILAMENT_CAP_AUTHORITATIVE=1 FILAMENT_L2=1 "$BIN" --server "$SERVER" up --dir "$WORK/Adrop" >"$WORK/up-auth.log" 2>&1 &
+FIX_PIDS+=($!)
+sleep 6
+
+# ================================================================== GATE AUTH-A =
+say "AUTH-A: shell within the enrolment ceiling succeeds under authoritative"
+OUTAA=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo FLEET-AUTH-OK 2>"$WORK/AA.err" </dev/null)
+rcAA=$?
+echo "## (authoritative covered exec) rc=$rcAA out='$OUTAA'"
+if [ "$rcAA" = "0" ] && [ "$OUTAA" = "FLEET-AUTH-OK" ]; then
+  ok "gateAUTH-A: covered exec allowed under authoritative (no grant needed)"
+else
+  # Known-red (#312), not a silent skip: print the mechanism's own evidence so a
+  # reader can see WHY it failed without rerunning anything -- the client's
+  # retryable reason, and the owner side naming the link that answered no
+  # challenge (`<pid> answered no possession challenge`).
+  echo "-- AA.err --"; cat "$WORK/AA.err"
+  echo "-- owner: links that answered no challenge --"
+  grep -c "answered no possession challenge" "$WORK/up-auth.log" || true
+  grep -i "deny\|refus" "$WORK/up-auth.log" | tail -5
+  bad "gateAUTH-A: covered exec refused under authoritative (rc=$rcAA)"
+fi
+
+# ================================================================== GATE RECON ==
+# The state AUTH-A lands in, asserted for what it HONESTLY is today. A link that
+# is mid-re-establishment must never fail SILENTLY and must never be reported as
+# a capability decision: the client gets a RETRYABLE reason, and the owner names
+# the link that answered no possession challenge. That is the difference between
+# a queue that has not drained and a refusal.
+#
+# NOT asserted yet, on purpose: "the retry then succeeds". Measured on this
+# stack, twelve fresh links over 20s all fail the same way, because the defect is
+# in the link (a primary transport can go writable-but-deaf, transport/direct.rs
+# :1410,:1436), not in the retry budget -- so asserting success here would be
+# asserting a fix that does not exist yet. When #312 lands, this gate gains its
+# second verdict (first-try success) and AUTH-A comes off KNOWN_RED.
+say "RECON: an exec during post-restart link re-establishment never fails SILENTLY"
+# The state AUTH-A lands in, asserted for what it HONESTLY is. A link that is
+# mid-re-establishment may refuse, but it must refuse with a RETRYABLE reason and
+# the owner must name the link that answered no possession challenge; a silent
+# drop (or a refusal that pretends to be a capability decision) is the failure
+# this gate exists to catch.
+#
+# It passes BOTH before and after #312: before, the branch below asserts the
+# honest refusal; after, the first branch asserts first-try success and this
+# gate's message names the ratchet step (AUTH-A comes off KNOWN_RED). Asserting
+# "the retry then succeeds" today would be asserting a fix that does not exist --
+# measured: twelve fresh links over 20s all fail the same way, because the defect
+# is in the link (transport/direct.rs:1410,:1436), not in the retry budget.
+RECON_RC="$rcAA"
+RECON_TEXT=$(cat "$WORK/AA.err" 2>/dev/null)
+NOCHAL=$(grep -c "answered no possession challenge" "$WORK/up-auth.log" || true)
+echo "## (reconnect window) rc=$RECON_RC no_challenge_lines=$NOCHAL"
+if [ "$RECON_RC" = "0" ] && [ "$OUTAA" = "FLEET-AUTH-OK" ]; then
+  ok "gateRECON: the covered exec survived the reconnect window first-try (link reconciliation landed: remove AUTH-A from KNOWN_RED and delete this note)"
+elif echo "$RECON_TEXT" | grep -q "identity not proven within" && [ "$NOCHAL" -ge 1 ]; then
+  ok "gateRECON: refused with the retryable 'identity not proven within N ms; retry' reason AND the owner named the unanswered link (honest, diagnosable; #312)"
+else
+  echo "-- AA.err (expected a retryable reason) --"; echo "$RECON_TEXT"
+  echo "-- owner: links that answered no challenge --"; grep -c "answered no possession challenge" "$WORK/up-auth.log" || true
+  bad "gateRECON: the reconnect-window refusal was SILENT (no retryable reason, or the owner never named the unanswered link)"
+fi
+
+# ================================================================== GATE AUTH-B =
+# A second spoke enrolled WITHOUT shell in its ceiling: exec must be refused
+# with the ceiling/grant reason, proving the ceiling (not mere membership)
+# is what authorizes.
+SPOKE2=spoke2
+DS2="$WORK/$SPOKE2"
+enroll_delegate "$SPOKE2" --allow transfer
+start_spoke "$DS2" "$SPOKE2"
+sleep 6
+say "AUTH-B: exec outside the enrolment ceiling is refused under authoritative"
+OUTAB=$(timeout 60 env FILAMENT_CONFIG_DIR="$DS2" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AB.err" </dev/null)
+rcAB=$?
+echo "## (authoritative uncovered exec) rc=$rcAB out='$OUTAB'"
+if [ "$rcAB" != "0" ] \
+   && ! echo "$OUTAB" | grep -q "SHOULD-NOT-RUN" \
+   && grep -qi "explicit grant" "$WORK/up-auth.log"; then
+  ok "gateAUTH-B: uncovered exec refused under authoritative (grant reason, no output)"
+else
+  echo "-- AB.err --"; cat "$WORK/AB.err"
+  echo "-- owner auth log --"; grep -i "deny\|refus" "$WORK/up-auth.log" | tail -5
+  bad "gateAUTH-B: uncovered exec NOT refused under authoritative (rc=$rcAB)"
+fi
+
+# ================================================================== GATE AUTH-C =
+say "AUTH-C: revoke --certificate refuses under authoritative too"
+"${O_ENV[@]}" "$BIN" --server "$SERVER" revoke "$SPOKE" --certificate --yes >"$WORK/revoke-auth.log" 2>&1
+sleep 3
+OUTAC=$(timeout 60 "${S_ENV[@]}" "$BIN" --server "$SERVER" exec alpha -- /bin/echo SHOULD-NOT-RUN 2>"$WORK/AC.err" </dev/null)
+rcAC=$?
+echo "## (authoritative exec after revoke) rc=$rcAC out='$OUTAC'"
+if [ "$rcAC" != "0" ] && ! echo "$OUTAC" | grep -q "SHOULD-NOT-RUN"; then
+  ok "gateAUTH-C: revoked spoke refused under authoritative"
+else
+  echo "-- AC.err --"; cat "$WORK/AC.err"
+  bad "gateAUTH-C: revoked exec NOT refused under authoritative (rc=$rcAC)"
+fi
+
 # ========================================================================= sum =
+# =============================================================== known-red ==
+# Convert the NAMED, TRACKED failures into their own verdict line (so the count
+# stays honest and the slot is never silently absent), and fail the run if one of
+# them starts passing (the ratchet only shrinks, and only with evidence).
+declare_known_red_summary
+KNOWN_RED_N=${#KNOWN_RED_HIT[@]}
+
 echo
 echo "==========================================="
-echo "fleet-cert gates: $PASS passed, $FAIL failed${FAILED:+ -- failed:$FAILED}"
+echo "fleet-cert gates: $PASS passed, $FAIL failed, $KNOWN_RED_N known-red${KNOWN_RED_HIT:+ -- known-red:$KNOWN_RED_HIT}${FAILED:+ -- failed:$FAILED}"
 echo "work: $WORK"
 [ "$FAIL" = "0" ]
