@@ -96,13 +96,17 @@ fn gate_inputs(
         own_user,
         has_grant,
         cert_revoked: cert_revoked_for(idev.as_ref()),
+        ceiling_covers: crate::identity_state::ceiling_covers_action(idev.as_ref(), action),
+        scoped_default: capability::is_scoped_default_action(action),
+        action: action.to_string(),
     }
 }
 
 /// The gate's verdict. Shell goes through the shared shell gate; every other
-/// action through the single policy site with the same legacy fold, and
-/// `scoped_in_bounds` set the way the daemon sets it for an open inside the
-/// scoped default (inbox, read-only share root).
+/// action through the single policy site with the same legacy fold and the
+/// same inputs, `scoped_in_bounds` set the way the daemon sets it for an open
+/// inside the scoped default (inbox, read-only share root). The resource is
+/// the row's, so a route grant is judged against its own header.
 fn decide(action: &str, resource: &str, inputs: &ShellGateInputs) -> Result<(), Option<String>> {
     if action == CAP_SHELL && resource == "self" {
         return pty_gate_decision(inputs);
@@ -120,9 +124,11 @@ fn decide(action: &str, resource: &str, inputs: &ShellGateInputs) -> Result<(), 
         inputs.expires,
         inputs.ak_caps.as_deref(),
         inputs.own_user.as_ref(),
-        capability::is_scoped_default_action(action),
+        inputs.scoped_default,
         inputs.has_grant,
         inputs.cert_revoked,
+        inputs.denied,
+        inputs.ceiling_covers,
     ) {
         GateDecision::Allow => Ok(()),
         GateDecision::Deny { cap_reason } => Err(cap_reason),
