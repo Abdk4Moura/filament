@@ -79,21 +79,17 @@ Consequence for the flip: in shadow this is invisible; under authoritative it
 locks out every fleet device that is mid-reconnect after an owner restart. Do NOT
 flip until #312 is fixed and AUTH-A is green first-try.
 
-## FLIP BLOCKER: fleet devices cannot re-prove after an owner restart
+## RESOLVED: fleet devices re-prove after an owner restart
 
-Measured by `cli/tests/fleet-cert-gates.sh` gate AUTH-A (currently KNOWN-RED,
-filed as issue #312): after the owner daemon restarts, the possession
-challenge does not reach the peer on the link that is carrying its traffic, so
-a covered shell-class open is refused under authoritative mode until the peer
-reconnects cleanly. The defect is in the LINK, not in the authz layer: a
-primary transport can go writable-but-deaf because its reader exits silently
-on a QUIC `FinishedEarly` without marking the link dead
-(`crates/filament-transport/src/direct.rs:1410` and `:1436`). Shadow mode
-masks it completely (legacy decides), which is why it went unnoticed.
-
-Consequence: invisible in shadow; under authoritative it locks out every
-fleet device that is mid-reconnect after an owner restart. Do NOT flip until
-issue #312 is fixed and AUTH-A is green first-try.
+Was a flip blocker; fixed and now gated first-try by `cli/tests/fleet-cert-gates.sh`
+gate AUTH-A. The possession challenge was being answered by nobody because the
+exec open travels on the one-shot `filament exec` client's link, which had no
+identity responder -- so the link could never become Proven, the open parked and
+expired, and each retry minted a fresh equally silent link. The client now answers
+challenges through the SAME shared responder the daemon uses (one
+possession-signing path). Kept here rather than deleted because the failure mode is
+invisible in shadow (legacy decides) and would return silently if the one-shot
+responder is ever refactored away.
 
 ## Mandatory review citation (not a boolean)
 

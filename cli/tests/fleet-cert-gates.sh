@@ -42,22 +42,15 @@
 # which IS the product path for a fleet device, and `grant` is deliberately
 # never called.
 #
-# KNOWN-RED (one gate, named and tracked, never silently absent):
-#   AUTH-A  the covered exec after an OWNER RESTART is refused, because the
-#           possession challenge does not reach the peer on the link that is
-#           carrying its traffic. Root-caused to a transport defect that is NOT
-#           in this PR: a primary link's reader exits silently on a QUIC
-#           FinishedEarly (transport/direct.rs:1410, :1436) leaving the link
-#           writable but deaf, so the challenge is written successfully and
-#           never read. Full evidence chain in the gate body below and in
-#           https://github.com/Abdk4Moura/filament/issues/312 . It is harmless
-#           while the capability layer is in shadow (legacy decides) and locks
-#           the device out under authoritative mode until it reconnects -- so it
-#           is a FLIP BLOCKER, tracked on docs/cap-flip-checklist.md.
-#           Reported through KNOWN_RED_ALLOW: its verdict slot still counts, the
-#           run stays green, and the run FAILS the moment it starts passing so
-#           the entry is removed with evidence (same ratchet as
-#           gates-ratchet.sh).
+# WAS KNOWN-RED, NOW GREEN: gateAUTH-A. The covered exec after an OWNER RESTART
+# was refused because the possession challenge went to the pid carrying the
+# exec-open -- the ONE-SHOT `filament exec` client's own link -- and that client
+# never answered challenges, so the link could never become Proven, the open
+# parked, expired, and every retry minted a fresh equally silent link. Fixed by
+# giving the one-shot client the same shared responder the daemon uses (one
+# possession-signing path; send_cmd.rs and exec_send.rs now differ only in which
+# loop calls it). AUTH-A now passes FIRST TRY. The half-dead-reader defect found
+# while chasing this is a real latent bug and remains its own slice (#312).
 #
 # Gates:
 #   enrolment x3  both ends resolved a certified identity (lib/fixture.sh)
@@ -133,7 +126,10 @@ AK_FILE="$HOME/.ssh/authorized_keys"
 
 # See the KNOWN-RED block in the header. Matching is on a stable substring of
 # the FAIL text, deliberately not the whole line (the measured rc varies).
-KNOWN_RED_ALLOW=("gateAUTH-A: covered exec allowed under authoritative|gateAUTH-A: covered exec refused under authoritative")
+# EMPTY, and it must stay empty until something is genuinely red: the ratchet
+# forces removal the moment a known-red gate starts passing, which is exactly
+# what happened to gateAUTH-A (see the header note).
+KNOWN_RED_ALLOW=()
 
 O_ENV=(env FILAMENT_CONFIG_DIR="$DA")
 S_ENV=(env FILAMENT_CONFIG_DIR="$DS")
