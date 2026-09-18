@@ -436,7 +436,17 @@ pub(crate) async fn serve_exec(
                         close["status"] = json!(code);
                     }
                 }
-                let _ = t.send_control(&close).await;
+                if let Err(e) = t.send_control(&close).await {
+                    // A close that never arrives leaves the initiator in a select with nothing
+                    // left to select: this file already documents that hazard class a few lines
+                    // above, for a different early break ("hanging the initiator"). The old
+                    // `let _ =` made a LOST close indistinguishable from a delivered one, so the
+                    // acceptor believed it had reported the exit while the initiator never heard
+                    // it and the only artifact was silence. Say so instead.
+                    crate::ui::say(&format!(
+                        "filament: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
+                    ));
+                }
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
                 return;
