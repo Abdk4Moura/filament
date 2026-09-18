@@ -583,6 +583,7 @@ pub(crate) async fn handle_sync_open(
     mux: Arc<l2::Mux>,
     v: &Value,
     drop_dir: &Path,
+    parked: &mut Vec<crate::recv_cmd::ParkedOpen>,
 ) {
     let Some(sid) = l2::wire_sid(v) else { return };
     if !l2::is_l2_sid(sid) {
@@ -605,6 +606,22 @@ pub(crate) async fn handle_sync_open(
     let who = match authorize_sync(conn, pid, true) {
         Ok(w) => w,
         Err(reason) => {
+            // Settle-then-evaluate, as exec does: a deny that rests on a
+            // not-yet-proven identity parks for re-drive on proof.
+            if crate::recv_cmd::park_on_deny(
+                parked,
+                conn,
+                pid,
+                crate::recv_cmd::ParkKind::Sync,
+                &t,
+                sid,
+                v,
+                &reason,
+            )
+            .await
+            {
+                return;
+            }
             let name = conn.link(pid).and_then(|l| l.verified_name.clone());
             crate::enqueue_if_requestable(name.as_deref().unwrap_or("<unverified>"), "transfer");
             return refuse(format!("not authorized: {reason}")).await;
