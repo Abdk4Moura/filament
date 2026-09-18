@@ -2144,26 +2144,36 @@ mod tests {
     /// received again, and no health check notices.
     #[tokio::test]
     async fn primary_link_reports_dead_when_the_peer_ends_its_send_half() {
-        let ((conn_d, send_d, recv_d), (_conn_a, mut send_a, _recv_a)) = connected_pair().await;
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let primary = make_transport(
-            "peer".to_string(),
-            conn_d,
-            send_d,
-            recv_d,
-            tx,
-            true,
-            None,
-            true, // PRIMARY: its inbound path is the link's inbound path
-        );
-        assert!(!primary.is_dead(), "a fresh link is alive");
-        // The peer cleanly ends its send half, exactly as a dropped or one-shot
-        // sender does.
-        let _ = send_a.finish();
-        assert!(
-            within(|| primary.is_dead(), 2_000).await,
-            "a primary link must report dead once the peer can no longer send to it"
-        );
+        // EVERY await in a socket-touching test is bounded. The first version of
+        // this pair bounded the handshake but not the body, and the worker arm
+        // then hung the linux job to its 25-minute timeout while printing no
+        // failing test name -- a hang is worse than a failure because it names
+        // nothing and reports as infrastructure.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ((conn_d, send_d, recv_d), (_conn_a, mut send_a, _recv_a)) =
+                connected_pair().await;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let primary = make_transport(
+                "peer".to_string(),
+                conn_d,
+                send_d,
+                recv_d,
+                tx,
+                true,
+                None,
+                true, // PRIMARY: its inbound path is the link's inbound path
+            );
+            assert!(!primary.is_dead(), "a fresh link is alive");
+            // The peer cleanly ends its send half, exactly as a dropped or
+            // one-shot sender does.
+            let _ = send_a.finish();
+            assert!(
+                within(|| primary.is_dead(), 2_000).await,
+                "a primary link must report dead once the peer can no longer send to it"
+            );
+        })
+        .await
+        .expect("primary-link test did not finish within 20s (a stall must FAIL here)");
     }
 
     /// #312 T2, the other arm: the SAME event on a one-shot WORKER stream must
@@ -2171,29 +2181,37 @@ mod tests {
     /// final file chunk), and their write half is still owed a delivery-ack.
     #[tokio::test]
     async fn worker_stream_is_not_killed_by_its_peers_send_half_ending() {
-        let ((conn_d, _send_d, _recv_d), (conn_a, _send_a, _recv_a)) = connected_pair().await;
-        // A second bi stream on the same connection: how mesh reuse hands out
-        // workers. The worker reads what the ACCEPTOR writes on THIS stream.
-        let (w_send_d, w_recv_d) = conn_d.open_bi().await.expect("dialer worker stream");
-        let (mut w_send_a, _w_recv_a) = conn_a.accept_bi().await.expect("acceptor worker stream");
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let worker = make_transport(
-            "peer".to_string(),
-            conn_d.clone(),
-            w_send_d,
-            w_recv_d,
-            tx,
-            false,
-            None,
-            false, // WORKER: ending a one-shot stream is normal
-        );
-        let _ = w_send_a.finish();
-        // Give the reader time to see the EOF, then require it NOT to be death.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        assert!(
-            !worker.is_dead(),
-            "a worker stream ending must not be reported as link death"
-        );
+        // Deliberately the SAME pair and the same event as the test above, with
+        // `primary=false`: that is what makes the two an A/B rather than two
+        // unrelated tests. The first version opened a second bi stream for the
+        // worker and awaited `open_bi`/`accept_bi` in sequence, which hung on a
+        // runner -- and an extra stream was never needed, because a worker is
+        // defined by the FLAG, not by how its stream was obtained.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let ((conn_d, send_d, recv_d), (_conn_a, mut send_a, _recv_a)) =
+                connected_pair().await;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let worker = make_transport(
+                "peer".to_string(),
+                conn_d,
+                send_d,
+                recv_d,
+                tx,
+                false,
+                None,
+                false, // WORKER: ending a one-shot stream is normal
+            );
+            let _ = send_a.finish();
+            // Give the reader time to see the EOF, then require it NOT to be
+            // death: the worker still owes its delivery-ack write half.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            assert!(
+                !worker.is_dead(),
+                "a worker stream ending must not be reported as link death"
+            );
+        })
+        .await
+        .expect("worker-arm test did not finish within 20s (a stall must FAIL here)");
     }
 
     #[test]
