@@ -1377,12 +1377,20 @@ impl Transport for DirectTransport {
     }
 
     fn is_alive(&self) -> bool {
-        // Our own teardown flag, OR quinn having closed the connection (idle
-        // timeout from the keepalive probe, peer close, transport error). With the
-        // 15s keepalive + 30s idle timeout, a NAT-dead or departed peer flips this
-        // within ~30s, so warm-link reuse skips it and falls back.
-        !self.dead.load(std::sync::atomic::Ordering::Relaxed)
-            && self.conn.close_reason().is_none()
+        // ASK is_dead() RATHER THAN READING THE RAW FLAG, because the two disagree for exactly
+        // one case and it is the case that hangs a caller: a PRIMARY whose peer ended its send
+        // half. The connection is still open there, so close_reason() is None, and `dead` stays
+        // false by design because the write half still owes delivery-acks; is_dead() is what
+        // calls that fatal for a primary and normal for a worker. Reading the flag directly made
+        // is_alive() say "live" about a link is_dead() called dead, and that disagreement is how
+        // an exec client sat in a select with nothing left to select while its own 2s ticker
+        // kept seeing a healthy link.
+        //
+        // The rest is unchanged: our teardown flag, or quinn having closed the connection (idle
+        // timeout from the keepalive probe, peer close, transport error). With the 15s keepalive
+        // and 30s idle timeout a NAT-dead or departed peer flips this within ~30s, so warm-link
+        // reuse skips it and falls back.
+        !self.is_dead() && self.conn.close_reason().is_none()
     }
 
     fn remote_addr(&self) -> Option<std::net::SocketAddr> {
