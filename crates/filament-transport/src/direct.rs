@@ -2121,7 +2121,7 @@ mod tests {
     /// received again, and no health check notices.
     #[tokio::test]
     async fn primary_link_reports_dead_when_the_peer_ends_its_send_half() {
-        let ((conn_d, send_d, recv_d), (_conn_a, send_a, _recv_a)) = connected_pair().await;
+        let ((conn_d, send_d, recv_d), (_conn_a, mut send_a, _recv_a)) = connected_pair().await;
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let primary = make_transport(
             "peer".to_string(),
@@ -2152,7 +2152,7 @@ mod tests {
         // A second bi stream on the same connection: how mesh reuse hands out
         // workers. The worker reads what the ACCEPTOR writes on THIS stream.
         let (w_send_d, w_recv_d) = conn_d.open_bi().await.expect("dialer worker stream");
-        let (w_send_a, _w_recv_a) = conn_a.accept_bi().await.expect("acceptor worker stream");
+        let (mut w_send_a, _w_recv_a) = conn_a.accept_bi().await.expect("acceptor worker stream");
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let worker = make_transport(
             "peer".to_string(),
