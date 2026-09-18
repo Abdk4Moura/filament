@@ -36,7 +36,10 @@ pub(crate) struct CapRow {
     pub resource: String,
     pub source: String,
     pub valid_until: Option<u64>,
-    pub effective: bool,
+    /// `Some(verdict)` from the gate; `None` when the gate cannot be asked
+    /// from the store alone (an uncertified device has no identity to
+    /// evaluate, and the gate refuses trust without one, see #161).
+    pub effective: Option<bool>,
     pub reason: String,
 }
 
@@ -74,6 +77,8 @@ fn gate_inputs(
             Some(c.expires),
             persisted_principal_for_cert(c).0.auth_key_caps().map(|s| s.to_vec()),
         ),
+        // Never reached with trusted=true (see perms_for); kept total so the
+        // matrix stays fabricable.
         None => (None, None, BindingStrength::None, None, None),
     };
     let outcome = capability::cap_authorize(
@@ -230,16 +235,30 @@ pub(crate) fn perms_for(
     for r in rows.iter_mut() {
         let live = r.valid_until.is_none_or(|t| capability::grant_active(t, now));
         if !live {
+            r.effective = Some(false);
             r.reason = format!("expired {}", when(r.valid_until.unwrap_or(0), now));
             continue;
         }
-        match decide(&r.action, &r.resource, &gate_inputs(&name, &r.action, &r.resource, cert.as_ref())) {
+        // The gate refuses legacy trust with no resolved identity (#161), so
+        // with no certificate there is no gate call to make: the verdict is
+        // decided on the live link, and the row says so instead of guessing.
+        let Some(c) = cert.as_ref() else {
+            r.reason = "not evaluated: uncertified, the gate decides on the live link".to_string();
+            continue;
+        };
+        match decide(&r.action, &r.resource, &gate_inputs(&name, &r.action, &r.resource, Some(c))) {
             Ok(()) => {
-                r.effective = true;
+                r.effective = Some(true);
                 r.reason = "gate allows".to_string();
             }
-            Err(Some(reason)) => r.reason = reason,
-            Err(None) => r.reason = "refused: legacy trust does not allow it".to_string(),
+            Err(Some(reason)) => {
+                r.effective = Some(false);
+                r.reason = reason;
+            }
+            Err(None) => {
+                r.effective = Some(false);
+                r.reason = "refused: legacy trust does not allow it".to_string();
+            }
         }
     }
 
@@ -264,7 +283,7 @@ fn row(action: &str, resource: &str, source: &str, valid_until: Option<u64>) -> 
         resource: resource.to_string(),
         source: source.to_string(),
         valid_until,
-        effective: false,
+        effective: None,
         reason: String::new(),
     }
 }
@@ -349,7 +368,11 @@ pub(crate) fn render(devices: &[&DevicePerms], now: u64) -> String {
                         r.resource.clone(),
                         r.source.clone(),
                         r.valid_until.map_or("no expiry".to_string(), |t| when(t, now)),
-                        if r.effective { "yes".to_string() } else { "no".to_string() },
+                        match r.effective {
+                            Some(true) => "yes".to_string(),
+                            Some(false) => "no".to_string(),
+                            None => "?".to_string(),
+                        },
                         r.reason.clone(),
                     ]
                 })
@@ -517,17 +540,17 @@ mod tests {
         assert_eq!(laptop.addr.as_deref(), Some("fdf1::a2"));
         let signed = find(laptop, "shell", "grant by 11111111 v5");
         assert_eq!(signed.valid_until, Some(now + 3600));
-        assert!(signed.effective, "{}", signed.reason);
-        assert!(find(laptop, "shell", "pair-secret legacy").effective);
-        assert!(find(laptop, "transfer", "pair-secret legacy").effective);
+        assert_eq!(signed.effective, Some(true), "{}", signed.reason);
+        assert_eq!(find(laptop, "shell", "pair-secret legacy").effective, Some(true));
+        assert_eq!(find(laptop, "transfer", "pair-secret legacy").effective, Some(true));
 
         // An expired grant is listed, not effective, and says when it lapsed.
         let oldbox = by("oldbox");
         let legacy = find(oldbox, "mount", "pair-secret legacy");
         assert_eq!(legacy.valid_until, Some(now - 10));
-        assert!(!legacy.effective && legacy.reason.starts_with("expired"), "{}", legacy.reason);
+        assert!(legacy.effective == Some(false) && legacy.reason.starts_with("expired"), "{}", legacy.reason);
         let sig = find(oldbox, "mount", "grant by 11111111 v9");
-        assert!(!sig.effective && sig.reason.starts_with("expired"));
+        assert!(sig.effective == Some(false) && sig.reason.starts_with("expired"));
 
         // A ceiling-covered cap: one row per ceiling entry, clocked by the binding deadline.
         let joined = by("joined");
@@ -542,7 +565,7 @@ mod tests {
         assert_eq!(perms_for(&record, &store, None, now).tier, "EXTERNAL");
         let mount = find(joined, "mount", "enrolment ceiling");
         assert_eq!(mount.valid_until, Some(now + 7200));
-        assert!(mount.effective, "{}", mount.reason);
+        assert_eq!(mount.effective, Some(true), "{}", mount.reason);
         assert!(joined.caps.iter().all(|r| r.source == "enrolment ceiling"), "no duplicate legacy rows");
         assert!(joined.caps.iter().all(|r| r.action != "shell"));
 
@@ -552,17 +575,20 @@ mod tests {
         assert_eq!(locked.denies, vec!["shell".to_string()]);
         assert!(locked.caveats.iter().any(|c| c == "cert revoked"));
         let xfer = find(locked, "transfer", "pair-secret legacy");
-        assert!(!xfer.effective && xfer.reason.contains("revoked"), "{}", xfer.reason);
+        assert!(xfer.effective == Some(false) && xfer.reason.contains("revoked"), "{}", xfer.reason);
 
         // An expired cert keeps the tier `devices` gives it and gains the caveat.
         let stale = by("stale");
         assert_eq!(stale.tier, "EXTERNAL");
         assert!(stale.caveats.iter().any(|c| c.starts_with("cert expired")), "{:?}", stale.caveats);
 
-        // A v1 record reads as the transfer baseline.
+        // A v1 record reads as the transfer baseline; with no certificate the
+        // gate is not asked (it refuses trust without an identity, #161).
         let plain = by("plain");
         assert_eq!(plain.tier, "NEEDS REVIEW");
-        assert!(find(plain, "transfer", "pair-secret legacy (v1 default)").effective);
+        let base = find(plain, "transfer", "pair-secret legacy (v1 default)");
+        assert_eq!(base.effective, None);
+        assert!(base.reason.starts_with("not evaluated"), "{}", base.reason);
 
         // Read-only: the view wrote nothing.
         let rendered = render(&all.iter().collect::<Vec<_>>(), now);
