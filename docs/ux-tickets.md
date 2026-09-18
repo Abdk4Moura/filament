@@ -27,7 +27,7 @@ Legend: `done` merged to main · `in PR` open pull request · `building` branch 
 
 | Ticket | What | Lane | State | Where |
 |---|---|---|---|---|
-| U1 | implicit `init` | helper | not started | |
+| U1 | implicit `init` | helper | in PR | #328 |
 | U2 | `serve shell` + `shell <code>` | pi | not started | |
 | U3 | `reach --until-direct` | helper | in PR | #315 (gate 3/3, waits on registry hotfix #317) |
 | U4 | `serve exec/forward/mount` | worker | not started | needs U2 |
