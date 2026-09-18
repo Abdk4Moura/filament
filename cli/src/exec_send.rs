@@ -16,9 +16,10 @@
 //! EOF goes out as one empty frame and then we stop reading stdin but keep
 //! draining both outputs until the close arrives.
 
+use crate::identity_lifecycle::respond_to_identity_challenge;
 use crate::l2;
-use anyhow::{Result, bail};
-use serde_json::{Value, json};
+use anyhow::{bail, Result};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
@@ -181,12 +182,11 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             f["cwd"] = json!(cwd.to_string_lossy());
         }
         if !opts.env.is_empty() {
-            f["env"] = json!(
-                opts.env
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-            );
+            f["env"] = json!(opts
+                .env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>());
         }
         if opts.tty {
             f["tty"] = json!(true);
@@ -207,6 +207,15 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             };
             match ev {
                 crate::net::Ev::Control(_pid, v) => {
+                    // #309: a covered-without-grant open needs a PROVEN link, and
+                    // the owner challenges the pid carrying the open -- this one.
+                    // Without an answer here the link can never become Proven,
+                    // the open parks and expires, and every retry mints a fresh
+                    // equally silent link. Same shared helper send_cmd uses, so
+                    // there is one possession-signing path, not two.
+                    if v.get("type").and_then(|t| t.as_str()) == Some("identity-nonce-challenge") {
+                        respond_to_identity_challenge(&t, &v).await;
+                    }
                     if v.get("type").and_then(|t| t.as_str()) == Some("exec-open-ack")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
@@ -299,6 +308,14 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
             },
             ev = rx.recv() => match ev {
                 Some(crate::net::Ev::Control(_pid, v)) => {
+                    // #309: the owner re-challenges while an open is parked (and
+                    // after any re-adopt), so the same answer is owed here, in
+                    // the long-lived pump, not only during the ack wait.
+                    if v.get("type").and_then(|t| t.as_str())
+                        == Some("identity-nonce-challenge")
+                    {
+                        respond_to_identity_challenge(&t, &v).await;
+                    }
                     if v.get("type").and_then(|t| t.as_str()) == Some("exec-close")
                         && v.get("sid").and_then(|s| s.as_u64()) == Some(sid as u64)
                     {
