@@ -320,12 +320,28 @@ decision.
 *Accept:* `filament devices --json | jq -e '.data.devices[0]'` exposes the
 agreed shape, and a schema test asserts every surface uses the same field names.
 
+### U20 — `sync <dir> <device>:<dir>` · `worker` · **B** · shipped, PR #326
+
+Delta directory transfer between paired devices, rsync-shaped: a manifest of
+whole-file and per-chunk digests goes over one L2 stream, the receiver answers
+with the chunks it lacks, only those move, and every landed file passes the
+same whole-file verifier `send`/`receive` use. Consent is the existing pairing
+and transfer grant, so there is no prompt on either end and a stranger cannot
+sync. `<remote-dir>` is bounded to the receiver's drop directory. `--delete`
+off by default; `--dry-run`/`-n` prints the plan and touches nothing.
+
+*Accept:* `cli/tests/sync-gates.sh`: change one chunk of one file and add one
+file, re-sync, and exactly those two move (bytes and lines); an unchanged
+re-run moves 0 bytes; `boxB:../x` is refused with exit 4 and nothing created;
+`-n` creates nothing on the receiver; an unknown device exits 3; a re-run after
+a file is lost and another truncated on the receiver moves only what is missing.
+
 ---
 
 ## Dependency order, compressed
 
 ```
-U1  U3                      independent, any order
+U1  U3  U20                 independent, any order
 U2 ──► U4
 U5                          independent (needs U2 only for the transcript)
 U6  U7                      independent

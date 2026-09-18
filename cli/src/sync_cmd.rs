@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -59,14 +59,16 @@ pub(crate) fn safe_relpath(s: &str) -> Option<PathBuf> {
     if s.is_empty() || s.len() > 4096 || s.chars().any(|c| c.is_control() || c == '\\') {
         return None;
     }
+    // Textual, not `Path::components()`: that normalizes an interior `.` away,
+    // and a path the peer spelled with one is a path we refuse, not tidy.
     let mut out = PathBuf::new();
-    for c in Path::new(s).components() {
-        match c {
-            Component::Normal(n) => out.push(n),
-            _ => return None,
+    for seg in s.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return None;
         }
+        out.push(seg);
     }
-    (!out.as_os_str().is_empty()).then_some(out)
+    Some(out)
 }
 
 fn hex(d: &[u8]) -> String {
@@ -537,8 +539,9 @@ fn authorize_sync(conn: &mut Conn, pid: &str, in_bounds: bool) -> Result<String,
 
 /// Bound the requested root to the drop directory: relative, or absolute under
 /// it; every existing ancestor canonical-within before anything is created,
-/// and the result canonical-within after.
-pub(crate) fn resolve_root(drop_dir: &Path, req: &str) -> Result<PathBuf, String> {
+/// and the result canonical-within after. With `create` false (a dry run) a
+/// missing root is returned as is and nothing touches the disk.
+pub(crate) fn resolve_root(drop_dir: &Path, req: &str, create: bool) -> Result<PathBuf, String> {
     let outside = || "remote dir is outside this device's drop directory".to_string();
     let rel = match req.trim() {
         "" | "." => PathBuf::new(),
@@ -562,6 +565,9 @@ pub(crate) fn resolve_root(drop_dir: &Path, req: &str) -> Result<PathBuf, String
     }
     if !crate::path_within_canonical(drop_dir, &probe) {
         return Err(outside());
+    }
+    if !create && !target.exists() {
+        return Ok(target);
     }
     std::fs::create_dir_all(&target).map_err(|e| format!("cannot create remote dir: {e}"))?;
     if !crate::path_within_canonical(drop_dir, &target) {
@@ -591,7 +597,8 @@ pub(crate) async fn handle_sync_open(
     };
     // Bounds first, so an out-of-root request never widens to a grant-only
     // decision it would have failed anyway, and the gate sees the real scope.
-    let root = match resolve_root(drop_dir, v["root"].as_str().unwrap_or("")) {
+    let dry_run = v["dry_run"].as_bool() == Some(true);
+    let root = match resolve_root(drop_dir, v["root"].as_str().unwrap_or(""), !dry_run) {
         Ok(r) => r,
         Err(e) => return refuse(e).await,
     };
@@ -610,7 +617,6 @@ pub(crate) async fn handle_sync_open(
         return refuse("sid in use".into()).await;
     };
     let delete = v["delete"].as_bool() == Some(true);
-    let dry_run = v["dry_run"].as_bool() == Some(true);
     let _ = t.send_control(&json!({ "type": "sync-open-ack", "sid": sid })).await;
     ui::say(&format!("sync: '{who}' -> {}{}", root.display(), if dry_run { " (dry run)" } else { "" }));
     tokio::spawn(async move {
@@ -642,7 +648,11 @@ async fn serve_sync(
         bail!("manifest names an unsafe path");
     }
     let r = root.to_path_buf();
-    let (have, _) = tokio::task::spawn_blocking(move || walk_manifest(&r)).await??;
+    let (have, _) = if r.is_dir() {
+        tokio::task::spawn_blocking(move || walk_manifest(&r)).await??
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let plan = diff(&files, &have);
     send_json(t, sid, &serde_json::to_value(&plan)?).await?;
     loop {
@@ -756,7 +766,7 @@ mod tests {
 
     #[test]
     fn relpaths_that_could_escape_are_refused() {
-        for bad in ["", "/etc/passwd", "../x", "a/../../b", "./a", "a/./b", "a\\b", "a\0b"] {
+        for bad in ["", "/etc/passwd", "../x", "a/../../b", "./a", "a/./b", "a/", "a//b", "a\\b", "a\0b"] {
             assert!(safe_relpath(bad).is_none(), "{bad:?}");
         }
         assert_eq!(safe_relpath("a/b/c.txt").unwrap(), PathBuf::from("a/b/c.txt"));
@@ -814,16 +824,19 @@ mod tests {
     #[test]
     fn remote_root_is_bounded_to_the_drop_dir() {
         let d = tmp("root");
-        assert_eq!(resolve_root(&d, "inbox/photos").unwrap(), d.join("inbox/photos").canonicalize().unwrap());
-        assert_eq!(resolve_root(&d, "").unwrap(), d.canonicalize().unwrap());
-        assert_eq!(resolve_root(&d, &d.join("abs").to_string_lossy()).unwrap(), d.join("abs").canonicalize().unwrap());
+        assert_eq!(resolve_root(&d, "dry", false).unwrap(), d.join("dry"));
+        assert!(!d.join("dry").exists(), "a dry run creates nothing");
+        assert_eq!(resolve_root(&d, "inbox/photos", true).unwrap(), d.join("inbox/photos").canonicalize().unwrap());
+        assert_eq!(resolve_root(&d, "", true).unwrap(), d.canonicalize().unwrap());
+        assert_eq!(resolve_root(&d, &d.join("abs").to_string_lossy(), true).unwrap(), d.join("abs").canonicalize().unwrap());
         for bad in ["../out", "/etc", "a/../../b"] {
-            assert!(resolve_root(&d, bad).is_err(), "{bad}");
+            assert!(resolve_root(&d, bad, true).is_err(), "{bad}");
+            assert!(resolve_root(&d, bad, false).is_err(), "{bad}");
         }
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink("/tmp", d.join("esc")).unwrap();
-            assert!(resolve_root(&d, "esc/x").is_err(), "symlink escape must be refused");
+            assert!(resolve_root(&d, "esc/x", true).is_err(), "symlink escape must be refused");
         }
         let _ = std::fs::remove_dir_all(&d);
     }
