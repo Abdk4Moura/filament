@@ -7,10 +7,10 @@
 #
 
 # --- BITE-CHECK CONVENTION (four rules, each earned by a specific failure) ---
-# evidence, and to be hoisted into cli/tests/lib/fixture.sh's "Preconditions and refusal"
-# any carry-over claim that depends on the tree being unchanged.)
 #
-# Three rules, each earned by a specific failure.
+# Four rules, each earned by a specific failure. Rules 1 to 3 make a measurement
+# trustworthy; rule 4 stops a reader downstream from throwing it away. Hoist these into
+# cli/tests/lib/fixture.sh's "Preconditions and refusal" section when PR #331 lands.
 #
 # 1. A BITE CHECK MUST PROVE THE ARTIFACT CONTAINS THE BITE. `rbuild --ref <branch>`
 # builds what is on GitHub, so a bite applied only in the working tree is built away, the
