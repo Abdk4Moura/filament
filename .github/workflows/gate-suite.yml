@@ -149,12 +149,21 @@ jobs:
             # assignment itself fail and errexit kills the step before the
             # output is printed. `|| code=$?` keeps the status without errexit.
             code=0
-            out="$(bash "$g" 2>&1)" || code=$?
+            # A PER-GATE BOUND. One hanging gate used to consume the whole 40-minute job budget
+            # and hide every gate after it in the loop: on 2026-09-18 the roster hang meant
+            # shell-gates and whoami-candidate-gates never ran at all, so two more gates went
+            # silently unexercised. 300s is generous for these fixtures and short enough that a
+            # hang fails THIS gate, prints its partial output, and lets the rest of the suite run.
+            # Note that this capture is also why a running gate prints nothing until it returns:
+            # silence in this log means "still running", not "nothing happened yet".
+            out="$(timeout 300 bash "$g" 2>&1)" || code=$?
             echo "$out"
             echo "::endgroup::"
             got=$(printf '%s\n' "$out" | grep -c '^PASS:' || true)
             want=${EXPECT[$g]}
-            if [ "$code" -ne 0 ]; then
+            if [ "$code" -eq 124 ]; then
+              echo "::error::$g HUNG: killed by the 300s per-gate timeout, so the output above is partial and every gate after it in this suite still ran"; rc=1
+            elif [ "$code" -ne 0 ]; then
               echo "::error::$g exited $code"; rc=1
             elif [ "$got" -ne "$want" ]; then
               echo "::error::$g passed $got gates but $want were expected; a gate did not run"; rc=1
