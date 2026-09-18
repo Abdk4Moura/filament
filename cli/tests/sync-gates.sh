@@ -8,8 +8,9 @@
 
 # --- BITE-CHECK CONVENTION (four rules, each earned by a specific failure) ---
 #
-# Four rules, each earned by a specific failure. Rules 1 to 3 make a measurement
-# trustworthy; rule 4 stops a reader downstream from throwing it away. Hoist these into
+# Five rules, each earned by a specific failure. Rules 1 to 3 make a measurement
+# trustworthy; rule 4 stops a reader downstream from throwing it away; rule 5 stops a
+# bound from being defeated by the thing it bounds. Hoist these into
 # cli/tests/lib/fixture.sh's "Preconditions and refusal" section when PR #331 lands.
 #
 # 1. A BITE CHECK MUST PROVE THE ARTIFACT CONTAINS THE BITE. `rbuild --ref <branch>`
@@ -298,3 +299,10 @@ fi
 echo
 echo "== sync gates: PASS=$PASS FAIL=$FAIL${FAILED:+ (failed:$FAILED)} =="
 [ "$FAIL" = 0 ]
+#
+# 5. A BOUND WHOSE OWN RESULT TRAVELS THROUGH A PIPE THE BOUNDED PROCESS CAN HOLD IS NOT A
+# BOUND. `out=$(fs_bounded ... shell ...)` fired the bound, wrote `wedged` to the state
+# file, and then never returned, because the command leaves a descendant holding the
+# capture pipe: the substitution waits for an EOF that the hung process owns. Write the
+# output to a file and read it with `fs_out` AFTER the call, let `fs_cli` abort the gate by
+# name on a wedge, and keep the invariant checkable: no `$(fs_cli ...)` captures anywhere.
