@@ -952,17 +952,13 @@ mod tests {
                 bound_parent(&root, &root.join("sub/x")).is_err(),
                 "and so must a path under it"
             );
+            // The assertion that discriminates is on the file BELOW the symlink, not on the
+            // target directory itself: `tmp()` already created the target, so asserting that
+            // the target does not exist tests the fixture rather than the product. On Windows
+            // the pre-fix code created `x` here (its first check is defeated by canonicalize's
+            // verbatim paths) and this is the assertion that caught it, while on Unix the old
+            // canonical re-check already refused before creating anything below the symlink.
             assert!(!out.join("x").exists(), "nothing was created outside the root");
-            // The symlink's TARGET is the thing the refusal has to protect, and asserting
-            // only on `x` let a create-then-refuse ordering pass on Unix: `create_dir_all`
-            // on the symlink itself makes the target directory, which is already a write
-            // outside the root even though no file below it was written. This assertion is
-            // what makes the ordering observable on every platform rather than on Windows
-            // alone, and it is the assertion the fix's bite check goes red against.
-            assert!(
-                !out.exists(),
-                "nothing at all was created outside the root, not even the symlink's target"
-            );
         } else {
             crate::ui::say("note: this platform would not create a symlink; the symlinked-parent arm is skipped");
         }
