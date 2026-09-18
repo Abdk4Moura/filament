@@ -306,7 +306,12 @@ pub struct DevicesFileLock {
 impl DevicesFileLock {
     /// Acquire the lock, blocking until it is available.
     pub fn acquire() -> anyhow::Result<Self> {
-        let path = Paths::config_dir().join("devices.json.lock");
+        Self::acquire_at(&Paths::config_dir().join("devices.json.lock"))
+    }
+
+    /// The same exclusive lock on an arbitrary sidecar (the identity mint in
+    /// `identity_flow::ensure_user_key_inner` uses `identity.lock`).
+    pub fn acquire_at(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -320,7 +325,8 @@ impl DevicesFileLock {
             let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
             if rc != 0 {
                 return Err(anyhow::anyhow!(
-                    "flock devices.json.lock: {}",
+                    "flock {}: {}",
+                    path.display(),
                     std::io::Error::last_os_error()
                 ));
             }
@@ -347,7 +353,8 @@ impl DevicesFileLock {
             };
             if ok == 0 {
                 return Err(anyhow::anyhow!(
-                    "LockFileEx devices.json.lock: {}",
+                    "LockFileEx {}: {}",
+                    path.display(),
                     std::io::Error::last_os_error()
                 ));
             }

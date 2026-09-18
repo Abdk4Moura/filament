@@ -57,18 +57,13 @@ pub(crate) fn tour_cmd() -> Result<()> {
         )),
     }
     let n = devices_load().len();
-    let identity = identity::UserKey::load(&crate::platform::PlatformKeyStore)?;
+    // U1: the first screen mints the identity instead of warning about it.
+    let identity = crate::identity_flow::ensure_user_key(false)?;
     ui::say(&format!("  {n} device{}", if n == 1 { "" } else { "s" }));
-    match identity {
-        Some(key) => ui::say(&format!(
-            "  identity {}",
-            ui::paint_when(color, ui::Tone::Bold, &key.fingerprint())
-        )),
-        None => ui::say(&format!(
-            "  {} no identity yet",
-            ui::paint_when(color, ui::Tone::Warn, "!")
-        )),
-    }
+    ui::say(&format!(
+        "  identity {}",
+        ui::paint_when(color, ui::Tone::Bold, &identity.fingerprint())
+    ));
     ui::say("");
     ui::say(&ui::paint_when(color, ui::Tone::Dim, "  do this:"));
     let act = |cmd: &str, desc: &str| ui::say(&format!("    {:<24} {}", cmd, desc));

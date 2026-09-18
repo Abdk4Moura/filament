@@ -3828,3 +3828,48 @@ async fn win_safe_resume_part_refuses_symlink() {
     let _ = std::fs::remove_dir_all(&outside);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// U1: the identity is minted on first use, exactly once, and shared under
+/// contention. Eight threads race the first call against a clean config dir;
+/// the lock must let exactly one of them create and hand the rest that key.
+#[test]
+fn implicit_identity_is_minted_once_even_under_contention() {
+    use crate::identity_flow::{ensure_user_key_inner, NO_IMPLICIT_INIT_ENV};
+    let _guard = lock_test_config();
+    let dir = td("u1-race");
+    unsafe { std::env::remove_var(NO_IMPLICIT_INIT_ENV) };
+    let outcomes: Vec<(String, bool)> = (0..8)
+        .map(|_| std::thread::spawn(|| ensure_user_key_inner().map(|(k, c)| (k.fingerprint(), c))))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap().expect("ensure"))
+        .collect();
+    assert_eq!(
+        outcomes.iter().filter(|(_, created)| *created).count(),
+        1,
+        "exactly one thread creates: {outcomes:?}"
+    );
+    assert!(outcomes.iter().all(|(fp, _)| *fp == outcomes[0].0), "one identity: {outcomes:?}");
+    assert!(dir.join("identity.ed25519").exists());
+    // Second call: a no-op, no created flag (so no line).
+    let (again, created) = ensure_user_key_inner().unwrap();
+    assert!(!created);
+    assert_eq!(again.fingerprint(), outcomes[0].0);
+
+    // A joined device (certificate on disk, no key) is never turned into an owner.
+    let dir = td("u1-joined");
+    std::fs::create_dir_all(dir.join("identity")).unwrap();
+    std::fs::write(crate::local_device_cert_path(), "{}").unwrap();
+    let err = ensure_user_key_inner().unwrap_err().to_string();
+    assert!(err.contains("joined device"), "{err}");
+    assert!(!dir.join("identity.ed25519").exists());
+
+    // Opt-out restores the old precondition, fail fast, nothing written.
+    let dir = td("u1-optout");
+    unsafe { std::env::set_var(NO_IMPLICIT_INIT_ENV, "1") };
+    let err = ensure_user_key_inner().unwrap_err().to_string();
+    unsafe { std::env::remove_var(NO_IMPLICIT_INIT_ENV) };
+    assert!(err.contains("filament init"), "{err}");
+    assert!(!dir.join("identity.ed25519").exists());
+    unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
+}
