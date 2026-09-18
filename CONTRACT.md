@@ -285,6 +285,222 @@ evaporate after 10 minutes.
 When `localHelper.available`, optionally show its `peers` as "found on your LAN
 (offline)". It's a presence hint from the native helper; absent by default.
 
+## Relationship frames
+
+Wire-visible pieces of the relationship model designed in
+`docs/design-relationship-ux.md`. Only what crosses a link or a signaling
+socket is here; the state model, the verbs and their prompts are not wire and
+live in that document.
+
+### One-shot verb codes (`serve <verb>` / `<verb> <code>`)
+
+A speakable code scoped to ONE verb and ONE session. It reuses the existing
+pairing code machinery unchanged and adds exactly one thing: the verb is bound
+into the key-confirmation MAC.
+
+- **Grammar.** `adjective-animal-NNNN`, the four-digit pairing nameplate
+  (`mint_words` / `mint_pair_nameplate`). The two words are the SPAKE2
+  password and NEVER leave the machine; the nameplate is the only part
+  registered with the signaling server. Splitting is `norm_code` then
+  `split_code`, identical to `add`/`join`.
+- **Registration.** Unchanged: the server sees `pair-create {nameplate, v:2}`
+  from the serving side and `pair-claim {nameplate, v:2}` from the claimer. The
+  verb is NOT sent. A server that learns the nameplate learns that a code
+  exists, not what it opens.
+- **Burn on use.** Unchanged and server-side. A second claim, or a claim after
+  the 10-minute TTL, yields `pair-error` and the claimer is told the code is
+  spent, never served.
+- **The scope byte.** `pake-confirm` already carries `scope`
+  (`{ type:"pake-confirm", v:2, mac, caps, scope }`), and the MAC is computed
+  over `K`, the two sorted DTLS fingerprints, the canonical caps and that byte.
+  Values `0x00`/`0x01` keep their present meaning (`IntroScope::Device` /
+  `User`). Verb scopes occupy a reserved range, one byte per verb:
+
+  | byte | scope |
+  |---|---|
+  | `0x00` | intro, device (existing) |
+  | `0x01` | intro, user (existing) |
+  | `0x10` | verb `shell` |
+  | `0x11` | verb `exec` |
+  | `0x12` | verb `forward` |
+  | `0x13` | verb `mount` |
+  | `0x14`-`0x1f` | reserved for future verb scopes |
+
+  Unknown scope bytes are REFUSED, not ignored: a confirmation whose scope byte
+  the receiver does not know must abort the ceremony. Skipping an unknown scope
+  would let a future verb be served by an older peer that has no idea what it
+  agreed to.
+- **Session, not relationship.** A verb-code ceremony persists NOTHING. The
+  derived secret (`secret_from_k`) is held for the life of the session and
+  discarded, exactly as `send`'s ephemeral ceremony does today. No
+  `devices.json` record is created and no capability op is written.
+
+Invariants:
+
+- The code is PAKE-protected and therefore **low-entropy-safe**: the words never
+  cross the wire, so there is no transcript to attack offline. An attacker gets
+  ONE online guess per nameplate, and a wrong guess fails key confirmation and
+  burns nothing on the honest side; a right guess burns the code for everyone.
+- **A code scoped to one verb cannot open another.** The verb is inside the
+  confirmation MAC, so a `shell` code presented to `mount` fails key
+  confirmation. This is a cryptographic property, not a policy check the
+  receiver could forget to make.
+- **The code authorizes a session, and `serve` authorizes the verb.** A peer
+  that completes the ceremony gets the one verb the serving side chose to serve.
+  It does not get a capability, a grant, a role, or the right to come back.
+
+### Remember offer and accept
+
+Promoting a session to a remembered relationship. This extends the existing
+`pair-keep` / `pair-keep-ack` control messages (see *Known devices*); v:1
+messages keep their present behaviour exactly.
+
+- `{ type:"pair-keep", v:2, offer_id, secret, name }` — the offer. `offer_id` is
+  a fresh 16-hex nonce. `name` is the OFFERER's proposed display name for
+  itself; it is a suggestion, never authoritative, and the receiver's petname
+  stays local (C12: names are local aliases for secrets).
+- `{ type:"pair-keep-ack", v:2, offer_id, ok }` — the answer. It MUST echo the
+  `offer_id` it answers. An ack whose `offer_id` matches no outstanding offer is
+  ignored. A v:1 ack (no `offer_id`) answers the single most recent outstanding
+  offer, which is the legacy behaviour.
+- Either side may send `pair-keep` at any point in a session, and either side
+  may send it first. The 3-second creator/claimer tie-break in the `filament
+  pair` ceremony applies to that ceremony only, not here.
+
+Invariants:
+
+- **Remembering is mutual or it does not happen.** On `ok:false`, and on a v:2
+  offer that receives no ack before the session ends, the offerer discards its
+  half. A kept-but-unreciprocated secret is the exact defect C12/C27 cured, and
+  v:2 closes the remaining hole by making silence a refusal rather than a
+  legacy sender-store.
+- **Silence is not consent.** This is the one behavioural difference from v:1,
+  and it is why the version bumped.
+- **`pair-keep` carries no grant and no role.** The secret makes two devices
+  findable and mutually authenticated. It authorizes nothing. A receiver that
+  infers any capability from having been remembered is non-conformant.
+
+### `pass` — a Grant to a person key with a device budget
+
+A pass is a widening op in the capability ledger, governed by exactly the L5
+rules that govern `Grant`, plus two restrictions of its own.
+
+```
+Pass { id, author: key, subject: person_key,
+       capability: (action, resource),     // resource-scoped, see below
+       way: In | Out | Both,
+       devices: u16,                       // device budget, 1..=n
+       interval: [not_before, not_after),  // half-open, UTC seconds
+       version: u64, sig }
+```
+
+- **Effective only while accepted.** Like any widening op, a `Pass` authorizes
+  nothing until a live subject-signed `Accept` naming its `id` exists (L5, L13).
+- **Attenuation only.** A `Pass` whose `(action, resource)` is not covered by
+  EVERY live `Ceiling` on its author is refused at ingest (L6), not merely
+  denied at evaluation. The refusal is at the boundary because a pass that the
+  author could not have honoured should never enter the log.
+- **No re-delegation.** An author whose own authority for that capability comes
+  from a `Pass` may not author a `Pass` for it. Ingest refuses it. A pass is a
+  leaf.
+- **The device budget.** Each distinct `device_pub` appearing in a live `Accept`
+  that names this pass consumes one slot. An `Accept` that would take the count
+  past `devices` is refused at ingest, with reason `budget` — distinct from
+  `denied` and from `paused`, because the remedy is "the grantor raises the
+  count", not "ask again".
+- **The card is a carrier, not an authority.** The card handed to a person
+  carries the signed `Pass` and nothing that authorizes by itself. Claiming a
+  card produces an `Accept` that the author must ingest before anything is
+  allowed. The same pass may also be delivered as a one-shot code, in which case
+  the code is a verb code for `join` and burns on first use.
+
+Invariant: **no frame carries a grant or a role the receiver did not sign for.**
+A card, a code, or an inbound `Pass` frame confers nothing until the holder's
+own `Accept` is signed and the author has ingested it. Arriving with a valid
+signed pass is not arriving with access.
+
+### The direction bit on grants
+
+`way` is a field on `Grant` and `Pass`. It is defined relative to the AUTHOR's
+resource.
+
+| `way` | meaning | authorizes the subject? |
+|---|---|---|
+| `In` | the subject may act on the author's resource | yes |
+| `Out` | the author may act on the subject's resource | **no** |
+| `Both` | both statements, together | only the `In` half |
+
+Invariants:
+
+- **`Out` grants the counterpart NOTHING.** An `Out` entry is a statement about
+  the author's own side. It does not authorize the subject, and it is not by
+  itself sufficient for the author either: the author may act on the subject's
+  resource only when the SUBJECT has authored a live, accepted `In` grant for
+  it. The reverse direction never exists unless it is separately granted.
+- `Both` is shorthand for the pair, and it widens nothing beyond its `In` half.
+  An implementation that treats `Both` as mutual authorization from one
+  signature is non-conformant.
+- `way` is a field on the op and part of the signed blob. It is never inferred
+  from the verb, the transport, or which side opened the connection.
+
+### Resource-scoped capabilities and the lattice
+
+Today a capability is `action` or, for `route` alone, `action:resource`; every
+other action resolves to the fixed resource `self`. Resource scoping generalizes
+that. The wire form is a canonical string in `CapOp.resource`.
+
+```
+capability := action [ ":" target [ ":" detail ] ]
+
+target     := device-key | "tag" ":" tag-id | "fleet" ":" owner-key | "*"
+detail     := port | port-range | path-prefix | cidr | "*"
+```
+
+| example (as the CLI renders it) | action | target | detail |
+|---|---|---|---|
+| `shell` | shell | self | — |
+| `forward:ws:8080` | forward | device `ws` | port 8080 |
+| `forward:ws:8000-8099` | forward | device `ws` | port range |
+| `receive:nas:~/share` | receive | device `nas` | path prefix |
+| `see:tag:lab` | see | tag `lab` | — |
+| `route:10.0.0.0/24` | route | self | CIDR (existing, unchanged) |
+| `shell:fleet:<owner>` | shell | every live-certified device of that owner | — |
+
+**Keys on the wire, names in the CLI.** A `device` target is the device's
+32-byte public key, and a `fleet` target is the owner's. Petnames appear only in
+the CLI's rendering. This is ledger law L2: renaming a device must change no
+verdict, and re-pairing one must change every verdict about it.
+
+**The lattice.** `covers(claim, pattern)` is supplied by the caller, never by
+the ledger (L8). It is component-wise, with `*` as top at each level:
+
+- action: exact, or `*`.
+- target: exact key, or `*`. `tag:X` covers every principal or resource bearing
+  a live binding for `X`; `fleet:O` covers every device with a live cert
+  chaining to `O`. A tag or fleet pattern NEVER covers another tag or fleet.
+- port: exact, a closed range, or `*`.
+- path: prefix match, boundary-aligned on `/`. `~/share` covers `~/share` and
+  `~/share/a`, and does NOT cover `~/shared`. A pattern containing `..` is
+  refused at ingest, not normalized.
+- cidr: containment, as today.
+
+A claim with a component the pattern does not mention is NOT covered: a pattern
+of `forward:ws` does not cover `forward:ws:8080`. Widening to "unspecified means
+any" is the single most attractive shortcut here and it is forbidden, because it
+turns every under-specified grant into a wildcard.
+
+Invariants:
+
+- **The request is daemon-derived, never peer-supplied.** The resource in a
+  `Request` is named by the receiving daemon from the connection it actually
+  accepted — the port it is listening on, the path the open named after
+  canonicalization. A peer asking for `forward:ws:8080` does not get to say what
+  it is asking for.
+- **A ceiling can only narrow.** An allow must lie within every live `Ceiling`
+  on that subject, and no wildcard in a grant can escape one (L4).
+- Unknown actions and unknown target forms are REFUSED at ingest. A capability
+  string the boundary cannot parse is not a capability it may store and skip.
+
 ## Exec streams (`filament exec`)
 
 Remote command execution over an established link, as a session-stream kind
