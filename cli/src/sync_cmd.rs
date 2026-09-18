@@ -448,8 +448,12 @@ async fn sync_inner(
     let by_path: BTreeMap<&str, &Entry> = files.iter().map(|e| (e.p.as_str(), e)).collect();
     for n in &plan.need {
         let Some(e) = by_path.get(n.p.as_str()) else { continue };
+        // `n.chunks` comes off the wire, so its indices are the PEER's claim,
+        // not ours. `saturating_*` keeps an index past the end of the file from
+        // panicking this side in a debug build (and from wrapping in release);
+        // such a chunk reads zero bytes and the receiver refuses it by range.
         let bytes: u64 = (n.chunks.iter())
-            .map(|&i| (e.size - (i as u64 * SYNC_CHUNK)).min(SYNC_CHUNK))
+            .map(|&i| e.size.saturating_sub((i as u64).saturating_mul(SYNC_CHUNK)).min(SYNC_CHUNK))
             .sum();
         let state = match (opts.dry_run, n.new) {
             (true, true) => "would send",
@@ -524,9 +528,15 @@ fn authorize_sync(conn: &mut Conn, pid: &str, in_bounds: bool) -> Result<String,
     let outcome = cap::cap_trust_floor(&outcome, trusted, binding, cap::cap_authoritative());
     let (own_user, has_grant) =
         cap::cap_fleet_inputs(&cfg, "self", cap::CAP_TRANSFER, idev, iusr, ak_caps);
+    // The last two arguments mirror the `file-offer` transfer gate exactly:
+    // `denied` false because no deny list is consulted on the transfer path
+    // today, and `ceiling_authorizes` false because transfer is a SCOPED
+    // DEFAULT (in_bounds above), not a deliberate-tier action the enrolment
+    // ceiling decides. Passing anything else here would make sync a different
+    // decision from a file-offer, which is precisely what this verb must not be.
     let d = cap::cap_gate_effective(
         trusted, &outcome, cap::CAP_TRANSFER, "self", idev, iusr, binding, expires, ak_caps,
-        own_user.as_ref(), in_bounds, has_grant, cert_revoked,
+        own_user.as_ref(), in_bounds, has_grant, cert_revoked, false, false,
     );
     if let Some(reason) = cap::transfer_gate_decision(&d, cap::cap_authoritative()) {
         return Err(reason);
@@ -702,6 +712,31 @@ async fn serve_sync(
     }
 }
 
+/// Create `parent` under `root`, refusing a symlinked ancestor. `path_within`
+/// is LEXICAL, so it cannot see a symlinked DIRECTORY already sitting inside
+/// the root: `root/sub -> /etc` makes `sub/passwd` a lexically-clean path that
+/// writes outside, and `safe_relpath` cannot see it either (it only reads the
+/// string). So bound the parent by canonical path the way `resolve_root` bounds
+/// the root: every existing ancestor first, then the parent once it exists.
+/// Nothing is written before both hold.
+fn bound_parent(root: &Path, parent: &Path) -> Result<()> {
+    let mut probe = parent.to_path_buf();
+    while !probe.exists() {
+        probe = match probe.parent() {
+            Some(p) => p.to_path_buf(),
+            None => bail!("path escapes the remote dir"),
+        };
+    }
+    if !crate::path_within_canonical(root, &probe) {
+        bail!("path escapes the remote dir");
+    }
+    std::fs::create_dir_all(parent)?;
+    if !crate::path_within_canonical(root, parent) {
+        bail!("path escapes the remote dir");
+    }
+    Ok(())
+}
+
 /// Land one file: copy the existing target (if any) to `.part`, write the
 /// chunks that arrive at their positions, truncate to size, verify the whole
 /// digest, rename into place. Any failure leaves the target untouched.
@@ -723,8 +758,10 @@ async fn receive_file(
     if !crate::path_within(root, &target) {
         bail!("path escapes the remote dir");
     }
+    // The check above is lexical; `bound_parent` is the canonical one that
+    // catches a symlinked directory already planted inside the root.
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+        bound_parent(root, parent)?;
     }
     let part = target.with_file_name(format!(
         "{}.part",
@@ -856,6 +893,38 @@ mod tests {
             assert!(resolve_root(&d, "esc/x", true).is_err(), "symlink escape must be refused");
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `safe_relpath` reads a string and `path_within` is lexical, so neither
+    /// can see a symlinked DIRECTORY planted inside the root. `bound_parent` is
+    /// what refuses it, and this is the case that proves it: `sub` is a clean
+    /// relative segment and `sub/x` a clean relative path, yet it resolves out.
+    #[test]
+    fn a_symlinked_parent_inside_the_root_cannot_be_written_through() {
+        let root = tmp("bound");
+        let out = tmp("bound-outside");
+        std::fs::create_dir_all(root.join("real/deep")).unwrap();
+        assert!(bound_parent(&root, &root.join("real/deep")).is_ok());
+        // A parent that does not exist yet is created, and stays inside.
+        assert!(bound_parent(&root, &root.join("fresh/deeper")).is_ok());
+        assert!(root.join("fresh/deeper").is_dir());
+        #[cfg(unix)]
+        {
+            assert!(safe_relpath("sub/x").is_some(), "the string itself is clean");
+            std::os::unix::fs::symlink(&out, root.join("sub")).unwrap();
+            assert!(crate::path_within(&root, &root.join("sub/x")), "lexically inside");
+            assert!(
+                bound_parent(&root, &root.join("sub")).is_err(),
+                "a symlinked parent must be refused"
+            );
+            assert!(
+                bound_parent(&root, &root.join("sub/x")).is_err(),
+                "and so must a path under it"
+            );
+            assert!(!out.join("x").exists(), "nothing was created outside the root");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

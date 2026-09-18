@@ -109,7 +109,7 @@ say C
 "${SYNC[@]}" sync "$TREE" boxB:inbox >"$WORK/C.out" 2>&1; rcC=$?
 cat "$WORK/C.out"
 if [ "$rcC" = 0 ] && grep -q '0 B of .* moved' "$WORK/C.out" && [ "$(grep -c '^  same ' "$WORK/C.out")" = 4 ] && ! grep -qE '^  (sent|updated) ' "$WORK/C.out"; then
-  ok "gateC: unchanged re-run moves 0 bytes, four `same` lines"
+  ok 'gateC: unchanged re-run moves 0 bytes, four same lines'
 else bad "gateC: no-op re-run moved something (rc=$rcC)"; fi
 
 # ===================================================================== GATE D ==
