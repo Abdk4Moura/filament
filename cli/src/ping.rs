@@ -166,56 +166,52 @@ pub async fn reach_until_direct(
     if relay {
         bail!("`--relay` forces the relay path, so it cannot be combined with `--until-direct`");
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (peer, timeout_s, json_out);
-        bail!("`--until-direct` reads the local `filament up` daemon, which this platform has no control socket for")
+    // Portable: `ctl::daemon_present` is the adapter (false where the platform
+    // has no control socket), so the same error covers "not running" and
+    // "cannot run here" without a platform branch in this file.
+    if !crate::ctl::daemon_present().await {
+        bail!("no local `filament up` daemon: `--until-direct` watches the daemon's link to {peer}. Start `filament up` first.");
     }
-    #[cfg(unix)]
-    {
-        if !crate::ctl::daemon_present().await {
-            bail!("no local `filament up` daemon: `--until-direct` watches the daemon's link to {peer}. Start `filament up` first.");
-        }
-        if !json_out {
-            ui::say(&format!(
-                "{} {} {}",
-                ui::paint(Tone::Dim, "filament reach →"),
-                ui::paint(Tone::Brand, peer),
-                ui::paint(Tone::Dim, &format!("(until direct, {timeout_s}s)"))
-            ));
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_s);
-        let mut saw_link = false;
-        loop {
-            let p = match crate::ctl::try_ping(peer).await {
-                Some(v) => probe_from_warm(&v),
-                None => Probe::NoLink,
-            };
-            emit_probe(&p, json_out);
-            if p.is_direct() {
-                return Ok(());
-            }
-            saw_link |= matches!(p, Probe::Warm { .. });
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            // Ctrl-C ends the watch here, between lines, so no half-written
-            // line and no orphaned probe.
-            tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
-                _ = tokio::signal::ctrl_c() => std::process::exit(130),
-            }
-        }
-        if !json_out {
-            let verdict = if saw_link {
-                format!("still on relay after {timeout_s}s")
-            } else {
-                format!("no link to {peer} after {timeout_s}s")
-            };
-            ui::critical(&format!("  {}", ui::paint(Tone::Warn, &verdict)));
-        }
-        std::process::exit(5)
+    if !json_out {
+        ui::say(&format!(
+            "{} {} {}",
+            ui::paint(Tone::Dim, "filament reach →"),
+            ui::paint(Tone::Brand, peer),
+            ui::paint(Tone::Dim, &format!("(until direct, {timeout_s}s)"))
+        ));
     }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_s);
+    let mut saw_link = false;
+    loop {
+        let p = match crate::ctl::try_ping(peer).await {
+            Some(v) => probe_from_warm(&v),
+            None => Probe::NoLink,
+        };
+        emit_probe(&p, json_out);
+        if p.is_direct() {
+            return Ok(());
+        }
+        saw_link |= matches!(p, Probe::Warm { .. });
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        // Ctrl-C ends the watch here, between lines, so no half-written
+        // line and no orphaned probe.
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            _ = tokio::signal::ctrl_c() => std::process::exit(130),
+        }
+    }
+    if !json_out {
+        let verdict = if saw_link {
+            format!("still on relay after {timeout_s}s")
+        } else {
+            format!("no link to {peer} after {timeout_s}s")
+        };
+        ui::critical(&format!("  {}", ui::paint(Tone::Warn, &verdict)));
+    }
+    std::process::exit(5)
+
 }
 
 /// One probe, for whichever audience asked: the envelope on stdout under
