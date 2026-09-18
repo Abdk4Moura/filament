@@ -713,13 +713,18 @@ event whose only ledger-visible result is this `Facts.cert`.
 default; `None` and `Inferred` are below it. `Inferred` is accepted for exactly
 one population -- a `Grant` over a pair secret, which is today's legacy path --
 so the migration has a home and nothing else silently inherits the weaker bar.
-`Facts.held_author_key` is the trust root: ops authored by it ARE the subject's
-own policy and decide on their own; ops by any other author are effective only
-within a ceiling that the held key granted them, so a foreign grant cannot
-exceed local policy and no chain of foreign authors can walk the boundary
-outward.
+An `Inferred` binding is never enough on its own: `unproven` is a distinct
+denial reason, so a caller can tell "no proof yet" from "refused".
 
-**L17 -- Compaction preserves verdicts.** Compaction may drop ops that cannot
+**L17 -- The held author key is the trust root.** Ops authored by
+`Facts.held_author_key` ARE the subject's own policy and decide on their own.
+Ops by any OTHER author are effective only within a ceiling that the held key
+granted them: a delegated op can never exceed the local policy that admitted
+its author, and no chain of foreign authors can walk the boundary outward.
+The model keys this as `own-policy-is-trust-root` and
+`delegated-ops-need-ceiling`.
+
+**L18 -- Compaction preserves verdicts.** Compaction may drop ops that cannot
 affect any verdict, and nothing else: for every request and instant, `decide`
 on the compacted log returns the same decision, the same reason, and the same
 `because` as on the full log. This is what makes the migration from today's
@@ -765,7 +770,9 @@ silently would be worse than naming them:
   adoption and a hard `Proven`-only rule for foreign ops would be a behaviour
   change smuggled in by a contract.
 
-The model checker for all seventeen laws is `proofs/capability_ledger_model.py`,
+The model checker for all eighteen laws (L14-L18 are the review rulings above; the
+model implements them and keys each check against these numbers) is
+`proofs/capability_ledger_model.py`,
 a required gate in `.github/workflows/proof.yml`.
 ## Bootstrap card (fc1)
 
