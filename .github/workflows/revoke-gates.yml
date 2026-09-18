@@ -43,6 +43,7 @@ on:
       - 'cli/tests/*revoke-gates.sh'
       - 'cli/tests/ssh-ca-gates.sh'
       - 'cli/tests/exec-gates.sh'
+      - 'cli/tests/sync-gates.sh'
       - 'cli/tests/fleet-cert-gates.sh'
       - 'cli/tests/shell-posture-gates.sh'
       - 'cli/tests/forward-refusal-gates.sh'
@@ -117,6 +118,7 @@ jobs:
           declare -A EXPECT=(
             [cli/tests/ssh-ca-gates.sh]=6
             [cli/tests/exec-gates.sh]=13
+            [cli/tests/sync-gates.sh]=9
             # 23 = 22 gate slots + the RECON (post-restart link re-establishment)
             # verdict. AUTH-A keeps its slot while it is KNOWN-RED: the count
             # below includes KNOWN-RED lines, so a tracked failure can never make
@@ -131,6 +133,7 @@ jobs:
           rc=0
           for g in cli/tests/ssh-ca-gates.sh \
                    cli/tests/exec-gates.sh \
+                   cli/tests/sync-gates.sh \
                    cli/tests/fleet-cert-gates.sh \
                    cli/tests/pty-revoke-gates.sh \
                    cli/tests/mount-revoke-gates.sh \

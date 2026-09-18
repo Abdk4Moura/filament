@@ -42,6 +42,17 @@
       ]
     },
     {
+      "path": "cli/tests/sync-gates.sh",
+      "disposition": "required",
+      "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/sync-gates.sh",
+      "matrix": [
+        {
+          "platform": "linux",
+          "topology": "local-fixture"
+        }
+      ]
+    },
+    {
       "path": "cli/tests/fleet-cert-gates.sh",
       "disposition": "required",
       "entrypoint": "FILAMENT_BIN=cli/target/release/filament bash cli/tests/fleet-cert-gates.sh",
