@@ -566,13 +566,16 @@ pause, and no subject counter-signature in the engine today.
 ```
 Op      { id, author: key, subject: key, capability: (action, resource),
           interval: [not_before, not_after),   // half-open, UTC seconds
-          kind: Grant | Deny | Ceiling | Certify | Pass | Pause | Accept,
+          kind: Grant | Deny | Ceiling | Pass | Pause | Accept,
+          min_binding: Proven | Inferred,       // author-signed, like kind
           version: u64,                        // per author, monotone
           sig }
 Facts   { now, subject: key, binding: None|Inferred|Proven,
           cert: Option<{ device_pub, user_pub, expires, revoked }>,
           held_author_key: Option<key>, ops: verified ops }
 Request { action, resource }                   // DAEMON-derived, never peer-supplied
+// Facts.subject is DAEMON-derived too: the daemon resolves it from the verified
+// link identity, never from a frame field, so a peer cannot name its own subject.
 Verdict { decision: Allow | Deny(reason), valid_until: Option<u64>,
           because: [op id] }
 ```
@@ -592,14 +595,11 @@ Two calls with equal arguments return equal verdicts, byte for byte. A
 non-conformant however correct its answer.
 
 **L2 -- Keys are identity, names are presentation.** The library never sees a
-display name, a petname, or a device label. Every `author` and `subject` is a
-key. Renaming a device changes no verdict; re-pairing one (a new key) changes
-every verdict about it. `Facts.binding`, `Facts.cert` and
-`Facts.held_author_key` are carried for the CLI's view layer and for
-boundary-side ingest, and `decide` does **not** read them: the verdict is a
-function of `now`, `ops` and `request` alone. Widening that -- making the
-verdict depend on the cert or the binding -- is a contract change, not an
-implementation detail.
+name: every op, fact and request is keyed by public key, and display names move
+no verdict. Facts the DECISION does read -- `binding`, `cert` and
+`held_author_key` -- are read by name here on purpose (L15-L17 depend on them),
+so this law says what it means: a name is never an input, and the facts that are
+inputs are listed rather than implied.
 
 **L3 -- Time is first-class.** Every op carries a half-open interval
 `[not_before, not_after)`; an op is live at `t` iff `not_before <= t <
@@ -629,6 +629,11 @@ whose id is already held under a DIFFERENT author, or whose version is not
 strictly greater than the highest version already recorded for that author.
 A refused op is refused, not silently sorted to the back of the log: the
 evaluator trusts the log completely and has no second line of defence.
+Revisions SHARE an op id, and the highest version recorded for an id is the
+one that decides. An id names one author for its whole life: a revision whose
+author differs from the id's first author is refused, because otherwise a
+foreign author could take over an id whose interval the subject already
+accepted.
 
 **L7 -- Explainable.** `because` is a MINIMAL SUFFICIENT CAUSE of the decision
 and its reason: evaluating the request against only the ops in `because`
@@ -651,15 +656,18 @@ same request cannot change at any instant strictly between `now` and
 again for those facts. A `valid_until` later than the first instant of change
 is a correctness bug, not a performance tuning knob.
 
-**L10 -- No widening by combination.** Ops that each deny do not combine into
-an allow. `Deny` is a TOMBSTONE: only its own author can lift it, and only by
+**L10 -- No widening by combination.** No combination of ops other than a
+`Grant` with its referenced `Accept` (L5) may turn denials into an allow.
+`Deny` is a TOMBSTONE: only its own author can lift it, and only by
 publishing a newer version of that same op with a shorter interval. No other
 author, no accumulation of grants, and no ceiling can retire someone else's
 deny. The single deliberate exception is the L5 pair: a `Grant` alone denies
 (unaccepted) and its `Accept` alone denies (nothing to accept), and together
 they allow. That pair is the ONLY combination of individually-denying ops
 that may allow, and an implementation that admits a second one is
-non-conformant.
+non-conformant. The model enumerates every pair of individually-denying ops
+that allows together and fails unless each one is a grant or pass together
+with its own accept.
 
 **L11 -- Idempotence and order independence.** Replaying the same op set in
 any arrival order, with any duplicates, yields the same verdict and the same
@@ -671,12 +679,67 @@ interval-bounded. A live `Pause` suppresses every allow its author would
 otherwise give for that subject during its interval, and the refusal carries
 reason `paused`, DISTINCT from `denied`. A pause is not a deny: it needs no
 lifting op, it expires on its own, and it leaves the author's grants intact
-underneath.
+underneath. A pause is PATTERN-SCOPED: its capability pattern is matched with
+the same `covers` rule as everything else, so the lattice top is the wholesale
+form ("pause everything I could otherwise allow") and a narrower pattern
+pauses exactly what it covers. Narrower pauses compose by intersection: an
+allow survives only while no live pause covers the request.
 
 **L13 -- Accept.** An `Accept` references exactly one `Grant` or `Pass` op id,
 is signed by that op's subject, and is meaningful only while both it and the
 referenced op are live. An `Accept` naming an op that does not exist, or
 signed by anyone but the subject, authorizes nothing.
+
+**L14 -- `Pass` is attenuated delegation.** A `Pass` is a `Grant` whose
+SUBJECT is a person key with a device budget: the subject may re-issue it, for
+its own device keys, strictly within what the author's own ceiling toward that
+resource allows. Attenuation-only is the whole law -- a `Pass` wider than its
+author's ceiling is inert, it can never be narrowed back into a widening, and
+it is governed by the same L5 pair rule as any other widening op. WHO may pass
+is anyone who already holds the capability being passed, so no separate
+authority is required and none can be manufactured: you cannot pass what you
+do not hold.
+
+**L15 -- Certificate facts are absolute.** A `Facts.cert` whose `revoked` is
+set, or whose `expires` is not after `now`, denies every request about that
+subject: like a tombstone, no grant, ceiling, pass, or combination outranks it.
+The reasons are DISTINCT -- `revoked` and `expired` -- because an operator
+debugging a lockout must be able to tell a deliberate revocation from a lapse.
+`Certify` is NOT an op kind: minting a certificate is an identity-lifecycle
+event whose only ledger-visible result is this `Facts.cert`.
+
+**L16 -- Binding is a precondition of every allow.** Every allow requires
+`Facts.binding` to be at least the op's `min_binding`, which is `Proven` by
+default; `None` and `Inferred` are below it. `Inferred` is accepted for exactly
+one population -- a `Grant` over a pair secret, which is today's legacy path --
+so the migration has a home and nothing else silently inherits the weaker bar.
+An `Inferred` binding is never enough on its own: `unproven` is a distinct
+denial reason, so a caller can tell "no proof yet" from "refused".
+
+**L17 -- The held author key is the trust root.** Ops authored by
+`Facts.held_author_key` ARE the subject's own policy and decide on their own.
+WIDENING ops by any other author (a `Grant` or a `Pass`) are effective only
+within a ceiling that the held key granted them: a delegated op can never
+exceed the local policy that admitted its author, and no chain of foreign
+authors can walk the boundary outward. `Accept`, `Deny`, `Pause` and a
+narrowing `Ceiling` are exempt from that filtering: L13 defines an `Accept` as
+the countersignature of the referenced op's subject, a `Deny` and a `Pause`
+refuse (L4, L12) and a `Ceiling` only narrows (L4, L8), so none of them asserts
+new authority and each takes effect on its author's signature alone. Filtering
+is therefore never allowed to turn a `Deny` into an `Allow`. The model keys
+this as `own-policy-is-trust-root`, `delegated-ops-need-ceiling` and
+`filter-never-turns-deny-into-allow`.
+
+**L18 -- Compaction preserves verdicts.** Compaction may drop ops that cannot
+affect any verdict, and nothing else: for every request and instant, `decide`
+on the compacted log returns the same decision, the same reason, and the same
+`because` as on the full log. This is what makes the migration from today's
+store safe. `Revoke` currently DELETES the grant row (`store.remove`), so the
+reason a device lost access stops existing the moment it takes effect; in the
+ledger the same act is a `Deny` tombstone (or a shorter-interval revision of
+the `Grant` by its author), and the reason survives the operation that removed
+the access. Compaction must not be allowed to quietly recreate the old
+behaviour by discarding it.
 
 ### Tiers are views, not state
 
@@ -690,23 +753,32 @@ and nothing persists a tier field) and the ledger must not regress it.
 
 ### Deliberately unresolved
 
-Two points are recorded here rather than resolved, because resolving them
+Three points are recorded here rather than resolved, because resolving them
 silently would be worse than naming them:
 
-- `Certify` and `Pass` are op kinds with no law constraining them. This
-  contract pins the conservative reading and no more: `Certify` is an
-  attestation that contributes nothing to a verdict and never appears in
-  `because`, and `Pass` is a widening op governed by exactly the L5 rules that
-  govern `Grant`. WHO may `Pass` WHAT -- the delegation rule -- is not pinned
-  by L1..L13 and must be decided before `Pass` is implemented.
+- `Pass`'s device budget is NAMED but not pinned. L14 fixes the shape
+  (person-key subject, re-issuable to its own device keys, attenuation-only,
+  never wider than the author's ceiling) and fixes who may pass (anyone holding
+  what is passed). Whether the budget is a count, an explicit list of device
+  keys, or a scope, and how it is decremented, is a product decision that must
+  be made before `Pass` is implemented -- resolving it silently here would
+  invent policy.
 - L10's plain-English form ("ops that each deny never combine into an allow")
   is contradicted by L5, whose whole mechanism is two individually-denying ops
   combining into an allow. L10 above states the restriction WITH its single
-  exception named. `proofs/capability_ledger_model.py` checks exactly that: it
-  enumerates every pair of individually-denying ops that allows together and
-  fails unless each one is a grant/pass and its own accept.
+  exception named, and the model enforces the enumeration rather than the
+  prose.
+- `Facts.binding` for a foreign author is not pinned: L17 says a foreign op is
+  effective only inside a ceiling the held key granted it, and L16 says every
+  allow needs binding >= `min_binding`, but whether a FOREIGN grant may carry
+  `Inferred` (a pair secret the subject's own key never proved) is left to the
+  migration, because today's fleet links reach `Proven` only on direct-link
+  adoption and a hard `Proven`-only rule for foreign ops would be a behaviour
+  change smuggled in by a contract.
 
-The model checker for all thirteen laws is `proofs/capability_ledger_model.py`,
+The model checker for all eighteen laws (L14-L18 are the review rulings above; the
+model implements them and keys each check against these numbers) is
+`proofs/capability_ledger_model.py`,
 a required gate in `.github/workflows/proof.yml`.
 ## Bootstrap card (fc1)
 
