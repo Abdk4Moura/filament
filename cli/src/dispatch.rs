@@ -1022,7 +1022,14 @@ pub(crate) async fn async_main() -> Result<()> {
             }
         }
         Cmd::Depart => depart_cmd(&server, relay).await,
-        Cmd::Devices { action, json } => {
+        Cmd::Devices { action, json, caps } => {
+            if let Some(selector) = caps {
+                if action.is_some() {
+                    bail!("--caps is a view; it takes a device name, not a subcommand");
+                }
+                let name = (!selector.is_empty()).then_some(selector.as_str());
+                return crate::device_perms::devices_caps_cmd(name, json || ui_caps.json);
+            }
             match action {
                 None => {
                     let all = devices_load();
