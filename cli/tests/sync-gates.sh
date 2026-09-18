@@ -5,6 +5,42 @@
 #
 #   FILAMENT_BIN=/path/to/filament ./sync-gates.sh
 #
+
+# --- BITE-CHECK CONVENTION (four rules, each earned by a specific failure) ---
+# evidence, and to be hoisted into cli/tests/lib/fixture.sh's "Preconditions and refusal"
+# any carry-over claim that depends on the tree being unchanged.)
+#
+# Three rules, each earned by a specific failure.
+#
+# 1. A BITE CHECK MUST PROVE THE ARTIFACT CONTAINS THE BITE. `rbuild --ref <branch>`
+# builds what is on GitHub, so a bite applied only in the working tree is built away, the
+# gate passes, and the report reads "the bite did not bite" as a false negative on the one
+# check whose entire purpose is to prevent false confidence. Commit the bite, push it to a
+# scratch branch, build THAT ref, and delete the scratch branch once its output is quoted.
+# This is not a tool lying about a number; it is a tool silently substituting a different
+# artifact than the one that was modified.
+#
+# 2. AN ARM ADDED FOR A CAPABILITY CARRIES BOTH HALVES IN ONE RUN, because a gate that
+# refuses everything is indistinguishable from one that refuses the right thing. Weaken the
+# guard and the refusal half must go RED while the positive half stays GREEN. If both
+# redden, the arm is measuring the fixture rather than the capability, and that is the
+# finding.
+#
+# 3. AN EMPTY LOG IS A PRECONDITION FAILURE, NOT A RESULT. A harness whose precondition is
+# unmet must refuse to report. Zero verdicts is the most dangerous possible output for a
+# bite run, because every conclusion drawn from it is the opposite of the truth: a gate
+# that never started looks exactly like a gate whose bite did not bite. This gate starts a
+# python backend on port 8107 and needs the backend's requirements, so invoke it with
+# FILAMENT_TEST_VENV pointing at an interpreter that has them (see
+# backend/requirements.txt); without that it dies with ModuleNotFoundError and produces no
+# verdicts at all. Pin the interpreter in every caller rather than rediscovering it.
+#
+# 4. READ THIS GATE'S VERDICT LINES, NEVER ITS EXIT STATUS. It exits 0 even when arms fail:
+#    a run with PASS=10 FAIL=7 exited 0 on 2026-09-18, and a later PASS=17 FAIL=0 exited 0 as
+#    well, so the status cannot distinguish them. Every consumer (a script, a CI step, an
+#    agent, a human) must parse the `^== sync gates: PASS=<n> FAIL=<n> ==` line or the
+#    per-arm `PASS:`/`FAIL:` lines. A zero here is not a pass.
+#
 # TWO PAIRING STYLES, and the gate says which arm uses which:
 #   * A to H are SECRET-PAIRED: each side hand-writes the other's name and a
 #     shared secret into devices.json. That link resolves NO device identity, so
