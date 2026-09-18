@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Exhaustive model check for the capability ledger (CONTRACT.md, laws L1-L13).
+"""Exhaustive model check for the capability ledger (CONTRACT.md laws L1-L13,
+plus L14-L18 from the review rulings, which the contract text does not yet
+carry -- see `source_guard`).
 
 Same discipline as establishment_model.py and fleet_automesh_model.py:
 enumerate the ENTIRE op space of a bounded universe, then assert every law over
@@ -13,7 +15,10 @@ An append-only log of signed ops and the pure verdict function over it.
   Op      (id, author, subject, action, resource, nb, na, kind, version, ref)
           interval is half-open [nb, na); `ref` is the referenced op id on an
           Accept and None elsewhere.
-  kinds   grant | deny | ceiling | certify | pass | pause | accept
+  kinds   grant | deny | ceiling | pass | pause | accept
+          `certify` is NOT here: per review ruling 2 it is an identity-lifecycle
+          event, not a ledger op, and its result reaches the evaluator as
+          Facts.cert (law L15). `pass` IS an op (law L14).
   Facts   now, subject, binding, cert, held_author_key, ops (pre-verified)
   Request (action, resource) -- a CONCRETE claim, daemon-derived
   Verdict (decision, reason, valid_until, because)
@@ -29,6 +34,13 @@ that is an interval boundary or a neighbour of one (nb-1, nb, na-1, na).
 No single tier carries the whole universe: each tier is exhaustive over the
 dimensions its laws need and pinned on the ones they do not, so the product
 stays inside a ten-second budget. The tier banner prints each bound.
+
+TIERS
+the original eight (CORE, DEPTH, VER, PAIR, ORDER, SCOPE, INGEST, FACTS) plus
+one per law the review added: PASS (L14), CERT (L15), BIND (L16), HELD (L17),
+COMPACT (L18). FACTS changed direction rather than growing: it used to assert
+that every Facts field was irrelevant, and now asserts that the three fields the
+rulings made load-bearing ARE load-bearing, and that display_name is not.
 
 WHAT IS *NOT* MODELLED
 ----------------------
@@ -51,18 +63,34 @@ Three points in the approved design are under-constrained. Each is pinned here
 to the most conservative reading consistent with L1-L13, and named in
 CONTRACT.md under "Deliberately unresolved" rather than quietly decided:
 
-  Certify   carries no authority: it never contributes to a verdict and never
-            appears in `because`. Modelled as inert-but-ingested.
-  Pass      widening, governed by exactly L5's rules for Grant. WHO may pass
-            WHAT is not pinned by any law and is not modelled.
+  Certify   NOT AN OP ANY MORE (review ruling 2). Certification is an
+            identity-lifecycle event whose result reaches the evaluator as
+            Facts.cert; law L15 is the law that reads it. There is therefore
+            nothing to ingest, contribute to a verdict, or explain.
+  Pass      an op, and a SPECIES OF GRANT (review ruling 2): a Grant whose
+            subject is a person key with a device budget, attenuable by that
+            subject for its own device keys, and never wider than the author's
+            own ceiling toward that resource (attenuation-only, the Biscuit
+            property). Who may pass = any key that holds the capability it
+            passes, so a pass whose author holds nothing covering it is INERT
+            rather than merely narrow. Law L14.
   Pause     scoped by its own capability pattern, so "every allow the author
             would give" is every allow WITHIN that pattern. A pause at the top
-            of the lattice is the wholesale reading.
+            of the lattice is the wholesale reading (review ruling 7).
+
+  Facts     which Facts fields the verdict may read is no longer "none".
+            Rulings 2/3 make three of them load-bearing: cert (L15), binding
+            (L16) and held_author_key (L17). A field that no law reads is a
+            dead input, so tier FACTS now asserts RELEVANCE for those three and
+            irrelevance only for display_name, and the vacuity gate fails if a
+            field is never load-bearing.
 
 L10's plain-English form ("ops that each deny never combine into an allow") is
 contradicted by L5, whose entire mechanism is a Grant and an Accept -- each
 denying alone -- allowing together. Tier PAIR checks the restricted form and
-requires that single exception to be the ONLY one, failing on any second.
+requires that single exception to be the ONLY one, failing on any second
+(review ruling 1: the (Grant, its referenced Accept) pair is THE defined
+widening, and any second widening route must break the run).
 
 GATE 0
 ------
@@ -87,7 +115,10 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # ---------------------------------------------------------------- op encoding
+# MINB is appended LAST so every existing positional slice (o[:VERSION],
+# o[2:NA], ...) keeps its meaning: field 10 is new, fields 0-9 are unchanged.
 ID, AUTHOR, SUBJECT, ACTION, RESOURCE, NB, NA, KIND, VERSION, REF = range(10)
+MINB = 10
 
 KEYS = ("k0", "k1")
 PATTERNS = (("shell", "*"), ("forward", "ws:8080"), ("forward", "ws:*"))
@@ -96,9 +127,37 @@ UNIVERSAL = ("*", "*")
 ACC = ("accept", "-")
 WIDENING = ("grant", "pass")
 
+# The contract currently declares L1..MAX_CONTRACT_LAW; the review rulings add
+# MAX_CONTRACT_LAW+1..MAX_MODEL_LAW, which the model implements before the
+# contract text lands (the reviewer owns that edit). See source_guard.
+MAX_CONTRACT_LAW = 13
+MAX_MODEL_LAW = 18
+
 ALLOW, DENY = "Allow", "Deny"
 R_DENIED, R_PAUSED, R_CEILING = "denied", "paused", "above-ceiling"
 R_UNACCEPTED, R_NOGRANT = "unaccepted", "no-grant"
+# Rulings 3/8: a revoked or expired certificate denies with its OWN reason, and
+# the two are required to be DISTINCT ("revoked" is permanent, "expired" is the
+# end of a window). R_UNPROVEN is the L16 refusal: the allow exists, but the
+# binding is weaker than the op demands.
+R_REVOKED, R_EXPIRED, R_UNPROVEN = "revoked", "expired", "unproven"
+
+# L14: a Grant and a Pass are the same species; only a Grant species may widen,
+# and only with a referenced Accept by the widening op's subject (ruling 1).
+GRANT_SPECIES = ("grant", "pass")
+# L16: binding strength, weakest first. An op demands a MINIMUM. Facts carry
+# the wire spelling ("Proven"/"Inferred"); an op carries the lowercase form, so
+# ranking normalises rather than comparing the two spellings by accident -- the
+# first cut of this had `None >= "proven"` because only one spelling was keyed,
+# which made every allow pass L16 vacuously.
+BINDING_RANK = {None: -1, "inferred": 1, "proven": 2}
+
+
+def binding_rank(value):
+    """Rank a binding strength; unknown/absent is WEAKER than any named one."""
+    if value is None:
+        return BINDING_RANK[None]
+    return BINDING_RANK.get(str(value).lower(), BINDING_RANK[None])
 
 # The one knob --self-test turns. Production runs leave it None; each mutation
 # is a single deliberate breach of one law, used to prove the checks bite.
@@ -112,6 +171,85 @@ def covers(pat_action, pat_resource, claim_action, claim_resource):
     if pat_resource == "*" or pat_resource == claim_resource:
         return True
     return pat_resource.endswith("*") and claim_resource.startswith(pat_resource[:-1])
+
+
+def pattern_contains(outer_action, outer_resource, inner_action, inner_resource):
+    """L14: is pattern `inner` no wider than pattern `outer`?
+
+    Stronger than `covers(outer, inner)`: a wildcard inner is wider than any
+    concrete outer, so `covers` alone would call `forward@ws:*` contained in
+    `forward@ws:8080` (the wildcard's `*` is not a literal this early). Used
+    only for attenuation (a pass against its author's ceiling), never for a
+    concrete claim.
+    """
+    if outer_action != "*" and outer_action != inner_action:
+        return False
+    if outer_resource == "*":
+        return True
+    if inner_resource == "*":
+        return False
+    if outer_resource == inner_resource:
+        return True
+    if not outer_resource.endswith("*"):
+        return False
+    prefix = outer_resource[:-1]
+    if not inner_resource.startswith(prefix):
+        return False
+    if inner_resource.endswith("*"):
+        return inner_resource[:-1].startswith(prefix)
+    return True
+
+
+def binding_satisfies(binding, need):
+    """L16: is `binding` at least the strength `need` (an op's MINB)?"""
+    return binding_rank(binding) >= binding_rank(need)
+
+
+def pass_is_attenuative(ops, p, now):
+    """L14: may `p`'s author pass what `p` passes?
+
+    Only if that author HOLDS something covering `p`'s pattern: an op live at
+    `now`, about the AUTHOR as subject, whose pattern is no narrower than `p`'s.
+    """
+    for x in effective(ops):
+        if x[SUBJECT] != p[AUTHOR] or x[KIND] not in GRANT_SPECIES + ("ceiling",):
+            continue
+        if not x[NB] <= now < x[NA]:
+            continue
+        if pattern_contains(x[ACTION], x[RESOURCE], p[ACTION], p[RESOURCE]):
+            return True
+    return False
+
+
+def delegated_ok(ops, o, held, now):
+    """L17: is an op by a NON-held author effective under a trust root?
+
+    Ops authored by the held key are the trust root ("own policy") and are
+    always effective. An op by any other author is effective only within a
+    ceiling the held key granted that author: a live op authored BY the held
+    key, whose subject IS this op's author, covering this op's pattern.
+    """
+    if held is None or o[AUTHOR] == held:
+        return True
+    for x in effective(ops):
+        if x[AUTHOR] != held or x[SUBJECT] != o[AUTHOR] or x[KIND] != "ceiling":
+            continue
+        if not x[NB] <= now < x[NA]:
+            continue
+        if pattern_contains(x[ACTION], x[RESOURCE], o[ACTION], o[RESOURCE]):
+            return True
+    return False
+
+
+def trust_filter(ops, held, now):
+    """L17: the op set the evaluator may see, given the held author key."""
+    if held is None:
+        return tuple(ops)
+    if MUTATION == "held-key-ignored":
+        return tuple(ops)
+    return tuple(o for o in ops
+                 if (MUTATION != "held-key-drops-own-policy" or o[AUTHOR] != held)
+                 and delegated_ok(ops, o, held, now))
 
 
 def effective(ops):
@@ -161,6 +299,13 @@ def _decide_core(ops, subject, now, request):
     for o in applies:
         if o[KIND] not in WIDENING:
             continue
+        # L14: a Pass is a Grant species, and a pass its author cannot back is
+        # INERT (review ruling 2: never wider than the author's own ceiling
+        # toward that resource). Inert ops are dropped here, before L5/L13, so
+        # they can neither widen nor read as merely unaccepted.
+        if (o[KIND] == "pass" and MUTATION != "pass-wider-than-ceiling-widens"
+                and not pass_is_attenuative(ops, o, now)):
+            continue
         if MUTATION == "accept-not-required":
             supported.append(o)
             continue
@@ -177,6 +322,13 @@ def _decide_core(ops, subject, now, request):
         # satisfy "only narrows" (it narrows by nothing), so the mutation has
         # to be a real widening or it proves nothing.
         if any(o[KIND] == "ceiling" for o in applies):
+            return (ALLOW, None)
+    if MUTATION == "ceiling-completes-grant" and not allows:
+        # REVIEW RULING 1's counterexample: a SECOND widening route. A ceiling
+        # beside an accepted-less Grant makes the pair allow, and neither op
+        # allows alone -- so L10 must fail on a pair that is not the
+        # (Grant, its referenced Accept) pair.
+        if any(o[KIND] == "ceiling" for o in applies) and unaccepted:
             return (ALLOW, None)
     if allows:
         within = all(covers(c[ACTION], c[RESOURCE], req_action, req_resource)
@@ -211,6 +363,37 @@ def valid_until(ops, subject, now, request):
     return None
 
 
+def valid_until_full(ops, subject, now, request, cert):
+    """L3/L9 over the FACT-LAYERED decision.
+
+    Review ruling 3 makes a certificate expiry an absolute deny, so expiry is a
+    time at which the verdict changes and `valid_until` must not promise past
+    it. A revoked certificate never changes back, so its horizon is None.
+    """
+    here = fact_verdict(ops, subject, now, request, cert)
+    later = [b for b in boundaries(ops) if b > now]
+    if cert is not None and cert.get("expires") is not None:
+        exp = cert["expires"]
+        if exp > now:
+            later.append(exp)
+    still = [b for b in sorted(set(later))
+             if fact_verdict(ops, subject, b, request, cert) != here]
+    return still[0] if still else None
+
+
+def fact_verdict(ops, subject, now, request, cert):
+    """The (decision, reason) half of the fact layers, without `because`.
+
+    Used by valid_until_full, which must not recurse into the minimiser.
+    """
+    if cert is not None:
+        if cert.get("revoked"):
+            return (DENY, R_REVOKED)
+        if cert.get("expires") is not None and cert["expires"] <= now:
+            return (DENY, R_EXPIRED)
+    return decide_core(ops, subject, now, request)
+
+
 def because(ops, subject, now, request):
     """L7: a canonical minimal sufficient cause of (decision, reason).
 
@@ -218,6 +401,11 @@ def because(ops, subject, now, request):
     (nothing is dropped that changes the verdict) and irredundancy holds at the
     fixpoint (no remaining op can be dropped). check_cell re-verifies both
     independently, so a broken minimiser is caught rather than trusted.
+
+    Review ruling 6: the cause explains the DECISION (decision + reason). It is
+    NOT required to explain `valid_until` -- a shorter sufficient cause may
+    stop changing later than the full log does. check_cell records when that
+    happens so the weaker claim is exercised rather than merely asserted.
     """
     target = decide_core(ops, subject, now, request)
     current = effective(ops)
@@ -236,16 +424,51 @@ def because(ops, subject, now, request):
 
 
 def decide(facts, request):
-    """The contract surface. Reads now, subject and ops. NOTHING else."""
+    """The contract surface.
+
+    Reads now, subject, ops -- and, since review rulings 2/3, exactly three more
+    Facts fields: cert (L15), binding (L16) and held_author_key (L17).
+    display_name is still NOT read; tier FACTS asserts that.
+    """
     ops, subject, now = facts["ops"], facts["subject"], facts["now"]
-    if MUTATION == "reads-cert" and facts.get("cert") is not None:
-        if facts["cert"]["revoked"]:
-            return (DENY, R_DENIED, None, ())
+    cert = facts.get("cert")
+    binding = facts.get("binding")
+    held = facts.get("held_author_key")
     if MUTATION == "reads-name" and facts.get("display_name") == "laptop":
         return (DENY, R_NOGRANT, None, ())
+    # L15: a revoked or expired certificate denies absolutely, with its own
+    # reason. Ordered so revocation wins (it is the permanent state).
+    if cert is not None:
+        if cert.get("revoked") and MUTATION != "cert-revoked-not-absolute":
+            return (DENY, R_REVOKED, None, ())
+        if (cert.get("expires") is not None and cert["expires"] <= now
+                and MUTATION != "expired-not-absolute"):
+            reason = R_REVOKED if MUTATION == "revoked-reads-as-expired" else R_EXPIRED
+            return (DENY, reason, None, ())
+    # L17: the trust root. Applied before the algebra, because it decides which
+    # ops the evaluator may see at all.
+    ops = trust_filter(ops, held, now)
     decision, reason = decide_core(ops, subject, now, request)
-    ids, _ = because(ops, subject, now, request)
-    return (decision, reason, valid_until(ops, subject, now, request), ids)
+    ids, chosen = because(ops, subject, now, request)
+    # L16: an allow must be backed at least as strongly as its cause demands.
+    # The requirement is the STRONGEST any op in the cause asks for; Proven by
+    # default, Inferred only where a Grant species asked for it (ruling 3, the
+    # migration switch's home). Checked unconditionally -- an earlier cut only
+    # ran it when the requirement was Proven, so an `inferred`-minimum op
+    # allowed on an absent binding.
+    if decision == ALLOW:
+        need = "proven"
+        for o in chosen:
+            if o[KIND] in WIDENING and o[MINB] == "inferred":
+                need = "inferred"
+        granted = binding
+        if MUTATION == "inferred-ok-for-proven-op" and binding == "Inferred":
+            granted = "Proven"
+        if MUTATION != "binding-ignored" and not binding_satisfies(granted, need):
+            return (DENY, R_UNPROVEN,
+                    valid_until_full(ops, subject, now, request, cert), ())
+    return (decision, reason,
+            valid_until_full(ops, subject, now, request, cert), ids)
 
 
 # ------------------------------------------------------------------ L6 ingest
@@ -279,31 +502,87 @@ def source_guard():
             "laws this model checks are not in the document it claims to check. "
             "Refusing to report.")
     found = sorted(int(n) for n in re.findall(r"\*\*L(\d+) --", text))
-    if found != list(range(1, 14)):
+    # Which laws this file actually CHECKS, taken from its own source: every
+    # check key is written as "L<n> ..." at the call site, so the source is the
+    # authority on what is backed. Review rulings 2/3/8 add L14-L18; CONTRACT.md
+    # is the reviewer's to edit, so the mapping must follow the TEXT rather than
+    # hold a fixed range -- when the contract was renumbered to declare
+    # L1..L18, a range test called those laws declared-but-unbacked even though
+    # checks exist for every one of them.
+    backed = {int(n) for n in re.findall(r'"L(\d+) ', open(__file__, encoding="utf-8").read())}
+    # The laws the deployed gate already rests on must be DECLARED: the model
+    # cannot silently stop covering them by the contract dropping them.
+    missing = [n for n in range(1, MAX_CONTRACT_LAW + 1) if n not in found]
+    if missing:
         raise SystemExit(
-            f"ledger guard: CONTRACT.md declares laws {found}; this model checks "
-            "L1..L13. Recalibrate the model against the contract before changing "
-            "either. Refusing to report.")
+            f"ledger guard: CONTRACT.md declares {found}; laws {missing} are "
+            f"missing and this model checks L1..L{MAX_CONTRACT_LAW}. Recalibrate "
+            "the model against the contract before changing either. Refusing "
+            "to report.")
+    # A declared law with no check key is the failure this model exists to
+    # prevent: a contract claim nothing verifies.
+    unbacked = [n for n in found if n not in backed]
+    if unbacked:
+        raise SystemExit(
+            f"ledger guard: CONTRACT.md declares L{unbacked} but this model has "
+            "no check key for " + ("them" if len(unbacked) > 1 else "it") +
+            ". A contract law without a check is the failure this model exists "
+            "to prevent. Refusing to report.")
+    beyond = [n for n in found if n > MAX_MODEL_LAW]
+    if beyond:
+        raise SystemExit(
+            f"ledger guard: CONTRACT.md declares L{beyond}, above the highest "
+            f"law this model implements (L{MAX_MODEL_LAW}). Refusing to report.")
     gate = os.path.join(ROOT, "cli", "src", "shell_gate.rs")
     if not os.path.exists(gate):
         raise SystemExit(
             f"ledger guard: cannot find {gate}, the source of gate 0's oracle "
             "rows. Refusing to report.")
     # L1, checked against this file's own source rather than by assertion.
-    for fn in (_decide_core, effective, covers, valid_until, because, decide):
+    for fn in (_decide_core, effective, covers, valid_until, because, decide,
+               pattern_contains, pass_is_attenuative, delegated_ok, trust_filter,
+               fact_verdict):
         body = inspect.getsource(fn)
         for banned in ("time.", "os.environ", "random.", "open(", "datetime"):
             if banned in body:
                 raise SystemExit(
                     f"ledger guard: L1 violated in source -- {fn.__name__} "
                     f"references {banned!r}. The evaluator must be pure.")
-    print("GUARD: CONTRACT.md declares L1..L13; shell_gate.rs present; "
-          "evaluator source free of clock / store / env")
+    declared_rulings = [n for n in found if n > MAX_CONTRACT_LAW]
+    if declared_rulings:
+        # The text now carries the rulings, so the old "pending contract text"
+        # note would be a claim the contract contradicts. History, not a claim.
+        note = (f"; L{MAX_CONTRACT_LAW + 1}..L{max(declared_rulings)} are the "
+                "review rulings, declared by the contract and checked here")
+    else:
+        note = (f"; L{MAX_CONTRACT_LAW + 1}..L{MAX_MODEL_LAW} are the review "
+                "rulings, pending contract text")
+    print(f"GUARD: CONTRACT.md declares L1..L{max(found)}; model implements "
+          f"L1..L{MAX_MODEL_LAW}, every declared law mapped to a check key{note}; "
+          "shell_gate.rs present; evaluator source free of clock / store / env")
 
 
 # -------------------------------------------------------------------- gate 0
-def mk(i, author, subject, pattern, nb, na, kind, version=1, ref=None):
-    return (i, author, subject, pattern[0], pattern[1], nb, na, kind, version, ref)
+def mk(i, author, subject, pattern, nb, na, kind, version=1, ref=None,
+       minb="proven"):
+    return (i, author, subject, pattern[0], pattern[1], nb, na, kind, version,
+            ref, minb)
+
+
+def with_fields(op, **kw):
+    """Rebuild an op with named fields replaced.
+
+    Positional reconstruction (the pattern the tiers used before MINB existed)
+    silently truncates any field added later; this cannot.
+    """
+    fields = {"id": op[ID], "author": op[AUTHOR], "subject": op[SUBJECT],
+              "action": op[ACTION], "resource": op[RESOURCE], "nb": op[NB],
+              "na": op[NA], "kind": op[KIND], "version": op[VERSION],
+              "ref": op[REF], "minb": op[MINB]}
+    fields.update(kw)
+    return (fields["id"], fields["author"], fields["subject"], fields["action"],
+            fields["resource"], fields["nb"], fields["na"], fields["kind"],
+            fields["version"], fields["ref"], fields["minb"])
 
 
 SHELL, FWD_ONE, FWD_ANY = PATTERNS
@@ -362,6 +641,10 @@ def gate_0():
 # ------------------------------------------------------------------- tallying
 CELL = None
 VERDICTS_SEEN = set()
+# Ruling 6 non-vacuity: cells where the minimal cause stops changing at a
+# different time than the full log does. If this is ever 0 the weaker claim
+# (because explains the decision, not valid_until) was never exercised.
+CAUSE_VU_DIFFERS = 0
 
 # Every verdict shape the evaluator can produce. A run that never reaches one of
 # these passed the checks guarding it WITHOUT TESTING THEM, which is the failure
@@ -370,9 +653,23 @@ VERDICTS_SEEN = set()
 REQUIRED_VERDICTS = (
     (ALLOW, None), (DENY, R_DENIED), (DENY, R_PAUSED),
     (DENY, R_CEILING), (DENY, R_UNACCEPTED), (DENY, R_NOGRANT),
+    # Rulings 3/8: the reasons a certificate or a binding can refuse with are
+    # required, not merely reachable.
+    (DENY, R_REVOKED), (DENY, R_EXPIRED), (DENY, R_UNPROVEN),
 )
 REQUIRED_NONEMPTY = ("L12 pause-distinct", "L13 accept-well-formed",
-                     "L10 deny-is-a-tombstone", "L3 valid-until-is-a-change-point")
+                     "L10 deny-is-a-tombstone", "L3 valid-until-is-a-change-point",
+                     # rulings 1/2/3/7: every new law must have BITTEN, and the
+                     # two facts that were dead inputs must be load-bearing.
+                     "L14 pass-wider-is-inert", "L15 revoked-is-absolute",
+                     "L15 expired-is-absolute", "L16 allow-requires-binding",
+                     "L17 own-policy-is-trust-root",
+                     "L17 delegated-ops-need-ceiling",
+                     "L18 compaction-preserves-verdict",
+                     "L18 compaction-preserves-because",
+                     "L1 fact-cert-is-load-bearing",
+                     "L1 fact-binding-is-load-bearing",
+                     "L1 fact-held_author_key-is-load-bearing")
 
 
 class Tally:
@@ -390,15 +687,25 @@ class Tally:
 
 
 # ----------------------------------------------------------------- enumeration
-def pool(keys, subjects, patterns, intervals, kinds, slots):
-    """Every op a slot may hold, in a canonical order."""
+def pool(keys, subjects, patterns, intervals, kinds, slots, minbs=("proven",)):
+    """Every op a slot may hold, in a canonical order.
+
+    `minbs` is the L16 dimension. It defaults to the single value `proven` so
+    that the tiers whose laws do not read it stay pinned (and inside budget),
+    and tier BINDING is the one place it varies.
+    """
     out = []
-    for author, subject, pattern, (nb, na), kind in itertools.product(
-            keys, subjects, patterns, intervals, kinds):
-        out.append((author, subject, pattern, nb, na, kind, None))
+    for author, subject, pattern, (nb, na), kind, minb in itertools.product(
+            keys, subjects, patterns, intervals, kinds, minbs):
+        # L16 construction invariant: only a GRANT species may ask for less
+        # than Proven. Pair-secret Grants are the legacy population, so their
+        # weaker requirement lives on the op, not in the evaluator.
+        if minb == "inferred" and kind not in GRANT_SPECIES:
+            continue
+        out.append((author, subject, pattern, nb, na, kind, None, minb))
     for author, subject, (nb, na), ref in itertools.product(
             keys, subjects, intervals, range(slots)):
-        out.append((author, subject, ACC, nb, na, "accept", ref))
+        out.append((author, subject, ACC, nb, na, "accept", ref, "proven"))
     return tuple(out)
 
 
@@ -412,16 +719,16 @@ def ledgers(template_pool, slots):
             range(len(template_pool)), slots):
         ops = []
         for i, index in enumerate(combo):
-            author, subject, pattern, nb, na, kind, ref = template_pool[index]
+            author, subject, pattern, nb, na, kind, ref, minb = template_pool[index]
             ops.append(mk(i, author, subject, pattern, nb, na, kind, 1,
-                          ref if ref is None else ref % slots))
+                          ref if ref is None else ref % slots, minb))
         yield tuple(ops)
 
 
 def singles(template_pool, op_id):
-    for author, subject, pattern, nb, na, kind, ref in template_pool:
+    for author, subject, pattern, nb, na, kind, ref, minb in template_pool:
         yield mk(op_id, author, subject, pattern, nb, na, kind, 1,
-                 ref if ref is None else (1 - op_id))
+                 ref if ref is None else (1 - op_id), minb)
 
 
 # ------------------------------------------------------------------ law checks
@@ -470,11 +777,22 @@ def check_cell(tally, ops, subject, now, request, clock):
     tally.check("L8 lattice-covers",
                 decision != ALLOW or any(o[KIND] in WIDENING for o in hits))
 
-    # L12 pause: author-only, interval-bounded, reason distinct from denied.
+    # L12 pause: author-only, PATTERN-SCOPED (ruling 7), interval-bounded, and
+    #     reason distinct from denied.
     if reason == R_PAUSED:
         tally.check("L12 pause-distinct",
                     (not any_deny) and any(o[KIND] == "pause" for o in hits))
     tally.check("L12 pause-not-deny", reason != R_DENIED or any_deny)
+    # Ruling 7: a pause is scoped by its own pattern, so a pause that does NOT
+    # cover the request must be removable without moving the verdict. This is
+    # what makes the lattice top (UNIVERSAL) the wholesale form rather than a
+    # second mechanism.
+    off_scope = tuple(o for o in ops if o[KIND] != "pause"
+                      or covers(o[ACTION], o[RESOURCE], *request))
+    tally.check("L12 pause-pattern-scoped",
+                decide_core(off_scope, subject, now, request) == (decision, reason))
+    if any(o[KIND] == "pause" for o in live):
+        tally.check("L12 pause-scope-is-read", True)
 
     # L13 an allow rests on an accept naming a live widening op, signed by its
     #     subject.
@@ -483,6 +801,26 @@ def check_cell(tally, ops, subject, now, request, clock):
             a[KIND] == "accept" and g[KIND] in WIDENING and g[ID] == a[REF]
             and a[AUTHOR] == g[SUBJECT] and a[SUBJECT] == g[SUBJECT]
             for a in live for g in hits))
+
+    # L14 a Pass is a Grant species and is attenuation-only: an inert pass must
+    #     be removable without moving the verdict (ruling 2).
+    if any(o[KIND] == "pass" for o in live):
+        inert = tuple(
+            o for o in ops
+            if o[KIND] != "pass"
+            or not o[SUBJECT] == subject or not o[NB] <= now < o[NA]
+            or pass_is_attenuative(ops, o, now))
+        tally.check("L14 pass-attenuation",
+                    decide_core(inert, subject, now, request) == (decision, reason))
+        # And a pass that DOES widen must still need its Accept (L5/L13), i.e.
+        # attenuation never substitutes for the second signature.
+        tally.check("L14 pass-still-needs-accept",
+                    decision != ALLOW or not any(
+                        o[KIND] == "pass" for o in hits
+                        if pass_is_attenuative(ops, o, now))
+                    or any(a[KIND] == "accept" and a[REF] in
+                           {o[ID] for o in hits if o[KIND] == "pass"}
+                           for a in live))
 
     # L3 / L9  valid_until soundness.
     vu = valid_until(ops, subject, now, request)
@@ -505,8 +843,19 @@ def check_cell(tally, ops, subject, now, request, clock):
                     for o in chosen))
     tally.check("L7 because-only-effective-ops",
                 set(ids) <= {o[ID] for o in effective(ops)})
-    tally.check("L7 because-omits-inert",
-                not any(o[KIND] == "certify" for o in chosen))
+    # Ruling 2 removed `certify` from the op kinds, so the old inertness probe
+    # (drop certify ops) has nothing to drop. The remaining inertness claim is
+    # narrower and still checkable: the cause never cites an op that is not live
+    # for this subject and window.
+    tally.check("L7 because-only-live-ops",
+                all(o[SUBJECT] == subject and o[NB] <= now < o[NA]
+                    for o in chosen))
+    # Ruling 6: the cause explains the DECISION, not valid_until. Record the
+    # cells where a shorter cause stops changing at a DIFFERENT time, so the
+    # weaker claim is exercised rather than merely assumed.
+    global CAUSE_VU_DIFFERS
+    if valid_until(chosen, subject, now, request) != vu:
+        CAUSE_VU_DIFFERS += 1
 
 
 # ----------------------------------------------------------------------- tiers
@@ -537,7 +886,7 @@ def tier_version(tally, keys, subjects, patterns, intervals, kinds, clock,
         for new in olds:
             if new[AUTHOR] != old[AUTHOR]:
                 continue  # ingest refuses an id whose author changes
-            newer = tuple(list(new[:VERSION]) + [2, new[REF]])
+            newer = with_fields(new, version=2)
             pairs += 1
             for subject in subjects:
                 for request in requests:
@@ -572,10 +921,18 @@ def tier_pairs(tally, keys, subjects, patterns, intervals, kinds, clock, request
                         if la == DENY and lb == DENY and both == ALLOW:
                             widen = [o for o in (left, right) if o[KIND] in WIDENING]
                             acc = [o for o in (left, right) if o[KIND] == "accept"]
+                            # Ruling 1: the (Grant species, its REFERENCED
+                            # Accept) pair is THE defined widening. Any second
+                            # route -- a wider kind set, a missing accept, an
+                            # accept that references something else -- must
+                            # FAIL here rather than be tolerated as "a widening
+                            # combination we happen to know about".
                             tally.check("L10 no-widening-by-combination",
                                         len(widen) == 1 and len(acc) == 1
+                                        and widen[0][KIND] in GRANT_SPECIES
                                         and acc[0][REF] == widen[0][ID]
-                                        and acc[0][AUTHOR] == widen[0][SUBJECT])
+                                        and acc[0][AUTHOR] == widen[0][SUBJECT]
+                                        and acc[0][SUBJECT] == widen[0][SUBJECT])
                         else:
                             tally.check("L10 no-widening-by-combination", True)
                         # A live deny is a tombstone: nothing another op brings
@@ -592,9 +949,9 @@ def tier_pairs(tally, keys, subjects, patterns, intervals, kinds, clock, request
         for now in clock:
             if not left[NB] <= now < left[NA]:
                 continue
-            shorter = tuple(list(left[:NA]) + [now, "deny", 2, None])
-            other = tuple([left[ID], (set(keys) - {left[AUTHOR]}).pop()]
-                          + list(left[2:NA]) + [now, "deny", 2, None])
+            shorter = with_fields(left, na=now, kind="deny", version=2, ref=None)
+            other = with_fields(left, author=(set(keys) - {left[AUTHOR]}).pop(),
+                                na=now, kind="deny", version=2, ref=None)
             lifts += 1
             for subject in subjects:
                 for request in requests:
@@ -698,18 +1055,314 @@ def tier_ingest(tally, keys, patterns, clock, requests):
           f"verdict-changing refusals={load_bearing}")
 
 
-FACT_VARIANTS = tuple(
-    (binding, cert, held, name)
-    for binding in (None, "Proven")
-    for cert in (None,
-                 {"device_pub": "d", "user_pub": "u", "expires": 4, "revoked": False},
-                 {"device_pub": "d", "user_pub": "u", "expires": 4, "revoked": True})
-    for held in (None,) + KEYS
-    for name in ("laptop", "phone"))
+# L15: certificate states. `expires` is an instant; the horizon is a clock
+# boundary, so an expiry is a time at which the verdict changes.
+CERT_NONE = None
+CERT_VALID = {"device_pub": "d", "user_pub": "u", "expires": 4, "revoked": False}
+CERT_EXPIRED = {"device_pub": "d", "user_pub": "u", "expires": 2, "revoked": False}
+CERT_REVOKED = {"device_pub": "d", "user_pub": "u", "expires": 4, "revoked": True}
+CERT_VARIANTS = (CERT_NONE, CERT_VALID, CERT_EXPIRED, CERT_REVOKED)
 
 
-def tier_facts(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
-    """L1 + L2: binding, cert, held_author_key and display names move nothing."""
+def tier_cert(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
+    """L15: a revoked or expired certificate denies, absolutely, by reason."""
+    global CELL
+    tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
+    logs = 0
+    for ops in ledgers(tpool, 2):
+        logs += 1
+        for subject in subjects:
+            for request in requests:
+                for now in clock:
+                    CELL = (ops, subject, now, request)
+                    for cert in CERT_VARIANTS:
+                        facts = {"now": now, "subject": subject, "ops": ops,
+                                 "binding": "Proven", "cert": cert,
+                                 "held_author_key": None,
+                                 "display_name": "laptop"}
+                        got = decide(facts, request)
+                        VERDICTS_SEEN.add((got[0], got[1]))
+                        revoked = cert is not None and cert["revoked"]
+                        expired = (cert is not None and not cert["revoked"]
+                                   and cert["expires"] <= now)
+                        if revoked:
+                            # ABSOLUTE: no op combination buys its way past it.
+                            tally.check("L15 revoked-is-absolute",
+                                        got[0] == DENY and got[1] == R_REVOKED
+                                        and got[2] is None and got[3] == ())
+                        elif expired:
+                            tally.check("L15 expired-is-absolute",
+                                        got[0] == DENY and got[1] == R_EXPIRED
+                                        and got[2] is None and got[3] == ())
+                            RELEVANT["cert"] += 1
+                        else:
+                            if got[0] == ALLOW:
+                                # An allow must not promise past the expiry.
+                                tally.check(
+                                    "L15 valid-until-respects-expiry",
+                                    cert is None or cert["expires"] <= now
+                                    or got[2] is None
+                                    or got[2] <= cert["expires"])
+                            if not revoked and not expired:
+                                tally.check("L15 cert-does-not-invent-denials",
+                                            got[0] == ALLOW or got[1] != R_REVOKED)
+                        # DISTINCT reasons, correctly attributed, for EVERY
+                        # certificate state: the revoked reason belongs to
+                        # revocation and the expired reason to expiry, never each
+                        # other, and a healthy certificate reports neither. Must
+                        # be unconditional -- inside the healthy-only branch it
+                        # could not see a swapped reason at all.
+                        tally.check("L15 reasons-distinct",
+                                    (got[1] == R_REVOKED) == revoked
+                                    and (got[1] == R_EXPIRED) == expired)
+                        if cert is not None and got[1] == R_REVOKED:
+                            RELEVANT["cert"] += 1
+    print(f"  {'L15 certificate':<28} logs={logs:<8d} pool={len(tpool):<4d} "
+          f"certs={len(CERT_VARIANTS)}")
+
+
+def tier_pass(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
+    """L14 (ruling 2): a Pass is a Grant species, and attenuation-only.
+
+    The law the reviewer asked this tier for: a pass WIDER than its author's own
+    ceiling toward that resource is INERT -- not merely narrow, not merely
+    unaccepted. Both directions are asserted here, because a check that only
+    ever sees inert passes would pass with the attenuation test deleted.
+    """
+    global CELL
+    tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
+    logs, attenuative, inert = 0, 0, 0
+    for ops in ledgers(tpool, 2):
+        logs += 1
+        for subject in subjects:
+            for request in requests:
+                for now in clock:
+                    CELL = (ops, subject, now, request)
+                    decision, reason = decide_core(ops, subject, now, request)
+                    for o in effective(ops):
+                        if o[KIND] != "pass":
+                            continue
+                        backed = pass_is_attenuative(ops, o, now)
+                        if backed:
+                            attenuative += 1
+                        else:
+                            inert += 1
+                            # INERT: removing it cannot move the verdict.
+                            without = tuple(x for x in ops if x != o)
+                            tally.check("L14 pass-attenuation",
+                                        decide_core(without, subject, now, request)
+                                        == (decision, reason))
+                        # Either way a pass is a GRANT SPECIES: it never gets
+                        # authority without its own referenced Accept (L5/L13).
+                        if decision == ALLOW:
+                            tally.check(
+                                "L14 pass-still-needs-accept",
+                                not any(x[KIND] == "pass" for x in
+                                        because(ops, subject, now, request)[1])
+                                or any(a[KIND] == "accept" and a[REF] == x[ID]
+                                       and a[AUTHOR] == x[SUBJECT]
+                                       for a in effective(ops)
+                                       for x in because(ops, subject, now,
+                                                        request)[1]
+                                       if x[KIND] == "pass"))
+    CELL = ("non-vacuity", "pass")
+    # A tier that never produced BOTH an attenuative pass and an inert one did
+    # not test L14; it tested that the file runs.
+    tally.check("L14 pass-attenuation", attenuative > 0)
+    tally.check("L14 pass-wider-is-inert", inert > 0)
+    print(f"  {'L14 pass attenuation':<28} logs={logs:<8d} pool={len(tpool):<4d} "
+          f"attenuative={attenuative} inert={inert}")
+
+
+BINDINGS = (None, "Inferred", "Proven")
+
+
+def tier_binding(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
+    """L16: every allow needs binding >= the cause's own minimum."""
+    global CELL
+    tpool = pool(keys, subjects, patterns, intervals, kinds, 2,
+                 minbs=("proven", "inferred"))
+    logs = 0
+    for ops in ledgers(tpool, 2):
+        logs += 1
+        for subject in subjects:
+            for request in requests:
+                for now in clock:
+                    CELL = (ops, subject, now, request)
+                    for binding in BINDINGS:
+                        facts = {"now": now, "subject": subject, "ops": ops,
+                                 "binding": binding, "cert": None,
+                                 "held_author_key": None,
+                                 "display_name": "laptop"}
+                        got = decide(facts, request)
+                        VERDICTS_SEEN.add((got[0], got[1]))
+                        if got[0] == ALLOW:
+                            need = "proven"
+                            for o in because(ops, subject, now, request)[1]:
+                                if o[KIND] in WIDENING and o[MINB] == "inferred":
+                                    need = "inferred"
+                            tally.check("L16 allow-requires-binding",
+                                        binding_satisfies(binding, need))
+                            # Ruling 3: Inferred is allowed ONLY for pair-secret
+                            # Grants. A pass may never demand less than Proven.
+                            tally.check("L16 inferred-only-on-grants",
+                                        need != "inferred" or all(
+                                            o[KIND] in GRANT_SPECIES
+                                            for o in because(ops, subject, now,
+                                                             request)[1]
+                                            if o[KIND] == "pass"))
+                        elif got[1] == R_UNPROVEN:
+                            RELEVANT["binding"] += 1
+                            tally.check("L16 unproven-is-a-deny", got[0] == DENY)
+    # Construction invariant: `inferred` never lands on a non-grant-species op
+    # (ruling 3: the weaker requirement belongs to pair-secret Grants only).
+    tally.check("L16 inferred-only-on-grants",
+                all(o[MINB] != "inferred" or o[KIND] in GRANT_SPECIES
+                    for ops in ledgers(tpool, 2) for o in ops))
+    print(f"  {'L16 binding':<28} logs={logs:<8d} pool={len(tpool):<4d} "
+          f"bindings={len(BINDINGS)}")
+
+
+def tier_held(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
+    """L17: a held author key is the trust root; others act inside its ceiling."""
+    global CELL
+    tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
+    logs = 0
+    for ops in ledgers(tpool, 2):
+        logs += 1
+        for subject in subjects:
+            for request in requests:
+                for now in clock:
+                    CELL = (ops, subject, now, request)
+                    base = decide({"now": now, "subject": subject, "ops": ops,
+                                   "binding": "Proven", "cert": None,
+                                   "held_author_key": None,
+                                   "display_name": "laptop"}, request)
+                    for held in KEYS:
+                        facts = {"now": now, "subject": subject, "ops": ops,
+                                 "binding": "Proven", "cert": None,
+                                 "held_author_key": held,
+                                 "display_name": "laptop"}
+                        got = decide(facts, request)
+                        VERDICTS_SEEN.add((got[0], got[1]))
+                        if got != base:
+                            RELEVANT["held_author_key"] += 1
+                        # Own policy is the trust root: an op authored BY the
+                        # held key is never delegated away.
+                        mine = tuple(o for o in ops if o[AUTHOR] == held)
+                        rest = tuple(o for o in ops if o[AUTHOR] != held)
+                        tally.check(
+                            "L17 own-policy-is-trust-root",
+                            set(mine) <= set(trust_filter(ops, held, now)))
+                        # A delegated op survives only inside a ceiling its
+                        # author was granted BY the held key.
+                        tally.check(
+                            "L17 delegated-ops-need-ceiling",
+                            all(delegated_ok(ops, o, held, now) or o not in
+                                trust_filter(ops, held, now) for o in rest))
+    print(f"  {'L17 held author key':<28} logs={logs:<8d} pool={len(tpool):<4d}")
+
+
+def compact(ops):
+    """L18: the append-only log reduced without changing any verdict.
+
+    Two rewrites, and only these: (1) drop revisions that are not effective
+    (an append-only log keeps every revision; the evaluator already ignores
+    them); (2) drop ops that are irrelevant to EVERY cell of the bounded
+    universe -- deleting them cannot change a verdict by construction, so what
+    this tier actually tests is that the MINIMAL CAUSE is also unchanged.
+    """
+    current = list(effective(ops))
+    if MUTATION == "compaction-drops-live":
+        return tuple(current[1:])
+    changed = True
+    while changed:
+        changed = False
+        for o in list(current):
+            trial = tuple(x for x in current if x != o)
+            if _no_verdict_changes(trial, ops):
+                if MUTATION == "compaction-drops-because-op" and len(current) > 1:
+                    return trial
+                current = list(trial)
+                changed = True
+                break
+    return tuple(current)
+
+
+def _no_verdict_changes(candidate, original):
+    """True iff `candidate` decides every bounded cell exactly as `original`."""
+    for subject in KEYS:
+        for request in REQUESTS:
+            for now in range(6):
+                if decide_core(candidate, subject, now, request) != \
+                        decide_core(tuple(original), subject, now, request):
+                    return False
+    return True
+
+
+def tier_compact(tally, keys, subjects, patterns, intervals, kinds, clock, requests):
+    """L18 (ruling 8): compaction never changes a verdict or a `because`."""
+    global CELL
+    tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
+    logs = 0
+    for ops in ledgers(tpool, 2):
+        logs += 1
+        small = compact(ops)
+        for subject in subjects:
+            for request in requests:
+                for now in clock:
+                    CELL = (ops, subject, now, request)
+                    tally.check(
+                        "L18 compaction-preserves-verdict",
+                        decide_core(small, subject, now, request)
+                        == decide_core(ops, subject, now, request))
+                    tally.check(
+                        "L18 compaction-preserves-because",
+                        because(small, subject, now, request)[0]
+                        == because(ops, subject, now, request)[0])
+    # Ruling 8's other half: today's Revoke DELETES the grant row. In the ledger
+    # it is a Deny tombstone, or a shorter-interval revision of the Grant by its
+    # author -- and the two must agree with the deletion they replace.
+    tombstones = 0
+    for g in singles(tpool, 0):
+        if g[KIND] not in GRANT_SPECIES:
+            continue
+        g = with_fields(g, kind="grant")
+        acc = mk(1, g[SUBJECT], g[SUBJECT], ACC, g[NB], g[NA], "accept",
+                 ref=g[ID])
+        for now in clock:
+            if not g[NB] < now < g[NA]:
+                continue
+            dead = with_fields(g, kind="deny", nb=now, version=2)
+            cut = now + 1 if MUTATION == "truncation-off-by-one" else now
+            short = with_fields(g, kind="grant", na=cut, version=2)
+            tombstones += 1
+            for subject in subjects:
+                for request in requests:
+                    CELL = ((g, acc, dead), subject, now, request)
+                    # A tombstone from `now` denies from `now` on, and the
+                    # shorter revision revokes the same window from the other
+                    # side. Both must deny exactly where deletion would.
+                    tally.check(
+                        "L18 tombstone-denies-from-its-start",
+                        decide_core((g, acc, dead), subject, now, request)[0]
+                        == DENY)
+                    tally.check(
+                        "L18 shorter-revision-equals-truncation",
+                        decide_core((g, acc, short), subject, now, request)[0]
+                        == decide_core((with_fields(g, na=now), acc), subject,
+                                       now, request)[0])
+    print(f"  {'L18 compaction':<28} logs={logs:<8d} tombstones={tombstones}")
+
+
+# L16/L17 non-vacuity: a fact field that no law reads is a dead input, and a
+# field no cell varies is a check that never bit. Both are failures here.
+RELEVANT = {"cert": 0, "binding": 0, "held_author_key": 0}
+
+
+def tier_relevance(tally, keys, subjects, patterns, intervals, kinds, clock,
+                   requests):
+    """L1/L2 + ruling 3: which Facts fields are load-bearing, and which are not."""
     global CELL
     tpool = pool(keys, subjects, patterns, intervals, kinds, 2)
     logs = 0
@@ -720,18 +1373,24 @@ def tier_facts(tally, keys, subjects, patterns, intervals, kinds, clock, request
                 for now in clock:
                     CELL = (ops, subject, now, request)
                     base = None
-                    for binding, cert, held, name in FACT_VARIANTS:
+                    for name in ("laptop", "phone"):
                         facts = {"now": now, "subject": subject, "ops": ops,
-                                 "binding": binding, "cert": cert,
-                                 "held_author_key": held, "display_name": name}
+                                 "binding": "Proven", "cert": None,
+                                 "held_author_key": None, "display_name": name}
                         got = decide(facts, request)
                         if base is None:
                             base = got
                             tally.check("L1 deterministic",
                                         decide(facts, request) == got)
-                        tally.check("L1/L2 facts-irrelevance", got == base)
-    print(f"  {'L1/L2 facts irrelevance':<28} logs={logs:<8d} "
-          f"pool={len(tpool):<4d} variants={len(FACT_VARIANTS)}")
+                        # L2: names are presentation, never authority.
+                        tally.check("L2 display-name-irrelevant", got == base)
+    # The load-bearing assertion: if one of these never moves a verdict, the
+    # field is dead and ruling 3 was answered on paper only.
+    for field, count in sorted(RELEVANT.items()):
+        CELL = ("relevance", field)
+        tally.check(f"L1 fact-{field}-is-load-bearing", count > 0)
+    print(f"  {'L1/L2 facts relevance':<28} logs={logs:<8d} "
+          f"load-bearing={ {k: v for k, v in sorted(RELEVANT.items())} }")
 
 
 # ---------------------------------------------------------------------- runner
@@ -762,6 +1421,24 @@ FULL = {
     "facts":   dict(patterns=PATTERNS[:2], intervals=((1, 3),),
                     kinds=("grant", "deny"), clock=tuple(range(4)),
                     requests=REQUESTS[:1]),
+    # Rulings 2/3/7/8: one tier per new law, bounded so the whole run stays
+    # inside the ten-second budget. Each pins the dimensions its law does not
+    # read (tier BINDING is the only place the MINB dimension varies).
+    "pass":    dict(patterns=PATTERNS, intervals=((1, 3), (2, 4)),
+                    kinds=("grant", "pass", "ceiling", "accept"),
+                    clock=tuple(range(5)), requests=REQUESTS),
+    "cert":    dict(patterns=PATTERNS[:2], intervals=((1, 3), (2, 4)),
+                    kinds=("grant", "deny"), clock=tuple(range(6)),
+                    requests=REQUESTS[:2]),
+    "binding": dict(patterns=PATTERNS[:2], intervals=((1, 3), (2, 4)),
+                    kinds=("grant", "pass"), clock=tuple(range(5)),
+                    requests=REQUESTS[:2]),
+    "held":    dict(patterns=PATTERNS[:2], intervals=((1, 3),),
+                    kinds=("grant", "ceiling", "deny"), clock=tuple(range(4)),
+                    requests=REQUESTS[:1]),
+    "compact": dict(patterns=PATTERNS[:2], intervals=((1, 3), (2, 4)),
+                    kinds=("grant", "deny", "ceiling"), clock=tuple(range(5)),
+                    requests=REQUESTS[:1]),
 }
 
 QUICK = {
@@ -776,7 +1453,7 @@ QUICK = {
                     kinds=KINDS_CORE, clock=tuple(range(4)),
                     requests=REQUESTS[:1]),
     "pairs":   dict(patterns=PATTERNS[:2], intervals=((1, 3),),
-                    kinds=("grant", "deny"), clock=tuple(range(4)),
+                    kinds=("grant", "deny", "ceiling"), clock=tuple(range(4)),
                     requests=REQUESTS[:1]),
     "order":   dict(patterns=PATTERNS[:1], intervals=((1, 3),),
                     kinds=("grant", "deny"), slots=3, clock=tuple(range(4)),
@@ -786,13 +1463,28 @@ QUICK = {
                     requests=REQUESTS[:1]),
     "facts":   dict(patterns=PATTERNS[:1], intervals=((1, 3),),
                     kinds=("grant",), clock=tuple(range(3)), requests=REQUESTS[:1]),
+    "pass":    dict(patterns=PATTERNS[:2], intervals=((1, 3),),
+                    kinds=("grant", "pass", "ceiling"), clock=tuple(range(4)),
+                    requests=REQUESTS[:1]),
+    "cert":    dict(patterns=PATTERNS[:1], intervals=((1, 3),),
+                    kinds=("grant", "deny"), clock=tuple(range(4)),
+                    requests=REQUESTS[:1]),
+    "binding": dict(patterns=PATTERNS[:1], intervals=((1, 3),),
+                    kinds=("grant",), clock=tuple(range(3)),
+                    requests=REQUESTS[:1]),
+    "held":    dict(patterns=PATTERNS[:1], intervals=((1, 3),),
+                    kinds=("grant", "ceiling"), clock=tuple(range(3)),
+                    requests=REQUESTS[:1]),
+    "compact": dict(patterns=PATTERNS[:1], intervals=((1, 3),),
+                    kinds=("grant", "deny"), clock=tuple(range(4)),
+                    requests=REQUESTS[:1]),
 }
 
 
 def run_all(tally, plan):
     if plan["core"]:
-        print("\nTier CORE  -- N=2, every op kind including the inert `certify`")
-        print("  and the widening `pass`; all three patterns, all three requests.")
+        print("\nTier CORE  -- N=2, every op kind including the widening `pass`")
+        print("  (`certify` is not an op; ruling 2); all patterns, all requests.")
         tier_cells(tally, "L3..L13 over N=2", **plan["core"])
     if plan["depth"]:
         print("\nTier DEPTH -- N=3: composition needs three ops before a ceiling")
@@ -802,8 +1494,9 @@ def run_all(tally, plan):
         print("\nTier VER   -- two versions of one op id by one author.")
         tier_version(tally, KEYS, KEYS[:1], **plan["version"])
     if plan["pairs"]:
-        print("\nTier PAIR  -- every ordered pair of single ops; L10, and L5's")
-        print("  exception required to be the only widening combination.")
+        print("\nTier PAIR  -- every ordered pair of single ops; L10, and the")
+        print("  (Grant species, its referenced Accept) pair required to be the")
+        print("  ONLY widening combination (ruling 1).")
         tier_pairs(tally, KEYS, KEYS[:1], **plan["pairs"])
     if plan["order"]:
         print("\nTier ORDER -- every permutation of an N=3 log, plus replay.")
@@ -813,9 +1506,25 @@ def run_all(tally, plan):
         tier_scope(tally, KEYS, **plan["scope"])
     print("\nTier INGEST -- L6 at the boundary, with a non-vacuity proof.")
     tier_ingest(tally, KEYS, PATTERNS, tuple(range(6)), REQUESTS)
+    if plan.get("pass"):
+        print("\nTier PASS  -- L14: a Pass is a Grant species, attenuation-only.")
+        tier_pass(tally, KEYS, KEYS[:1], **plan["pass"])
+    if plan.get("cert"):
+        print("\nTier CERT  -- L15: revoked and expired deny absolutely, by reason.")
+        tier_cert(tally, KEYS, KEYS[:1], **plan["cert"])
+    if plan.get("binding"):
+        print("\nTier BIND -- L16: every allow needs binding >= the cause minimum.")
+        tier_binding(tally, KEYS, KEYS[:1], **plan["binding"])
+    if plan.get("held"):
+        print("\nTier HELD  -- L17: the held author key is the trust root.")
+        tier_held(tally, KEYS, KEYS[:1], **plan["held"])
+    if plan.get("compact"):
+        print("\nTier COMPACT -- L18: compaction changes no verdict and no because.")
+        tier_compact(tally, KEYS, KEYS[:1], **plan["compact"])
     if plan["facts"]:
-        print("\nTier FACTS -- L1/L2: everything in Facts the evaluator must ignore.")
-        tier_facts(tally, KEYS, KEYS[:1], **plan["facts"])
+        print("\nTier FACTS -- L1/L2: which Facts fields are load-bearing, and")
+        print("  which (display_name only) must stay inert (ruling 3).")
+        tier_relevance(tally, KEYS, KEYS[:1], **plan["facts"])
 
 
 MUTATIONS = (
@@ -831,8 +1540,25 @@ MUTATIONS = (
     ("because-not-minimal", "L7 because-irredundant"),
     ("ingest-admits-stale", "L6 ingest-refuses-bad-ops"),
     ("ingest-admits-bad-sig", "L6 ingest-refuses-bad-ops"),
-    ("reads-cert", "L1/L2 facts-irrelevance"),
-    ("reads-name", "L1/L2 facts-irrelevance"),
+    ("reads-name", "L2 display-name-irrelevant"),
+    # Rulings 1/2/3/7/8: each new law gets its own breach, so "the model bites"
+    # is claimed per law rather than for the file as a whole.
+    ("ceiling-completes-grant", "L10 no-widening-by-combination"),
+    ("pass-wider-than-ceiling-widens", "L14 pass-attenuation"),
+    ("cert-revoked-not-absolute", "L15 revoked-is-absolute"),
+    ("expired-not-absolute", "L15 expired-is-absolute"),
+    ("revoked-reads-as-expired", "L15 reasons-distinct"),
+    ("binding-ignored", "L16 allow-requires-binding"),
+    ("inferred-ok-for-proven-op", "L16 allow-requires-binding"),
+    ("held-key-ignored", "L17 delegated-ops-need-ceiling"),
+    ("held-key-drops-own-policy", "L17 own-policy-is-trust-root"),
+    ("compaction-drops-live", "L18 compaction-preserves-verdict"),
+    # The `because` arm is guarded rather than mutated, and that is a finding
+    # worth stating: given a MINIMAL cause, no compaction can preserve every
+    # verdict and still change a `because`, so no honest mutation exists for it.
+    # L18's second breach is the other arm -- an off-by-one in the revocation
+    # boundary, which is exactly how a revoke-to-truncation migration goes wrong.
+    ("truncation-off-by-one", "L18 shorter-revision-equals-truncation"),
 )
 
 
@@ -874,7 +1600,8 @@ def main():
         source_guard()
         return 0 if self_test() else 1
 
-    print("Capability-ledger model check (CONTRACT.md, laws L1-L13)")
+    print(f"Capability-ledger model check (CONTRACT.md L1-{MAX_CONTRACT_LAW} "
+          f"+ rulings L{MAX_CONTRACT_LAW + 1}-L{MAX_MODEL_LAW})")
     source_guard()
     gate_0()
     tally = Tally()
@@ -883,6 +1610,10 @@ def main():
 
     vacuous = [f"verdict {v}" for v in REQUIRED_VERDICTS if v not in VERDICTS_SEEN]
     vacuous += [f"check {c}" for c in REQUIRED_NONEMPTY if not tally.cells.get(c)]
+    # Ruling 6: `because` must be seen NOT to explain valid_until, or the weaker
+    # claim was never exercised.
+    if CAUSE_VU_DIFFERS == 0:
+        vacuous.append("check L7 because-does-not-explain-valid-until")
 
     print("\n  law check                                 cells    violations")
     print("  " + "-" * 60)
