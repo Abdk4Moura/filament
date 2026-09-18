@@ -642,11 +642,21 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Id { action } => {
             match action.unwrap_or(IdAction::Show) {
                 IdAction::Show => {
-                    // U1: a joined device keeps its no-key display below; any
-                    // other keyless device gets its identity minted here.
+                    // U1: a keyless device gets its identity minted here, and
+                    // `id` is the one inspect verb that should mint, because the
+                    // identity IS its subject. Two devices keep the pre-U1
+                    // no-key display below instead: a joined one, which must
+                    // never quietly become a second owner, and one that set the
+                    // opt-out, which asked for the old answer and must keep
+                    // getting it (`{"configured": false}`, exit 0) rather than
+                    // an error the old build never returned.
                     let key = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
                         Some(key) => Some(key),
-                        None if local_device_cert_path().exists() => None,
+                        None if local_device_cert_path().exists()
+                            || crate::identity_flow::implicit_init_disabled() =>
+                        {
+                            None
+                        }
                         None => Some(crate::identity_flow::ensure_user_key(ui_caps.json)?),
                     };
                     match key {
@@ -703,11 +713,15 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "{}",
                                     serde_json::to_string_pretty(&json!({ "configured": false }))?
                                 );
-                            } else {
-                                // Only reachable with a joined certificate on disk
-                                // that did not parse or verify.
+                            } else if local_device_cert_path().exists() {
                                 println!(
                                     "this device holds a joined certificate that could not be read; `filament join` again from a clean device."
+                                );
+                            } else {
+                                // The opt-out path: implicit minting is off, so
+                                // this is the pre-U1 answer, verbatim.
+                                println!(
+                                    "no identity yet. Run 'filament init' or 'filament join'."
                                 );
                             }
                         }
