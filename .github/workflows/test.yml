@@ -79,7 +79,13 @@ jobs:
       # also refuses a name in the loop with no crate behind it, because the
       # loop's `[ -f ... ]` guard skips a stale name SILENTLY. A comment cannot
       # fail; this can.
+      # `always()` because a CANCELLED job never reaches a plain step: the two
+      # runs that hung on the crate tests were cancelled before this ran, so the
+      # check that exists to catch a dishonest crate list printed nothing in
+      # exactly the situation it is for. The checks that matter most are the ones
+      # that must still run when the job is already broken.
       - name: Every crate that carries tests is in the loop
+        if: always()
         run: python3 scripts/check_crate_test_loop.py
 
       - name: Show sccache stats
