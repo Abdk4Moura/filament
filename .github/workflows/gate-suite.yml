@@ -117,6 +117,16 @@ jobs:
             [cli/tests/shell-gates.sh]=6
             [cli/tests/whoami-candidate-gates.sh]=8
           )
+          # MODE MATTERS HERE, and it is not a formality: `[ -x "$g" ]` below
+          # fails the gate when the file is not executable, which is how this
+          # workflow first went red on three scripts that were 0644 in the tree
+          # (a local `bash cli/tests/x.sh` run cannot see that, because bash does
+          # not need the bit). The revoke-gates family is all 0755, so copying its
+          # precheck is only safe if the scripts you wire are too: `git
+          # update-index --chmod=+x <path>` fixes the index, and `chmod +x` the
+          # working tree. Note that MOST `required` artifacts in the registry are
+          # 0644 and work fine, because their entrypoints name the interpreter
+          # (`bash x`, `python3 x`) -- this precheck is stricter than the registry.
           rc=0
           for g in cli/tests/cap-verbs-gates.sh \
                    cli/tests/devices-write-race-gates.sh \
