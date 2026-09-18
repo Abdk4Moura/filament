@@ -1441,6 +1441,13 @@ mod tests {
     /// holds the shared test lock; this test keeps it across each snapshot/call pair.
     #[test]
     fn shadow_detector_proof_six_buckets() {
+        // #320: this test asserts DELTAS over the process-global LA_*/LD_*
+        // counters, so any concurrent cap_gate_effective caller moves them
+        // between our snap() calls and the deltas go wrong under parallel test
+        // execution (seen as `left 1, right 0` on a docs-only merge ref). The
+        // sibling gate tests all take this lock; this one was the exception.
+        let _counter_guard = CAP_GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
         // Mode-independent since the 0.7 authoritative-default flip: pass
         // Proven binding + Some(u64::MAX) expiry so the restrictive gates are
         // no-ops and each (legacy, cap-outcome) pair is counted verbatim,
