@@ -3863,3 +3863,31 @@ fn implicit_identity_is_minted_once_even_under_contention() {
     assert!(!dir.join("identity.ed25519").exists());
     unsafe { std::env::remove_var("FILAMENT_CONFIG_DIR") };
 }
+
+/// U1: the bare tour screen is an INSPECT surface. It renders whatever
+/// identity it finds and never mints one, so `filament` with no arguments
+/// writes no private key as a side effect of being looked at, and cannot fail
+/// on a device that is unable to mint (a joined one, or one with
+/// FILAMENT_NO_IMPLICIT_INIT set). The screen is printed rather than returned,
+/// so the assertion is on the source, the same way the verb-description scan
+/// in this file already reads it.
+#[test]
+fn tour_screen_never_mints_an_identity() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let src =
+        std::fs::read_to_string(format!("{manifest}/src/status_cmd.rs")).expect("status_cmd.rs");
+    let after = src
+        .split_once("fn tour_cmd")
+        .expect("tour_cmd must exist for this test to mean anything")
+        .1;
+    // Bound to the function: the closing brace at column zero ends the body.
+    let body = after.split("\n}").next().unwrap_or(after);
+    assert!(
+        !body.contains("ensure_user_key"),
+        "tour_cmd calls the minting accessor; the first screen must only READ the identity"
+    );
+    assert!(
+        body.contains("UserKey::load"),
+        "tour_cmd no longer reads the identity at all, so this test has drifted from the source"
+    );
+}
