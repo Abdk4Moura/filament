@@ -452,9 +452,20 @@ pub(crate) async fn serve_exec(
                     crate::ui::say(&format!(
                         "filament: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
                     ));
-                    let _ = t.send_frame(sid, 0, &[]).await;
-                    let _ = t.send_frame(err_sid, 0, &[]).await;
                 }
+                // THE END OF THE STREAM IS SIGNALLED UNCONDITIONALLY, and that is the correction
+                // this fix carries: the sentinel was inside the error branch, so it fired only
+                // when the close send FAILED. The observed run is the case where the send
+                // returns Ok and the frame is still not acted on downstream, which left the
+                // initiator waiting with nothing to observe -- the `fs.out`/`fs.done` evidence
+                // from the gate, and the reason commit 5 did not remove the hang.
+                //
+                // An EMPTY payload is the mux's pipe-end convention (`on_frame` maps it to
+                // None, and `exec_send` already uses it for stdin EOF), so these two frames are
+                // how a stream's end reaches its reader whether or not the status frame made
+                // it. Sent after the close attempt so the normal path still exits on the STATUS.
+                let _ = t.send_frame(sid, 0, &[]).await;
+                let _ = t.send_frame(err_sid, 0, &[]).await;
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
                 return;
