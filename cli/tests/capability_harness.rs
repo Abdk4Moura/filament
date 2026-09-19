@@ -2452,9 +2452,14 @@ fn add_for_device_and_person_carry_different_caps() {
     let parse = |file: &Path| -> Invitation {
         let raw = std::fs::read_to_string(file).expect("read invitation file");
         let token = raw.trim();
+        // The prefix is `filament-invite:` with no version segment: the payload
+        // carries its own version byte, which is what `from_token` checks. It
+        // was `filament-invite:v2:` when this test was written in August.
+        // Anchored to what add_for.rs emits today (`cli/src/add_for.rs:240`) and
+        // what file_io::parse_invitation consumes.
         let encoded = token
-            .strip_prefix("filament-invite:v2:")
-            .unwrap_or_else(|| panic!("token has the v2 prefix: {token}"));
+            .strip_prefix("filament-invite:")
+            .unwrap_or_else(|| panic!("token has the invitation prefix: {token}"));
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded)
             .expect("token is valid base64url");
