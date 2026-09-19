@@ -779,6 +779,266 @@ fn revoked_device_first_transfer_is_denied() {
     );
 }
 
+/// Read a config dir's devices.json, dumping the dir listing on failure so a
+/// missing store (a real setup finding) names what actually exists.
+fn read_devices_json(config_dir: &Path) -> Value {
+    let p = config_dir.join("devices.json");
+    let raw = match std::fs::read_to_string(&p) {
+        Ok(raw) => raw,
+        Err(e) => {
+            let listing: Vec<String> = std::fs::read_dir(config_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            panic!(
+                "cannot read {}: {e}; config dir contents: {listing:?}",
+                p.display()
+            );
+        }
+    };
+    serde_json::from_str(&raw).expect("parse devices.json")
+}
+
+/// Run a real pairing ceremony between two config dirs: A mints a code with
+/// `add --word <word>` and B claims it with `add <code>`. Both sides store the
+/// REAL code-derived shared secret. This is the pair-for-real rule; a seeded
+/// store (placeholder secret) is exactly what made the first #172 control
+/// stall forever. Deadline-bounded; a ceremony that does not converge fails
+/// loudly.
+fn live_pair(
+    bin: &Path,
+    server: &str,
+    envs: &[(&str, &str)],
+    a_dir: &Path,
+    b_dir: &Path,
+    word: &str,
+) {
+    let mut create = Command::new(bin);
+    create.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", a_dir)
+        .env("FILAMENT_NAME", "test-a")
+        .arg("add")
+        .arg("--word")
+        .arg(word)
+        .arg("--server")
+        .arg(server);
+    let create_proc = spawn_captured(create).expect("pair create spawn");
+
+    let word_lower = word.to_lowercase();
+    let started = Instant::now();
+    let code = loop {
+        let (stdout, stderr) = create_proc.snapshot();
+        let text = format!("{stdout}\n{stderr}");
+        let lower = text.to_lowercase();
+        if let Some(start) = lower.find(&word_lower) {
+            if let Some(tok) = text[start..].split_whitespace().find(|w| {
+                w.to_lowercase().contains(&word_lower) && w.split('-').count() >= 4
+            }) {
+                break tok.to_string();
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "pair create did not mint a code within 60s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // The create process BLOCKS until the other side claims the code, so the
+    // claim MUST be spawned before we wait for the create to exit: waiting on
+    // the create first is a deadlock (the claim never arrives, the create
+    // times out, and the pairing reports a spurious failure).
+    let mut claim = Command::new(bin);
+    claim.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", b_dir)
+        .env("FILAMENT_NAME", "test-b")
+        .arg("add")
+        .arg(&code)
+        .arg("--server")
+        .arg(server);
+    let claim_out = spawn_captured(claim)
+        .expect("pair claim spawn")
+        .wait_until(Duration::from_secs(60));
+    let create_out = create_proc.wait_until(Duration::from_secs(60));
+
+    assert!(
+        matches!(create_out.outcome, ChildOutcome::ExitedSuccess(_)),
+        "pair create failed: {}",
+        create_out.stderr
+    );
+    assert!(
+        matches!(claim_out.outcome, ChildOutcome::ExitedSuccess(_)),
+        "pair claim failed: {}",
+        claim_out.stderr
+    );
+}
+
+/// Send a file to a REMEMBERED device (`send <file> --to <name>`), deadline-
+/// bounded so a non-converging transfer FAILS loudly instead of hanging the
+/// harness step. Used where the receiver is a daemon, which is the only path
+/// that surfaces the gate's decline reason.
+fn run_send_to(
+    bin: &Path,
+    server: &str,
+    envs: &[(&str, &str)],
+    sender_dir: &Path,
+    to: &str,
+    payload: &Path,
+) -> CapturedChild {
+    let mut send = Command::new(bin);
+    send.envs(envs.iter().map(|(k, v)| (*k, *v)))
+        .env("FILAMENT_CONFIG_DIR", sender_dir)
+        .arg("send")
+        .arg(payload)
+        .arg("--to")
+        .arg(to)
+        .arg("--server")
+        .arg(server);
+    spawn_captured(send)
+        .expect("send")
+        .wait_until(Duration::from_secs(90))
+}
+
+
+/// #172, the 1.0.0 gate: a REVOKED device must not reach anything, and a
+/// revocation denial must be observable.
+///
+/// The receiver is a DAEMON, deliberately: only the daemon surfaces the gate's
+/// xfer_deny_reason. The one-shot receive masks EVERY denial as "no tty, use -y
+/// to auto-accept" (main.rs:17848) even when the reason is "device revoked",
+/// so a one-shot receiver can never produce the revocation-named denial this
+/// cell asserts. That masking is filed as its own bug.
+///
+/// Transport is WebRTC-only (FILAMENT_DIRECT=0): the artificial direct-blocked
+/// fallback glare-loops for already-paired devices (#214, filed), so the exact
+/// direct-blocked scenario cannot be exercised yet, and WebRTC is the transport
+/// the fallback lands on anyway. The direct-blocked residual remains the
+/// documented gap in #214.
+///
+/// Three verdicts, named in the failure message:
+///
+///   FAIL-OPEN            the file lands. Security hole: blocks 1.0 and the tag.
+///   FAIL-CLOSED-LOUD     no file, and the daemon names revocation. Correct.
+///   FAIL-CLOSED-SILENT   no file, no revocation-named denial. Message defect
+///                        (#206 class), not a fail-open hole.
+///
+/// The CONTROL runs first in the same test: a legitimate device under IDENTICAL
+/// conditions must complete. If it does not, nothing can be attributed to
+/// revocation and the test reports UNCLASSIFIED.
+#[test]
+fn revoked_device_direct_blocked_gets_no_fallback_access() {
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+    let loopback_only =
+        std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    // WebRTC-only (FILAMENT_DIRECT=0): the direct-blocked fallback glare (#214)
+    // prevents the artificial direct-block path for already-paired devices.
+    let env = [
+        ("FILAMENT_CAP_AUTHORITATIVE", "0"),
+        ("FILAMENT_DIRECT", "0"),
+        ("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only),
+        ("FILAMENT_L3_USERSPACE", "1"),
+    ];
+
+    // 1. REAL pairing first: `add --word` mints, `add <code>` claims, and B
+    // stores A's record with the REAL code-derived secret. This is the
+    // pair-for-real rule (USER-FLOWS.md): a seeded placeholder secret is
+    // exactly what made the first version of this test stall forever (the
+    // pair-proof over the link failed, the link dropped and re-established,
+    // silent until a happy path ran next to it). Do not reseed a store here.
+    let a_cert_path = h.a_dir.join("identity").join("device-cert.json");
+    let pair_word = format!("cryptocell-pair-p{:x}", std::process::id());
+    live_pair(&bin, &server, &env, &h.a_dir, &h.b_dir, &pair_word);
+
+    // 2. B's DAEMON is the receiver: it is the only path that surfaces
+    // xfer_deny_reason.
+    let (daemon_b, log_b) = spawn_daemon_inner(&bin, &server, "test-b", &h.b_dir);
+    h.daemon_b = Some(daemon_b);
+    h.daemon_b_log = log_b;
+    std::thread::sleep(Duration::from_secs(8));
+
+    // 3. CONTROL: A sends to the remembered B (`--to test-b`); the daemon must
+    // accept it. If it does not, the transport is wedged under these conditions
+    // and the revoked case that follows cannot be attributed to revocation.
+    let control_payload = h.work_dir.join("control-payload.bin");
+    std::fs::write(&control_payload, b"control bytes that must land").unwrap();
+    let ctrl_send = run_send_to(&bin, &server, &env, &h.a_dir, "test-b", &control_payload);
+    let control_landed = h.b_dir.join("drops").join("control-payload.bin").exists();
+    assert!(
+        control_landed,
+        "UNCLASSIFIED: the CONTROL (legitimate device) did not reach B's daemon \
+         (file landed: false). The transport is wedged under these conditions, so \
+         nothing can be attributed to revocation. send output:\n{}{}",
+        ctrl_send.stdout, ctrl_send.stderr
+    );
+
+    // 4. B must hold A's CERT for the revocation gate to bind (cert_revoked_for
+    // keys off deviceCert.devicePub). The daemon records it when it resolves A's
+    // identity during the control; if not, record A's REAL cert now.
+    let b_records = read_devices_json(&h.b_dir);
+    let b_has_a_cert = b_records.as_array().unwrap().iter().any(|d| {
+        d["name"].as_str() == Some("test-a") && d["deviceCert"]["devicePub"].as_str().is_some()
+    });
+    if !b_has_a_cert {
+        let a_cert_val: Value = serde_json::from_str(
+            &std::fs::read_to_string(&a_cert_path).expect("a device cert"),
+        )
+        .expect("parse a device cert");
+        let a_cert = a_cert_val["cert"].clone();
+        assert!(a_cert["devicePub"].as_str().is_some(), "A's device cert has a devicePub");
+        let mut arr: Vec<Value> = read_devices_json(&h.b_dir).as_array().unwrap().clone();
+        for d in arr.iter_mut() {
+            if d["name"].as_str() == Some("test-a") {
+                d["userKey"] = serde_json::json!(a_cert["userPub"].as_str().unwrap_or_default());
+                d["deviceCert"] = a_cert.clone();
+            }
+        }
+        std::fs::write(
+            h.b_dir.join("devices.json"),
+            serde_json::to_string_pretty(&arr).unwrap(),
+        )
+        .expect("write b devices.json with A's cert");
+    }
+
+    // 5. Revoke A on B.
+    let revoke = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.b_dir)
+        .args(["devices", "revoke", "test-a", "--yes"])
+        .output()
+        .expect("revoke");
+    assert!(
+        revoke.status.success(),
+        "devices revoke failed: {}",
+        String::from_utf8_lossy(&revoke.stderr)
+    );
+
+    // 6. REVOKED CASE: A sends again under the same conditions. Three verdicts,
+    // named explicitly.
+    let revoked_payload = h.work_dir.join("revoked-blocked-payload.bin");
+    std::fs::write(&revoked_payload, b"secret bytes that must never land").unwrap();
+    let rev_send = run_send_to(&bin, &server, &env, &h.a_dir, "test-b", &revoked_payload);
+    let rev_out = format!("{}\n{}", rev_send.stdout, rev_send.stderr);
+    let file_landed = h.b_dir.join("drops").join("revoked-blocked-payload.bin").exists();
+    let daemon_log = h.daemon_b_log.lock().unwrap().join("\n");
+    assert!(
+        !file_landed,
+        "FAIL-OPEN: a revoked device's transfer LANDED on B's daemon. Security \
+         hole: a revoked device reached data it must not have. Blocks 1.0.\n\
+         send:\n{rev_out}\ndaemon log:\n{daemon_log}"
+    );
+    assert!(
+        daemon_log.contains("device revoked"),
+        "FAIL-CLOSED-SILENT: the revoked device was refused (no file landed) but \
+         the daemon did not NAME revocation. Message defect (#206 class), not a \
+         fail-open hole.\nsend:\n{rev_out}\ndaemon log:\n{daemon_log}"
+    );
+    // Otherwise: FAIL-CLOSED-LOUD, the correct behaviour, and the test passes.
+}
+
 /// The case the WebRTC fallback EXISTS for: direct-QUIC enabled, direct-QUIC
 /// FAILS, and the transfer must still complete over WebRTC, promptly.
 ///
@@ -2126,5 +2386,367 @@ fn warm_one_shot_pty_instant_eof() {
     assert!(
         out_stdout.contains(&nonce),
         "pty output does not contain nonce '{nonce}'\nstdout: {out_stdout}\nstderr: {out_stderr}"
+    );
+}
+
+// ------------------------------------------------------------- invitations ---
+
+/// Write a file that `read_owner_only_file` will accept (owner-only mode on
+/// unix; the join path refuses anything with group/other bits). The minted
+/// invitations and the test v1 token all travel this way, same as a real
+/// `add --out`.
+fn write_owner_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// A fresh, clean joiner config dir: no identity, no certificate. `join` only
+/// proceeds from this state (main.rs join_cmd refuses if a UserKey or cert
+/// exists), so every invitation-lifecycle test claims from here.
+fn clean_joiner_dir(h: &Harness, name: &str) -> PathBuf {
+    let dir = h.work_dir.join(name);
+    std::fs::create_dir_all(&dir).expect("create clean joiner dir");
+    dir
+}
+
+/// `add --for device` and `add --for person` mint different SIGNED ceilings:
+/// device carries transfer+mount, person carries transfer only. The difference
+/// lives in the signed auth-key caps, which is exactly what the delegated-
+/// ceiling gate (`cap_gate_effective`'s `action in auth_key_caps` check) enforces
+/// at serve time. So the difference is enforced, not just displayed: a
+/// person-joined device is denied `mount` because `mount` is not in its signed
+/// caps.
+#[test]
+fn add_for_device_and_person_carry_different_caps() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use filament_cap::ephemeral::Invitation;
+
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let device_file = h.work_dir.join("inv-device.txt");
+    let person_file = h.work_dir.join("inv-person.txt");
+
+    for (for_, file) in [("device", &device_file), ("person", &person_file)] {
+        let out = Command::new(&bin)
+            .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+            .args(["--server", &server, "add", "--for", for_, "--out"])
+            .arg(file)
+            .arg("--yes")
+            .output()
+            .expect("add --for mint");
+        assert!(
+            out.status.success(),
+            "add --for {for_} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let parse = |file: &Path| -> Invitation {
+        let raw = std::fs::read_to_string(file).expect("read invitation file");
+        let token = raw.trim();
+        let encoded = token
+            .strip_prefix("filament-invite:v2:")
+            .unwrap_or_else(|| panic!("token has the v2 prefix: {token}"));
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("token is valid base64url");
+        // Invitation is not Debug; go through a Result whose error is a &str.
+        Invitation::from_token(&bytes)
+            .ok_or("token parses as a v2 invitation")
+            .expect("from_token")
+    };
+
+    let mut device_caps = parse(&device_file).caps;
+    device_caps.sort();
+    assert_eq!(
+        device_caps,
+        vec!["mount".to_string(), "transfer".to_string()],
+        "device invitation must carry transfer+mount in the SIGNED ceiling"
+    );
+    let person_caps = parse(&person_file).caps;
+    assert_eq!(
+        person_caps,
+        vec!["transfer".to_string()],
+        "person invitation must carry transfer only: the mount difference is \
+         what the gate enforces for a person-joined device"
+    );
+}
+
+/// An expired bounded invitation is refused AS expired. The joiner names the
+/// expiry; it does not fail to parse and it does not time out.
+#[test]
+fn expired_invitation_refused_as_expired() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let invite_file = h.work_dir.join("inv-expired.txt");
+    let mint = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "add", "--for", "device", "--expires", "2s", "--out"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("mint short-lived invitation");
+    assert!(
+        mint.status.success(),
+        "mint failed: {}",
+        String::from_utf8_lossy(&mint.stderr)
+    );
+
+    // Let the 2s TTL lapse, then claim from a clean joiner.
+    std::thread::sleep(Duration::from_secs(4));
+    let clean = clean_joiner_dir(&h, "c");
+    let join = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &clean)
+        .args(["--server", &server, "join", "--invite-file"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("join expired invitation");
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        !join.status.success(),
+        "an expired invitation must be refused; join unexpectedly succeeded"
+    );
+    assert!(
+        stderr.contains("expired"),
+        "expired invitation must be refused AS expired, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown format") && !stderr.contains("not valid"),
+        "an expired invitation is not a parse error, got: {stderr}"
+    );
+}
+
+/// An invitation minted before 0.8.4 is refused with a message SAYING SO, not
+/// with a parse error: the v1 token is recognized and named stale.
+#[test]
+fn pre_084_invitation_refused_with_message_not_parse_error() {
+    let h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let invite_file = h.work_dir.join("inv-v1.txt");
+    write_owner_only(&invite_file, "filament-invite:v1:AAAA\n").expect("write v1 invitation");
+
+    let clean = clean_joiner_dir(&h, "c");
+    let join = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &clean)
+        .args(["--server", &server, "join", "--invite-file"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("join v1 invitation");
+    let stderr = String::from_utf8_lossy(&join.stderr);
+    assert!(
+        !join.status.success(),
+        "a pre-0.8.4 invitation must be refused"
+    );
+    assert!(
+        stderr.contains("pre-0.8.4"),
+        "the refusal must name the pre-0.8.4 format, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unknown format") && !stderr.contains("not valid"),
+        "the refusal must not be a parse error, got: {stderr}"
+    );
+}
+
+// ----------------------------------------------------------- cap-store cell ---
+
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    )
+}
+
+/// Wait for a file to exist, up to `timeout`. Returns true if it appeared.
+fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    path.exists()
+}
+
+/// Count capability GRANTS in a cap store. A store that exists but contains no
+/// grants (genesis header + ratchet only) is the allowed delta after a join.
+fn cap_store_grant_count(config_dir: &Path) -> usize {
+    let p = config_dir.join("caps.json");
+    let Ok(raw) = std::fs::read_to_string(&p) else {
+        return 0; // absent store: no grants by construction
+    };
+    let Ok(arr) = serde_json::from_str::<Vec<Value>>(&raw) else {
+        panic!("caps.json at {} is not a valid store: {raw}", p.display());
+    };
+    arr.iter()
+        .filter(|e| e.get("type").and_then(|t| t.as_str()) == Some("cap_grant"))
+        .count()
+}
+
+/// #210/advisor invariant: a full join must not change the capability store.
+///
+/// No CapOp is ever parsed from the wire. `apply_cap_op` (capability.rs:1360)
+/// is the only owner-signature-verifying store writer and has exactly one
+/// production call site, the local `revoke`. This property contains owner-key
+/// compromise: fleet_auto_trust already grants transfer+mount fleet-wide with
+/// no local grant, so the local grant is the last boundary for the deliberate
+/// tier. The owner is considering putting permissions inside the invitation
+/// and applying them at join, which would be the first network-origin write.
+///
+/// This test turns "there is no network path into the cap store" from a grep
+/// someone ran once into an invariant that stays true. It performs a REAL join
+/// (not a seeded store) and asserts:
+///
+///   - the JOINER's cap store is unchanged across the ceremony (a clean joiner
+///     has no store before or after; if a genesis header appears, no grant may),
+///   - the ISSUER's cap store is byte-identical across mint + claim,
+///   - the join actually RAN (the joiner ends up with a device cert), so a
+///     no-op join cannot read as a pass.
+///
+/// Hash, not eyeball: the issuer side asserts byte equality of the whole file.
+/// The joiner side asserts the grant set specifically, because a genesis header
+/// written during the ceremony is legitimate and would break a byte comparison;
+/// the grant count is the strongest assertion available there.
+#[test]
+fn join_does_not_change_the_capability_store() {
+    let mut h = Harness::new();
+    let bin = h.filament_bin().to_path_buf();
+    let server = h.server_url();
+
+    let joiner = clean_joiner_dir(&h, "joiner");
+    let issuer_caps = h.a_dir.join("caps.json");
+    let joiner_caps = joiner.join("caps.json");
+
+    // The issuer (a_dir) was init'd, so its genesis header already exists; the
+    // daemon-start heal is a no-op and the store must stay byte-stable.
+    let issuer_before = sha256_file(&issuer_caps)
+        .unwrap_or_else(|| panic!("issuer caps.json absent after init: {}", issuer_caps.display()));
+    assert_eq!(
+        cap_store_grant_count(&h.a_dir),
+        0,
+        "issuer must start with zero grants"
+    );
+
+    // Start the issuer daemon: the join claim needs the armed enrollment room.
+    let (child_a, log_a) = spawn_daemon_inner(&bin, &server, "test-a", &h.a_dir);
+    h.daemon_a = Some(child_a);
+    h.daemon_a_log = log_a;
+
+    // #211: `up` prints its ready banner BEFORE its control socket accepts, and
+    // the mint's try_arm swallows a connect failure as None. A mint that races
+    // the socket produces an invitation nobody can ever claim. The PRODUCT bug
+    // is #211 (filed); this wait only keeps the test from tripping over it. The
+    // arm-success assertion below still fails loudly if the socket never came
+    // up, so the test cannot silently pass while the product cannot arm.
+    let ctl_sock = h.a_dir.join("control.sock");
+    assert!(
+        wait_for_file(&ctl_sock, Duration::from_secs(30)),
+        "issuer daemon control socket never appeared: {}. The enrollment room \
+         could not be armed, so the join cannot run (see #211).",
+        ctl_sock.display()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Mint an invitation. Minting is a local act (signing + printing) and must
+    // not touch the issuer's cap store either. If the arm failed (the daemon
+    // was not ready, or #205's Windows stub), the mint says so and this test
+    // stops HERE with a clear message instead of failing 60s later at the join.
+    let invite_file = h.work_dir.join("inv-cap-store.txt");
+    let mint = Command::new(&bin)
+        .env("FILAMENT_CONFIG_DIR", &h.a_dir)
+        .args(["--server", &server, "add", "--for", "device", "--out"])
+        .arg(&invite_file)
+        .arg("--yes")
+        .output()
+        .expect("mint invitation");
+    let mint_stderr = String::from_utf8_lossy(&mint.stderr);
+    assert!(
+        mint.status.success(),
+        "mint failed: {mint_stderr}"
+    );
+    assert!(
+        !mint_stderr.contains("cannot be claimed"),
+        "UNCLASSIFIED: the mint did not arm the enrollment room (stderr says \
+         the invitation 'cannot be claimed yet'). This run cannot exercise the \
+         join. stderr: {mint_stderr}"
+    );
+    let issuer_after_mint = sha256_file(&issuer_caps).unwrap();
+    assert_eq!(
+        issuer_after_mint, issuer_before,
+        "minting an invitation must not change the issuer's cap store"
+    );
+
+    // The joiner starts clean: no cap store, no identity.
+    assert!(!joiner_caps.exists(), "clean joiner must have no cap store");
+
+    // Full join ceremony. The joiner must actually complete it (device cert
+    // written), or the invariant below is vacuous. The joiner's transport env
+    // matches the issuer daemon's (direct enabled, same candidate policy) so
+    // the enrollment link has the same chances the transfer path does; without
+    // it the joiner can end up with only a STUN srflx candidate and ICE fails.
+    let loopback_only = std::env::var("FILAMENT_DIRECT_LOOPBACK_ONLY").unwrap_or_else(|_| "1".into());
+    let join = spawn_captured({
+        let mut c = Command::new(&bin);
+        c.env("FILAMENT_CONFIG_DIR", &joiner)
+            .env("FILAMENT_DIRECT", "1")
+            .env("FILAMENT_DIRECT_LOOPBACK_ONLY", &loopback_only)
+            .env("FILAMENT_L3_USERSPACE", "1")
+            .args(["--server", &server, "join", "--invite-file"])
+            .arg(&invite_file)
+            .arg("--name")
+            .arg("joiner")
+            .arg("--yes");
+        c
+    })
+    .expect("join spawn")
+    .wait_until(Duration::from_secs(120));
+    let joined_cert = joiner.join("identity").join("device-cert.json");
+    assert!(
+        joined_cert.exists(),
+        "the join did not run: no device cert written for the joiner.\n\
+         join stdout: {}\njoin stderr: {}",
+        join.stdout, join.stderr
+    );
+
+    // ISSUER: byte-identical across the whole ceremony (mint + claim). This is
+    // the strong form: no writer touched the store at any step.
+    let issuer_after_claim = sha256_file(&issuer_caps).unwrap();
+    assert_eq!(
+        issuer_after_claim, issuer_before,
+        "a full join changed the issuer's cap store: byte-level invariant broken.\n\
+         This is the network-origin write the advisor's grep said does not exist."
+    );
+
+    // JOINER: the store must contain no grants. The joiner started with NO
+    // store, so the byte-level invariant is "still absent". If a genesis
+    // header was legitimately written during the ceremony, a byte comparison
+    // becomes impossible, and the grant set is the strongest assertion
+    // available there: no cap_grant may appear, either way. Both cases are
+    // covered by the single grant count below.
+    assert_eq!(
+        cap_store_grant_count(&joiner),
+        0,
+        "a full join wrote a capability GRANT into the joiner's cap store.\n\
+         This is the network-origin write the advisor's grep said does not exist.\n\
+         joiner store: {}",
+        std::fs::read_to_string(&joiner_caps).unwrap_or_default()
     );
 }
