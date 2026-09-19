@@ -175,6 +175,100 @@ pub(crate) fn local_device_cert() -> Option<identity::DeviceCert> {
     None
 }
 
+/// Restores the pre-U1 precondition for scripts that want to fail fast: with
+/// this set (any value but empty or `0`), a verb that needs an identity bails
+/// with the old "run `filament init` first" instead of minting one.
+pub(crate) const NO_IMPLICIT_INIT_ENV: &str = "FILAMENT_NO_IMPLICIT_INIT";
+
+/// Whether the opt-out above is set (any value except empty and `0`).
+///
+/// The INSPECT surfaces read this instead of calling the accessor and letting
+/// it fail. `filament id` and the bare tour screen answered pre-U1 without an
+/// identity and exited 0; if the opt-out turned either into an error, U1 would
+/// have taken a working read-only answer away from exactly the scripts that
+/// asked for the old behaviour, which is the opposite of what an opt-out is
+/// for.
+pub(crate) fn implicit_init_disabled() -> bool {
+    std::env::var_os(NO_IMPLICIT_INIT_ENV).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The identity, minted on first use (U1). A keypair is not a ceremony: the
+/// bails that read "no identity. Run `filament init` first" route through here
+/// and proceed instead. Prints one past-tense line the ONE time the key is
+/// created, to stderr via `ui::say`, and nothing under `--json` (the envelope
+/// that could carry it as a data field is audit ticket 1; until then a prose
+/// line on a `--json` run is the defect `docs/agent-output-audit.md` names).
+///
+/// WHERE IT IS CALLED, and the rule behind the list: a verb mints only when it
+/// needs the key to do the job it was asked to do. `add --for` and both `grant`
+/// paths sign with it; `id` is the verb whose entire subject is the identity.
+/// The bare tour screen (`status_cmd::tour_cmd`) does NOT call this and must
+/// not: it is an inspect screen that renders whatever state it finds, so
+/// minting there would make `filament` with no arguments write a private key
+/// as a side effect of being looked at, and would make the screen FAIL on the
+/// two devices that cannot mint (a joined one, and one with the opt-out set).
+///
+/// What it deliberately does NOT do, because those ARE ceremonies and
+/// `filament init` still owns them: name the device, choose the inbox, write
+/// a stored device cert, install the service, or touch anything outside the
+/// config dir. `local_device_cert()` mints the self-cert on demand, so an
+/// implicit identity pairs the same as an `init`ed one.
+pub(crate) fn ensure_user_key(json: bool) -> Result<identity::UserKey> {
+    let (key, created) = ensure_user_key_inner()?;
+    if created && !json {
+        ui::say(&format!(
+            "  created your identity at {}  (filament id to see it)",
+            settings::config_dir().display()
+        ));
+    }
+    Ok(key)
+}
+
+/// `(key, created)`: the bool is what the tests count. Two concurrent first
+/// commands must yield ONE identity, so creation happens under an exclusive
+/// lock on a sidecar in the config dir (the key file itself is written by
+/// temp + rename, so a lock on its inode would be replaced out from under a
+/// holder; same reasoning as `DevicesFileLock`), and the load is repeated
+/// under the lock. The seed is written by `SecretFile` (0600, atomic).
+pub(crate) fn ensure_user_key_inner() -> Result<(identity::UserKey, bool)> {
+    let store = crate::platform::PlatformKeyStore;
+    if let Some(key) = identity::UserKey::load(&store)? {
+        return Ok((key, false));
+    }
+    // A joined device holds a certificate from another owner and, by design,
+    // no owner signing key. Minting one here would turn it into a second
+    // owner behind the user's back; `join` refuses a device that has a key
+    // for the same reason from the other side.
+    if local_device_cert_path().exists() {
+        bail!(
+            "this is a joined device: it holds no owner signing key, so it cannot sign this. \
+             Run the command on the owner's machine."
+        );
+    }
+    if implicit_init_disabled() {
+        bail!("no identity. Run `filament init` first");
+    }
+    let dir = settings::config_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("create config dir {}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let _lock = crate::platform::DevicesFileLock::acquire_at(&dir.join("identity.lock"))?;
+    if let Some(key) = identity::UserKey::load(&store)? {
+        return Ok((key, false));
+    }
+    // Recoverable form (seed + phrase), not a bare pkcs8: the phrase is not
+    // shown now (nothing worth recovering yet) but must exist for the first
+    // verb that creates something worth losing to show it.
+    let key = identity::PendingIdentity::generate()?.commit(&store)?;
+    Ok((key, true))
+}
+
 fn confirm_recovery_phrase(words: &[&str], phrase: &str) -> Result<()> {
     use crossterm::{execute, terminal};
     let mut err = std::io::stderr();

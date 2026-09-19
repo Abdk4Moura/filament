@@ -642,7 +642,24 @@ pub(crate) async fn async_main() -> Result<()> {
         Cmd::Id { action } => {
             match action.unwrap_or(IdAction::Show) {
                 IdAction::Show => {
-                    match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
+                    // U1: a keyless device gets its identity minted here, and
+                    // `id` is the one inspect verb that should mint, because the
+                    // identity IS its subject. Two devices keep the pre-U1
+                    // no-key display below instead: a joined one, which must
+                    // never quietly become a second owner, and one that set the
+                    // opt-out, which asked for the old answer and must keep
+                    // getting it (`{"configured": false}`, exit 0) rather than
+                    // an error the old build never returned.
+                    let key = match identity::UserKey::load(&crate::platform::PlatformKeyStore)? {
+                        Some(key) => Some(key),
+                        None if local_device_cert_path().exists()
+                            || crate::identity_flow::implicit_init_disabled() =>
+                        {
+                            None
+                        }
+                        None => Some(crate::identity_flow::ensure_user_key(ui_caps.json)?),
+                    };
+                    match key {
                         None => {
                             if let Ok(raw) = std::fs::read_to_string(local_device_cert_path()) {
                                 if let Ok(record) = serde_json::from_str::<Value>(&raw) {
@@ -696,7 +713,13 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "{}",
                                     serde_json::to_string_pretty(&json!({ "configured": false }))?
                                 );
+                            } else if local_device_cert_path().exists() {
+                                crate::ui::say(&format!(
+                                    "this device holds a joined certificate that could not be read; `filament join` again from a clean device."
+                                ));
                             } else {
+                                // The opt-out path: implicit minting is off, so
+                                // this is the pre-U1 answer, verbatim.
                                 println!(
                                     "no identity yet. Run 'filament init' or 'filament join'."
                                 );
@@ -759,7 +782,7 @@ pub(crate) async fn async_main() -> Result<()> {
                                     "  {}",
                                     ui::paint(
                                         ui::Tone::Warn,
-                                        "no certified local device record; run `filament init` or `filament id recover` on a clean device"
+                                        "no stored local device record; this device's certificate is minted on demand from the identity above"
                                     )
                                 );
                             }
@@ -1449,9 +1472,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 // The tag path SIGNS the CapOp below with the owner keypair, so
                 // unlike the device path it genuinely needs the signing key, not
                 // just the public half. Keep requiring a full identity here.
-                let Some(user_key) = load_owner_key() else {
-                    bail!("identity not initialized");
-                };
+                let user_key = crate::identity_flow::ensure_user_key(false)?;
                 let pk = user_key.public_key_bytes();
                 let g = crate::capability::parse_grant_spec(&spec, &pk)?;
                 let (capability, resource) = (g.action.clone(), g.resource.clone());
@@ -1515,15 +1536,18 @@ pub(crate) async fn async_main() -> Result<()> {
                                  grant. Run this on the owner's machine:\n  filament grant {device} {spec}"
                             );
                         }
-                        bail!(
-                            "'{spec}' names a resource, which needs an identity to bind it to. Run `filament init` first."
-                        );
+                        // U1: not joined and no key, so this is the first use;
+                        // mint the identity and bind the resource to it.
+                        let pk = crate::identity_flow::ensure_user_key(false)?.public_key_bytes();
+                        let g = crate::capability::parse_grant_spec(&spec, &pk)?;
+                        (g.action, g.resource, g.nonce)
+                    } else {
+                        (
+                            crate::capability::canonical_capability(&spec)?,
+                            "self".to_string(),
+                            crate::capability::self_resource_nonce(),
+                        )
                     }
-                    (
-                        crate::capability::canonical_capability(&spec)?,
-                        "self".to_string(),
-                        crate::capability::self_resource_nonce(),
-                    )
                 }
             };
 

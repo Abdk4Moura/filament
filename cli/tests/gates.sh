@@ -903,6 +903,41 @@ else bad "gate-L convergence"; tail -n 4 "$WORK/g19-up.log" "$WORK/g19-send.log"
 # SPAKE2 crate: `cargo test` in pake/ (10 unit tests incl. reflection-rejected).
 # ============================================================================
 
+say "20: U1 implicit identity: minted once on first use, never twice, inspect screens mint nothing"
+# The config dir is NOT pre-created: the accessor makes it (0700) and the key
+# (0600). Run 1 creates and says so once on stderr; run 2 says nothing and
+# prints the same identity; `init` afterwards still refuses; `--json` never
+# gets the prose line. Then the three that must NOT mint: the bare tour screen
+# (an inspect surface, which must also not FAIL on a device that cannot mint),
+# `id` under the opt-out (the pre-U1 answer, exit 0, nothing written), and a
+# verb that must sign under the opt-out (still fails fast).
+D20="$WORK/g20-cfg"; rm -rf "$D20"
+FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-1.out" 2>"$WORK/g20-1.err"; R20A=$?
+FILAMENT_CONFIG_DIR="$D20" "$BIN" id >"$WORK/g20-2.out" 2>"$WORK/g20-2.err"; R20B=$?
+N20A=$(grep -c "created your identity" "$WORK/g20-1.err"); N20B=$(grep -c "created your identity" "$WORK/g20-2.err")
+M20K=$(stat -c %a "$D20/identity.ed25519" 2>/dev/null); M20D=$(stat -c %a "$D20" 2>/dev/null)
+FILAMENT_CONFIG_DIR="$D20" "$BIN" init --yes --name g20 --recovery-file "$WORK/g20-rec" >"$WORK/g20-init.log" 2>&1; R20I=$?
+D20J="$WORK/g20-json"; rm -rf "$D20J"
+FILAMENT_CONFIG_DIR="$D20J" "$BIN" id --json >"$WORK/g20-j.out" 2>"$WORK/g20-j.err"; R20J=$?
+D20T="$WORK/g20-tour"; rm -rf "$D20T"
+FILAMENT_CONFIG_DIR="$D20T" "$BIN" >"$WORK/g20-t.log" 2>&1; R20T=$?
+D20N="$WORK/g20-noimplicit"; rm -rf "$D20N"
+FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" id >"$WORK/g20-n.log" 2>&1; R20N=$?
+FILAMENT_NO_IMPLICIT_INIT=1 FILAMENT_CONFIG_DIR="$D20N" "$BIN" grant g20peer route:10.66.0.0/24 >"$WORK/g20-g.log" 2>&1; R20G=$?
+if [ $R20A -eq 0 ] && [ $R20B -eq 0 ] && [ "$N20A" = 1 ] && [ "$N20B" = 0 ] \
+   && cmp -s "$WORK/g20-1.out" "$WORK/g20-2.out" && [ "$M20K" = 600 ] && [ "$M20D" = 700 ] \
+   && [ $R20I -ne 0 ] && grep -q "already has identity" "$WORK/g20-init.log" \
+   && [ $R20J -eq 0 ] && ! grep -q "created your identity" "$WORK/g20-j.err" && [ -f "$D20J/identity.ed25519" ] \
+   && [ $R20T -eq 0 ] && grep -q "do this:" "$WORK/g20-t.log" && [ ! -e "$D20T/identity.ed25519" ] \
+   && [ $R20N -eq 0 ] && grep -q "no identity yet" "$WORK/g20-n.log" \
+   && [ $R20G -ne 0 ] && grep -q "filament init" "$WORK/g20-g.log" && [ ! -e "$D20N/identity.ed25519" ]; then
+  ok "U1: created once ($N20A line, key $M20K, dir $M20D), second run silent, init refuses, --json silent, tour and opt-out mint nothing"
+else
+  bad "u1-implicit-init"
+  echo "  rc: id=$R20A/$R20B lines=$N20A/$N20B key=$M20K dir=$M20D init=$R20I json=$R20J tour=$R20T optout-id=$R20N optout-grant=$R20G"
+  tail -n 3 "$WORK/g20-1.err" "$WORK/g20-2.err" "$WORK/g20-init.log" "$WORK/g20-j.err" "$WORK/g20-t.log" "$WORK/g20-n.log" "$WORK/g20-g.log"
+fi
+
 # --------------------------------------------------------- L2 tunnel gates ---
 # ssh / TCP over the data channel (docs/L2-tunnel-design.md). These run their
 # OWN fixture backend on port 8097 (NOT this suite's 8077) and are OPT-IN:
