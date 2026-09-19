@@ -464,8 +464,21 @@ pub(crate) async fn serve_exec(
                 // None, and `exec_send` already uses it for stdin EOF), so these two frames are
                 // how a stream's end reaches its reader whether or not the status frame made
                 // it. Sent after the close attempt so the normal path still exits on the STATUS.
-                let _ = t.send_frame(sid, 0, &[]).await;
-                let _ = t.send_frame(err_sid, 0, &[]).await;
+                // AND THE SEND'S OUTCOME IS OBSERVED, because the previous attempt discarded it
+                // and therefore could not tell whether the end was emitted at all -- the same
+                // discarded-error shape this file's close path already carries a fix for. If
+                // these fail, the initiator cannot have observed an end, and the next run says so
+                // instead of leaving "emitted but unseen" and "never emitted" indistinguishable.
+                if let Err(e) = t.send_frame(sid, 0, &[]).await {
+                    crate::ui::say(&format!(
+                        "filament: could not signal the end of exec stream sid {sid}: {e}"
+                    ));
+                }
+                if let Err(e) = t.send_frame(err_sid, 0, &[]).await {
+                    crate::ui::say(&format!(
+                        "filament: could not signal the end of exec stream sid {err_sid}: {e}"
+                    ));
+                }
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
                 return;
