@@ -18,7 +18,6 @@ use crate::command_arg;
 use crate::conn::Conn;
 use crate::conn::{AdoptSource, Presence, Rung};
 use crate::ctl;
-use crate::device_caps::devices_remove;
 use crate::device_cert_for;
 use crate::device_name_for_pub;
 use crate::devices_store::devices_load;
@@ -44,7 +43,7 @@ use crate::prompt_line;
 use crate::proof_for;
 use crate::protocol;
 use crate::recv_files::full_hash;
-use crate::remember::{self, Ack, Offer};
+use crate::remember::{self, Ack, Offer, Outcome as RememberOutcome};
 use crate::relay_banner;
 use crate::relay_forbidden;
 use crate::send_outcome;
@@ -57,7 +56,7 @@ use filament_transfer::Outgoing;
 use filament_transport::direct;
 use filament_transport::net;
 use net::{Ev, Transport};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -695,6 +694,26 @@ async fn send_cmd_inner(
             .unwrap_or(60),
     );
     let mut pake_deadline: Option<Instant> = None;
+    // U5: the remember ceremony's state for this run.
+    //
+    // `pending_offer` holds the ONE offer we have made and that is not yet
+    // answered. Its secret exists only here until an accepting ack arrives:
+    // that is what makes "silence is a refusal" true by construction rather
+    // than by a timer, because the only write is in `remember::apply_ack`.
+    // `remember_outcome` is what we will TELL the operator at exit, and it is
+    // set from what actually happened, never from the flag.
+    let mut pending_offer: Option<Offer> = None;
+    let mut offered_peers: HashSet<String> = HashSet::new();
+    let mut remember_outcome: Option<RememberOutcome> = None;
+    // How long a remember-only run waits for the peer and its answer before
+    // saying, honestly, that nothing was stored.
+    let remember_budget = Duration::from_secs(
+        std::env::var("FILAMENT_REMEMBER_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60),
+    );
+    let remember_deadline = Instant::now() + remember_budget;
     // C30 phase 3: link mini-sync, pings out, divergence corrections in.
     let mut last_state_ping = Instant::now();
     let mut reproved: std::collections::HashSet<String> = Default::default();
@@ -1403,6 +1422,27 @@ async fn send_cmd_inner(
                             ));
                         }
                     }
+                    // U5: the remember offer rides the SAME gate as a file
+                    // offer, and for the same reason. Everything above has
+                    // settled who this peer is (PAKE confirmed on the code
+                    // path, certificate proven on a fleet link, pre-proven on a
+                    // direct one); offering a shared secret before that would
+                    // hand it to whoever answered first. One offer per peer.
+                    if let Some(rname) = &remember {
+                        if pending_offer.is_none() && offered_peers.insert(pid.clone()) {
+                            let o = remember::make_offer(rname, &pid);
+                            t.send_control(&remember::offer_frame(&o)).await?;
+                            pending_offer = Some(o);
+                            ui::say(&format!(
+                                "  offering to remember {}, and to be remembered by it.",
+                                ui::paint(ui::Tone::Bold, rname)
+                            ));
+                            ui::say(&ui::paint(
+                                ui::Tone::Dim,
+                                "  waiting for the other side to accept (nothing is stored until it does)...",
+                            ));
+                        }
+                    }
                     // (Re-)offer everything unfinished; resume:true after a
                     // prior accept so receivers continue from their partial.
                     // (The `--code` path offers later, post-PAKE; this is the
@@ -1661,12 +1701,35 @@ async fn send_cmd_inner(
                         }
                     }
                 }
-                // C27: the human on the other side answered our remember offer.
+                // C27/U5: the other side answered our remember offer. The
+                // record is written HERE, inside `apply_ack`, and the line
+                // below is said only because that write returned Ok. The old
+                // code printed "mutually remembered" off the `--remember` flag
+                // alone while `send` had never stored anything and never even
+                // emitted a `pair-keep`: the claim and the effect had no
+                // relationship at all. They are now the same statement.
                 Some("pair-keep-ack") => {
-                    if let Some(name) = &remember {
-                        let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
-                        if v["ok"].as_bool() == Some(false) {
-                            devices_remove(name)?;
+                    let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    match remember::apply_ack(&mut pending_offer, &pid, &v)? {
+                        Ack::Accepted { name, secret } => {
+                            // C30: the link can now be re-found on the pair
+                            // channel, exactly as a `pair` would leave it.
+                            sess.channels.push(channel_of(&secret));
+                            sess.touch();
+                            sio.emit("subscribe", json!({ "channels": [channel_of(&secret)] }))
+                                .await
+                                .ok();
+                            remember_outcome = Some(RememberOutcome::Remembered(name.clone()));
+                            ui::say(&conn.roster(
+                                &pid,
+                                ui::glyph_ok(),
+                                ui::Tone::Ok,
+                                &format!("mutually remembered as '{name}', stored"),
+                                &n,
+                            ));
+                        }
+                        Ack::Declined => {
+                            remember_outcome = Some(RememberOutcome::Declined);
                             ui::say(&conn.roster(
                                 &pid,
                                 ui::glyph_err(),
@@ -1674,15 +1737,43 @@ async fn send_cmd_inner(
                                 "declined to be remembered, nothing stored",
                                 &n,
                             ));
-                        } else {
+                        }
+                        // An ack for an offer we do not hold. Ignored, per the
+                        // contract; it must never be applied to a different
+                        // outstanding offer.
+                        Ack::Unmatched => {
+                            ui::debug("pair-keep-ack answered no offer of ours, ignoring");
+                        }
+                    }
+                }
+                // U5: either side may offer, so the sending side answers one
+                // too. Consent here is our own `--remember <name>` or `--yes`;
+                // with neither we refuse and say the flag, and nothing is
+                // stored on either end.
+                Some("pair-keep") => {
+                    let n = conn.link(&pid).map(|l| l.name.clone()).unwrap_or_default();
+                    let ans = remember::answer_offer(&v, remember.as_deref(), &n)?;
+                    match &ans {
+                        remember::Answer::Kept { name, secret } => {
+                            sess.channels.push(channel_of(secret));
+                            sess.touch();
+                            sio.emit("subscribe", json!({ "channels": [channel_of(secret)] }))
+                                .await
+                                .ok();
+                            remember_outcome = Some(RememberOutcome::Remembered(name.clone()));
                             ui::say(&conn.roster(
                                 &pid,
                                 ui::glyph_ok(),
                                 ui::Tone::Ok,
-                                "mutually remembered, you'll reconnect automatically",
+                                &format!("mutually remembered as '{name}', stored"),
                                 &n,
                             ));
                         }
+                        remember::Answer::Refused { why } => ui::say(&ui::paint(ui::Tone::Dim, why)),
+                        remember::Answer::Ignored => {}
+                    }
+                    if let (Some(ok), Some(t)) = (ans.ok(), conn.transport_of(&pid)) {
+                        t.send_control(&remember::ack_frame(&v, ok)).await.ok();
                     }
                 }
                 // C27: their verdict on our identity proof. false = they have

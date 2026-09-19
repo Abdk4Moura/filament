@@ -223,3 +223,47 @@ fn petname(proposed: Option<&str>, fallback: &str) -> String {
         cleaned
     }
 }
+
+/// What a run's remember ceremony actually did, for the one line said at exit.
+///
+/// Every variant is set from an OBSERVED event: a stored record, a refusing
+/// ack, a deadline with no answer, or a peer that never arrived. There is no
+/// variant that can be reached from the presence of `--remember` alone, which
+/// is the property the old code lacked.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// Stored, on disk, under this local name.
+    Remembered(String),
+    /// They answered no. Nothing stored on either side.
+    Declined,
+    /// The session ended with the offer outstanding. Silence is a refusal, so
+    /// nothing was stored.
+    Unanswered,
+    /// No peer was ever reached, so no offer was even made.
+    NoPeer,
+}
+
+impl Outcome {
+    /// True when a durable record exists because of this run.
+    pub(crate) fn stored(&self) -> bool {
+        matches!(self, Outcome::Remembered(_))
+    }
+
+    /// The honest line. Nothing here claims a write that did not happen.
+    pub(crate) fn line(&self) -> String {
+        match self {
+            Outcome::Remembered(n) => format!(
+                "remembered as '{n}'. it is in `filament devices` and survives a restart; find each other with no code"
+            ),
+            Outcome::Declined => {
+                "not remembered: the other side declined. nothing was stored here or there".into()
+            }
+            Outcome::Unanswered => {
+                "not remembered: the other side never answered, so nothing was stored (it needs --remember <name> or --yes)".into()
+            }
+            Outcome::NoPeer => {
+                "not remembered: no peer was reached, so nothing was offered and nothing was stored".into()
+            }
+        }
+    }
+}
