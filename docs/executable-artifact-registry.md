@@ -26,6 +26,13 @@ here as follow-up inventory, not release work.
 The registry also records known gates that return success after a platform skip.
 Phase 1 does not repair those verdicts; it keeps the Phase 2 work visible.
 
+## Preconditions and refusal
+
+A harness must REFUSE to report when its preconditions are unmet, with an exit
+code distinct from pass and fail, rather than print a result from a box that could
+not have produced one. Stated in full, with the reference implementation, in the
+header of `cli/tests/lib/fixture.sh` (see "Preconditions and refusal").
+
 ## Retired artifacts
 
 - `cli/tests/livelock-nat-gates.sh`: removed because the netns/coturn

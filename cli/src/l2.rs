@@ -4937,6 +4937,18 @@ mod h1_tests {
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
 
+    /// HARNESS-LEVEL SERIALIZATION for the three tests that acquire a GLOBAL PTY
+    /// slot. The slot pool and `LIVE_PTYS` are process-global, and these tests
+    /// assert against a PER-TEST baseline, so a slot held by a sibling test makes
+    /// the count 1 where the baseline was 0 (#330: 3 failures in 20 runs at
+    /// --test-threads=16).
+    ///
+    /// Taken ONCE per test, at the top, and NEVER by the code under test -- so
+    /// there is no reentrancy and it cannot deadlock. That is the difference from
+    /// the #322 failure mode, which added a SECOND acquisition of a non-reentrant
+    /// mutex to a test that already held it.
+    static PTY_SLOT_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
     /// Minimal in-memory Transport: records control messages, discards frames.
     struct MockTransport {
         controls: StdMutex<Vec<Value>>,
@@ -5024,6 +5036,9 @@ mod h1_tests {
     /// path, and the global PTY counter returns to zero.
     #[tokio::test]
     async fn pty_open_close_leaves_maps_empty() {
+        let _slot_guard = PTY_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let start = LIVE_PTYS.load(Ordering::SeqCst);
         let mux = Mux::new(MockTransport::new());
         let n = 5u32;
@@ -5293,8 +5308,12 @@ mod h1_tests {
     /// are held, and frees them on drop.
     #[tokio::test]
     async fn global_pty_cap_is_enforced() {
-        // Other tests may hold none here, but to be robust we only assert the
-        // guard refuses once at-capacity relative to the current baseline.
+        let _slot_guard = PTY_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // With the lock held no sibling test is in the pool, and the baseline
+        // logic below stays anyway: it makes the assertion robust rather than
+        // dependent on how many slots this test could take.
         let mut held = Vec::new();
         while LIVE_PTYS.load(Ordering::SeqCst) < MAX_PTYS_GLOBAL {
             match PtyGuard::try_acquire() {
@@ -5465,6 +5484,9 @@ mod h1_tests {
     /// link B, proving the SAME process survived the reconnect.
     #[tokio::test]
     async fn session_survives_detach_and_reattaches_with_replay() {
+        let _slot_guard = PTY_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // `cat` echoes its stdin: a deterministic stand-in for a live shell whose
         // process identity we can verify survived the drop.
         if !std::path::Path::new("/bin/cat").exists() {
