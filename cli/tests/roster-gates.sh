@@ -61,7 +61,6 @@ say "A2: reach <sibling> is a known name"
 fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach charlie 2>&1
 rc_reach=$(fs_rc)
 reach_out=$(fs_out)
-rc_reach=$?
 # Positive proof of recognition (a pong, or the roster-only mesh narration),
 # not mere absence of one error string: timeouts and crashes used to pass
 # this gate for the wrong reason (any output without 'no device named').
