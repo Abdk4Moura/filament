@@ -277,7 +277,12 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                     if !mux.transport().is_alive() {
                         bail!("link to '{peer}' died during exec");
                     }
-                    bail!("'{peer}' closed the exec stream without an exit status");
+                    // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
+                    // and no `exec-close` carrying a status will follow, so waiting longer can
+                    // only wait on a link that is working and a frame that is not coming.
+                    bail!(
+                        "exec stream ended without an exit status; the peer's close frame did not arrive ('{peer}')"
+                    );
                 }
             },
             item = err_pipe.recv() => match item {

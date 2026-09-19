@@ -436,7 +436,65 @@ pub(crate) async fn serve_exec(
                         close["status"] = json!(code);
                     }
                 }
-                let _ = t.send_control(&close).await;
+                if let Err(e) = t.send_control(&close).await {
+                    // The close is the only other way the initiator learns the session finished,
+                    // so when it cannot be delivered the streams have to END on the wire instead.
+                    // An EMPTY payload is the mux's pipe-end sentinel (`on_frame` maps it to
+                    // None), which is the same mechanism stdin EOF uses, and the initiator's
+                    // closed-pipe arm reads it as a terminal end without an exit status rather
+                    // than waiting forever for a frame that will never be actioned.
+                    // A close that never arrives leaves the initiator in a select with nothing
+                    // left to select: this file already documents that hazard class a few lines
+                    // above, for a different early break ("hanging the initiator"). The old
+                    // `let _ =` made a LOST close indistinguishable from a delivered one, so the
+                    // acceptor believed it had reported the exit while the initiator never heard
+                    // it and the only artifact was silence. Say so instead.
+                    crate::ui::say(&format!(
+                        "filament: could not deliver exec-close for sid {sid}: {e}; the initiator will not learn the exit status"
+                    ));
+                }
+                // THE END OF THE STREAM IS SIGNALLED UNCONDITIONALLY, and that is the correction
+                // this fix carries: the sentinel was inside the error branch, so it fired only
+                // when the close send FAILED. The observed run is the case where the send
+                // returns Ok and the frame is still not acted on downstream, which left the
+                // initiator waiting with nothing to observe -- the `fs.out`/`fs.done` evidence
+                // from the gate, and the reason commit 5 did not remove the hang.
+                //
+                // An EMPTY payload is the mux's pipe-end convention (`on_frame` maps it to
+                // None, and `exec_send` already uses it for stdin EOF), so these two frames are
+                // how a stream's end reaches its reader whether or not the status frame made
+                // it. Sent after the close attempt so the normal path still exits on the STATUS.
+                // AND THE SEND'S OUTCOME IS OBSERVED, because the previous attempt discarded it
+                // and therefore could not tell whether the end was emitted at all -- the same
+                // discarded-error shape this file's close path already carries a fix for. If
+                // these fail, the initiator cannot have observed an end, and the next run says so
+                // instead of leaving "emitted but unseen" and "never emitted" indistinguishable.
+                if let Err(e) = t.send_frame(sid, 0, &[]).await {
+                    crate::ui::say(&format!(
+                        "filament: could not signal the end of exec stream sid {sid}: {e}"
+                    ));
+                }
+                if let Err(e) = t.send_frame(err_sid, 0, &[]).await {
+                    crate::ui::say(&format!(
+                        "filament: could not signal the end of exec stream sid {err_sid}: {e}"
+                    ));
+                }
+                // THE CONTROL CHANNEL CARRIES THE END TOO, because the data-frame sentinel does
+                // not reach the peer -- an empty frame is not forwarded, which is its own claim
+                // and filed separately. `l2-close` demonstrably delivers: the peer's `on_close`
+                // records the reason and calls `drop_stream`, whose own comment says that
+                // dropping the pipe's sender is what closes it, so the consumer's `recv()`
+                // returns None and its select bails with a name instead of waiting. Sent AFTER
+                // the close attempt and on the SAME ordered control channel, so the normal path
+                // still exits on the STATUS and this is only what the wedged path sees.
+                for s in [sid, err_sid] {
+                    let _ = t.send_control(&json!({
+                        "type": "l2-close",
+                        "sid": s,
+                        "err": "exec session ended without a delivered exit status",
+                    }))
+                    .await;
+                }
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
                 return;

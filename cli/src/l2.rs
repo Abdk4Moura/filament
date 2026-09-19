@@ -303,7 +303,18 @@ impl Mux {
     pub async fn on_frame(&self, sid: u32, payload: Bytes) {
         let tx = match self.streams.lock().await.get(&sid) {
             Some(s) => s.tx.clone(),
-            None => return,
+            None => {
+                // A frame for a sid this mux no longer holds: the session was torn down before
+                // it arrived, so a close can be DELIVERED and still unactionable. To the caller
+                // whose stream this was that is indistinguishable from never-delivered, and it
+                // used to be silent. Behaviour is unchanged (the frame is dropped); what changes
+                // is that a future occurrence leaves a trace instead of nothing.
+                crate::ui::debug(&format!(
+                    "l2: frame for unknown sid {sid} ({} bytes) dropped",
+                    payload.len()
+                ));
+                return;
+            }
         };
         let msg = if payload.is_empty() {
             None
