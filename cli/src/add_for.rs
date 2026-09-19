@@ -203,8 +203,7 @@ pub(crate) async fn add_for_cmd(
             .join("\n")
         );
     }
-    let owner_key = identity::UserKey::load(&crate::platform::PlatformKeyStore)?
-        .ok_or_else(|| anyhow!("no identity. Run `filament init` first"))?;
+    let owner_key = crate::identity_flow::ensure_user_key(caps.json)?;
     let mut enroll_seed = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut enroll_seed)
         .map_err(|_| anyhow!("failed to generate invitation possession key"))?;

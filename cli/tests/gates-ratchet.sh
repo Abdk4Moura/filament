@@ -60,6 +60,7 @@ EXPECTED_GREEN=(
   "active link preserved across same-uid reconnect|flow-preserve (#28)"
   "deferred drop: flowing link survives its peer-left|deferred-drop (#28 trigger)"
   "stepped-away sender: held|stepped-away wait"
+  "U1: created once|u1-implicit-init"
 )
 
 # A missing PASS line has three different causes and they want different

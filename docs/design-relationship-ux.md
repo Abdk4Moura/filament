@@ -259,7 +259,15 @@ A$ filament send report.pdf --code
   waiting for the other side …
 ```
 
-One line, past tense, not a prompt. The recovery phrase is not shown here: an
+One line, past tense, not a prompt. As shipped (U1, #328) the accessor is
+`identity_flow::ensure_user_key`: it mints under an exclusive `identity.lock`
+so two concurrent first commands yield one identity, refuses on a joined device
+(a certificate on disk and no key is a device that must never quietly become an
+owner), prints the line to stderr through `ui::say`, and prints nothing under
+`--json`: the envelope that could carry `created` as a data field is audit
+ticket 1, and until it lands a prose line on a `--json` run is the defect that
+audit exists to remove. `FILAMENT_NO_IMPLICIT_INIT=1` restores the old fail-fast
+bail for scripts that want it. The recovery phrase is not shown here: an
 implicit identity has nothing worth recovering yet, and `filament id` prints the
 phrase on demand. The first verb that creates something worth losing — `add`,
 `certify`, `pass` — prints the "write this down" screen instead.
