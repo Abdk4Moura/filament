@@ -29,6 +29,7 @@ COMMANDS
     receive [code]         receive from a code or your nearby network
     shell <device>         open a shell on a device (native PTY; --ssh for real ssh)
     exec <device> [--] cmd run a command on a device (argv crosses exactly)
+    sync <dir> <device>:<dir>  mirror a directory onto a device (only changes move)
     reach <device>         check if a device is reachable (direct/relay + rtt)
     forward <device>:<port>  tunnel to a peer's port   (--socks for a local proxy)
     expose <port>          publish a local port on your mesh address
@@ -701,6 +702,25 @@ pub(crate) enum Cmd {
         /// The command and its arguments, passed exactly (trailing)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
+    },
+    /// Mirror a local directory onto a paired device; only changed chunks move.
+    ///
+    /// The receiver's `filament up` writes under its drop directory, so
+    /// <remote-dir> is relative to (or absolute within) that directory. The
+    /// receiver's consent is the existing pairing and transfer grant: there is
+    /// no prompt on either end. Re-running after an interruption moves only
+    /// what is still missing.
+    Sync {
+        /// Local directory to mirror
+        local: PathBuf,
+        /// Destination as <device>:<remote-dir>
+        dest: String,
+        /// Remove files on the device that are not in the local directory
+        #[arg(long)]
+        delete: bool,
+        /// Print the plan (what would move) and move nothing
+        #[arg(long, short = 'n')]
+        dry_run: bool,
     },
     Shell {
         /// Known device (petname) to open a shell on

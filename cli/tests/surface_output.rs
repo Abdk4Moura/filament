@@ -33,6 +33,10 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("recv_cmd.rs", 8),
         ("update_cmd.rs", 8),
         ("send_cmd.rs", 7),
+        // sync_cmd.rs: three println! sites, all `--json` envelopes on stdout
+        // (per-file JSONL, the final summary, the error envelope). Human
+        // lines go through ui::. Machine output is what println! is for.
+        ("sync_cmd.rs", 3),
         ("conn.rs", 4),
         ("up_logs.rs", 4),
         ("runtime_support.rs", 3),

@@ -80,6 +80,19 @@ pub(crate) enum ParkKind {
     Pty,
     SshSign,
     Forward,
+    /// A `sync-open`: transfer-class, so the durable-deny check below reads
+    /// the transfer capability, not shell.
+    Sync,
+}
+
+impl ParkKind {
+    /// The capability an explicit per-device deny would name for this kind.
+    pub(crate) fn denied_cap(self) -> &'static str {
+        match self {
+            ParkKind::Sync => crate::capability::CAP_TRANSFER,
+            _ => "shell",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -225,7 +238,7 @@ pub(crate) async fn park_on_deny(
         return false;
     }
     if let Some(n) = name.as_deref() {
-        if crate::device_capability_denied(n, "shell") {
+        if crate::device_capability_denied(n, kind.denied_cap()) {
             return false;
         }
     }
@@ -2088,6 +2101,22 @@ pub(crate) async fn recv_cmd(
                             t,
                             &p.v,
                             &shell_policy,
+                            &mut parked_opens,
+                        )
+                        .await;
+                    }
+                    ParkKind::Sync => {
+                        let mux = l2_muxes
+                            .entry(p.pid.clone())
+                            .or_insert_with(|| l2::Mux::new(t.clone()))
+                            .clone();
+                        crate::sync_cmd::handle_sync_open(
+                            &mut conn,
+                            &p.pid,
+                            t,
+                            mux,
+                            &p.v,
+                            &dir,
                             &mut parked_opens,
                         )
                         .await;
@@ -5188,6 +5217,30 @@ pub(crate) async fn recv_cmd(
                         mux,
                         &v,
                         &shell_policy,
+                        &mut parked_opens,
+                    )
+                    .await;
+                    continue;
+                }
+                // Directory sync: bounds + transfer gate + serve, all in the
+                // module. Not gated on l2_enabled: it is a transfer, admitted by
+                // the same capability a file-offer from this peer would be, and
+                // parked on an unproven-identity deny like the shell-class opens.
+                Some("sync-open") => {
+                    let Some(t) = conn.transport_of(&pid) else {
+                        continue;
+                    };
+                    let mux = l2_muxes
+                        .entry(pid.clone())
+                        .or_insert_with(|| l2::Mux::new(t.clone()))
+                        .clone();
+                    crate::sync_cmd::handle_sync_open(
+                        &mut conn,
+                        &pid,
+                        t,
+                        mux,
+                        &v,
+                        &dir,
                         &mut parked_opens,
                     )
                     .await;
