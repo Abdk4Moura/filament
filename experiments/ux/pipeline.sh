@@ -57,7 +57,7 @@ FLAGS
   --help                     this help
 
 CASES (ids)
-  cli:    cli-01 … cli-07, cli-11   (existing CLI scenarios via scenarios.sh — real cli↔cli peers)
+  cli:    cli-01 … cli-06, cli-11   (existing CLI scenarios via scenarios.sh — real cli↔cli peers; cli-12 is verification-only, not a gallery cast)
   web:    pair-device, web-shell, device-sheet-mobile, device-sheet-desktop,
           sessions-dock, cmd-k, pwa-update   (REAL app + REAL peers, real PAKE pairing)
   runner: runner-local                (loopback file-driven runner via runner/run_local_test.sh)
@@ -118,7 +118,7 @@ register device-sheet-desktop web    case_device_sheet_desktop
 register sessions-dock        web    case_sessions_dock
 register cmd-k                web    case_cmd_k
 register pwa-update           web    case_pwa_update
-for n in 01 02 03 04 05 06 07 11; do register "cli-$n" cli "case_cli"; done
+for n in 01 02 03 04 05 06 11; do register "cli-$n" cli "case_cli"; done
 register runner-local         runner case_runner_local
 # usecases "journey" suite — real user stories, real peers, recorded + annotated.
 register maya-send-big-file    usecases case_maya_send_big_file
@@ -127,7 +127,7 @@ register maya-gpu-render       usecases case_maya_gpu_render
 register sam-phone-shell       usecases case_sam_phone_shell
 register sam-drag-build        usecases case_sam_drag_build
 ALL_IDS=(pair-device web-shell device-sheet-mobile device-sheet-desktop sessions-dock cmd-k pwa-update \
-         cli-01 cli-02 cli-03 cli-04 cli-05 cli-06 cli-07 cli-11 runner-local \
+         cli-01 cli-02 cli-03 cli-04 cli-05 cli-06 cli-11 runner-local \
          maya-send-big-file maya-phone-to-laptop maya-gpu-render sam-phone-shell sam-drag-build)
 
 in_csv() { case ",$1," in *",$2,"*) return 0;; esac; return 1; }

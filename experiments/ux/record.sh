@@ -24,6 +24,20 @@ IDLE_EFF="$(ps_var "SCENARIO_IDLE_$ID")";       [ -n "$IDLE_EFF" ]      || IDLE_
 [ -n "${AGG_SPEED:-}" ] && AGG_SPEED_EFF="$AGG_SPEED"   # raw override always wins
 [ -n "${IDLE_LIMIT:-}" ] && IDLE_EFF="$IDLE_LIMIT"
 
+# Recording is STRICTLY OPTIONAL and OFF by default. UX_RECORD=1 produces the
+# asciinema cast + GIF for the gallery; without it the scenario runs bare and
+# the verdict comes straight from that run, so the recorder can never change a
+# result. If a scenario only passes when it is not being filmed, that is a
+# finding, not a workaround.
+if [ -z "${UX_RECORD:-}" ]; then
+  bash "$HERE/scenarios.sh" "$ID" >"$UX_WORK/verify-$ID.log" 2>&1 || true
+  VERIFY_RES=$(grep -h "^RESULT $ID " "$UX_WORK/verify-$ID.log" 2>/dev/null | tail -1)
+  echo "[record] $ID verify-only (no recorder): ${VERIFY_RES:-<none>}"
+  if [ -n "$VERIFY_RES" ]; then echo "$VERIFY_RES" > "$RES"; else echo "RESULT $ID FAIL no-result-line" > "$RES"; fi
+  cat "$RES"
+  exit 0
+fi
+
 # Scenarios that DECOUPLE the verdict from the recording. The single-host
 # CLI<->CLI word-code transfer (03) and the ssh-over-tunnel handshake (06) are
 # GREEN standalone but wedge reliably under asciinema recorder load (the same
