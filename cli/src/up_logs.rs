@@ -421,17 +421,10 @@ pub(crate) async fn logs_cmd(follow: bool, tail: usize) -> Result<()> {
         let n = interrupted.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            // Remove any subnet-router forwarding rules this process installed.
-            // A FORWARD ACCEPT that outlives the daemon keeps the machine
-            // forwarding for an overlay that is gone, and nothing would report
-            // it.
-            subnet_forward::cleanup();
-            // A WireGuard interface must not outlive the daemon that made it:
-            // left behind, it keeps routing a peer's overlay address into a
-            // tunnel with nobody on the other end, which looks exactly like the
-            // network breaking. Best-effort and idempotent, like the rest of
-            // teardown.
-            crate::wg::teardown(crate::wg::WG_DEV);
+            // Read-only verb: `logs -f` installs no forwarding rules and
+            // creates no WireGuard interface, so there is nothing to tear
+            // down here (those cleanups belong to the daemon paths that
+            // own the state). Just wake the loop to detach.
             n.notify_one();
         });
     }

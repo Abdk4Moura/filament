@@ -668,19 +668,6 @@ pub(crate) enum Cmd {
         #[arg(long)]
         options: Option<String>,
     },
-    /// Open a shell on a device.
-    ///
-    // #234: this said "The peer must explicitly authorize shell", which reads as
-    // per-device and is why `up --shell` surprised people: one flag on the
-    // acceptor admits every paired device, present and future. The behaviour is
-    // deliberate (see ShellPolicy::All); the sentence describing it was not.
-    // Rationale lives here, in a comment. The doc line below is what a user
-    // reads, so it states the two ways in and nothing else.
-    /// Default: Filament's native PTY. The peer must authorize shell, either
-    /// per-device with `grant <device> shell`, or for every paired device at
-    /// once by serving `up --shell` (use `up --shell-only a,b` to scope it).
-    /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
-    /// (reuses your keys, known_hosts, and ~/.ssh/config).
     /// Run a command on a device. The argument vector crosses exactly;
     /// opt into a shell explicitly with --shell (never implied).
     Exec {
@@ -702,6 +689,19 @@ pub(crate) enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
+    /// Open a shell on a device.
+    ///
+    // #234: this said "The peer must explicitly authorize shell", which reads as
+    // per-device and is why `up --shell` surprised people: one flag on the
+    // acceptor admits every paired device, present and future. The behaviour is
+    // deliberate (see ShellPolicy::All); the sentence describing it was not.
+    // Rationale lives here, in a comment. The doc line below is what a user
+    // reads, so it states the two ways in and nothing else.
+    /// Default: Filament's native PTY. The peer must authorize shell, either
+    /// per-device with `grant <device> shell`, or for every paired device at
+    /// once by serving `up --shell` (use `up --shell-only a,b` to scope it).
+    /// With `--ssh`: runs your real ssh over the data channel via ProxyCommand
+    /// (reuses your keys, known_hosts, and ~/.ssh/config).
     Shell {
         /// Known device (petname) to open a shell on
         peer: Option<String>,
