@@ -232,6 +232,42 @@ What would change this: if filament ever gains a transport that forwards
 ciphertext without authenticating peers (a true DERP equivalent), WireGuard would
 become the security layer for that path and boringtun would earn its place.
 
+## 2026-09-08: DIRECT kernel-to-kernel, verified with no NAT anywhere
+
+Both daemons in ROOT namespaces on their real public IPs. No namespace, no
+MASQUERADE, no DNAT in the path:
+
+    owner  endpoint 162.35.114.254:51820  handshake 1m40s ago  220 B recv / 180 B sent
+    peer   endpoint 165.22.207.231:51820  handshake 1m42s ago  180 B recv / 400 B sent
+
+Real addresses on both sides, not 127.0.0.1, so nothing is being relayed: kernel
+crypto, kernel data path, zero userspace hops. That is the design this ADR asked
+for, and the opt-in default is now the only thing between it and being on.
+
+### Three bugs, none of which the namespace rig could reach
+
+1. **`peer_overlay_of` used `try_lock`**, so ordinary CONTENTION returned `None`,
+   indistinguishable from "that peer is not on the overlay". A key announcement
+   was rejected with "no direct endpoint or overlay address yet" for a peer
+   plainly on the mesh, intermittently.
+2. **WireGuard was attempted with no kernel TUN.** A node on the userspace
+   overlay has no kernel device to bind the overlay address to, and the result
+   was a literal `ip addr add /128` with nothing before the prefix. `usable()`
+   checked the wg tools and the module, which say nothing about that.
+3. **`ip addr add` idempotence matched only the IPv4 wording.** iproute2 says
+   "File exists" for IPv4 and "address already assigned" for IPv6, and the
+   overlay is an IPv6 ULA, so every retry and every second peer failed there and
+   took the whole adopt down.
+
+### The finding that is not about WireGuard
+
+The peer had **IPv6 disabled system-wide** (`net.ipv6.conf.all.disable_ipv6=1`),
+which is a common hardening default. filament's overlay IS an IPv6 ULA, so
+`ip addr add` failed, the node fell back to the userspace overlay, and the only
+evidence was a log line quoting the failed command. A host with IPv6 disabled
+silently loses the kernel data plane. filament should DETECT this and say so by
+name; that is worth a separate fix and is not done.
+
 ## 2026-09-07, correction: kernel-direct works, and my rig said otherwise
 
 Plain kernel WireGuard between do-vm and the KVM VPS, no filament involved:
