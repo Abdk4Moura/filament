@@ -545,6 +545,13 @@ pub(crate) enum Cmd {
     Reach {
         /// Device to probe (omit for the environment preflight).
         dev: Option<String>,
+        /// Keep probing (one line a second) until the link is direct: exit 0 on
+        /// the first direct path, exit 5 if it is still on a relay at --timeout.
+        #[arg(long)]
+        until_direct: bool,
+        /// Seconds to wait for a direct path with --until-direct.
+        #[arg(long, value_name = "SECS", default_value_t = 30)]
+        timeout: u64,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,

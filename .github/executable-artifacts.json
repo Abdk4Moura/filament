@@ -536,6 +536,13 @@
           "topology": "model-checker"
         }
       ]
+    },
+    {
+      "path": "cli/tests/reach-until-direct-gates.sh",
+      "disposition": "diagnostic",
+      "issue": "https://github.com/Abdk4Moura/filament/issues/316",
+      "owner": "claude-advisor",
+      "expires": "2026-10-18"
     }
   ],
   "verdict_debt": [

@@ -52,6 +52,8 @@ Once two machines are paired, they share a crypto-addressed overlay — each dev
 
 ```sh
 filament dovm                        # open a shell on a paired device
+filament reach dovm                  # is it reachable, and over which route?
+filament reach dovm --until-direct   # wait for the link to leave the relay
 filament expose 5432                 # publish a local port on the mesh
 filament forward 5432 dovm:5432      # forward a remote port to localhost
 filament mount dovm:~/data ./data    # mount a remote folder (sshfs over the mesh)

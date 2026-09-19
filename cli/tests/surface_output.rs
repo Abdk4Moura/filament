@@ -45,7 +45,9 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("doctor.rs", 44),
         ("settings.rs", 37),
         ("direct.rs", 14),
-        ("ping.rs", 11),
+        // reach now renders every human line through ui:: (the route label is
+        // must-see, so ui::critical); the two left are the --json envelopes.
+        ("ping.rs", 2),
         ("tun/linux.rs", 11),
         ("interact.rs", 5),
         // ui.rs is the emitter of last resort; these ARE the implementation.

@@ -1317,7 +1317,7 @@ pub(crate) async fn async_main() -> Result<()> {
                 code => std::process::exit(code),
             }
         }
-        Cmd::Reach { dev, json, socks } => {
+        Cmd::Reach { dev, until_direct, timeout, json, socks } => {
             if socks {
                 bail!(
                     "`reach --socks` moved to `forward --socks`: reach now probes only. Run `filament forward <device>:<port> --socks`"
@@ -1355,7 +1355,11 @@ pub(crate) async fn async_main() -> Result<()> {
                         ));
                         return Ok(());
                     }
-                    crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                    if until_direct {
+                        crate::ping::reach_until_direct(&d, timeout, json, relay).await
+                    } else {
+                        crate::ping::ping_cmd(&server, &d, 1, json, relay).await
+                    }
                 }
                 None => bail!(
                     "reach needs a device to probe: `filament reach <device>`. To tunnel a port use `filament forward <device>:<port>`."
