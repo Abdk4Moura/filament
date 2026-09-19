@@ -714,9 +714,9 @@ pub(crate) async fn async_main() -> Result<()> {
                                     serde_json::to_string_pretty(&json!({ "configured": false }))?
                                 );
                             } else if local_device_cert_path().exists() {
-                                println!(
+                                crate::ui::say(&format!(
                                     "this device holds a joined certificate that could not be read; `filament join` again from a clean device."
-                                );
+                                ));
                             } else {
                                 // The opt-out path: implicit minting is off, so
                                 // this is the pre-U1 answer, verbatim.
