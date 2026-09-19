@@ -292,6 +292,23 @@ pub(crate) enum Cmd {
         #[arg(long)]
         to: Option<String>,
     },
+    /// Remember a peer: offer a shared secret so you can find each other with
+    /// no code. It grants nothing.
+    ///
+    /// Remembering is mutual or it does not happen. This offers, and writes
+    /// nothing until the other side accepts (`--remember <name>` or `--yes`
+    /// there); an offer that is declined, or that the session ends without
+    /// answering, leaves a record on neither side.
+    #[command(next_help_heading = "Connect")]
+    Remember {
+        /// The peer to offer to, and the local name to file them under. The
+        /// name is a LOCAL alias for the shared secret; the other side keeps
+        /// its own.
+        name: String,
+        /// Join an explicit room instead of the same-network auto room
+        #[arg(long)]
+        room: Option<String>,
+    },
     /// Tell the owner you are shutting down so it frees your slot now.
     /// Advisory only: if the owner is unreachable, the offline budget still
     /// lapses you. A joined device's end-of-life verb.

@@ -5,7 +5,7 @@
 //! a quiet receive may wait before exiting, and the cancellation error.
 //!
 //! Five scattered blocks. NO cfg, NO spawns, NO nested fns, NO function-local uses.
-use crate::shared_defs::{NO_INTERACTIVE, NO_RELAY};
+use crate::shared_defs::{ASSUME_YES, NO_INTERACTIVE, NO_RELAY};
 use crate::ui;
 use anyhow::{anyhow};
 use std::io::IsTerminal;
@@ -20,6 +20,14 @@ pub(crate) fn quiet_exit_window() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_secs)
         .unwrap_or(Duration::from_secs(10))
+}
+
+/// True when the user passed the global `--yes`: consent was given up front.
+///
+/// The scripted form of answering a prompt, per the design's non-interactive
+/// contract: `--yes` is the ONLY bypass, and its absence is never consent.
+pub(crate) fn assume_yes() -> bool {
+    ASSUME_YES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// True when the user passed `--no-relay`: relay fallback is forbidden.

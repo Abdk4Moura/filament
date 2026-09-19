@@ -52,6 +52,15 @@ pub(crate) static NO_INTERACTIVE: std::sync::atomic::AtomicBool =
 pub(crate) static FORCE_INTERACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Set once in `run`, before any worker spawns, from the global `--yes` flag
+/// (mirrors NO_RELAY and NO_INTERACTIVE). Read by `policy::assume_yes` so the
+/// long-lived event loops (`send`, `receive`, `up`) can tell "the operator
+/// pre-agreed" from "nobody has been asked" without threading `UiCapability`
+/// through their fourteen-argument signatures. It is a READ of a decision the
+/// user already made, never a substitute for asking.
+pub(crate) static ASSUME_YES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// P0 (GAP-1): stall-correction ladder bound. Attempt 0 is rung (a) (resume on
 /// the same transport); attempts 1..STALL_MAX_REPAIRS are rung (c) (repair the
 /// transport in place, a fresh direct dial / ICE-restart). At the ceiling the

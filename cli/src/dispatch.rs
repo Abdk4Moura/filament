@@ -15,7 +15,7 @@ use crate::DEFAULT_SERVER;
 use crate::DevicesAction;
 use crate::FORCE_INTERACTIVE;
 use crate::IdAction;
-use crate::NO_INTERACTIVE;
+use crate::{ASSUME_YES, NO_INTERACTIVE};
 use crate::NO_RELAY;
 use crate::ShellPolicy;
 use crate::UiCapability;
@@ -388,6 +388,13 @@ pub(crate) async fn async_main() -> Result<()> {
     }
     if cli.no_interactive || cli.json {
         NO_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    // Record the global --yes the same way and for the same reason: the event
+    // loops that outlive a prompt (`send`, `receive`, `up`) need to know the
+    // operator pre-agreed without carrying `UiCapability` through their whole
+    // signature. Written once, before any worker spawns.
+    if cli.yes {
+        ASSUME_YES.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if cli.interactive {
         FORCE_INTERACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);

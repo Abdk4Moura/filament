@@ -86,6 +86,9 @@ mod identity_lifecycle;
 mod enrollment;
 /// `filament introduce` / `filament depart`.
 mod membership;
+/// The remember ceremony (`pair-keep` v2): `remember`, and the `--remember`
+/// half that `send` and `receive` now share.
+mod remember;
 /// `filament pair` and its pair-specific helpers.
 mod pair_cmd;
 #[cfg(test)]
@@ -149,7 +152,7 @@ mod file_io;
 pub(crate) use file_io::{parse_duration_secs, parse_invitation, parse_mint_ttl, pidfile, read_owner_only_fd, write_owner_only_fd, write_owner_only_file, write_pidfile};
 /// Shared limits, wire constants and small types.
 mod shared_defs;
-pub(crate) use shared_defs::{DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, RevokeRecheck, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
+pub(crate) use shared_defs::{ASSUME_YES, DEFAULT_SERVER, DeadlineClock, FLEET_LINK_NAME, FORCE_INTERACTIVE, MAX_ATTEMPTS, MAX_PENDING, MAX_VERIFY_FAILS, MountPlan, NO_INTERACTIVE, NO_RELAY, PRINCIPAL_STATE_LAPSED, PRINCIPAL_STATE_REVOKED, PartMeta, PeerAuthz, PendingRequest, REJOIN_WINDOW, REPO, REQUEST_TTL_SECS, RecvState, RevokeRecheck, STALL_MAX_REPAIRS, SendOutcome, ServiceManager, ShellPolicy, TtyGuard, VERIFY_PROBE_SID};
 #[cfg(test)]
 pub(crate) use shared_defs::HEAD_BYTES;
 /// Shell authority helpers and daemon/service probes.

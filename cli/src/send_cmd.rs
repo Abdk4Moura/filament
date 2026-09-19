@@ -44,6 +44,7 @@ use crate::prompt_line;
 use crate::proof_for;
 use crate::protocol;
 use crate::recv_files::full_hash;
+use crate::remember::{self, Ack, Offer};
 use crate::relay_banner;
 use crate::relay_forbidden;
 use crate::send_outcome;
@@ -56,7 +57,7 @@ use filament_transfer::Outgoing;
 use filament_transport::direct;
 use filament_transport::net;
 use net::{Ev, Transport};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::PathBuf;
@@ -76,7 +77,58 @@ pub(crate) async fn send_cmd(
     relay: bool,
     remember: Option<String>,
 ) -> Result<()> {
-    let opened_flow = interactive_allowed()
+    send_cmd_inner(
+        server, paths, use_code, word, room, to, name, relay, remember, false,
+    )
+    .await
+}
+
+/// `filament remember <name>`: the same machinery with nothing to send.
+///
+/// Deliberately not a second implementation. The remember ceremony is one code
+/// path (`crate::remember`) driven from one event loop; the verb is that loop
+/// with an empty file list, which is what keeps `remember` and `--remember`
+/// from drifting apart the way the two half-mechanisms before them did.
+pub(crate) async fn remember_cmd(
+    server: &str,
+    name: String,
+    room: Option<String>,
+    relay: bool,
+) -> Result<()> {
+    send_cmd_inner(
+        server,
+        Vec::new(),
+        false,
+        None,
+        room,
+        Some(name.clone()),
+        None,
+        relay,
+        Some(name),
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_cmd_inner(
+    server: &str,
+    mut paths: Vec<String>,
+    mut use_code: bool,
+    mut word: Option<String>,
+    room: Option<String>,
+    mut to: Option<String>,
+    name: Option<String>,
+    relay: bool,
+    remember: Option<String>,
+    remember_only: bool,
+) -> Result<()> {
+    // `remember` has nothing to send: no picker, no path prompt, no file
+    // validation, and never the "mint a code" default. It meets the peer on the
+    // same-network room (or --room) and filters by name, exactly as a send
+    // without a code does.
+    let opened_flow = !remember_only
+        && interactive_allowed()
         && (paths.is_empty() || (!use_code && to.is_none()) || interactive_requested());
 
     // #230: `filament send <file>` with no --to and no --code fell through to
@@ -94,10 +146,10 @@ pub(crate) async fn send_cmd(
     // So: ask when we can, and default to a code only when we are not going to
     // ask. Non-interactive keeps the code instead of the room id, which was the
     // actual complaint. Local discovery stays reachable with --room.
-    if !opened_flow && !use_code && to.is_none() && room.is_none() {
+    if !remember_only && !opened_flow && !use_code && to.is_none() && room.is_none() {
         use_code = true;
     }
-    if paths.is_empty() {
+    if paths.is_empty() && !remember_only {
         if !interactive_allowed() {
             bail!(
                 "nothing to send in non-interactive mode; pass a file, directory, or '-' for stdin"
@@ -113,7 +165,7 @@ pub(crate) async fn send_cmd(
     // flow asked local-vs-code first and only then statted the file, so a typo
     // at the prompt cost two questions and a raw syscall error. Validate and
     // re-prompt once instead.
-    if !paths.iter().any(|p| p == "-") {
+    if !remember_only && !paths.iter().any(|p| p == "-") {
         loop {
             let first = paths.first().cloned().unwrap_or_default();
             if first.is_empty() {
