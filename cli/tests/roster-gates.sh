@@ -58,7 +58,9 @@ else
 fi
 
 say "A2: reach <sibling> is a known name"
-reach_out=$(timeout 40 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach charlie 2>&1)
+fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" reach charlie 2>&1
+rc_reach=$(fs_rc)
+reach_out=$(fs_out)
 rc_reach=$?
 # Positive proof of recognition (a pong, or the roster-only mesh narration),
 # not mere absence of one error string: timeouts and crashes used to pass
@@ -84,7 +86,9 @@ fs_cli 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" revoke bravo -
 # sharp form of the invariant: roster presence is evidence of nothing.
 fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo POST-OK' 2>&1
 post=$(fs_out)
-rc=$?
+# rc from the RECORDED code, not $?: $? here is the status of `fs_out`'s cat, which
+# always succeeds, so rc was constant 0 and this gate could not observe a refusal at all.
+rc=$(fs_rc)
 if [ "$rc" -ne 0 ]; then
   ok "gateB: revoked bravo is refused (exit $rc), roster presence did not resurrect it"
 else
@@ -110,7 +114,8 @@ fi
 # And the acceptor still refuses bravo if presented again (both halves).
 fs_cli 60 env FILAMENT_CONFIG_DIR="$DB" "$BIN" --server "$SERVER" shell alpha -- 'echo AGAIN-OK' 2>&1
 again=$(fs_out)
-rc2=$?
+# Same correction as gateB: $? would be the cat's status and the gate would be constant-false.
+rc2=$(fs_rc)
 if [ "$rc2" -ne 0 ]; then
   ok "gateB2: revoked bravo is still refused after the refresh (exit $rc2)"
 else
