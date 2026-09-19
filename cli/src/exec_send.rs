@@ -274,7 +274,10 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                 _ => {
                     // Pipe closed without a close payload: transport-level liveness
                     // decides whether this was a clean end we misread or a drop.
-                    if !mux.transport().is_alive() {
+                    // The STRICT question, asked here because only this caller wants it: for the exec select,
+                // a peer that can never send again means waiting is pointless, even though the
+                // connection is otherwise usable.
+                if mux.transport().is_dead() {
                         bail!("link to '{peer}' died during exec");
                     }
                     // TERMINAL AND NAMED, with no timeout involved: the session's stream ended
@@ -355,7 +358,10 @@ async fn exec_once(server: &str, peer: &str, relay: bool, opts: &ExecOpts) -> Re
                 }
             },
             _ = ticker.tick() => {
-                if !mux.transport().is_alive() {
+                // The STRICT question, asked here because only this caller wants it: for the exec select,
+                // a peer that can never send again means waiting is pointless, even though the
+                // connection is otherwise usable.
+                if mux.transport().is_dead() {
                     bail!("link to '{peer}' died during exec");
                 }
             }
