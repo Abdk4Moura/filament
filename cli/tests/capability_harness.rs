@@ -2425,7 +2425,7 @@ fn clean_joiner_dir(h: &Harness, name: &str) -> PathBuf {
 fn add_for_device_and_person_carry_different_caps() {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
-    use filament_cap::ephemeral::InvitationV2;
+    use filament_cap::ephemeral::Invitation;
 
     let h = Harness::new();
     let bin = h.filament_bin().to_path_buf();
@@ -2449,7 +2449,7 @@ fn add_for_device_and_person_carry_different_caps() {
         );
     }
 
-    let parse = |file: &Path| -> InvitationV2 {
+    let parse = |file: &Path| -> Invitation {
         let raw = std::fs::read_to_string(file).expect("read invitation file");
         let token = raw.trim();
         let encoded = token
@@ -2458,8 +2458,8 @@ fn add_for_device_and_person_carry_different_caps() {
         let bytes = URL_SAFE_NO_PAD
             .decode(encoded)
             .expect("token is valid base64url");
-        // InvitationV2 is not Debug; go through a Result whose error is a &str.
-        InvitationV2::from_token(&bytes)
+        // Invitation is not Debug; go through a Result whose error is a &str.
+        Invitation::from_token(&bytes)
             .ok_or("token parses as a v2 invitation")
             .expect("from_token")
     };
