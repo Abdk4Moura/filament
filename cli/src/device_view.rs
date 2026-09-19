@@ -288,17 +288,36 @@ fn device_caps_summary(caps: &[String], tier: fleet_ui::devices::DeviceTier) -> 
     }
 }
 
+/// The key that identifies "same mesh as me": my own owner key if I have one,
+/// else the issuer key held in my own device certificate (the owner I joined
+/// under). A device whose cert chains to THIS key is fleet, not external; so
+/// a spoke stops filing its owner under "other people". Shared by `devices`
+/// and `devices --caps` so the two cannot disagree on who is fleet.
+pub(crate) fn same_owner_key() -> Option<[u8; 32]> {
+    load_owner_key()
+        .map(|key| key.public_key_bytes())
+        .or_else(|| local_device_cert().map(|c| c.user_pub))
+}
+
+/// The tier `devices` renders TODAY from a stored certificate. Deliberately
+/// takes `device_cert_for`'s output, which skips expiry, so an expired cert
+/// still files as FLEET here; the caps view says "cert expired" beside it
+/// rather than silently re-tiering (docs/design-relationship-ux.md §2.2 is
+/// the planned change, not this).
+pub(crate) fn tier_for(
+    cert: Option<&identity::DeviceCert>,
+    same_owner: Option<&[u8; 32]>,
+) -> fleet_ui::devices::DeviceTier {
+    match cert {
+        None => fleet_ui::devices::DeviceTier::NeedsReview,
+        Some(cert) if same_owner == Some(&cert.user_pub) => fleet_ui::devices::DeviceTier::Fleet,
+        Some(_) => fleet_ui::devices::DeviceTier::External,
+    }
+}
+
 pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::DeviceEntry> {
     let warm_names = warm_device_names(warm);
-    let owner = load_owner_key().map(|key| key.public_key_bytes());
-    // The key that identifies "same mesh as me": my own owner key if I have one,
-    // else the issuer key held in my own device certificate (the owner I joined
-    // under). A device whose cert chains to THIS key is fleet, not external; so
-    // a spoke stops filing its owner under "other people".
-    let same_owner = owner
-        .as_ref()
-        .copied()
-        .or_else(|| local_device_cert().map(|c| c.user_pub));
+    let same_owner = same_owner_key();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -316,13 +335,7 @@ pub(crate) fn device_entries(warm: Option<&Value>) -> Vec<fleet_ui::devices::Dev
         .filter_map(|r| r["name"].as_str().map(str::to_string))
         .map(|name| {
             let cert = device_cert_for(&name);
-            let tier = match cert.as_ref() {
-                None => fleet_ui::devices::DeviceTier::NeedsReview,
-                Some(cert) if same_owner.as_ref() == Some(&cert.user_pub) => {
-                    fleet_ui::devices::DeviceTier::Fleet
-                }
-                Some(_) => fleet_ui::devices::DeviceTier::External,
-            };
+            let tier = tier_for(cert.as_ref(), same_owner.as_ref());
             let caps = effective_device_caps(&name);
             let (last_seen, stored_v6, stored_v4) = devices_info(&name).unwrap_or((0, None, None));
             let address = stored_v6.or(stored_v4);

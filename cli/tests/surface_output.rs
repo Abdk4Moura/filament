@@ -37,6 +37,10 @@ fn budget() -> BTreeMap<&'static str, usize> {
         ("up_logs.rs", 4),
         ("runtime_support.rs", 3),
         ("devices_store.rs", 1),
+        // `devices --caps` prints its table or its one JSON document to stdout
+        // for a script to consume, the same contract as the `devices` arm in
+        // dispatch.rs; its human asides go through ui::.
+        ("device_perms.rs", 3),
         ("enrollment.rs", 1),
         ("pair_cmd.rs", 1),
         ("recv_files.rs", 1),

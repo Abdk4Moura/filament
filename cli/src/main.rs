@@ -110,6 +110,7 @@ mod update_cmd;
 pub(crate) use update_cmd::update_cmd;
 /// Device lookups and views.
 mod device_view;
+mod device_perms;
 pub(crate) use device_view::{devices_store, devices_store_v2, device_cert_for, device_cert_valid_for, device_record_exists, device_name_for_pub, device_cert_revoked, devices_find_by_device_pub, devices_sweep_lapsed, devices_touch, devices_info, device_countdown, device_entries};
 #[cfg(test)]
 pub(crate) use device_view::devices_touch_at;

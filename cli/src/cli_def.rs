@@ -306,6 +306,11 @@ pub(crate) enum Cmd {
         /// Machine-readable JSON (for scripts): [{name, channel, caps}].
         #[arg(long)]
         json: bool,
+        /// What each device can do to this machine, and until when: one row per
+        /// capability with its source, expiry and whether the gate honours it
+        /// right now. Give a device name to show just that device. Read-only.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "DEVICE")]
+        caps: Option<String>,
     },
     /// Always-on receiver: trusted known devices only, invisible to strangers
     Up {
