@@ -252,11 +252,7 @@ pub(crate) fn ensure_user_key_inner() -> Result<(identity::UserKey, bool)> {
     if !dir.exists() {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("create config dir {}", dir.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
+        crate::platform::tighten_new_dir(&dir);
     }
     let _lock = crate::platform::DevicesFileLock::acquire_at(&dir.join("identity.lock"))?;
     if let Some(key) = identity::UserKey::load(&store)? {

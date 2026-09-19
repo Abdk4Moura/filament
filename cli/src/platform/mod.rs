@@ -217,6 +217,26 @@ fn repair_sensitive_permissions_in(dir: &Path) -> std::io::Result<usize> {
     Ok(repaired)
 }
 
+/// Tighten a directory we just created to owner-only, where the platform has
+/// POSIX modes. BOTH ARMS LIVE HERE, per docs/architecture/PLATFORM.md: on
+/// Windows a directory created under the user's profile inherits an ACL that is
+/// already owner-only, so there is nothing to set, and saying so in code is the
+/// difference between "portable" and "never tested on the other platform".
+/// Best effort: a config dir that exists with the wrong mode is not a reason to
+/// fail the command that created it, and `repair_sensitive_permissions()` is the
+/// path that reports on modes.
+pub fn tighten_new_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
 fn repair_sensitive_dir(dir: &Path) -> std::io::Result<usize> {
     let mut repaired = 0;
     #[cfg(unix)]
