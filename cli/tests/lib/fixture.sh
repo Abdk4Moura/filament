@@ -115,24 +115,18 @@ start_acceptor() {
 enroll_delegate() {
   local name="$1"; shift
   local ddir="$WORK/$name"; mkdir -p "$ddir"
-  local out state
-  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes)
-  state=$(fs_state)
-  case "$state" in
-    ok) ;;
-    err)  fixture_die "setup: 'add --for $name' failed (fs_state=$state): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
-    *)    fixture_die "setup: 'add --for $name' WEDGED after 45s (fs_state=$state). A hang is a failure, not a slow pass; see lib/fixture.sh fs_bounded." ;;
-  esac
-  out=$(fs_bounded 45 env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive)
-  state=$(fs_state)
-  case "$state" in
-    ok) ;;
-    err)  fixture_die "setup: 'join --name $name' failed (fs_state=$state): $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" ;;
-    *)    fixture_die "setup: 'join --name $name' WEDGED after 45s (fs_state=$state). A hang is a failure, not a slow pass; see lib/fixture.sh fs_bounded." ;;
-  esac
-  printf '%s\n' "$out" > "$WORK/$name-join.log"
+  env FILAMENT_CONFIG_DIR="$DA" "$BIN" --server "$SERVER" add --for "$name" "$@" --out "$WORK/$name-inv.txt" --yes >/dev/null 2>&1
+  env FILAMENT_CONFIG_DIR="$ddir" "$BIN" --server "$SERVER" join --invite-file "$WORK/$name-inv.txt" --name "$name" --no-interactive >"$WORK/$name-join.log" 2>&1
   sleep 2
 }
+  # NOTE: this function is deliberately NOT bounded through fs_bounded. It was, and it broke
+  # devices-write-race-gates: fs_bounded runs its command detached in a backgrounded subshell with
+  # the output captured through a command substitution, and the enrolment's `join` is the step
+  # that leaves the delegate's daemon behind, so running it detached changed the delegate's
+  # session state and the owner's liveness sweep stopped seeing it -- lastSeen never advanced and
+  # that gate's vacuity detector fired, correctly, because a sweep that did not run proves nothing.
+  # The wedge this fixture needed to name was in the gates' own `shell` calls, not here; the bound
+  # belongs where a hang was observed, not everywhere a command runs.
 
 # Report a setup failure that makes the rest of the gate meaningless, name it, count it and
 # stop. Called from inside the fixture rather than from the gate's tail, because a wedged
