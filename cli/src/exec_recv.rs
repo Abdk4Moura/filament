@@ -479,6 +479,22 @@ pub(crate) async fn serve_exec(
                         "filament: could not signal the end of exec stream sid {err_sid}: {e}"
                     ));
                 }
+                // THE CONTROL CHANNEL CARRIES THE END TOO, because the data-frame sentinel does
+                // not reach the peer -- an empty frame is not forwarded, which is its own claim
+                // and filed separately. `l2-close` demonstrably delivers: the peer's `on_close`
+                // records the reason and calls `drop_stream`, whose own comment says that
+                // dropping the pipe's sender is what closes it, so the consumer's `recv()`
+                // returns None and its select bails with a name instead of waiting. Sent AFTER
+                // the close attempt and on the SAME ordered control channel, so the normal path
+                // still exits on the STATUS and this is only what the wedged path sees.
+                for s in [sid, err_sid] {
+                    let _ = t.send_control(&json!({
+                        "type": "l2-close",
+                        "sid": s,
+                        "err": "exec session ended without a delivered exit status",
+                    }))
+                    .await;
+                }
                 mux.drop_stream(sid).await;
                 mux.drop_stream(err_sid).await;
                 return;
